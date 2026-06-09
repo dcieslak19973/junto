@@ -116,6 +116,7 @@ Settled **architectural** decisions live in [`adr/`](adr/), one file each — ex
 | [0009](adr/0009-git-refs-substrate-ndjson-per-author.md) | The **git-refs substrate** stores an append-only **NDJSON log per author** under `refs/junto/<channel>/<author>` (local durable record; forge sync deferred). |
 | [0010](adr/0010-canonical-order-and-dedup-by-entry-id.md) | Canonical order is **`(timestamp, author email, entry id)`** — a deterministic *total* order — and projection **dedups by `EntryId`** (substrates may hold duplicates). |
 | [0011](adr/0011-sync-is-push-fetch-plus-convergent-union-merge.md) | **Sync** = push/fetch of author refs to any git remote; divergence (same author, two machines) reconciles by a **deterministic union-merge** — set union of immutable entries *is* the merge (no CRDT needed). |
+| [0012](adr/0012-mcp-over-http-is-the-first-write-surface.md) | The first write surface is **MCP over streamable HTTP** (`junto serve`, localhost:1727); **named channels** derive their id via UUIDv5 (no registry). Identity is claimed, not verified — a recorded dogfood-era limit. |
 
 **Settled naming** (low-stakes calls, already reflected in the tables above — recorded here only so the choice isn't re-litigated): **Agent Session** (over "Run"; always qualified) · **Playbook** (over "Channel Kind") · **Provenance** is a relation, not a standalone entity · keep **Gate** / **gate-routing** / **policy** distinct from agent **Policy Version**.
 
