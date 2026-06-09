@@ -1,0 +1,18 @@
+[package]
+name = "junto-substrate-git"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "junto git-refs SubstrateProvider — local durable record in refs/junto/*"
+
+[dependencies]
+junto-kernel.workspace = true
+# `io-util` brings AsyncWriteExt (feeding git stdin); `process` comes from the
+# workspace tokio features.
+tokio = { workspace = true, features = ["io-util"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }

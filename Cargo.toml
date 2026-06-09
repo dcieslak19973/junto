@@ -3,7 +3,7 @@
 # adapter crates; the `junto` binary is the host/app entry (not a human terminal).
 [workspace]
 resolver = "3"
-members = ["crates/junto-kernel", "crates/junto"]
+members = ["crates/junto-kernel", "crates/junto", "crates/junto-substrate-git"]
 
 [workspace.package]
 edition = "2024"
@@ -23,5 +23,8 @@ serde_json = "1.0.145"
 # JCS / RFC 8785 canonical JSON for the durable record (MIT; RFC-compliant
 # successor to the abandoned serde_jcs). See docs/adr/0008.
 serde_json_canonicalizer = "0.3.2"
-# dev-only: drives the async SubstrateProvider in tests (the in-memory impl does no real I/O)
-tokio = { version = "1.52.3", features = ["macros", "rt"] }
+# async runtime; `process` drives the git CLI in the git-refs substrate, `macros`+`rt`
+# drive the async SubstrateProvider in tests (the in-memory impl does no real I/O)
+tokio = { version = "1.52.3", features = ["macros", "rt", "process"] }
+# dev-only: real temp git repos for the git-refs substrate tests (MIT/Apache)
+tempfile = "3.24.0"
