@@ -6,7 +6,7 @@
 
 junto is a place for humans and AI agents to *do work together*: talk it through, let agents act, gate the consequential steps, and end with a trustworthy, reproducible record of what happened and why.
 
-> **Status:** early / design-stage. This repo currently holds **design notes, not shipping code.** It's MIT-licensed and being figured out in the open. Expect things to change.
+> **Status:** early implementation. The design corpus is settled enough to build on, and the first kernel slices exist as code: the ledger (immutable entries, event-sourced projection), the gate engine, canonical serialization, and a git-refs storage backend — built in the open, MIT-licensed, decisions recorded as ADRs in [`docs/adr/`](docs/adr/). No usable product surface yet. Expect things to change.
 
 ---
 
@@ -59,7 +59,7 @@ Benjamin Franklin's **Junto** (Philadelphia, 1727) was a club of working tradesp
 
 ## Status & scope
 
-- **Design-stage**, no implementation yet. MIT-licensed, greenfield.
+- **Early implementation.** The generic kernel is underway in Rust (`crates/junto-kernel`): ledger entries with provenance, the event-sourced gate engine, a canonical (JCS) record format, and a git-refs substrate that stores the durable record in `refs/junto/*`. Syncing that record through a forge, and any human-facing surface, come next. MIT-licensed, greenfield.
 - First focus: **OSS / small teams** — the durable record syncs through the git forge you already use; a heavier self-hosted/regulated mode is a later concern.
 - Deliberately *not* trying to be everything at once: build a few concrete Playbooks first, extract the general framework only after.
 

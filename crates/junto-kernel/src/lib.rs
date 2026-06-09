@@ -3,18 +3,20 @@
 //! The **generic, playbook-agnostic core** of junto. See `domain-model.md` for
 //! the ubiquitous language and `CLAUDE.md` for the hard constraints.
 //!
-//! The kernel owns only the nouns that every Playbook shares — Channel,
-//! Member/Party, Message, Artifact, Provenance, Agent Session, the Gate engine,
-//! the Ledger (and its entries), Outcome, and Event. It contains **no
-//! playbook-specific logic and no vendor names**: those live in playbook crates
-//! and behind adapter traits, respectively.
+//! The kernel owns only the nouns that every Playbook shares. **Modelled so
+//! far:** Member, Provenance, the Gate engine, and the Ledger (and its
+//! entries). **Planned, not yet modelled:** Channel (today just a [`ChannelId`]),
+//! Party, Message, Artifact, Agent Session, Outcome, and Event. It contains
+//! **no playbook-specific logic and no vendor names**: those live in playbook
+//! crates and behind adapter traits, respectively.
 //!
 //! The first modelled slice is the **Ledger**: an immutable, append-only log of
 //! [`LedgerEntry`] values projected into current standings ([`Ledger::project`]),
-//! stored behind the [`SubstrateProvider`] seam (in-memory today, git-refs
-//! later). Each entry has a deterministic canonical byte form
-//! ([`LedgerEntry::to_canonical_bytes`], see [`serial`]). The ledger-entry
-//! content model is locked per the ADRs in `docs/adr/` (`0001`–`0008`).
+//! stored behind the [`SubstrateProvider`] seam (in-memory here; git-refs in
+//! the `junto-substrate-git` crate). Each entry has a deterministic canonical
+//! byte form ([`LedgerEntry::to_canonical_bytes`], see [`serial`]). The
+//! ledger-entry content model is locked per the ADRs in `docs/adr/`
+//! (`0001`–`0010`).
 
 #![forbid(unsafe_code)]
 

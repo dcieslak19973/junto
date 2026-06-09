@@ -6,16 +6,18 @@
 
 junto is **one surface where people and agents take a piece of work to a verified, provenance-bound outcome** — over the tools you already use. The unit is a **Channel** (a unit of inquiry) running one loop: *deliberate → agent-augmented work → gate → verified record*. It is vendor-neutral by adapters, terminal-less for humans, workflow-general (coding is one Playbook of several), and its durable output is a re-runnable record, not prose. Read [`README.md`](README.md) then [`docs/junto.md`](docs/junto.md) (the vision spine) for the full story.
 
-## Status: early implementation (scaffold up)
+## Status: early implementation (kernel spine built)
 
-✅ The design corpus (`docs/`) is settled enough to build on; its language and the constraints below are load-bearing for the code. A Cargo workspace scaffold exists — `crates/junto-kernel` (lib) + `crates/junto` (bin) — but the domain model is **not** modelled yet (the ledger-entry content model is still open; see `docs/junto.md` item *b*).
+✅ The design corpus (`docs/`) is settled enough to build on; its language and the constraints below are load-bearing for the code. The first kernel slices exist and are test-pinned: the **Ledger** (immutable `LedgerEntry`s, event-sourced projection into standings + gate statuses), the **Gate engine**, the **canonical (JCS) record format**, and the **git-refs substrate** (local durable record in `refs/junto/*`). Settled decisions live in `docs/adr/` (0001–0010) — read the relevant ADRs before touching the ledger, gates, serialization, or substrate. Not built yet: forge sync, Channel/Party/Artifact/Agent Session modelling, playbooks, any human surface.
 
 **Workspace layout:**
 
 ```
-crates/junto-kernel/   # the generic, playbook-agnostic core (lib) — no vendor names, no playbook logic
-crates/junto/          # the host/app entry (bin) — terminal-less for humans; not a CLI UI
-docs/                  # the design corpus (vision, domain model, architecture, pluggability, worked examples)
+crates/junto-kernel/        # the generic, playbook-agnostic core (lib) — no vendor names, no playbook logic
+crates/junto-substrate-git/ # git-refs SubstrateProvider adapter (shells out to system git)
+crates/junto/               # the host/app entry (bin) — terminal-less for humans; not a CLI UI
+docs/                       # the design corpus (vision, domain model, architecture, pluggability, worked examples)
+docs/adr/                   # one settled architectural decision per file
 ```
 
 **Commands** (from repo root):
