@@ -126,12 +126,7 @@ impl<S: SubstrateProvider> Ledger<S> {
     /// Propagates any error from the underlying [`SubstrateProvider`].
     pub async fn project(&self, channel: &ChannelId) -> Result<ChannelView> {
         let mut entries = self.substrate.entries(channel).await?;
-        entries.sort_by(|a, b| {
-            a.timestamp
-                .cmp(&b.timestamp)
-                .then_with(|| a.author.email.cmp(&b.author.email))
-                .then_with(|| a.id.cmp(&b.id))
-        });
+        entries.sort_by(LedgerEntry::canonical_cmp);
         // Keep the first occurrence of each id (in canonical order), so a
         // double-appended entry projects as one.
         let mut seen = HashSet::new();

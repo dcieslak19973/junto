@@ -12,6 +12,8 @@
 //! ([`EntryPayload`], `docs/adr/0003`). Verifications (ratify / park / correct) are
 //! themselves ledger entries, not a separate event channel.
 
+use std::cmp::Ordering;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{EntryId, Member, ProvenanceRef, Timestamp, gate::ApprovalRequirement, ids::ChannelId};
@@ -120,6 +122,24 @@ pub enum EntryPayload {
         /// Why it was rejected.
         rationale: String,
     },
+}
+
+impl LedgerEntry {
+    /// The canonical total order of the record: `(timestamp, author email, id)`
+    /// (`docs/adr/0010`). The id tie-break makes this a *total* order, so every
+    /// replica sorts an identical entry set identically — which matters because
+    /// standing is last-applicable-wins during projection.
+    ///
+    /// This is the **one definition** of record order: [`crate::Ledger::project`]
+    /// sorts with it, and substrates that materialize a log in canonical order
+    /// (e.g. a sync union-merge) reuse it rather than re-deriving the key.
+    #[must_use]
+    pub fn canonical_cmp(&self, other: &Self) -> Ordering {
+        self.timestamp
+            .cmp(&other.timestamp)
+            .then_with(|| self.author.email.cmp(&other.author.email))
+            .then_with(|| self.id.cmp(&other.id))
+    }
 }
 
 impl EntryPayload {
