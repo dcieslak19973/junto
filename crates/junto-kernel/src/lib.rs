@@ -19,6 +19,7 @@
 
 pub mod entry;
 pub mod error;
+pub mod gate;
 pub mod ids;
 pub mod ledger;
 pub mod member;
@@ -28,6 +29,7 @@ pub mod time;
 
 pub use entry::{EntryPayload, LedgerEntry};
 pub use error::{Error, Result};
+pub use gate::{ApprovalRequirement, GateStatus};
 pub use ids::{ChannelId, EntryId};
 pub use ledger::{ChannelView, Ledger, Standing};
 pub use member::{Member, MemberKind};

@@ -8,9 +8,26 @@
 //! Immutability is structural: the only mutating call is [`Ledger::append`];
 //! there is no edit or delete anywhere in the API. Corrections are new entries.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use crate::{EntryId, EntryPayload, LedgerEntry, Result, SubstrateProvider, ids::ChannelId};
+use crate::{
+    EntryId, EntryPayload, GateStatus, LedgerEntry, Result, SubstrateProvider,
+    gate::ApprovalRequirement, ids::ChannelId,
+};
+
+/// Whether a proposal's [`ApprovalRequirement`] is satisfied by the set of
+/// distinct approver emails seen so far (rejection is handled separately, and
+/// dominates). An absent approver set is treated as empty.
+fn requirement_met(requirement: &ApprovalRequirement, approvers: Option<&HashSet<&str>>) -> bool {
+    let approvers = approvers.cloned().unwrap_or_default();
+    match requirement {
+        ApprovalRequirement::Auto => true,
+        ApprovalRequirement::Count(n) => approvers.len() as u32 >= *n,
+        ApprovalRequirement::AllOf(members) => members
+            .iter()
+            .all(|member| approvers.contains(member.email.as_str())),
+    }
+}
 
 /// The derived standing of an [`EntryPayload::Assertion`] after folding the log.
 ///
@@ -30,13 +47,16 @@ pub enum Standing {
 }
 
 /// A point-in-time projection of a Channel's Ledger: the entries in canonical
-/// order, plus the current [`Standing`] of each assertion.
+/// order, plus the derived [`Standing`] of each assertion and
+/// [`GateStatus`] of each proposal.
 #[derive(Debug, Clone)]
 pub struct ChannelView {
     /// All entries, in canonical `(timestamp, author.email)` order.
     pub entries: Vec<LedgerEntry>,
     /// Current standing per assertion [`EntryId`].
     pub standings: HashMap<EntryId, Standing>,
+    /// Current gate status per proposal [`EntryId`].
+    pub gate_status: HashMap<EntryId, GateStatus>,
 }
 
 impl ChannelView {
@@ -44,6 +64,12 @@ impl ChannelView {
     #[must_use]
     pub fn standing(&self, id: &EntryId) -> Option<Standing> {
         self.standings.get(id).copied()
+    }
+
+    /// The gate status of a specific proposal, if present.
+    #[must_use]
+    pub fn gate_status(&self, id: &EntryId) -> Option<GateStatus> {
+        self.gate_status.get(id).copied()
     }
 }
 
@@ -74,13 +100,22 @@ impl<S: SubstrateProvider> Ledger<S> {
     /// Project the Channel's log into a [`ChannelView`].
     ///
     /// Entries are sorted by `(timestamp, author.email)` — a deterministic
-    /// total order even when wall-clocks collide across authors — then folded:
-    /// each assertion starts [`Standing::Provisional`]; a later verification
-    /// entry moves its target's standing (ratify → [`Standing::Ratified`],
-    /// park → [`Standing::Parked`], correction → [`Standing::Superseded`]).
-    /// The last applicable verification in order wins. A verification whose
-    /// `target` is unknown is ignored leniently (dangling references are
-    /// tolerated for now).
+    /// total order even when wall-clocks collide across authors — then folded
+    /// into two derived views:
+    ///
+    /// - **Assertion [`Standing`]:** each assertion starts
+    ///   [`Standing::Provisional`]; a later verification moves its target
+    ///   (ratify → [`Standing::Ratified`], park → [`Standing::Parked`],
+    ///   correction → [`Standing::Superseded`]); the last applicable one wins.
+    /// - **Proposal [`GateStatus`]:** each proposal starts [`GateStatus::Pending`]
+    ///   ([`GateStatus::Approved`] immediately if its requirement is
+    ///   [`ApprovalRequirement::Auto`]); approvals accumulate by *distinct
+    ///   author email* and a rejection is *sticky*. Any rejection ⇒
+    ///   [`GateStatus::Rejected`]; otherwise the requirement decides
+    ///   approved-vs-pending.
+    ///
+    /// An act whose `target` is unknown is ignored leniently (dangling
+    /// references are tolerated for now).
     ///
     /// # Errors
     /// Propagates any error from the underlying [`SubstrateProvider`].
@@ -92,23 +127,39 @@ impl<S: SubstrateProvider> Ledger<S> {
                 .then_with(|| a.author.email.cmp(&b.author.email))
         });
 
+        let standings = Self::project_standings(&entries);
+        let gate_status = Self::project_gates(&entries);
+
+        Ok(ChannelView {
+            entries,
+            standings,
+            gate_status,
+        })
+    }
+
+    /// Fold the assertion standings out of an ordered entry list.
+    fn project_standings(entries: &[LedgerEntry]) -> HashMap<EntryId, Standing> {
         let mut standings: HashMap<EntryId, Standing> = HashMap::new();
 
-        // First pass: every assertion exists, provisionally.
-        for entry in &entries {
+        // Every assertion exists, provisionally.
+        for entry in entries {
             if matches!(entry.payload, EntryPayload::Assertion { .. }) {
                 standings.insert(entry.id, Standing::Provisional);
             }
         }
 
-        // Second pass: apply verification acts in canonical order. A dangling
-        // target (no such assertion) is skipped rather than erroring.
-        for entry in &entries {
+        // Apply verification acts in canonical order; a dangling target (no
+        // such assertion) is skipped rather than erroring.
+        for entry in entries {
             let new_standing = match &entry.payload {
-                EntryPayload::Assertion { .. } => continue,
                 EntryPayload::Ratification { .. } => Standing::Ratified,
                 EntryPayload::Park { .. } => Standing::Parked,
                 EntryPayload::Correction { .. } => Standing::Superseded,
+                // Not standing-bearing acts.
+                EntryPayload::Assertion { .. }
+                | EntryPayload::Proposal { .. }
+                | EntryPayload::Approval { .. }
+                | EntryPayload::Rejection { .. } => continue,
             };
             if let Some(target) = entry.payload.target()
                 && let Some(slot) = standings.get_mut(&target)
@@ -117,15 +168,62 @@ impl<S: SubstrateProvider> Ledger<S> {
             }
         }
 
-        Ok(ChannelView { entries, standings })
+        standings
+    }
+
+    /// Fold the proposal gate statuses out of an ordered entry list.
+    fn project_gates(entries: &[LedgerEntry]) -> HashMap<EntryId, GateStatus> {
+        // Per proposal: its requirement, the distinct emails that approved it,
+        // and whether it has been rejected.
+        let mut requirements: HashMap<EntryId, &ApprovalRequirement> = HashMap::new();
+        let mut approvers: HashMap<EntryId, HashSet<&str>> = HashMap::new();
+        let mut rejected: HashSet<EntryId> = HashSet::new();
+
+        for entry in entries {
+            if let EntryPayload::Proposal { requirement, .. } = &entry.payload {
+                requirements.insert(entry.id, requirement);
+                approvers.entry(entry.id).or_default();
+            }
+        }
+
+        // Accumulate approvals (by distinct author email) and rejections,
+        // ignoring acts whose target is not a known proposal.
+        for entry in entries {
+            match &entry.payload {
+                EntryPayload::Approval { target, .. } if requirements.contains_key(target) => {
+                    approvers
+                        .entry(*target)
+                        .or_default()
+                        .insert(entry.author.email.as_str());
+                }
+                EntryPayload::Rejection { target, .. } if requirements.contains_key(target) => {
+                    rejected.insert(*target);
+                }
+                _ => {}
+            }
+        }
+
+        requirements
+            .into_iter()
+            .map(|(id, requirement)| {
+                let status = if rejected.contains(&id) {
+                    GateStatus::Rejected
+                } else if requirement_met(requirement, approvers.get(&id)) {
+                    GateStatus::Approved
+                } else {
+                    GateStatus::Pending
+                };
+                (id, status)
+            })
+            .collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::{
-        EntryId, EntryPayload, InMemorySubstrate, Ledger, LedgerEntry, Member, Standing, Timestamp,
-        ids::ChannelId,
+        ApprovalRequirement, EntryId, EntryPayload, GateStatus, InMemorySubstrate, Ledger,
+        LedgerEntry, Member, Standing, Timestamp, ids::ChannelId,
     };
 
     /// Build an entry with explicit id/timestamp/author for deterministic tests.
@@ -388,5 +486,329 @@ mod tests {
         let view_b = ledger.project(&channel_b).await.unwrap();
         assert_eq!(view_b.entries.len(), 1);
         assert_ne!(view_b.entries[0].id, in_a);
+    }
+
+    // --- Gate engine ---
+
+    fn proposal(requirement: ApprovalRequirement) -> EntryPayload {
+        EntryPayload::Proposal {
+            action: "push the diff".into(),
+            rationale: "ready".into(),
+            provenance: Vec::new(),
+            requirement,
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_requirement_approves_with_no_approvals() {
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let agent = Member::agent("Bot", "bot@junto.local");
+        let prop = EntryId::new();
+        ledger
+            .append(entry(
+                prop,
+                channel,
+                agent,
+                1,
+                proposal(ApprovalRequirement::Auto),
+            ))
+            .await
+            .unwrap();
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert_eq!(view.gate_status(&prop), Some(GateStatus::Approved));
+    }
+
+    #[tokio::test]
+    async fn count_requires_that_many_distinct_approvals() {
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let alice = Member::human("Alice", "alice@example.com");
+        let bob = Member::human("Bob", "bob@example.com");
+        let prop = EntryId::new();
+        ledger
+            .append(entry(
+                prop,
+                channel,
+                alice.clone(),
+                1,
+                proposal(ApprovalRequirement::Count(2)),
+            ))
+            .await
+            .unwrap();
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                alice,
+                2,
+                EntryPayload::Approval {
+                    target: prop,
+                    rationale: "ok".into(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        // One approval — still short of two.
+        let view = ledger.project(&channel).await.unwrap();
+        assert_eq!(view.gate_status(&prop), Some(GateStatus::Pending));
+
+        // A second, distinct approver satisfies it.
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                bob,
+                3,
+                EntryPayload::Approval {
+                    target: prop,
+                    rationale: "ok".into(),
+                },
+            ))
+            .await
+            .unwrap();
+        let view = ledger.project(&channel).await.unwrap();
+        assert_eq!(view.gate_status(&prop), Some(GateStatus::Approved));
+    }
+
+    #[tokio::test]
+    async fn count_does_not_stack_same_member() {
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let alice = Member::human("Alice", "alice@example.com");
+        let prop = EntryId::new();
+        ledger
+            .append(entry(
+                prop,
+                channel,
+                alice.clone(),
+                1,
+                proposal(ApprovalRequirement::Count(2)),
+            ))
+            .await
+            .unwrap();
+        // Alice approves twice — distinct-member rule means this counts once.
+        for ts in [2, 3] {
+            ledger
+                .append(entry(
+                    EntryId::new(),
+                    channel,
+                    alice.clone(),
+                    ts,
+                    EntryPayload::Approval {
+                        target: prop,
+                        rationale: "ok".into(),
+                    },
+                ))
+                .await
+                .unwrap();
+        }
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert_eq!(view.gate_status(&prop), Some(GateStatus::Pending));
+    }
+
+    #[tokio::test]
+    async fn all_of_requires_every_named_member() {
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let alice = Member::human("Alice", "alice@example.com");
+        let bob = Member::human("Bob", "bob@example.com");
+        let prop = EntryId::new();
+        ledger
+            .append(entry(
+                prop,
+                channel,
+                alice.clone(),
+                1,
+                proposal(ApprovalRequirement::AllOf(vec![alice.clone(), bob.clone()])),
+            ))
+            .await
+            .unwrap();
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                alice,
+                2,
+                EntryPayload::Approval {
+                    target: prop,
+                    rationale: "ok".into(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        // Only Alice so far.
+        let view = ledger.project(&channel).await.unwrap();
+        assert_eq!(view.gate_status(&prop), Some(GateStatus::Pending));
+
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                bob,
+                3,
+                EntryPayload::Approval {
+                    target: prop,
+                    rationale: "ok".into(),
+                },
+            ))
+            .await
+            .unwrap();
+        let view = ledger.project(&channel).await.unwrap();
+        assert_eq!(view.gate_status(&prop), Some(GateStatus::Approved));
+    }
+
+    #[tokio::test]
+    async fn rejection_is_sticky_even_with_enough_approvals() {
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let alice = Member::human("Alice", "alice@example.com");
+        let bob = Member::human("Bob", "bob@example.com");
+        let prop = EntryId::new();
+        ledger
+            .append(entry(
+                prop,
+                channel,
+                alice.clone(),
+                1,
+                proposal(ApprovalRequirement::Count(1)),
+            ))
+            .await
+            .unwrap();
+        // Enough approvals to satisfy Count(1)...
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                alice,
+                2,
+                EntryPayload::Approval {
+                    target: prop,
+                    rationale: "ok".into(),
+                },
+            ))
+            .await
+            .unwrap();
+        // ...but a rejection blocks regardless.
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                bob,
+                3,
+                EntryPayload::Rejection {
+                    target: prop,
+                    rationale: "unsafe".into(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert_eq!(view.gate_status(&prop), Some(GateStatus::Rejected));
+    }
+
+    #[tokio::test]
+    async fn approval_after_rejection_does_not_revive() {
+        // reject@2 then approve@3 — stickiness is order-independent: you cannot
+        // undo a rejection by approving. This is exactly the behaviour that
+        // motivates the deferred admin-override kind (domain-model #17).
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let alice = Member::human("Alice", "alice@example.com");
+        let bob = Member::human("Bob", "bob@example.com");
+        let prop = EntryId::new();
+        ledger
+            .append(entry(
+                prop,
+                channel,
+                alice.clone(),
+                1,
+                proposal(ApprovalRequirement::Count(1)),
+            ))
+            .await
+            .unwrap();
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                bob,
+                2,
+                EntryPayload::Rejection {
+                    target: prop,
+                    rationale: "unsafe".into(),
+                },
+            ))
+            .await
+            .unwrap();
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                alice,
+                3,
+                EntryPayload::Approval {
+                    target: prop,
+                    rationale: "lgtm".into(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert_eq!(view.gate_status(&prop), Some(GateStatus::Rejected));
+    }
+
+    #[tokio::test]
+    async fn dangling_approval_is_ignored() {
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let alice = Member::human("Alice", "alice@example.com");
+        // An approval whose target is no known proposal.
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                alice,
+                1,
+                EntryPayload::Approval {
+                    target: EntryId::new(),
+                    rationale: "ok".into(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert!(view.gate_status.is_empty());
+        assert_eq!(view.entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn proposals_are_channel_scoped() {
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel_a = ChannelId::new();
+        let channel_b = ChannelId::new();
+        let agent = Member::agent("Bot", "bot@junto.local");
+        let prop_a = EntryId::new();
+        ledger
+            .append(entry(
+                prop_a,
+                channel_a,
+                agent,
+                1,
+                proposal(ApprovalRequirement::Auto),
+            ))
+            .await
+            .unwrap();
+
+        let view_b = ledger.project(&channel_b).await.unwrap();
+        assert!(view_b.gate_status(&prop_a).is_none());
+        let view_a = ledger.project(&channel_a).await.unwrap();
+        assert_eq!(view_a.gate_status(&prop_a), Some(GateStatus::Approved));
     }
 }

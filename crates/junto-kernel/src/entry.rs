@@ -12,7 +12,7 @@
 //! ([`EntryPayload`], decision #9). Verifications (ratify / park / correct) are
 //! themselves ledger entries, not a separate event channel.
 
-use crate::{EntryId, Member, ProvenanceRef, Timestamp, ids::ChannelId};
+use crate::{EntryId, Member, ProvenanceRef, Timestamp, gate::ApprovalRequirement, ids::ChannelId};
 
 /// One immutable record in a Channel's Ledger.
 ///
@@ -84,20 +84,58 @@ pub enum EntryPayload {
         /// Why the correction was made.
         rationale: String,
     },
+    /// A consequential action awaiting a Gate. Like an
+    /// [`Assertion`](EntryPayload::Assertion) it is a *subject* (targets
+    /// nothing); its [`GateStatus`](crate::GateStatus) is derived by folding the
+    /// [`Approval`](EntryPayload::Approval)/[`Rejection`](EntryPayload::Rejection)
+    /// entries that reference it against its `requirement`.
+    Proposal {
+        /// A generic, repo-agnostic descriptor of the action being proposed
+        /// (so a research-persona gate behaves identically to a code-PR gate).
+        action: String,
+        /// Why the action is proposed.
+        rationale: String,
+        /// Evidence backing the proposal.
+        provenance: Vec<ProvenanceRef>,
+        /// What the gate requires before approval — recorded here so the gate
+        /// is auditable from the log alone.
+        requirement: ApprovalRequirement,
+    },
+    /// Approves a [`Proposal`](EntryPayload::Proposal). Distinct from
+    /// [`Ratification`](EntryPayload::Ratification): approve/reject pass-or-block
+    /// an action *before* it happens; ratify confirms a recorded claim *after*.
+    Approval {
+        /// The proposal being approved.
+        target: EntryId,
+        /// Why it was approved.
+        rationale: String,
+    },
+    /// Rejects a [`Proposal`](EntryPayload::Proposal). Reject is *sticky* — one
+    /// rejection blocks the gate regardless of approvals.
+    Rejection {
+        /// The proposal being rejected.
+        target: EntryId,
+        /// Why it was rejected.
+        rationale: String,
+    },
 }
 
 impl EntryPayload {
-    /// The entry this payload acts upon, if it is a verification act.
+    /// The entry this payload acts upon, if it acts on a prior entry.
     ///
-    /// Returns `None` for an [`Assertion`](EntryPayload::Assertion) (which
-    /// targets nothing) and `Some(target)` for the verification kinds.
+    /// Returns `None` for the *subject* kinds — [`Assertion`](EntryPayload::Assertion)
+    /// and [`Proposal`](EntryPayload::Proposal), which target nothing — and
+    /// `Some(target)` for the acts that reference a prior entry (ratify / park /
+    /// correct / approve / reject).
     #[must_use]
     pub fn target(&self) -> Option<EntryId> {
         match self {
-            EntryPayload::Assertion { .. } => None,
+            EntryPayload::Assertion { .. } | EntryPayload::Proposal { .. } => None,
             EntryPayload::Ratification { target, .. }
             | EntryPayload::Park { target, .. }
-            | EntryPayload::Correction { target, .. } => Some(*target),
+            | EntryPayload::Correction { target, .. }
+            | EntryPayload::Approval { target, .. }
+            | EntryPayload::Rejection { target, .. } => Some(*target),
         }
     }
 }
