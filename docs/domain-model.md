@@ -112,6 +112,7 @@ Settled **architectural** decisions live in [`adr/`](adr/), one file each — ex
 | [0005](adr/0005-provenance-ref-uri-plus-digest.md) | A `ProvenanceRef` = URI + optional self-describing **content digest** (drift-detectable). |
 | [0006](adr/0006-gate-engine-event-sourced.md) | The **Gate engine** is event-sourced into the Ledger (`Proposal`/`Approval`/`Rejection`; derived `GateStatus`; reject is *sticky*). |
 | [0007](adr/0007-routing-stays-out-of-the-kernel.md) | **Routing stays out of the kernel**: it executes an `ApprovalRequirement`; the importable **Rubric** layer (future) decides it. |
+| [0008](adr/0008-canonical-entry-serialization-is-jcs-json.md) | A `LedgerEntry`'s **canonical byte form** is **JCS / RFC 8785 JSON** (deterministic by spec, readable/diffable); newtypes re-validate on deserialize. |
 
 **Settled naming** (low-stakes calls, already reflected in the tables above — recorded here only so the choice isn't re-litigated): **Agent Session** (over "Run"; always qualified) · **Playbook** (over "Channel Kind") · **Provenance** is a relation, not a standalone entity · keep **Gate** / **gate-routing** / **policy** distinct from agent **Policy Version**.
 

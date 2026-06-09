@@ -10,6 +10,9 @@ description = "junto kernel — the generic, playbook-agnostic core"
 [dependencies]
 thiserror.workspace = true
 uuid.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_json_canonicalizer.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

@@ -2,7 +2,7 @@
 //!
 //! The substrate stores entries dumbly; the [`Ledger`] supplies the *meaning*:
 //! it orders the log and folds it into a [`ChannelView`] of current standings.
-//! This is the event-sourcing projection behind decision #8 — state is never
+//! This is the event-sourcing projection behind `docs/adr/0002` — state is never
 //! stored on an entry, it is **derived** by replaying the immutable log.
 //!
 //! Immutability is structural: the only mutating call is [`Ledger::append`];

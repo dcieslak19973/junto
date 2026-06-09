@@ -17,6 +17,11 @@ junto-kernel = { path = "crates/junto-kernel" }
 # external (latest as of 2026-06-08)
 thiserror = "2.0.18"
 anyhow = "1.0.102"
-uuid = { version = "1.23.2", features = ["v4"] }
+uuid = { version = "1.23.2", features = ["v4", "serde"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+# JCS / RFC 8785 canonical JSON for the durable record (MIT; RFC-compliant
+# successor to the abandoned serde_jcs). See docs/adr/0008.
+serde_json_canonicalizer = "0.3.2"
 # dev-only: drives the async SubstrateProvider in tests (the in-memory impl does no real I/O)
 tokio = { version = "1.52.3", features = ["macros", "rt"] }
