@@ -7,8 +7,11 @@
 //! unlike the library crates.
 
 mod mcp;
+mod render;
+mod web;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -52,20 +55,28 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Run the MCP host until Ctrl-C.
+/// Run the host until Ctrl-C: the MCP write surface at /mcp, and the
+/// read-only channel pages at /channels/{name} (+ /brief for hooks/agents).
 async fn serve(repo: PathBuf, port: u16) -> Result<()> {
     let repo = repo.canonicalize()?;
-    let handler = mcp::JuntoMcp::new(repo.clone());
+    // One ledger, shared by the MCP tools and the web read routes.
+    let ledger: web::SharedLedger = Arc::new(tokio::sync::Mutex::new(junto_kernel::Ledger::new(
+        junto_substrate_git::GitRefsSubstrate::open(repo.clone()),
+    )));
+    let handler = mcp::JuntoMcp::from_ledger(ledger.clone());
     let service = StreamableHttpService::new(
         move || Ok(handler.clone()),
         LocalSessionManager::default().into(),
         StreamableHttpServerConfig::default(),
     );
 
-    let router = axum::Router::new().nest_service("/mcp", service);
+    let router = axum::Router::new()
+        .nest_service("/mcp", service)
+        .merge(web::router(ledger));
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     tracing::info!(
-        "junto serving MCP at http://127.0.0.1:{port}/mcp over {}",
+        "junto serving MCP at http://127.0.0.1:{port}/mcp and channels at \
+         http://127.0.0.1:{port}/channels/{{name}} over {}",
         repo.display()
     );
     axum::serve(listener, router)

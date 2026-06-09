@@ -23,6 +23,7 @@ serde.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+time.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal"] }
 
 [dev-dependencies]

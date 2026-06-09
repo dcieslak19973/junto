@@ -187,6 +187,7 @@ Domain tools per Playbook (market-data/backtest/P&L for quant; EHR/cohort stats 
 ## Open questions
 
 1. 🔵 **Harness `permission_model` vs junto's gate engine — overlap to resolve.** Some harnesses (e.g. Claude Code) gate their *own* tool use (ask/auto/modes); junto *also* gates consequential actions via the L0 gate-engine + playbook routing. Unresolved: does junto's gate **replace** the harness's permission prompts, **layer on top** of them, or **delegate** to them? Naive composition risks **double-gating** (human approves twice) or **gaps** (an action junto would gate slips through because the harness auto-approved it). Likely answer: junto sets the harness to non-interactive/auto for tool use it can observe, and is itself the single accountable gate — but that depends on `artifact_hooks` fidelity (junto must *see* every action to gate it). Resolve before building the harness adapter.
+   ✅ **Position recorded (Dan, 2026-06-09 — `junto-dev` ledger, grill session): they LAYER.** The harness gates *mechanics* (synchronous, ephemeral — "may I run this command"); junto gates *outcomes* (asynchronous, durable, rationale-bearing — "should this merge"). *Replace* was rejected as unbuildable today (needs full `artifact_hooks` observability). Full resolution — whether junto additionally absorbs the harness prompts when observability allows — still waits on the `AgentHarnessAdapter`.
 
 ## Discipline (don't boil the ocean)
 
