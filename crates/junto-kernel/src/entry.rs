@@ -1,6 +1,6 @@
 //! The Ledger entry — junto's atomic, immutable unit of record.
 //!
-//! A [`LedgerEntry`] is **append-only and immutable** (domain decision #8):
+//! A [`LedgerEntry`] is **append-only and immutable** (`docs/adr/0002`):
 //! once written it is never edited or deleted. Mistakes are corrected the way
 //! an accounting ledger does it — by appending a *new* entry
 //! ([`EntryPayload::Correction`]) that supersedes the target, leaving the
@@ -9,8 +9,10 @@
 //! ([`crate::Ledger::project`]).
 //!
 //! There is exactly one envelope ([`LedgerEntry`]) and one closed set of kinds
-//! ([`EntryPayload`], decision #9). Verifications (ratify / park / correct) are
+//! ([`EntryPayload`], `docs/adr/0003`). Verifications (ratify / park / correct) are
 //! themselves ledger entries, not a separate event channel.
+
+use serde::{Deserialize, Serialize};
 
 use crate::{EntryId, Member, ProvenanceRef, Timestamp, gate::ApprovalRequirement, ids::ChannelId};
 
@@ -18,13 +20,13 @@ use crate::{EntryId, Member, ProvenanceRef, Timestamp, gate::ApprovalRequirement
 ///
 /// The envelope (id, channel, author, timestamp) is uniform across kinds; the
 /// [`payload`](LedgerEntry::payload) carries the kind-specific content.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LedgerEntry {
     /// Stable, opaque identifier for this entry.
     pub id: EntryId,
     /// The Channel whose Ledger this entry belongs to.
     pub channel: ChannelId,
-    /// Who wrote it — human or agent (decision #11).
+    /// Who wrote it — human or agent (`docs/adr/0004`).
     pub author: Member,
     /// When it was written; the primary projection sort key.
     pub timestamp: Timestamp,
@@ -32,25 +34,25 @@ pub struct LedgerEntry {
     pub payload: EntryPayload,
 }
 
-/// The closed set of entry kinds (decision #9).
+/// The closed set of entry kinds (`docs/adr/0003`).
 ///
 /// An [`Assertion`](EntryPayload::Assertion) is an original claim/decision/
 /// finding. The other three are **verification acts** that reference a prior
 /// entry by [`EntryId`] and move its standing during projection:
 /// [`Ratification`](EntryPayload::Ratification) accepts it,
 /// [`Park`](EntryPayload::Park) sets it aside as a negative/abandoned result
-/// (decision #13 — Park and Falsify are one kind for now), and
+/// (`docs/adr/0003` — Park and Falsify are one kind for now), and
 /// [`Correction`](EntryPayload::Correction) supersedes it with a restated claim.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EntryPayload {
     /// An original claim, decision, or finding. Alternatives considered live in
-    /// `rationale` until a second Playbook proves a richer shape (decision #12).
+    /// `rationale` until a second Playbook proves a richer shape (`docs/adr/0003`).
     Assertion {
         /// The claim itself.
         statement: String,
         /// Why — reasoning, and any alternatives considered.
         rationale: String,
-        /// Evidence backing the claim (decision #14).
+        /// Evidence backing the claim (`docs/adr/0005`).
         provenance: Vec<ProvenanceRef>,
     },
     /// Accepts a prior entry: moves its standing to ratified.
@@ -61,7 +63,7 @@ pub enum EntryPayload {
         rationale: String,
     },
     /// Sets a prior entry aside — a negative or abandoned result, retained in
-    /// the log (decision #13).
+    /// the log (`docs/adr/0003`).
     Park {
         /// The entry being parked.
         target: EntryId,
@@ -69,12 +71,12 @@ pub enum EntryPayload {
         rationale: String,
     },
     /// Supersedes a prior entry with a restated claim, leaving the original
-    /// intact (decision #8).
+    /// intact (`docs/adr/0002`).
     ///
     /// Note: the restated `statement` is recorded but does **not** itself gain
     /// a [`Standing`](crate::Standing) during projection — only the superseded
     /// original is tracked. Surfacing the corrected value as a first-class
-    /// standing is deferred (decision #12: keep minimal until a second Playbook
+    /// standing is deferred (`docs/adr/0003`: keep minimal until a second Playbook
     /// proves the shape).
     Correction {
         /// The entry being superseded.

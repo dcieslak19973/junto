@@ -12,6 +12,8 @@
 //! This module is just the vocabulary; the fold lives in `ledger.rs`, which
 //! owns projection.
 
+use serde::{Deserialize, Serialize};
+
 use crate::Member;
 
 /// What a Gate requires before its proposed action is approved.
@@ -20,7 +22,7 @@ use crate::Member;
 /// / hard-gated) down to one of these; the kernel never sees the preset names.
 /// The requirement is recorded on the [`Proposal`](crate::EntryPayload::Proposal)
 /// entry, so a gate's outcome is auditable from the log alone.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ApprovalRequirement {
     /// No approval needed — the action is auto-approved.
     Auto,

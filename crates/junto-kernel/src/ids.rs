@@ -9,10 +9,12 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Identifies a single [`crate::LedgerEntry`] within a channel's Ledger.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct EntryId(Uuid);
 
 impl EntryId {
@@ -36,7 +38,8 @@ impl fmt::Display for EntryId {
 }
 
 /// Identifies a Channel — one unit of inquiry, owning one Ledger.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct ChannelId(Uuid);
 
 impl ChannelId {

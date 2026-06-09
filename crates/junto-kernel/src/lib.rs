@@ -12,8 +12,9 @@
 //! The first modelled slice is the **Ledger**: an immutable, append-only log of
 //! [`LedgerEntry`] values projected into current standings ([`Ledger::project`]),
 //! stored behind the [`SubstrateProvider`] seam (in-memory today, git-refs
-//! later). The ledger-entry content model is locked per `domain-model.md`
-//! decisions #8–#14.
+//! later). Each entry has a deterministic canonical byte form
+//! ([`LedgerEntry::to_canonical_bytes`], see [`serial`]). The ledger-entry
+//! content model is locked per the ADRs in `docs/adr/` (`0001`–`0008`).
 
 #![forbid(unsafe_code)]
 
@@ -24,6 +25,7 @@ pub mod ids;
 pub mod ledger;
 pub mod member;
 pub mod provenance;
+pub mod serial;
 pub mod substrate;
 pub mod time;
 

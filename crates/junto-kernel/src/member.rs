@@ -1,13 +1,15 @@
 //! Members — the authors of ledger entries.
 //!
 //! A [`Member`] is a participant in a Channel: a **human or an agent**. Agents
-//! are first-class authors (domain decision #11) — the kernel does *not*
+//! are first-class authors (`docs/adr/0004`) — the kernel does *not*
 //! restrict who may write a [`crate::LedgerEntry`]. Any policy that some action
 //! requires a human, or an eval-gated agent, lives at the Gate/Verifier layer,
 //! not in authorship.
 
+use serde::{Deserialize, Serialize};
+
 /// Whether a [`Member`] is a person or an automated agent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MemberKind {
     /// A human participant.
     Human,
@@ -21,7 +23,7 @@ pub enum MemberKind {
 /// when two entries share a [`crate::Timestamp`] during projection, and is the
 /// natural partition key for the author-partitioned git-refs substrate.
 /// `display_name` is presentation-only and may change.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Member {
     /// Human-readable name; presentation-only, may change over time.
     pub display_name: String,

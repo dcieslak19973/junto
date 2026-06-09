@@ -2,7 +2,7 @@
 //!
 //! [`ProvenanceRef`] is a **relation**, not a standalone entity: it binds an
 //! [`crate::EntryPayload::Assertion`] to the evidence that backs it. This slice
-//! keeps it minimal (domain decision #14): a `uri` locating the evidence plus
+//! keeps it minimal (`docs/adr/0005`): a `uri` locating the evidence plus
 //! an optional self-describing `digest` so drift can be detected if the URI's
 //! content later changes.
 //!
@@ -11,9 +11,16 @@
 //! re-runnable provenance. Alternatives stay in an assertion's `rationale`
 //! until a second Playbook proves the richer shape is needed.
 
+use serde::{Deserialize, Serialize};
+
 /// A location for a piece of evidence — an artifact path, a git object, a
 /// session record, an external URL. Validated only as non-empty for now.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// Serializes as a bare string; **deserialization re-validates** through
+/// [`Uri::new`] (via [`TryFrom`]), so a malformed value cannot enter the kernel
+/// through the canonical-bytes boundary (see [`crate::serial`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(into = "String", try_from = "String")]
 pub struct Uri(String);
 
 impl Uri {
@@ -38,10 +45,29 @@ impl Uri {
     }
 }
 
+impl From<Uri> for String {
+    fn from(uri: Uri) -> Self {
+        uri.0
+    }
+}
+
+impl TryFrom<String> for Uri {
+    type Error = crate::Error;
+
+    fn try_from(value: String) -> crate::Result<Self> {
+        Self::new(value)
+    }
+}
+
 /// A self-describing content digest, stored as `algorithm:value`
 /// (e.g. `sha256:abc…`), mirroring Subresource-Integrity style. Stored to
 /// detect drift; not yet computed or verified by the kernel.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// Serializes as a bare string; **deserialization re-validates** through
+/// [`ContentDigest::new`] (via [`TryFrom`]), so a value missing the
+/// `algorithm:` prefix cannot enter via the canonical-bytes boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(into = "String", try_from = "String")]
 pub struct ContentDigest(String);
 
 impl ContentDigest {
@@ -68,13 +94,30 @@ impl ContentDigest {
     }
 }
 
+impl From<ContentDigest> for String {
+    fn from(digest: ContentDigest) -> Self {
+        digest.0
+    }
+}
+
+impl TryFrom<String> for ContentDigest {
+    type Error = crate::Error;
+
+    fn try_from(value: String) -> crate::Result<Self> {
+        Self::new(value)
+    }
+}
+
 /// Binds an assertion to a piece of evidence: where it is, and (optionally) a
 /// digest of what it was, so later drift is detectable.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProvenanceRef {
     /// Where the evidence lives.
     pub uri: Uri,
-    /// Optional self-describing digest of the evidence at reference time.
+    /// Optional self-describing digest of the evidence at reference time. A
+    /// digest-less ref omits the field entirely from the canonical form (rather
+    /// than emitting `null`), keeping the bytes minimal.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub digest: Option<ContentDigest>,
 }
 
