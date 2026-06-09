@@ -8,7 +8,7 @@ junto is **one surface where people and agents take a piece of work to a verifie
 
 ## Status: early implementation (kernel spine built)
 
-✅ The design corpus (`docs/`) is settled enough to build on; its language and the constraints below are load-bearing for the code. The first kernel slices exist and are test-pinned: the **Ledger** (immutable `LedgerEntry`s, event-sourced projection into standings + gate statuses), the **Gate engine**, the **canonical (JCS) record format**, and the **git-refs substrate** (local durable record in `refs/junto/*`). Settled decisions live in `docs/adr/` (0001–0010) — read the relevant ADRs before touching the ledger, gates, serialization, or substrate. Not built yet: forge sync, Channel/Party/Artifact/Agent Session modelling, playbooks, any human surface.
+✅ The design corpus (`docs/`) is settled enough to build on; its language and the constraints below are load-bearing for the code. The first kernel slices exist and are test-pinned: the **Ledger** (immutable `LedgerEntry`s, event-sourced projection into standings + gate statuses), the **Gate engine**, the **canonical (JCS) record format**, the **git-refs substrate** (durable record in `refs/junto/*`), and **sync** (push/fetch to any git remote with convergent union-merge reconciliation). Settled decisions live in `docs/adr/` (0001–0011) — read the relevant ADRs before touching the ledger, gates, serialization, substrate, or sync. Not built yet: forge capability flags (Bitbucket fallback), Channel/Party/Artifact/Agent Session modelling, playbooks, any way to author entries, any human surface.
 
 **Workspace layout:**
 

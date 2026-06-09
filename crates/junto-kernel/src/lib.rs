@@ -16,7 +16,7 @@
 //! the `junto-substrate-git` crate). Each entry has a deterministic canonical
 //! byte form ([`LedgerEntry::to_canonical_bytes`], see [`serial`]). The
 //! ledger-entry content model is locked per the ADRs in `docs/adr/`
-//! (`0001`–`0010`).
+//! (`0001`–`0011`).
 
 #![forbid(unsafe_code)]
 

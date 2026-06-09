@@ -21,10 +21,15 @@
 //! working tree — so there is no `git status` pollution and Windows file
 //! locking is sidestepped (git owns its own ref locks; we hold no files open).
 //!
-//! This is the **local** durable record. Syncing `refs/junto/*` to a forge
-//! (push/fetch, capability flags, the Bitbucket fallback) is a separate, later
-//! concern (`docs/adr/0009`).
+//! Beyond local storage, [`GitRefsSubstrate::sync`] exchanges a channel's refs
+//! with any git remote (the forge-as-hub model, `docs/adr/0011`): fetch every
+//! author ref, reconcile each one locally (create / fast-forward / union-merge
+//! on divergence), then push. There is no merge *logic* — a union of immutable
+//! entries deduplicated by id is the whole reconciliation, which is exactly
+//! what the no-CRDT design promised. Forge capability flags (the Bitbucket
+//! `refs/heads/junto/*` fallback) remain deferred (`docs/adr/0009`).
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::{Output, Stdio};
 
@@ -43,6 +48,27 @@ const LOG_FILE: &str = "entries.ndjson";
 /// makes contention rare (only the *same* author writing concurrently), so a
 /// small bound is ample.
 const MAX_APPEND_ATTEMPTS: usize = 8;
+
+/// Bounded fetch→reconcile→push cycles for [`GitRefsSubstrate::sync`]: a push
+/// is rejected (and the cycle repeats) only when the remote advanced between
+/// our fetch and our push.
+const MAX_SYNC_ATTEMPTS: usize = 4;
+
+/// The fixed identity stamped on reconciliation merge commits. Mechanical
+/// merges have no human author; a fixed identity (plus sorted parents and a
+/// date pinned to the newer parent) makes the merge commit **deterministic**,
+/// so two replicas reconciling the same divergence mint the *same* commit and
+/// converge instead of ping-ponging new merges at each other.
+const SYNC_NAME: &str = "junto sync";
+const SYNC_EMAIL: &str = "sync@junto.invalid";
+
+/// How one fetch→reconcile→push cycle ended (private detail of `sync`).
+enum PushOutcome {
+    /// Every local ref is on the remote.
+    Done,
+    /// The remote advanced since our fetch; carry the stderr and re-cycle.
+    Rejected(String),
+}
 
 /// A [`SubstrateProvider`] backed by `refs/junto/*` in a local git repository.
 ///
@@ -132,6 +158,287 @@ impl GitRefsSubstrate {
             Ok(None)
         }
     }
+
+    /// The full refnames under `refs/junto/<channel>/` in this repo.
+    async fn channel_refs(&self, channel: &ChannelId) -> Result<Vec<String>> {
+        let prefix = format!("refs/junto/{channel}/");
+        let out = self
+            .git(&["for-each-ref", "--format=%(refname)", &prefix], None, &[])
+            .await?;
+        let text = String::from_utf8(out)
+            .map_err(|e| Error::Substrate(format!("for-each-ref output not utf-8: {e}")))?;
+        Ok(text
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// The entry-log bytes at `rev` (a commit oid or refname).
+    async fn log_at(&self, rev: &str) -> Result<Vec<u8>> {
+        self.git(&["cat-file", "-p", &format!("{rev}:{LOG_FILE}")], None, &[])
+            .await
+    }
+
+    /// Write `contents` as the single-file log tree and commit it with the
+    /// given parents, identity envs, and message; returns the commit oid.
+    ///
+    /// blob → tree → commit, all in the object DB (no working tree).
+    /// `--no-filters` is already implied for `--stdin` without `--path`, but we
+    /// state it so no clean/smudge filter (notably `core.autocrlf`) can ever
+    /// rewrite the bytes of the record. See the autocrlf test.
+    async fn commit_log(
+        &self,
+        contents: &[u8],
+        parents: &[&str],
+        envs: &[(&str, &str)],
+        message: &str,
+    ) -> Result<String> {
+        let blob = trimmed(
+            self.git(
+                &["hash-object", "-w", "--no-filters", "--stdin"],
+                Some(contents),
+                &[],
+            )
+            .await?,
+        )?;
+        let tree = trimmed(
+            self.git(
+                &["mktree"],
+                Some(format!("100644 blob {blob}\t{LOG_FILE}\n").as_bytes()),
+                &[],
+            )
+            .await?,
+        )?;
+
+        let mut commit_args = vec!["commit-tree", tree.as_str()];
+        for parent in parents {
+            commit_args.push("-p");
+            commit_args.push(parent);
+        }
+        commit_args.push("-m");
+        commit_args.push(message);
+        trimmed(self.git(&commit_args, None, envs).await?)
+    }
+
+    /// Whether `ancestor` is an ancestor of (or equal to) `descendant`.
+    async fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool> {
+        let out = self
+            .git_raw(
+                &["merge-base", "--is-ancestor", ancestor, descendant],
+                None,
+                &[],
+            )
+            .await?;
+        match out.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(Error::Substrate(format!(
+                "merge-base --is-ancestor {ancestor} {descendant} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))),
+        }
+    }
+
+    /// Synchronize one channel's record with `remote` (a git remote name, URL,
+    /// or path — anything the system git accepts): **fetch** every
+    /// `refs/junto/<channel>/*` author ref, **reconcile** each into the local
+    /// record, then **push** every local author ref back.
+    ///
+    /// Reconciliation per ref: create it if absent, fast-forward if the remote
+    /// is ahead, keep ours if we are ahead, and on true divergence (the same
+    /// author wrote on two machines) mint a **union-merge commit** — the
+    /// deduplicated union of both logs in canonical order, with both tips as
+    /// parents (`docs/adr/0011`). Entries are immutable and identified by id,
+    /// so the union *is* the merge; no conflict is possible by construction.
+    ///
+    /// A push rejected because the remote advanced mid-cycle re-runs the
+    /// fetch→reconcile→push loop (bounded). Safe to call with nothing local,
+    /// nothing remote, or both.
+    ///
+    /// # Errors
+    /// Any failing git command surfaces as [`Error::Substrate`]; exhausting the
+    /// retry bound reports the last push rejection.
+    pub async fn sync(&mut self, remote: &str, channel: &ChannelId) -> Result<()> {
+        let mut last_rejection = String::new();
+        for _ in 0..MAX_SYNC_ATTEMPTS {
+            self.fetch_and_reconcile(remote, channel).await?;
+            match self.push_channel(remote, channel).await? {
+                PushOutcome::Done => return Ok(()),
+                PushOutcome::Rejected(stderr) => last_rejection = stderr,
+            }
+        }
+        Err(Error::Substrate(format!(
+            "sync with {remote} kept being outpaced after {MAX_SYNC_ATTEMPTS} attempts: \
+             {last_rejection}"
+        )))
+    }
+
+    /// Fetch the remote's author refs for `channel` and reconcile each into
+    /// the local record. No local ref is moved except through the guarded
+    /// reconcile, so a concurrent local append cannot be clobbered.
+    async fn fetch_and_reconcile(&self, remote: &str, channel: &ChannelId) -> Result<()> {
+        let pattern = format!("refs/junto/{channel}/*");
+        let listing = self
+            .git(&["ls-remote", "--refs", remote, &pattern], None, &[])
+            .await?;
+        let listing = String::from_utf8(listing)
+            .map_err(|e| Error::Substrate(format!("ls-remote output not utf-8: {e}")))?;
+        let tips: Vec<(&str, &str)> = listing
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split_whitespace();
+                Some((parts.next()?, parts.next()?))
+            })
+            .collect();
+        if tips.is_empty() {
+            return Ok(());
+        }
+
+        // One fetch brings every remote tip's objects into the local object DB.
+        // Deliberately no destination refspec: we move local refs ourselves,
+        // under the optimistic guard in `reconcile_ref`.
+        let mut fetch_args = vec!["fetch", "--quiet", remote];
+        fetch_args.extend(tips.iter().map(|(_, refname)| *refname));
+        self.git(&fetch_args, None, &[]).await?;
+
+        for (oid, refname) in &tips {
+            self.reconcile_ref(refname, oid).await?;
+        }
+        Ok(())
+    }
+
+    /// Move the local `refname` to incorporate `remote_oid`, retrying the
+    /// guarded update if a concurrent local append moves the ref under us.
+    async fn reconcile_ref(&self, refname: &str, remote_oid: &str) -> Result<()> {
+        let mut last_stderr = String::new();
+        for _ in 0..MAX_APPEND_ATTEMPTS {
+            let local = self.ref_tip(refname).await?;
+            let (new, old) = match &local {
+                // Unknown ref: adopt the remote tip (guard: must still not exist).
+                None => (remote_oid.to_string(), ZERO_OID.to_string()),
+                Some(local_oid) if local_oid == remote_oid => return Ok(()),
+                Some(local_oid) => {
+                    if self.is_ancestor(remote_oid, local_oid).await? {
+                        // We already contain the remote history.
+                        return Ok(());
+                    } else if self.is_ancestor(local_oid, remote_oid).await? {
+                        // Remote is strictly ahead: fast-forward.
+                        (remote_oid.to_string(), local_oid.clone())
+                    } else {
+                        // True divergence: same author wrote on two machines.
+                        let merge = self.union_merge(local_oid, remote_oid).await?;
+                        (merge, local_oid.clone())
+                    }
+                }
+            };
+            let update = self
+                .git_raw(&["update-ref", refname, &new, &old], None, &[])
+                .await?;
+            if update.status.success() {
+                return Ok(());
+            }
+            last_stderr = String::from_utf8_lossy(&update.stderr).trim().to_string();
+        }
+        Err(Error::Substrate(format!(
+            "reconciling {refname} failed after {MAX_APPEND_ATTEMPTS} attempts \
+             (a contended ref, or a non-race fault): {last_stderr}"
+        )))
+    }
+
+    /// Mint the union-merge commit of two diverged log tips: the deduplicated
+    /// union of both logs, in canonical order, with both tips as parents.
+    ///
+    /// Deterministic by construction — sorted parents, fixed identity, date
+    /// pinned to the newer parent — so both replicas mint the same commit oid
+    /// from the same divergence and converge immediately.
+    async fn union_merge(&self, ours: &str, theirs: &str) -> Result<String> {
+        let mut seen = HashSet::new();
+        let mut entries: Vec<LedgerEntry> = Vec::new();
+        for rev in [ours, theirs] {
+            let log = self.log_at(rev).await?;
+            for line in log.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+                let entry = LedgerEntry::from_canonical_bytes(line)?;
+                if seen.insert(entry.id) {
+                    entries.push(entry);
+                }
+            }
+        }
+        entries.sort_by(LedgerEntry::canonical_cmp);
+
+        let mut contents = Vec::new();
+        for entry in &entries {
+            contents.extend_from_slice(&entry.to_canonical_bytes()?);
+            contents.push(b'\n');
+        }
+
+        let mut parents = [ours, theirs];
+        parents.sort_unstable();
+        let date = format!("@{} +0000", self.newest_commit_epoch(&parents).await?);
+        let envs: [(&str, &str); 6] = [
+            ("GIT_AUTHOR_NAME", SYNC_NAME),
+            ("GIT_AUTHOR_EMAIL", SYNC_EMAIL),
+            ("GIT_AUTHOR_DATE", &date),
+            ("GIT_COMMITTER_NAME", SYNC_NAME),
+            ("GIT_COMMITTER_EMAIL", SYNC_EMAIL),
+            ("GIT_COMMITTER_DATE", &date),
+        ];
+        self.commit_log(
+            &contents,
+            &parents,
+            &envs,
+            "junto sync: union of diverged author logs",
+        )
+        .await
+    }
+
+    /// The newest committer epoch (seconds) among `oids`.
+    async fn newest_commit_epoch(&self, oids: &[&str]) -> Result<i64> {
+        let mut newest = 0_i64;
+        for oid in oids {
+            let raw = trimmed(
+                self.git(&["show", "-s", "--format=%ct", oid], None, &[])
+                    .await?,
+            )?;
+            let seconds: i64 = raw.parse().map_err(|e| {
+                Error::Substrate(format!("unparsable committer date for {oid}: {e}"))
+            })?;
+            newest = newest.max(seconds);
+        }
+        Ok(newest)
+    }
+
+    /// Push every local author ref for `channel` to `remote`. A rejection
+    /// (the remote advanced since our fetch) is reported as
+    /// [`PushOutcome::Rejected`] for the caller to re-cycle; any other failure
+    /// is an error.
+    async fn push_channel(&self, remote: &str, channel: &ChannelId) -> Result<PushOutcome> {
+        let refs = self.channel_refs(channel).await?;
+        if refs.is_empty() {
+            return Ok(PushOutcome::Done);
+        }
+        let refspecs: Vec<String> = refs.iter().map(|r| format!("{r}:{r}")).collect();
+
+        let mut args = vec!["push", "--quiet", remote];
+        args.extend(refspecs.iter().map(String::as_str));
+        let out = self.git_raw(&args, None, &[]).await?;
+        if out.status.success() {
+            return Ok(PushOutcome::Done);
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        // git reports a stale push as rejected / fetch-first; everything else
+        // (no such remote, auth, corruption) is a real fault.
+        if stderr.contains("rejected")
+            || stderr.contains("fetch first")
+            || stderr.contains("failed to push some refs")
+        {
+            Ok(PushOutcome::Rejected(stderr))
+        } else {
+            Err(Error::Substrate(format!(
+                "git push to {remote} failed: {stderr}"
+            )))
+        }
+    }
 }
 
 impl SubstrateProvider for GitRefsSubstrate {
@@ -169,47 +476,15 @@ impl SubstrateProvider for GitRefsSubstrate {
 
             // Read the author's current log (empty on first write), append the line.
             let mut contents = match &tip {
-                Some(_) => {
-                    self.git(
-                        &["cat-file", "-p", &format!("{refname}:{LOG_FILE}")],
-                        None,
-                        &[],
-                    )
-                    .await?
-                }
+                Some(_) => self.log_at(&refname).await?,
                 None => Vec::new(),
             };
             contents.extend_from_slice(&line);
 
-            // blob -> tree -> commit, all in the object DB (no working tree).
-            // `--no-filters` is already implied for `--stdin` without `--path`,
-            // but we state it so no clean/smudge filter (notably `core.autocrlf`)
-            // can ever rewrite the bytes of the record. See the autocrlf test.
-            let blob = trimmed(
-                self.git(
-                    &["hash-object", "-w", "--no-filters", "--stdin"],
-                    Some(&contents),
-                    &[],
-                )
-                .await?,
-            )?;
-            let tree = trimmed(
-                self.git(
-                    &["mktree"],
-                    Some(format!("100644 blob {blob}\t{LOG_FILE}\n").as_bytes()),
-                    &[],
-                )
-                .await?,
-            )?;
-
-            let mut commit_args = vec!["commit-tree", tree.as_str()];
-            if let Some(parent) = &tip {
-                commit_args.push("-p");
-                commit_args.push(parent.as_str());
-            }
-            commit_args.push("-m");
-            commit_args.push(message.as_str());
-            let commit = trimmed(self.git(&commit_args, None, &envs).await?)?;
+            let parents: Vec<&str> = tip.as_deref().into_iter().collect();
+            let commit = self
+                .commit_log(&contents, &parents, &envs, &message)
+                .await?;
 
             // Move the ref, guarded by the value we read — losing the race means
             // a concurrent same-author write landed; re-read and retry.
@@ -233,22 +508,9 @@ impl SubstrateProvider for GitRefsSubstrate {
     }
 
     async fn entries(&self, channel: &ChannelId) -> Result<Vec<LedgerEntry>> {
-        let prefix = format!("refs/junto/{channel}/");
-        let refs_out = self
-            .git(&["for-each-ref", "--format=%(refname)", &prefix], None, &[])
-            .await?;
-        let refs_text = String::from_utf8(refs_out)
-            .map_err(|e| Error::Substrate(format!("for-each-ref output not utf-8: {e}")))?;
-
         let mut entries = Vec::new();
-        for refname in refs_text.lines().filter(|l| !l.is_empty()) {
-            let blob = self
-                .git(
-                    &["cat-file", "-p", &format!("{refname}:{LOG_FILE}")],
-                    None,
-                    &[],
-                )
-                .await?;
+        for refname in self.channel_refs(channel).await? {
+            let blob = self.log_at(&refname).await?;
             for line in blob.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
                 entries.push(LedgerEntry::from_canonical_bytes(line)?);
             }
@@ -311,6 +573,20 @@ mod tests {
         assert!(status.success(), "git init failed");
         let substrate = GitRefsSubstrate::open(dir.path().to_path_buf());
         (dir, substrate)
+    }
+
+    /// A fresh **bare** repo in a tempdir — the stand-in for the forge hub —
+    /// plus its path in the string form `sync` takes as a remote.
+    fn init_bare_hub() -> (TempDir, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let status = StdCommand::new("git")
+            .args(["init", "--bare", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .expect("run git init --bare");
+        assert!(status.success(), "git init --bare failed");
+        let url = dir.path().to_string_lossy().into_owned();
+        (dir, url)
     }
 
     fn assertion(author: &Member, ts: i64, statement: &str) -> LedgerEntry {
@@ -535,6 +811,137 @@ mod tests {
         );
         let blob = git_out(dir.path(), &["show", &format!("{refname}:{LOG_FILE}")]);
         assert_eq!(blob.matches('\n').count(), 1, "exactly one framed line");
+    }
+
+    // --- sync (forge-as-hub, with a local bare repo as the hub) ---
+
+    #[tokio::test]
+    async fn sync_propagates_the_record_between_clones() {
+        let (_hub_dir, hub) = init_bare_hub();
+        let (_a_dir, mut machine_a) = init_repo();
+        let (_b_dir, mut machine_b) = init_repo();
+        let ada = Member::human("Ada", "ada@example.com");
+        let entry = assertion(&ada, 10, "written on A");
+        let channel = entry.channel;
+
+        machine_a.append(entry.clone()).await.unwrap();
+        machine_a.sync(&hub, &channel).await.unwrap();
+        machine_b.sync(&hub, &channel).await.unwrap();
+
+        assert_eq!(machine_b.entries(&channel).await.unwrap(), vec![entry]);
+    }
+
+    #[tokio::test]
+    async fn sync_merges_different_authors_across_machines() {
+        let (_hub_dir, hub) = init_bare_hub();
+        let (_a_dir, mut machine_a) = init_repo();
+        let (_b_dir, mut machine_b) = init_repo();
+        let ada = Member::human("Ada", "ada@example.com");
+        let bob = Member::human("Bob", "bob@example.com");
+        let from_ada = assertion(&ada, 10, "from ada on A");
+        let mut from_bob = assertion(&bob, 20, "from bob on B");
+        from_bob.channel = from_ada.channel;
+        let channel = from_ada.channel;
+
+        machine_a.append(from_ada.clone()).await.unwrap();
+        machine_b.append(from_bob.clone()).await.unwrap();
+        machine_a.sync(&hub, &channel).await.unwrap();
+        machine_b.sync(&hub, &channel).await.unwrap();
+        machine_a.sync(&hub, &channel).await.unwrap();
+
+        // Both machines project the identical two-entry record.
+        let view_a = Ledger::new(machine_a).project(&channel).await.unwrap();
+        let view_b = Ledger::new(machine_b).project(&channel).await.unwrap();
+        let ids_a: Vec<_> = view_a.entries.iter().map(|e| e.id).collect();
+        let ids_b: Vec<_> = view_b.entries.iter().map(|e| e.id).collect();
+        assert_eq!(ids_a, vec![from_ada.id, from_bob.id]);
+        assert_eq!(ids_a, ids_b);
+    }
+
+    #[tokio::test]
+    async fn same_author_divergence_unions_without_loss() {
+        // The one real conflict shape: the same author appends on two machines
+        // while offline, so their author ref diverges. Reconciliation is a
+        // union-merge — no entry may be lost, and both machines must converge
+        // on the same ref tip.
+        let (hub_dir, hub) = init_bare_hub();
+        let (a_dir, mut machine_a) = init_repo();
+        let (b_dir, mut machine_b) = init_repo();
+        let ada = Member::human("Ada", "ada@example.com");
+        let on_a = assertion(&ada, 10, "offline on A");
+        let mut on_b = assertion(&ada, 20, "offline on B");
+        on_b.channel = on_a.channel;
+        let channel = on_a.channel;
+
+        machine_a.append(on_a.clone()).await.unwrap();
+        machine_b.append(on_b.clone()).await.unwrap();
+        machine_a.sync(&hub, &channel).await.unwrap();
+        // B's push is rejected (hub holds A's tip), forcing the
+        // fetch → union-merge → push cycle.
+        machine_b.sync(&hub, &channel).await.unwrap();
+        machine_a.sync(&hub, &channel).await.unwrap();
+
+        // No loss: both entries on both machines.
+        for substrate in [&machine_a, &machine_b] {
+            let mut got = substrate.entries(&channel).await.unwrap();
+            got.sort_by_key(|e| e.timestamp.as_millis());
+            assert_eq!(got, vec![on_a.clone(), on_b.clone()]);
+        }
+
+        // Convergence: one author ref, same tip everywhere (hub included).
+        let refname = format!("refs/junto/{channel}/{}", author_slug(&ada.email));
+        let tip_a = git_out(a_dir.path(), &["rev-parse", &refname]);
+        let tip_b = git_out(b_dir.path(), &["rev-parse", &refname]);
+        let tip_hub = git_out(hub_dir.path(), &["rev-parse", &refname]);
+        assert_eq!(tip_a, tip_b);
+        assert_eq!(tip_a, tip_hub);
+
+        // The merged log is the union in canonical order: exactly two lines.
+        let blob = git_out(a_dir.path(), &["show", &format!("{refname}:{LOG_FILE}")]);
+        assert_eq!(blob.matches('\n').count(), 2, "two framed lines: {blob}");
+    }
+
+    #[tokio::test]
+    async fn sync_is_idempotent_once_converged() {
+        let (_hub_dir, hub) = init_bare_hub();
+        let (a_dir, mut machine_a) = init_repo();
+        let ada = Member::human("Ada", "ada@example.com");
+        let entry = assertion(&ada, 10, "x");
+        let channel = entry.channel;
+        machine_a.append(entry).await.unwrap();
+        machine_a.sync(&hub, &channel).await.unwrap();
+
+        let refname = format!("refs/junto/{channel}/{}", author_slug(&ada.email));
+        let tip_before = git_out(a_dir.path(), &["rev-parse", &refname]);
+        machine_a.sync(&hub, &channel).await.unwrap();
+        let tip_after = git_out(a_dir.path(), &["rev-parse", &refname]);
+        assert_eq!(tip_before, tip_after, "a no-op sync must not mint commits");
+    }
+
+    #[tokio::test]
+    async fn sync_with_nothing_anywhere_is_a_no_op() {
+        let (_hub_dir, hub) = init_bare_hub();
+        let (_a_dir, mut machine_a) = init_repo();
+        let channel = junto_kernel::ChannelId::new();
+        machine_a.sync(&hub, &channel).await.unwrap();
+        assert!(machine_a.entries(&channel).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_keeps_the_working_tree_clean() {
+        let (_hub_dir, hub) = init_bare_hub();
+        let (a_dir, mut machine_a) = init_repo();
+        let ada = Member::human("Ada", "ada@example.com");
+        let entry = assertion(&ada, 10, "x");
+        let channel = entry.channel;
+        machine_a.append(entry).await.unwrap();
+        machine_a.sync(&hub, &channel).await.unwrap();
+
+        let status = git_out(a_dir.path(), &["status", "--porcelain"]);
+        assert!(
+            status.trim().is_empty(),
+            "working tree must stay clean: {status:?}"
+        );
     }
 
     #[tokio::test]
