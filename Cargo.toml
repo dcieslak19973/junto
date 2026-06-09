@@ -17,3 +17,6 @@ junto-kernel = { path = "crates/junto-kernel" }
 # external (latest as of 2026-06-08)
 thiserror = "2.0.18"
 anyhow = "1.0.102"
+uuid = { version = "1.23.2", features = ["v4"] }
+# dev-only: drives the async SubstrateProvider in tests (the in-memory impl does no real I/O)
+tokio = { version = "1.52.3", features = ["macros", "rt"] }

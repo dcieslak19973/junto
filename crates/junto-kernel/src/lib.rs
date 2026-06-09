@@ -9,15 +9,31 @@
 //! playbook-specific logic and no vendor names**: those live in playbook crates
 //! and behind adapter traits, respectively.
 //!
-//! Domain types are deliberately not modelled yet — the ledger-entry content
-//! model is still an open decision (`junto.md`, open item *b*). This crate
-//! currently establishes the workspace, the error convention, and the seam.
+//! The first modelled slice is the **Ledger**: an immutable, append-only log of
+//! [`LedgerEntry`] values projected into current standings ([`Ledger::project`]),
+//! stored behind the [`SubstrateProvider`] seam (in-memory today, git-refs
+//! later). The ledger-entry content model is locked per `domain-model.md`
+//! decisions #8–#14.
 
 #![forbid(unsafe_code)]
 
+pub mod entry;
 pub mod error;
+pub mod ids;
+pub mod ledger;
+pub mod member;
+pub mod provenance;
+pub mod substrate;
+pub mod time;
 
+pub use entry::{EntryPayload, LedgerEntry};
 pub use error::{Error, Result};
+pub use ids::{ChannelId, EntryId};
+pub use ledger::{ChannelView, Ledger, Standing};
+pub use member::{Member, MemberKind};
+pub use provenance::{ContentDigest, ProvenanceRef, Uri};
+pub use substrate::{InMemorySubstrate, SubstrateProvider};
+pub use time::Timestamp;
 
 #[cfg(test)]
 mod tests {

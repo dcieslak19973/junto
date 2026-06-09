@@ -9,3 +9,7 @@ description = "junto kernel — the generic, playbook-agnostic core"
 
 [dependencies]
 thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
