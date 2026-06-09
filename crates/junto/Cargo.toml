@@ -13,4 +13,17 @@ path = "src/main.rs"
 
 [dependencies]
 junto-kernel.workspace = true
+junto-substrate-git.workspace = true
 anyhow.workspace = true
+# the MCP write surface (`junto serve`): streamable HTTP over axum
+rmcp.workspace = true
+axum.workspace = true
+schemars.workspace = true
+serde.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal"] }
+
+[dev-dependencies]
+tempfile.workspace = true

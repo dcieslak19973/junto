@@ -89,6 +89,13 @@ impl<S: SubstrateProvider> Ledger<S> {
         Self { substrate }
     }
 
+    /// Mutable access to the wrapped substrate, for backend-specific
+    /// operations the generic ledger does not model (e.g. the git-refs
+    /// backend's `sync`). Appends still go through [`Ledger::append`].
+    pub fn substrate_mut(&mut self) -> &mut S {
+        &mut self.substrate
+    }
+
     /// Append one immutable entry. The sole mutating operation.
     ///
     /// # Errors
