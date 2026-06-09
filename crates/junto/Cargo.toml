@@ -1,0 +1,16 @@
+[package]
+name = "junto"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "junto — host/app entry point"
+
+[[bin]]
+name = "junto"
+path = "src/main.rs"
+
+[dependencies]
+junto-kernel.workspace = true
+anyhow.workspace = true

@@ -1,0 +1,5 @@
+# Normalize line endings: LF in the repo for all text (cross-platform rule, see CLAUDE.md).
+* text=auto eol=lf
+
+# Binary / generated — leave untouched.
+*.db binary

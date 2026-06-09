@@ -1,0 +1,19 @@
+# junto workspace — see CLAUDE.md and domain-model.md.
+# Kernel ↔ adapter ↔ app seam: the kernel is generic; vendor code lives behind
+# adapter crates; the `junto` binary is the host/app entry (not a human terminal).
+[workspace]
+resolver = "3"
+members = ["crates/junto-kernel", "crates/junto"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+authors = ["Dan Cieslak <dcieslak@hotmail.com>"]
+
+[workspace.dependencies]
+# internal
+junto-kernel = { path = "crates/junto-kernel" }
+# external (latest as of 2026-06-08)
+thiserror = "2.0.18"
+anyhow = "1.0.102"
