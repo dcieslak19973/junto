@@ -163,6 +163,7 @@ impl SubstrateProvider for GitRefsSubstrate {
         ];
         let message = format!("junto entry {}", entry.id);
 
+        let mut last_update_stderr = String::new();
         for _ in 0..MAX_APPEND_ATTEMPTS {
             let tip = self.ref_tip(&refname).await?;
 
@@ -219,10 +220,15 @@ impl SubstrateProvider for GitRefsSubstrate {
             if update.status.success() {
                 return Ok(());
             }
+            // A failure here is usually the optimistic guard losing a race, but
+            // can also be a non-race fault (permissions, corrupt repo) — keep
+            // the last stderr so the exhausted-retries error stays honest.
+            last_update_stderr = String::from_utf8_lossy(&update.stderr).trim().to_string();
         }
 
         Err(Error::Substrate(format!(
-            "update-ref for {refname} kept losing races after {MAX_APPEND_ATTEMPTS} attempts"
+            "update-ref for {refname} failed after {MAX_APPEND_ATTEMPTS} attempts \
+             (a contended ref, or a non-race fault): {last_update_stderr}"
         )))
     }
 
@@ -261,14 +267,25 @@ fn trimmed(bytes: Vec<u8>) -> Result<String> {
 /// A ref-safe slug for an author email. The email is also stored inside each
 /// entry's JSON, so the slug need only be **safe and unique**, not reversible.
 ///
-/// We keep only ASCII alphanumerics, `-`, and `_`, percent-encoding everything
-/// else (incl. `.` and `@`). Dropping `.` is deliberate — it removes any chance
-/// of a forbidden `..` sequence or a leading/trailing dot in a ref component.
+/// The email is **ASCII-lowercased first**: loose refs are files, and on the
+/// case-insensitive filesystems junto targets (NTFS, default APFS) two slugs
+/// differing only in case would collide as paths while staying distinct on
+/// Linux CI — the exact casing trap CLAUDE.md warns about. Emails differing
+/// only in case therefore share one ref; that is safe, because the partition
+/// exists only to avoid write contention (the optimistic `update-ref` retry
+/// already handles same-ref writers) and each entry carries its true-case
+/// author email in its JSON.
+///
+/// We then keep only ASCII lowercase alphanumerics, `-`, and `_`,
+/// percent-encoding everything else (incl. `.` and `@`). Dropping `.` is
+/// deliberate — it removes any chance of a forbidden `..` sequence or a
+/// leading/trailing dot in a ref component.
 fn author_slug(email: &str) -> String {
+    let email = email.to_ascii_lowercase();
     let mut slug = String::with_capacity(email.len());
     for &byte in email.as_bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' => slug.push(byte as char),
+            b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' => slug.push(byte as char),
             _ => slug.push_str(&format!("%{byte:02X}")),
         }
     }
@@ -393,6 +410,48 @@ mod tests {
         substrate.append(b.clone()).await.unwrap();
         assert_eq!(substrate.entries(&a.channel).await.unwrap(), vec![a]);
         assert_eq!(substrate.entries(&b.channel).await.unwrap(), vec![b]);
+    }
+
+    #[test]
+    fn author_slug_is_case_insensitive_and_ref_safe() {
+        // Loose refs are files; on case-insensitive filesystems (NTFS, APFS)
+        // slugs differing only in case would collide as paths. Lowercasing
+        // makes the mapping case-stable on every platform.
+        assert_eq!(
+            author_slug("Ada@Example.COM"),
+            author_slug("ada@example.com")
+        );
+        assert_eq!(author_slug("ada@example.com"), "ada%40example%2Ecom");
+    }
+
+    #[tokio::test]
+    async fn case_variant_emails_share_one_ref_without_losing_entries() {
+        // "Ada@example.com" and "ada@example.com" map to the same ref; both
+        // appends must accumulate (the optimistic update-ref retry handles the
+        // shared-ref contention), and the union returns both entries intact.
+        let (dir, mut substrate) = init_repo();
+        let upper = Member::human("Ada", "Ada@example.com");
+        let lower = Member::human("Ada", "ada@example.com");
+        let a = assertion(&upper, 10, "from Upper");
+        let mut b = assertion(&lower, 20, "from lower");
+        b.channel = a.channel;
+        substrate.append(a.clone()).await.unwrap();
+        substrate.append(b.clone()).await.unwrap();
+
+        let refs = git_out(
+            dir.path(),
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                &format!("refs/junto/{}/", a.channel),
+            ],
+        );
+        assert_eq!(refs.lines().count(), 1, "case variants share one ref");
+
+        let mut got = substrate.entries(&a.channel).await.unwrap();
+        got.sort_by_key(|e| e.timestamp.as_millis());
+        // True-case emails survive inside the entries themselves.
+        assert_eq!(got, vec![a, b]);
     }
 
     #[tokio::test]

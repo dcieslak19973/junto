@@ -36,8 +36,9 @@ pub trait SubstrateProvider {
     async fn append(&mut self, entry: LedgerEntry) -> Result<()>;
 
     /// The complete set of entries for `channel`, in no particular order
-    /// (the [`crate::Ledger`] sorts them). Returns an empty vec for an unknown
-    /// channel.
+    /// (the [`crate::Ledger`] sorts them; duplicates are tolerated — the
+    /// projection deduplicates by [`crate::EntryId`]). Returns an empty vec
+    /// for an unknown channel.
     async fn entries(&self, channel: &ChannelId) -> Result<Vec<LedgerEntry>>;
 }
 

@@ -114,6 +114,7 @@ Settled **architectural** decisions live in [`adr/`](adr/), one file each — ex
 | [0007](adr/0007-routing-stays-out-of-the-kernel.md) | **Routing stays out of the kernel**: it executes an `ApprovalRequirement`; the importable **Rubric** layer (future) decides it. |
 | [0008](adr/0008-canonical-entry-serialization-is-jcs-json.md) | A `LedgerEntry`'s **canonical byte form** is **JCS / RFC 8785 JSON** (deterministic by spec, readable/diffable); newtypes re-validate on deserialize. |
 | [0009](adr/0009-git-refs-substrate-ndjson-per-author.md) | The **git-refs substrate** stores an append-only **NDJSON log per author** under `refs/junto/<channel>/<author>` (local durable record; forge sync deferred). |
+| [0010](adr/0010-canonical-order-and-dedup-by-entry-id.md) | Canonical order is **`(timestamp, author email, entry id)`** — a deterministic *total* order — and projection **dedups by `EntryId`** (substrates may hold duplicates). |
 
 **Settled naming** (low-stakes calls, already reflected in the tables above — recorded here only so the choice isn't re-litigated): **Agent Session** (over "Run"; always qualified) · **Playbook** (over "Channel Kind") · **Provenance** is a relation, not a standalone entity · keep **Gate** / **gate-routing** / **policy** distinct from agent **Policy Version**.
 

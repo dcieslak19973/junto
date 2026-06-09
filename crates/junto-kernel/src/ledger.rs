@@ -19,13 +19,12 @@ use crate::{
 /// distinct approver emails seen so far (rejection is handled separately, and
 /// dominates). An absent approver set is treated as empty.
 fn requirement_met(requirement: &ApprovalRequirement, approvers: Option<&HashSet<&str>>) -> bool {
-    let approvers = approvers.cloned().unwrap_or_default();
     match requirement {
         ApprovalRequirement::Auto => true,
-        ApprovalRequirement::Count(n) => approvers.len() as u32 >= *n,
-        ApprovalRequirement::AllOf(members) => members
-            .iter()
-            .all(|member| approvers.contains(member.email.as_str())),
+        ApprovalRequirement::Count(n) => approvers.map_or(0, HashSet::len) as u32 >= *n,
+        ApprovalRequirement::AllOf(members) => members.iter().all(|member| {
+            approvers.is_some_and(|approvers| approvers.contains(member.email.as_str()))
+        }),
     }
 }
 
@@ -51,7 +50,8 @@ pub enum Standing {
 /// [`GateStatus`] of each proposal.
 #[derive(Debug, Clone)]
 pub struct ChannelView {
-    /// All entries, in canonical `(timestamp, author.email)` order.
+    /// All entries, deduplicated by id, in canonical
+    /// `(timestamp, author.email, id)` order.
     pub entries: Vec<LedgerEntry>,
     /// Current standing per assertion [`EntryId`].
     pub standings: HashMap<EntryId, Standing>,
@@ -99,8 +99,13 @@ impl<S: SubstrateProvider> Ledger<S> {
 
     /// Project the Channel's log into a [`ChannelView`].
     ///
-    /// Entries are sorted by `(timestamp, author.email)` — a deterministic
-    /// total order even when wall-clocks collide across authors — then folded
+    /// Entries are **deduplicated by [`EntryId`]** (the substrate may hold the
+    /// same entry twice — a retried append, or the same author's log synced
+    /// from two remotes) and sorted by `(timestamp, author.email, id)` — a
+    /// deterministic total order even when wall-clocks collide, including two
+    /// entries from the *same* author in the same millisecond. Determinism
+    /// matters because standing is last-applicable-wins: replicas that
+    /// disagreed on order would disagree on standing. The log is then folded
     /// into two derived views:
     ///
     /// - **Assertion [`Standing`]:** each assertion starts
@@ -125,7 +130,12 @@ impl<S: SubstrateProvider> Ledger<S> {
             a.timestamp
                 .cmp(&b.timestamp)
                 .then_with(|| a.author.email.cmp(&b.author.email))
+                .then_with(|| a.id.cmp(&b.id))
         });
+        // Keep the first occurrence of each id (in canonical order), so a
+        // double-appended entry projects as one.
+        let mut seen = HashSet::new();
+        entries.retain(|entry| seen.insert(entry.id));
 
         let standings = Self::project_standings(&entries);
         let gate_status = Self::project_gates(&entries);
@@ -449,6 +459,140 @@ mod tests {
 
         let view = ledger.project(&channel).await.unwrap();
         assert_eq!(view.standing(&claim), Some(Standing::Ratified));
+    }
+
+    #[tokio::test]
+    async fn same_author_same_millisecond_orders_by_id() {
+        // Two verification acts by one author in the same millisecond: the
+        // entry id is the final tie-break, so every replica projects the same
+        // standing regardless of the order the substrate returned them in.
+        let (lo, hi) = {
+            let (a, b) = (EntryId::new(), EntryId::new());
+            if a < b { (a, b) } else { (b, a) }
+        };
+        let alice = Member::human("Alice", "alice@example.com");
+        let claim = EntryId::new();
+        let park = |channel| {
+            entry(
+                hi, // the larger id: applies last in canonical order, so it wins
+                channel,
+                alice.clone(),
+                2,
+                EntryPayload::Park {
+                    target: claim,
+                    rationale: "set aside".into(),
+                },
+            )
+        };
+        let ratify = |channel| {
+            entry(
+                lo,
+                channel,
+                alice.clone(),
+                2,
+                EntryPayload::Ratification {
+                    target: claim,
+                    rationale: "confirmed".into(),
+                },
+            )
+        };
+
+        // Append in both orders; the projection must agree.
+        for flipped in [false, true] {
+            let mut ledger = Ledger::new(InMemorySubstrate::new());
+            let channel = ChannelId::new();
+            ledger
+                .append(entry(claim, channel, alice.clone(), 1, assertion("h")))
+                .await
+                .unwrap();
+            let (first, second) = if flipped {
+                (ratify(channel), park(channel))
+            } else {
+                (park(channel), ratify(channel))
+            };
+            ledger.append(first).await.unwrap();
+            ledger.append(second).await.unwrap();
+
+            let view = ledger.project(&channel).await.unwrap();
+            assert_eq!(
+                view.standing(&claim),
+                Some(Standing::Parked),
+                "standing must not depend on substrate return order (flipped={flipped})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_appends_project_once() {
+        // The same entry appended twice (a retried append, or a future sync
+        // unioning overlapping logs) must project as one entry.
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let alice = Member::human("Alice", "alice@example.com");
+        let claim = entry(EntryId::new(), channel, alice, 1, assertion("once"));
+        ledger.append(claim.clone()).await.unwrap();
+        ledger.append(claim.clone()).await.unwrap();
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert_eq!(view.entries.len(), 1);
+        assert_eq!(view.standing(&claim.id), Some(Standing::Provisional));
+    }
+
+    #[tokio::test]
+    async fn cross_kind_acts_are_ignored() {
+        // A Ratification targeting a Proposal, and an Approval targeting an
+        // Assertion, both act on the wrong kind: neither moves anything.
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let alice = Member::human("Alice", "alice@example.com");
+        let claim = EntryId::new();
+        let prop = EntryId::new();
+        ledger
+            .append(entry(claim, channel, alice.clone(), 1, assertion("h")))
+            .await
+            .unwrap();
+        ledger
+            .append(entry(
+                prop,
+                channel,
+                alice.clone(),
+                2,
+                proposal(ApprovalRequirement::Count(1)),
+            ))
+            .await
+            .unwrap();
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                alice.clone(),
+                3,
+                EntryPayload::Ratification {
+                    target: prop, // wrong kind: proposals have no Standing
+                    rationale: "misdirected".into(),
+                },
+            ))
+            .await
+            .unwrap();
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                alice,
+                4,
+                EntryPayload::Approval {
+                    target: claim, // wrong kind: assertions have no GateStatus
+                    rationale: "misdirected".into(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert_eq!(view.standing(&claim), Some(Standing::Provisional));
+        assert_eq!(view.gate_status(&prop), Some(GateStatus::Pending));
+        assert!(view.standing(&prop).is_none());
+        assert!(view.gate_status(&claim).is_none());
     }
 
     #[tokio::test]
