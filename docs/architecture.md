@@ -38,10 +38,29 @@ Takeaway: the canonical product built for this exact problem uses **zero CRDTs**
 
 The durable record (channel state, decisions/ledger entries, message log) lives in **git refs** — `refs/junto/*`, partitioned by author so git never conflicts (prior art: **git-bug**, a tracker stored in git refs). **Dedicated refs, not working-tree files** (no `git status` pollution). What differs by deployment is *how those refs are synced and authorized* — the `SubstrateProvider` boundary:
 
-- **forge-as-hub (OSS / small teams).** Push/fetch `refs/junto/*` to the forge the team already uses (GitHub/GitLab/Bitbucket). The forge is the hub; no server to run, no VPN, no peer discovery. Simplest, and leverages existing infrastructure. Forge-agnostic.
+- **forge-as-hub (OSS / small teams).** Push/fetch `refs/junto/*` to the forge the team already uses (GitHub/GitLab/Bitbucket). The forge is the hub; no server to run, no VPN, no peer discovery. Simplest, and leverages existing infrastructure. Forge-agnostic — **with one custom-ref caveat (Bitbucket), see below.**
 - **central self-hosted SoR (regulated / enterprise).** A self-hosted server stores the record in a controlled store with **WORM retention, SSO-tied info-barrier ACLs, supervision, revocation, legal hold** — controls a mesh *cannot* provide by construction (no central authority). This is the higher-stakes mode; see §research-spaces.
 
 > ⚠️ "No central service / decentralized" is therefore at most the OSS default, and even there forge-as-hub *is* a hub. It is **not** a core differentiator. What survives every mode: one unified surface · forge-/harness-/backend-agnostic · terminal-less · workflow-general · verified-reproducible record.
+
+### ⚠️ Custom-ref support is not uniform across forges (assessed 2026-06-08)
+
+The forge-as-hub plan assumes a forge will accept a push to the **`refs/junto/*`** namespace. Git itself permits pushing any ref outside `refs/{heads,tags}/*` ([git-push docs](https://git-scm.com/docs/git-push)), and **GitHub and GitLab (cloud + self-hosted) honor this** — `refs/junto/*` works. **Bitbucket does not**, and this is the *same wall* git-bug's `refs/bugs/*` hits (our cited prior art), so it's a direct, foreseeable risk:
+
+| Forge | `refs/junto/*` push | Note |
+|---|---|---|
+| GitHub (cloud + Enterprise) | ✅ | arbitrary refs allowed |
+| GitLab (cloud + self-managed) | ✅ | arbitrary refs allowed |
+| **Bitbucket Cloud** | ❌ | pre-receive rejects custom namespaces; **no admin access to relax** — hard limit |
+| **Bitbucket Data Center** | ⚠️ | rejected by default; a **server admin can relax** pre-receive/ref restrictions |
+
+📚 Sources: [Atlassian — pre-receive declined on reserved/custom refs](https://support.atlassian.com/bitbucket-cloud/kb/unable-to-push-to-repository-pre-receive-hook-declined-error/) · [Atlassian DC — reserved ref namespaces](https://confluence.atlassian.com/bitbucketserverkb/bitbucket-data-center-does-not-accept-push-after-using-bfg-tool-1431539871.html).
+
+🔵 **Design implication — this is a `SubstrateProvider` capability, not a vendor special-case.** Carry a `supports_arbitrary_refs` capability flag; branch on it (consistent with "capability flags, not vendor name"):
+- **true** (GitHub/GitLab, Bitbucket DC with relaxed hooks) → dedicated `refs/junto/*` as designed (no `git status` / branch-list pollution).
+- **false** (Bitbucket Cloud, default DC) → fall back to an *allowed* namespace, e.g. **`refs/heads/junto/*`** — works everywhere because it's `refs/heads/*`. ⚠️ The cost is exactly the **branch-list clutter + branch-protection/CI interplay** the dedicated-ref design set out to avoid; treat it as a degraded mode, not parity.
+
+⚠️ **Verify empirically** against a real Bitbucket Cloud + Data Center instance before committing the fallback. Open question: whether the `refs/heads/junto/*` fallback meaningfully degrades UX enough to instead treat Bitbucket as "forge-for-code, different substrate for the record."
 
 ### Conversation
 Realtime conversation is **delegated**, not built: a `ChatConnector` (Slack/Discord/Telegram/Teams) is ingested **into** the one surface (inbound aggregation primary; optional outbound bridge for non-adopters), and/or a light native conversation surface. Agents post via **MCP**; the **Connector** handles the bidirectional bridge + inbound triggers. junto's founding thesis (don't split conversation from work) is served by **unifying in one surface**, not by building chat transport.

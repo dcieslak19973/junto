@@ -46,17 +46,24 @@ Why `cargo check` over `cargo build`: it validates the code compiles without pro
 | MSRV | 1.94 (`rust-version` in workspace) | 🔵 |
 | Layout | Cargo **workspace**; kernel crate + one crate (or module) per adapter boundary, so vendor code stays quarantined | ✅ (seam) / 🔵 (granularity) |
 | Async runtime | `tokio` (MIT) | 🔵 |
-| Git access | `gix` (gitoxide, MIT/Apache) — see git note below | 🔵 ⚠️ verify |
+| Git — substrate push/fetch | **System `git` CLI (shell out)** for `refs/junto/*` | 🔵 (recommended; see note) |
 | PTY capture | `portable-pty` (wezterm, MIT — wraps ConPTY on Windows, openpty on macOS) | 🔵 |
 
-### ⚠️ Git library — verify before committing
+### Git library — assessed 2026-06-08
 
-The substrate is **push/fetch of `refs/junto/*` to a forge** (see `docs/architecture.md` §Substrate). The deciding question for the git library is whether it can do **authenticated push/fetch of custom refspecs, cross-platform**.
+The substrate is **`git push`/`fetch` of custom `refs/junto/*` over the standard git wire protocol** (see `docs/architecture.md` §Substrate) — **not** forge APIs. Because all targets (GitHub/GitLab/Bitbucket, cloud + DC) speak the same git protocol, the library choice is **forge-independent**; forge-specific concerns (PRs, CODEOWNERS) live in `ForgeAdapter`, not here.
 
-- **`gix` (gitoxide)** — pure Rust, MIT/Apache, no C toolchain (a real Windows win), zero licensing ambiguity. **Preferred *if* it supports authenticated custom-refspec push today.** Verify this first — gix's push of custom refspecs over https/ssh has historically lagged its fetch.
-- **`git2` (libgit2)** — mature push/fetch. libgit2 is **GPLv2 *with a linking exception*** — linking it into an MIT binary is explicitly permitted and is *not* "incorporating source," so it does **not** violate junto's MIT constraint. This is the fallback if gix push isn't ready.
+- ❌ **`gix` (gitoxide) — ruled out for now.** Pure Rust / MIT, but **push is entirely unimplemented** (authoritative [crate-status.md](https://github.com/GitoxideLabs/gitoxide/blob/main/crate-status.md): `[ ] push`, `[ ] send-pack/receive-pack`, `[ ] refspec for push`; fetch is `[x]`). Keep as a candidate for fast pure-Rust **reads/fetch** later, and revisit for push when it lands.
+- ✅ **System `git` CLI (shell out) — recommended primary.** Pushes custom refspecs natively and, crucially, **inherits the user's existing git auth** (credential managers, SSH, enterprise SSO/tokens, proxies) uniformly across all six targets — the real cross-forge pain point. Needs `git` on PATH (safe for junto's audience); fits "agents run shells under the hood".
+- 🔵 **`git2` (libgit2) — in-process fallback** if we ever want to drop the system-git dependency. GPLv2 **with a linking exception** → linking into an MIT binary is permitted and is *not* "incorporating source" (does not violate the MIT constraint). Caveat: its credential callbacks can stumble on enterprise helpers/SSH.
 
-Do not record this as settled until the gix-push capability is checked.
+⚠️ **Forge custom-ref support (substrate design, not a library question) — assessed 2026-06-08:**
+- **GitHub & GitLab (cloud + self-hosted): ✅** accept arbitrary `refs/junto/*` (git allows any ref outside `refs/{heads,tags}`).
+- **Bitbucket Cloud: ❌** pre-receive hooks reject custom namespaces; **no way to relax** (this is the exact wall `git-bug`'s `refs/bugs/*` hits).
+- **Bitbucket Data Center: ⚠️** blocked by default; a server admin *can* relax pre-receive/ref restrictions.
+- **Mitigation (fits the capability-flag design):** `SubstrateProvider` carries a `supports_arbitrary_refs` capability; when false, fall back to an allowed namespace like **`refs/heads/junto/*`** (works everywhere since it's `refs/heads/*`, at the cost of branch-list clutter / possible branch-protection interplay — the very pollution the dedicated-ref design wanted to avoid). **Verify empirically against a real Bitbucket instance before locking in.**
+
+🔁 **Revisit trigger — re-check gix periodically.** gix is the *preferred* long-term substrate (pure Rust, no C toolchain, MIT/Apache) and is ruled out only for lack of push. **When [crate-status.md](https://github.com/GitoxideLabs/gitoxide/blob/main/crate-status.md) flips `push`, `send-pack/receive-pack`, and `gix-refspec for push` to `[x]`, re-run this assessment** — empirically push a custom `refs/junto/*` ref over authenticated https + ssh to GitHub/GitLab/Bitbucket (cloud + DC), and if it holds, switch the substrate from the `git` CLI to gix. Suggested cadence: every few months, or whenever the git library is otherwise touched. (Last assessed 2026-06-08.)
 
 ## Hard constraints (do not violate)
 
@@ -75,7 +82,11 @@ Do not record this as settled until the gix-push capability is checked.
 
 ## Rust conventions
 
-🔵 Defaults drawn from widely-used Rust CLAUDE.md practice — change if you disagree, but they're the safe baseline (Dan doesn't write Rust, so lean idiomatic).
+🔵 Defaults drawn from widely-used Rust practice — change if you disagree, but they're the safe baseline (Dan doesn't write Rust, so lean **idiomatic, conventional, and boring**; favor the obvious solution over the clever one).
+
+**Write Rust the way the ecosystem does.** Follow the [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/) and standard idioms (`Result`/`Option` with `?`, iterators, `From`/`Into`, the newtype pattern, RAII). Don't import patterns from other languages (no manual getters/setters, no inheritance-style hierarchies, no `Arc<Mutex<…>>` reached for before it's needed). When unsure how something is conventionally done, match `std` and the surrounding code.
+
+### Correctness & safety
 
 - **Error handling:** `thiserror` for typed errors in **library** crates (the kernel + adapters); `anyhow` for **application/binary** crates (the CLI/daemon top level). Don't leak `anyhow::Error` out of library APIs.
 - **No `unwrap()` / `expect()` / `panic!` in library code.** Return a `Result` instead. They're fine in tests, build scripts, and `main`-level setup. If a panic is truly unreachable, `expect("why this can't fail")` with a reason — never bare `unwrap()`.
@@ -84,6 +95,18 @@ Do not record this as settled until the gix-push capability is checked.
 - Prefer borrowing (`&str`, `&[T]`) over owned (`String`, `Vec<T>`) in function parameters.
 - **Don't restate what the tools enforce.** `rustfmt` owns formatting and `clippy` owns lint style — don't add rules CLAUDE.md can't enforce that the linter already does. Fix clippy warnings rather than `#[allow(...)]`-ing them; if you must allow one, comment why.
 - Adapter boundaries are **traits**; vendor implementations live in their own module/crate. A trait method branching on a vendor name is a bug — branch on a `Capabilities` value instead (constraint #4).
+
+### Readable & understandable code (a first-class goal)
+
+This codebase is meant to be **navigable by both humans and agents** (it's the substrate for a system where agents are peers — see `docs/junto.md`). Clarity outranks cleverness; optimize for the next reader, not for line count.
+
+- **Names carry the ubiquitous language.** Types, functions, and modules should read like `docs/domain-model.md` — a `Channel`, a `Gate`, a `LedgerEntry`. A reader who knows the domain should recognize the code. Spell names out; avoid cryptic abbreviations.
+- **Make illegal states unrepresentable.** Reach for the type system: `enum`s over stringly-typed states, **newtypes** over bare `String`/`u64` (e.g. `ChannelId(Uuid)`, not `String`), `Option`/`Result` over sentinel values. Self-documenting types beat comments.
+- **Small, single-purpose functions.** Prefer early returns and `?` over deep nesting; if a function needs section comments to be followed, split it. Keep modules organized by domain concept so the file tree tells the story.
+- **Comment the *why*, not the *what*.** The code says what it does; comments explain intent, invariants, and non-obvious tradeoffs (especially around the gate engine, provenance, and sync). Doc-comment every public item with a one-line summary of its role.
+- **Prefer clear standard combinators** (`map`, `and_then`, `filter`, `?`) where they read naturally — but break a long iterator chain into named steps before it becomes a puzzle. Readability is the tiebreaker, not brevity.
+- **Match the surrounding code.** Consistency (naming, structure, error style) matters more than any individual preference; when editing, mirror the file you're in.
+- **Simplest thing that works.** No premature abstraction or speculative generality (rule of three — build concrete cases first). A bit of duplication is cheaper than the wrong abstraction.
 
 ## Ubiquitous language — use these names in code
 
