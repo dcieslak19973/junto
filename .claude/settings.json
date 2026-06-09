@@ -1,4 +1,5 @@
 {
+  "//": "Shared project hooks. Cross-platform: bare `cargo` invocations (on PATH everywhere), no shell operators or scripts. Runs from the session's project-root cwd. Personal/machine settings live in the gitignored settings.local.json.",
   "hooks": {
     "PostToolUse": [
       {
@@ -6,8 +7,13 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"%CLAUDE_PROJECT_DIR%\\.claude\\hooks\\rust-check.ps1\"",
-            "timeout": 90
+            "command": "cargo fmt --quiet",
+            "timeout": 60
+          },
+          {
+            "type": "command",
+            "command": "cargo clippy --workspace --all-targets --quiet -- -D warnings",
+            "timeout": 120
           }
         ]
       }

@@ -73,12 +73,27 @@ The substrate is **`git push`/`fetch` of custom `refs/junto/*` over the standard
 4. ✅ **Vendor-neutral by adapters.** Every external dependency sits behind a swappable adapter; **no vendor name reaches the kernel** — branch on **capability flags, not vendor identity**.
 5. ✅ **Kernel ↔ Playbook seam.** **No playbook-specific logic in the kernel.** The kernel is generic (Channel · Member/Party · Message · Artifact · Provenance · Agent Session · Gate engine · Ledger · Outcome · Event). A Playbook *supplies* its Lifecycle, **gate-routing function** (the single most playbook-specific thing), Verifier, offered tools/agents, and artifact renderers.
 
-## Cross-platform rules (Win + Mac)
+## Cross-platform rules (Win + Mac — first-class, tested on both)
 
-- **Never hardcode `/` or `\`.** Use `std::path::Path` / `PathBuf` everywhere. Git refs and ledger paths cross OSes.
-- **PTY capture must work on both** — ConPTY (Windows) and openpty (macOS). Use `portable-pty`; don't reach for unix-only `nix`/`fork`/`exec` PTY paths.
-- **Normalize line endings** for the git-refs ledger. The same record gets written on both platforms; pin LF (or normalize on read) so CRLF vs LF doesn't corrupt dedup/ordering.
-- Prefer cross-platform crates; gate any unavoidable OS-specific code behind `#[cfg(...)]` with both arms implemented.
+junto targets **Windows and macOS equally** (Linux likely comes free). Windows is the one that surprises people, so assume a contributor on either OS and design for the harder case. **Set up CI with a `{windows, macos}` matrix early** — most of these pitfalls (casing, path separators, a platform-locked script) are cheap to catch on commit #3 and expensive later.
+
+**Filesystem & git:**
+- **Never hardcode `/` or `\`.** Use `std::path::Path` / `PathBuf` and `join`, never string concatenation. Git refs and ledger paths cross OSes.
+- **Normalize line endings** for the git-refs ledger. The same record gets written on both platforms; pin LF (`.gitattributes` does this for the repo; do the same in code that writes refs) so CRLF vs LF doesn't corrupt dedup/ordering.
+- **Windows filesystem is case-insensitive; Linux/CI is not.** `Foo.rs` and `foo.rs` collide on Windows but differ on Linux — a casing typo can build for you and break CI. Keep module/file names consistent.
+- **Avoid relying on the executable bit or symlinks** — neither round-trips cleanly through Windows git (symlinks need Developer Mode). Don't commit artifacts that depend on them.
+
+**Runtime (the genuinely hard, junto-specific ones):**
+- **PTY capture: ConPTY (Windows) ≠ openpty (macOS).** Use `portable-pty`; never reach for unix-only `nix`/`fork`/`exec`. The *semantics* still differ (ConPTY does its own VT processing/screen rewrites), so **agent-output→artifact fidelity must be validated on both** — don't assume byte-identical capture. This is core to the terminal-less model; treat it as a design risk, not a detail.
+- **Process control differs.** No real `SIGTERM` on Windows (it's job objects / `TerminateProcess`), and killing a process *tree* (an agent plus its children) is fiddlier. Wrap "spawn / time out / kill an Agent Session" in one cross-platform abstraction from the start; don't sprinkle `kill(2)` calls.
+- **Windows locks open files** — you can't delete/rename a file another process holds open (Unix lets you). Expect "file in use" errors around git-worktree cleanup while an agent process is alive; sequence teardown accordingly.
+- **Shell assumptions for agent-run commands.** An agent emitting `sh`/bash lines assumes a Unix shell; the Windows local backend is PowerShell/cmd. This is what the `ExecutionBackend` abstraction is for — **WSL is the Windows escape hatch** to give agents a Unix shell without porting every command.
+- Prefer cross-platform crates; gate any unavoidable OS-specific code behind `#[cfg(...)]` with **both arms implemented**, not a Windows stub.
+
+**Dev tooling & scripts:**
+- **Write tooling in Rust, not shell.** A `.ps1` is Windows-only; a `.sh` is Unix-only. For anything beyond a one-liner, prefer a `cargo xtask` (a Rust dev-tool crate) so there's one implementation that runs everywhere.
+- **Hooks are cross-platform by construction:** the auto-fmt/clippy hook (`.claude/settings.json`) is just bare `cargo fmt` / `cargo clippy` invocations — single tokens with no shell operators or scripts, so they run identically under cmd, PowerShell, bash, and zsh. Keep new hooks to that shape (one executable, no `&&`/`||`/`;` chaining, no interpreter-specific syntax). It runs from the session's project-root cwd.
+- On **Windows**, add a Defender exclusion for the repo's `target/` dir — real-time AV scanning of build artifacts noticeably slows rebuilds.
 
 ## Rust conventions
 
