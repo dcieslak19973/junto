@@ -2,10 +2,16 @@
 //!
 //! A [`SubstrateProvider`] is the boundary between the kernel's domain logic
 //! and *where entries physically live*. It does the minimum: append an entry,
-//! and hand back every entry for a channel **in append order**. It does **no**
-//! ordering, folding, or interpretation — that is the [`crate::Ledger`]'s job.
-//! Keeping the substrate dumb is what lets the same domain logic run over the
-//! in-memory backend (here) and, later, the git-refs backend unchanged.
+//! and hand back **the complete set of entries** for a channel. It does **no**
+//! folding or interpretation — that is the [`crate::Ledger`]'s job. Keeping the
+//! substrate dumb is what lets the same domain logic run over the in-memory
+//! backend (here) and, later, the git-refs backend unchanged.
+//!
+//! **Ordering is not part of the contract.** A backend returns entries in
+//! whatever order is natural for it; [`crate::Ledger::project`] imposes the
+//! canonical `(timestamp, author.email)` order. (The git-refs backend
+//! partitions storage by author, so it cannot cheaply reconstruct a global
+//! append order — and does not need to.)
 //!
 //! The trait is `async` because the durable backend will do real I/O
 //! (`git push`/`fetch`). [`InMemorySubstrate`] does none, but implements the
@@ -29,8 +35,9 @@ pub trait SubstrateProvider {
     /// Append one entry to its channel's log.
     async fn append(&mut self, entry: LedgerEntry) -> Result<()>;
 
-    /// Every entry for `channel`, in the order they were appended. Returns an
-    /// empty vec for an unknown channel.
+    /// The complete set of entries for `channel`, in no particular order
+    /// (the [`crate::Ledger`] sorts them). Returns an empty vec for an unknown
+    /// channel.
     async fn entries(&self, channel: &ChannelId) -> Result<Vec<LedgerEntry>>;
 }
 

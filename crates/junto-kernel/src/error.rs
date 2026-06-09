@@ -19,6 +19,14 @@ pub enum Error {
     /// public error stays independent of the record format (see `docs/adr/0008`).
     #[error("ledger entry serialization failed: {0}")]
     Serialization(String),
+
+    /// A [`SubstrateProvider`](crate::SubstrateProvider) backend operation
+    /// failed (e.g. a git command). The message carries the underlying cause;
+    /// the concrete backend type is not exposed, keeping the kernel error
+    /// independent of any particular substrate. Never produced by the in-memory
+    /// backend.
+    #[error("substrate operation failed: {0}")]
+    Substrate(String),
 }
 
 /// The kernel's `Result` alias.
