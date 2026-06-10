@@ -58,6 +58,15 @@ pub enum EntryPayload {
         /// identity (`docs/adr/0014`).
         name: String,
     },
+    /// The founding member grants channel membership to `member`
+    /// (`docs/adr/0017`) — the second entry kind in the lifecycle family
+    /// (`docs/adr/0016`). Only the founder (the genesis author) can extend the
+    /// Party: a `MemberAdded` authored by anyone else is recorded but has no
+    /// roster effect during projection.
+    MemberAdded {
+        /// The member being granted membership — human or agent.
+        member: Member,
+    },
     /// An original claim, decision, or finding. Alternatives considered live in
     /// `rationale` until a second Playbook proves a richer shape (`docs/adr/0003`).
     Assertion {
@@ -158,13 +167,15 @@ impl EntryPayload {
     ///
     /// Returns `None` for the kinds that target nothing — the *subject* kinds
     /// [`Assertion`](EntryPayload::Assertion) and [`Proposal`](EntryPayload::Proposal),
-    /// and the lifecycle act [`ChannelOpened`](EntryPayload::ChannelOpened) — and
-    /// `Some(target)` for the acts that reference a prior entry (ratify / park /
-    /// correct / approve / reject).
+    /// and the lifecycle acts [`ChannelOpened`](EntryPayload::ChannelOpened) /
+    /// [`MemberAdded`](EntryPayload::MemberAdded) — and `Some(target)` for the
+    /// acts that reference a prior entry (ratify / park / correct / approve /
+    /// reject).
     #[must_use]
     pub fn target(&self) -> Option<EntryId> {
         match self {
             EntryPayload::ChannelOpened { .. }
+            | EntryPayload::MemberAdded { .. }
             | EntryPayload::Assertion { .. }
             | EntryPayload::Proposal { .. } => None,
             EntryPayload::Ratification { target, .. }

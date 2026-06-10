@@ -66,10 +66,11 @@ pub async fn run(repo: &Path, channel: Option<String>, open: bool) -> Result<()>
     if open {
         let opened_by = host::git_user(&repo)?;
         let host = host::Host::fixed(vec![repo.clone()]);
-        let id = host
+        let opened = host
             .open_channel(Some(&repo), &channel, opened_by, None)
             .await?;
-        println!("opened channel '{channel}' (id {id})");
+        println!("opened channel '{channel}' (id {})", opened.id);
+        print_founder_code(&opened);
     } else {
         println!("(channel '{channel}' not opened — run `junto open \"{channel}\"` when ready)");
     }
@@ -79,6 +80,20 @@ pub async fn run(repo: &Path, channel: Option<String>, open: bool) -> Result<()>
          sessions get briefs via the SessionStart hook (`junto brief` must be on PATH)."
     );
     Ok(())
+}
+
+/// Tell the founder their member code once (`docs/adr/0017`) — writes through
+/// the code-checked surfaces (MCP tools, web forms) will require it.
+pub fn print_founder_code(opened: &host::OpenedChannel) {
+    if opened.founder_code.newly_minted {
+        println!(
+            "your member code is {} — writes on the MCP/web surfaces require it \
+             (machine-local, never in the ledger; docs/adr/0017)",
+            opened.founder_code.code
+        );
+    } else {
+        println!("your existing member code applies to this channel too");
+    }
 }
 
 /// Add junto's server entry to `.mcp.json`, preserving everything else.

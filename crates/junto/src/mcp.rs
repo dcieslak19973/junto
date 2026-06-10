@@ -102,6 +102,9 @@ pub struct RecordRequest {
     /// Channel name (bound at open_channel) or raw channel id.
     pub channel: String,
     pub author: AuthorParam,
+    /// The author's member code (docs/adr/0017) — required once the channel
+    /// has a Party.
+    pub code: Option<String>,
     /// The claim / decision / finding itself.
     pub statement: String,
     /// Why — reasoning and alternatives considered.
@@ -115,6 +118,9 @@ pub struct ActRequest {
     /// Channel name or id.
     pub channel: String,
     pub author: AuthorParam,
+    /// The author's member code (docs/adr/0017) — required once the channel
+    /// has a Party.
+    pub code: Option<String>,
     /// The id of the entry being acted on (shown by `view_channel`).
     pub target: String,
     /// Why. A rationale, not a checkbox.
@@ -126,6 +132,9 @@ pub struct CorrectRequest {
     /// Channel name or id.
     pub channel: String,
     pub author: AuthorParam,
+    /// The author's member code (docs/adr/0017) — required once the channel
+    /// has a Party.
+    pub code: Option<String>,
     /// The id of the entry being superseded.
     pub target: String,
     /// The corrected claim.
@@ -139,6 +148,9 @@ pub struct ProposeRequest {
     /// Channel name or id.
     pub channel: String,
     pub author: AuthorParam,
+    /// The author's member code (docs/adr/0017) — required once the channel
+    /// has a Party.
+    pub code: Option<String>,
     /// What is being proposed (a generic action descriptor, e.g.
     /// "merge PR #5", "push the slice-7 branch").
     pub action: String,
@@ -152,6 +164,18 @@ pub struct ProposeRequest {
     /// Require every one of these members to approve. Mutually exclusive
     /// with `require_count`.
     pub require_all_of: Option<Vec<AuthorParam>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AddMemberRequest {
+    /// Channel name or id.
+    pub channel: String,
+    /// The granter — must be the channel's founding member (docs/adr/0017).
+    pub author: AuthorParam,
+    /// The founding member's own code.
+    pub code: Option<String>,
+    /// The member being granted membership.
+    pub member: AuthorParam,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -249,12 +273,32 @@ impl JuntoMcp {
         Ok(text(format!("recorded {id} in channel '{channel}'")))
     }
 
+    /// The write-surface guardrail (`docs/adr/0017`): project the channel and
+    /// refuse a non-member author or a missing/wrong member code.
+    async fn authorize(
+        &self,
+        ledger: &SharedLedger,
+        channel: &ChannelId,
+        author: &Member,
+        code: Option<&str>,
+    ) -> Result<(), McpError> {
+        let view = ledger
+            .lock()
+            .await
+            .project(channel)
+            .await
+            .map_err(internal)?;
+        self.host
+            .authorize_write(&view, author, code)
+            .map_err(|err| invalid(err.to_string()))
+    }
+
     /// Build the envelope for a fresh entry authored now.
-    fn entry(channel: ChannelId, author: AuthorParam, payload: EntryPayload) -> LedgerEntry {
+    fn entry(channel: ChannelId, author: Member, payload: EntryPayload) -> LedgerEntry {
         LedgerEntry {
             id: EntryId::new(),
             channel,
-            author: author.into(),
+            author,
             timestamp: Timestamp::now(),
             payload,
         }
@@ -268,12 +312,56 @@ impl JuntoMcp {
         Parameters(req): Parameters<OpenChannelRequest>,
     ) -> Result<CallToolResult, McpError> {
         let repo = req.repo.as_deref().map(Path::new);
-        let id = self
+        let opened = self
             .host
             .open_channel(repo, &req.name, req.author.into(), None)
             .await
             .map_err(|err| invalid(err.to_string()))?;
-        Ok(text(format!("opened channel '{}' (id {id})", req.name)))
+        let code_note = if opened.founder_code.newly_minted {
+            format!(
+                "your member code is {} — pass it as `code` on every write (machine-local, \
+                 never in the ledger; docs/adr/0017)",
+                opened.founder_code.code
+            )
+        } else {
+            "your existing member code applies — pass it as `code` on every write".to_string()
+        };
+        Ok(text(format!(
+            "opened channel '{}' (id {}); you are its founding member. {code_note}",
+            req.name, opened.id
+        )))
+    }
+
+    #[tool(
+        description = "Grant channel membership (docs/adr/0017): the founding member adds a new member (human or agent) to the channel's Party and mints their machine-local member code. Only the founder may grant; pass the founder's own `code`."
+    )]
+    async fn add_member(
+        &self,
+        Parameters(req): Parameters<AddMemberRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let granted_by: Member = req.author.into();
+        let (ledger, channel) = self.resolve(&req.channel).await?;
+        self.authorize(&ledger, &channel, &granted_by, req.code.as_deref())
+            .await?;
+        let member: Member = req.member.into();
+        let email = member.email.clone();
+        let minted = self
+            .host
+            .add_member(&req.channel, &granted_by, member)
+            .await
+            .map_err(|err| invalid(err.to_string()))?;
+        let code_note = if minted.newly_minted {
+            format!(
+                "their member code is {} — hand it to them once",
+                minted.code
+            )
+        } else {
+            "they already had a member code on this machine; it still applies".to_string()
+        };
+        Ok(text(format!(
+            "added {email} to channel '{}'. {code_note}",
+            req.channel
+        )))
     }
 
     #[tool(
@@ -315,11 +403,14 @@ impl JuntoMcp {
         &self,
         Parameters(req): Parameters<RecordRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let author: Member = req.author.into();
         let (ledger, channel) = self.resolve(&req.channel).await?;
+        self.authorize(&ledger, &channel, &author, req.code.as_deref())
+            .await?;
         let provenance = parse_provenance(req.provenance)?;
         let entry = Self::entry(
             channel,
-            req.author,
+            author,
             EntryPayload::Assertion {
                 statement: req.statement,
                 rationale: req.rationale,
@@ -336,11 +427,14 @@ impl JuntoMcp {
         &self,
         Parameters(req): Parameters<ActRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let author: Member = req.author.into();
         let (ledger, channel) = self.resolve(&req.channel).await?;
+        self.authorize(&ledger, &channel, &author, req.code.as_deref())
+            .await?;
         let target = parse_entry_id(&req.target)?;
         let entry = Self::entry(
             channel,
-            req.author,
+            author,
             EntryPayload::Ratification {
                 target,
                 rationale: req.rationale,
@@ -356,11 +450,14 @@ impl JuntoMcp {
         &self,
         Parameters(req): Parameters<ActRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let author: Member = req.author.into();
         let (ledger, channel) = self.resolve(&req.channel).await?;
+        self.authorize(&ledger, &channel, &author, req.code.as_deref())
+            .await?;
         let target = parse_entry_id(&req.target)?;
         let entry = Self::entry(
             channel,
-            req.author,
+            author,
             EntryPayload::Park {
                 target,
                 rationale: req.rationale,
@@ -376,11 +473,14 @@ impl JuntoMcp {
         &self,
         Parameters(req): Parameters<CorrectRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let author: Member = req.author.into();
         let (ledger, channel) = self.resolve(&req.channel).await?;
+        self.authorize(&ledger, &channel, &author, req.code.as_deref())
+            .await?;
         let target = parse_entry_id(&req.target)?;
         let entry = Self::entry(
             channel,
-            req.author,
+            author,
             EntryPayload::Correction {
                 target,
                 statement: req.statement,
@@ -397,7 +497,10 @@ impl JuntoMcp {
         &self,
         Parameters(req): Parameters<ProposeRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let author: Member = req.author.into();
         let (ledger, channel) = self.resolve(&req.channel).await?;
+        self.authorize(&ledger, &channel, &author, req.code.as_deref())
+            .await?;
         let requirement = match (req.require_count, req.require_all_of) {
             (None, None) => ApprovalRequirement::Auto,
             (Some(n), None) => ApprovalRequirement::Count(n),
@@ -411,7 +514,7 @@ impl JuntoMcp {
         let provenance = parse_provenance(req.provenance)?;
         let entry = Self::entry(
             channel,
-            req.author,
+            author,
             EntryPayload::Proposal {
                 action: req.action,
                 rationale: req.rationale,
@@ -429,11 +532,14 @@ impl JuntoMcp {
         &self,
         Parameters(req): Parameters<ActRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let author: Member = req.author.into();
         let (ledger, channel) = self.resolve(&req.channel).await?;
+        self.authorize(&ledger, &channel, &author, req.code.as_deref())
+            .await?;
         let target = parse_entry_id(&req.target)?;
         let entry = Self::entry(
             channel,
-            req.author,
+            author,
             EntryPayload::Approval {
                 target,
                 rationale: req.rationale,
@@ -449,11 +555,14 @@ impl JuntoMcp {
         &self,
         Parameters(req): Parameters<ActRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let author: Member = req.author.into();
         let (ledger, channel) = self.resolve(&req.channel).await?;
+        self.authorize(&ledger, &channel, &author, req.code.as_deref())
+            .await?;
         let target = parse_entry_id(&req.target)?;
         let entry = Self::entry(
             channel,
-            req.author,
+            author,
             EntryPayload::Rejection {
                 target,
                 rationale: req.rationale,
@@ -514,11 +623,14 @@ impl ServerHandler for JuntoMcp {
         info.instructions = Some(
             "junto's ledger: open channels (open_channel) and discover them (list_channels), \
              record decisions/findings (assertions), verify them (ratify/park/correct), gate \
-             consequential actions (propose/approve/reject), inspect a channel (view_channel), \
-             and sync the durable record through a git remote (sync_channel). Channels are \
-             addressed by name (bound when opened) or id; a channel must be opened before \
-             recording into it. Always pass your own identity as `author` — agents author as \
-             themselves, never as their operator."
+             consequential actions (propose/approve/reject), grant membership (add_member, \
+             founder only), inspect a channel (view_channel), and sync the durable record \
+             through a git remote (sync_channel). Channels are addressed by name (bound when \
+             opened) or id; a channel must be opened before recording into it. Always pass \
+             your own identity as `author` — agents author as themselves, never as their \
+             operator — plus your member code as `code`: writes require membership in the \
+             channel's Party and the matching machine-local code (your operator hands you \
+             the code when minting you as a member; docs/adr/0017)."
                 .to_string(),
         );
         info
@@ -531,7 +643,8 @@ mod tests {
     use std::process::Command as StdCommand;
     use tempfile::TempDir;
 
-    /// A host over `count` fresh single-purpose git repos.
+    /// A host over `count` fresh single-purpose git repos, with its
+    /// member-code store in its own temp dir (never the real `~/.junto`).
     fn init_host(count: usize) -> (Vec<TempDir>, JuntoMcp) {
         let mut dirs = Vec::new();
         let mut paths = Vec::new();
@@ -547,7 +660,12 @@ mod tests {
             paths.push(dir.path().to_path_buf());
             dirs.push(dir);
         }
-        let handler = JuntoMcp::new(Host::fixed(paths));
+        let member_home = tempfile::tempdir().expect("member home");
+        let handler = JuntoMcp::new(Host::fixed_with_member_home(
+            paths,
+            Some(member_home.path().to_path_buf()),
+        ));
+        dirs.push(member_home);
         (dirs, handler)
     }
 
@@ -571,8 +689,24 @@ mod tests {
         }
     }
 
-    /// Open `name` in the host's only substrate.
-    async fn open(mcp: &JuntoMcp, name: &str) {
+    /// The member home the test host was built over (the last temp dir
+    /// pushed by [`init_host`]).
+    fn member_home(dirs: &[TempDir]) -> &std::path::Path {
+        dirs.last().expect("member home").path()
+    }
+
+    /// A member's code from the test host's store, minting if absent.
+    fn code_of(dirs: &[TempDir], who: AuthorParam) -> Option<String> {
+        Some(
+            crate::members::mint(member_home(dirs), &who.into())
+                .expect("mint")
+                .code,
+        )
+    }
+
+    /// Open `name` in the host's only substrate (Dan is the founder) and add
+    /// Claude to its Party, so both fixtures can write.
+    async fn open(mcp: &JuntoMcp, dirs: &[TempDir], name: &str) {
         mcp.open_channel(Parameters(OpenChannelRequest {
             name: name.into(),
             author: dan(),
@@ -580,6 +714,14 @@ mod tests {
         }))
         .await
         .expect("open channel");
+        mcp.add_member(Parameters(AddMemberRequest {
+            channel: name.into(),
+            author: dan(),
+            code: code_of(dirs, dan()),
+            member: claude(),
+        }))
+        .await
+        .expect("add claude");
     }
 
     /// Pull the single text block out of a tool result.
@@ -602,12 +744,13 @@ mod tests {
 
     #[tokio::test]
     async fn record_then_view_shows_the_assertion() {
-        let (_dirs, mcp) = init_repo();
-        open(&mcp, "junto-dev").await;
+        let (dirs, mcp) = init_repo();
+        open(&mcp, &dirs, "junto-dev").await;
         let recorded = mcp
             .record(Parameters(RecordRequest {
                 channel: "junto-dev".into(),
                 author: claude(),
+                code: code_of(&dirs, claude()),
                 statement: "the sky is blue".into(),
                 rationale: "observed".into(),
                 provenance: Some(vec![ProvenanceParam {
@@ -638,6 +781,7 @@ mod tests {
             .record(Parameters(RecordRequest {
                 channel: "never-opened".into(),
                 author: claude(),
+                code: None,
                 statement: "s".into(),
                 rationale: "r".into(),
                 provenance: None,
@@ -649,8 +793,8 @@ mod tests {
 
     #[tokio::test]
     async fn open_enforces_name_uniqueness_per_substrate() {
-        let (_dirs, mcp) = init_repo();
-        open(&mcp, "junto-dev").await;
+        let (dirs, mcp) = init_repo();
+        open(&mcp, &dirs, "junto-dev").await;
         let err = mcp
             .open_channel(Parameters(OpenChannelRequest {
                 name: "junto-dev".into(),
@@ -664,8 +808,8 @@ mod tests {
 
     #[tokio::test]
     async fn channels_resolve_by_raw_id_too() {
-        let (_dirs, mcp) = init_repo();
-        open(&mcp, "junto-dev").await;
+        let (dirs, mcp) = init_repo();
+        open(&mcp, &dirs, "junto-dev").await;
         let listed = text_of(
             &mcp.list_channels(Parameters(ListChannelsRequest { repo: None }))
                 .await
@@ -750,12 +894,13 @@ mod tests {
 
     #[tokio::test]
     async fn ratify_moves_standing() {
-        let (_dirs, mcp) = init_repo();
-        open(&mcp, "junto-dev").await;
+        let (dirs, mcp) = init_repo();
+        open(&mcp, &dirs, "junto-dev").await;
         let recorded = mcp
             .record(Parameters(RecordRequest {
                 channel: "junto-dev".into(),
                 author: claude(),
+                code: code_of(&dirs, claude()),
                 statement: "claim".into(),
                 rationale: "because".into(),
                 provenance: None,
@@ -767,6 +912,7 @@ mod tests {
         mcp.ratify(Parameters(ActRequest {
             channel: "junto-dev".into(),
             author: dan(),
+            code: code_of(&dirs, dan()),
             target: id,
             rationale: "checked".into(),
         }))
@@ -785,12 +931,13 @@ mod tests {
 
     #[tokio::test]
     async fn propose_approve_opens_the_gate() {
-        let (_dirs, mcp) = init_repo();
-        open(&mcp, "junto-dev").await;
+        let (dirs, mcp) = init_repo();
+        open(&mcp, &dirs, "junto-dev").await;
         let proposed = mcp
             .propose(Parameters(ProposeRequest {
                 channel: "junto-dev".into(),
                 author: claude(),
+                code: code_of(&dirs, claude()),
                 action: "merge slice 7".into(),
                 rationale: "tests green".into(),
                 provenance: None,
@@ -813,6 +960,7 @@ mod tests {
         mcp.approve(Parameters(ActRequest {
             channel: "junto-dev".into(),
             author: dan(),
+            code: code_of(&dirs, dan()),
             target: id,
             rationale: "lgtm".into(),
         }))
@@ -831,12 +979,13 @@ mod tests {
 
     #[tokio::test]
     async fn channels_are_isolated_by_name() {
-        let (_dirs, mcp) = init_repo();
-        open(&mcp, "alpha").await;
-        open(&mcp, "beta").await;
+        let (dirs, mcp) = init_repo();
+        open(&mcp, &dirs, "alpha").await;
+        open(&mcp, &dirs, "beta").await;
         mcp.record(Parameters(RecordRequest {
             channel: "alpha".into(),
             author: claude(),
+            code: code_of(&dirs, claude()),
             statement: "only in alpha".into(),
             rationale: "r".into(),
             provenance: None,
@@ -856,13 +1005,14 @@ mod tests {
 
     #[tokio::test]
     async fn bad_inputs_are_invalid_params() {
-        let (_dirs, mcp) = init_repo();
-        open(&mcp, "junto-dev").await;
+        let (dirs, mcp) = init_repo();
+        open(&mcp, &dirs, "junto-dev").await;
         // Not a UUID target.
         let err = mcp
             .ratify(Parameters(ActRequest {
                 channel: "junto-dev".into(),
                 author: dan(),
+                code: code_of(&dirs, dan()),
                 target: "not-a-uuid".into(),
                 rationale: "r".into(),
             }))
@@ -875,6 +1025,7 @@ mod tests {
             .propose(Parameters(ProposeRequest {
                 channel: "junto-dev".into(),
                 author: claude(),
+                code: code_of(&dirs, claude()),
                 action: "a".into(),
                 rationale: "r".into(),
                 provenance: None,
@@ -890,6 +1041,7 @@ mod tests {
             .record(Parameters(RecordRequest {
                 channel: "junto-dev".into(),
                 author: claude(),
+                code: code_of(&dirs, claude()),
                 statement: "s".into(),
                 rationale: "r".into(),
                 provenance: Some(vec![ProvenanceParam {
@@ -900,5 +1052,150 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.message.contains("algorithm"));
+    }
+
+    // ---- membership & member codes on the write surface (docs/adr/0017) ----
+
+    #[tokio::test]
+    async fn non_member_writes_are_refused() {
+        let (dirs, mcp) = init_repo();
+        // Open without adding Claude: Dan is the only member.
+        mcp.open_channel(Parameters(OpenChannelRequest {
+            name: "solo".into(),
+            author: dan(),
+            repo: None,
+        }))
+        .await
+        .unwrap();
+
+        let err = mcp
+            .record(Parameters(RecordRequest {
+                channel: "solo".into(),
+                author: claude(),
+                code: code_of(&dirs, claude()),
+                statement: "s".into(),
+                rationale: "r".into(),
+                provenance: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("not a member"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn wrong_or_missing_codes_are_refused() {
+        let (dirs, mcp) = init_repo();
+        open(&mcp, &dirs, "junto-dev").await;
+
+        let err = mcp
+            .record(Parameters(RecordRequest {
+                channel: "junto-dev".into(),
+                author: claude(),
+                code: Some("WRONG0".into()),
+                statement: "s".into(),
+                rationale: "r".into(),
+                provenance: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("wrong member code"), "{}", err.message);
+
+        let err = mcp
+            .record(Parameters(RecordRequest {
+                channel: "junto-dev".into(),
+                author: claude(),
+                code: None,
+                statement: "s".into(),
+                rationale: "r".into(),
+                provenance: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("member code is required"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn only_the_founder_grants_membership() {
+        let (dirs, mcp) = init_repo();
+        open(&mcp, &dirs, "junto-dev").await;
+
+        // Claude is a member, but not the founder.
+        let err = mcp
+            .add_member(Parameters(AddMemberRequest {
+                channel: "junto-dev".into(),
+                author: claude(),
+                code: code_of(&dirs, claude()),
+                member: AuthorParam {
+                    name: "Interloper".into(),
+                    email: "interloper@junto.invalid".into(),
+                    kind: AuthorKind::Agent,
+                },
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("only the founding member"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn re_granting_mints_without_a_duplicate_roster_entry() {
+        let (dirs, mcp) = init_repo();
+        open(&mcp, &dirs, "junto-dev").await;
+
+        // Granting Claude again: no new entry, the existing code applies.
+        let result = mcp
+            .add_member(Parameters(AddMemberRequest {
+                channel: "junto-dev".into(),
+                author: dan(),
+                code: code_of(&dirs, dan()),
+                member: claude(),
+            }))
+            .await
+            .unwrap();
+        assert!(
+            text_of(&result).contains("already had a member code"),
+            "{}",
+            text_of(&result)
+        );
+
+        let rendered = text_of(
+            &mcp.view_channel(Parameters(ViewRequest {
+                channel: "junto-dev".into(),
+            }))
+            .await
+            .unwrap(),
+        );
+        assert_eq!(
+            rendered.matches("member added").count(),
+            1,
+            "one grant entry, not two: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn opening_mints_the_founder_code() {
+        let (dirs, mcp) = init_repo();
+        let result = mcp
+            .open_channel(Parameters(OpenChannelRequest {
+                name: "fresh".into(),
+                author: dan(),
+                repo: None,
+            }))
+            .await
+            .unwrap();
+        let message = text_of(&result);
+        assert!(message.contains("founding member"), "{message}");
+        assert!(message.contains("your member code is"), "{message}");
+        // The store holds it.
+        let dan_member: Member = dan().into();
+        let on_file = crate::members::minted_members(member_home(&dirs)).unwrap();
+        assert!(on_file.iter().any(|r| r.member.email == dan_member.email));
     }
 }

@@ -105,11 +105,16 @@ async fn channel_page(State(host): State<Arc<Host>>, Path(channel): Path<String>
     }
 }
 
-/// The form body of a verification act: the rationale, nothing else (the act
-/// and target come from the URL, the author from git config).
+/// The form body of a verification act: the rationale and the author's member
+/// code (`docs/adr/0017`) — the act and target come from the URL, the author
+/// from git config.
 #[derive(Debug, Deserialize)]
 struct ActForm {
     rationale: String,
+    /// The member code of the machine user (required once the channel has a
+    /// Party; blank tolerated for pre-genesis channels).
+    #[serde(default)]
+    code: String,
 }
 
 /// Append one verification act from the channel page's forms.
@@ -202,6 +207,14 @@ async fn verify(
         }
     };
 
+    // The write-surface guardrail (docs/adr/0017): the author must be in the
+    // channel's Party and present their member code.
+    let code = form.code.trim();
+    let code = (!code.is_empty()).then_some(code);
+    if let Err(err) = host.authorize_write(&view, &author, code) {
+        return (StatusCode::FORBIDDEN, format!("{err:#}")).into_response();
+    }
+
     let entry = LedgerEntry {
         id: EntryId::new(),
         channel: id,
@@ -237,9 +250,19 @@ mod tests {
     use std::process::Command as StdCommand;
     use tempfile::TempDir;
 
-    /// A host over one fresh git repo with a configured user, plus an opened
-    /// channel holding one entry built by `payload`.
-    async fn host_with_entry(payload: EntryPayload) -> (TempDir, Arc<Host>, ChannelId, EntryId) {
+    /// A test host: one fresh git repo, the member-code store in its own temp
+    /// dir, a channel founded by the repo's git user (the web-write author,
+    /// `docs/adr/0017`), and one entry by a granted "Bot" member.
+    struct WebFixture {
+        _dirs: Vec<TempDir>,
+        host: Arc<Host>,
+        channel: ChannelId,
+        target: EntryId,
+        /// The founder's (= git user's) member code, for the act forms.
+        code: String,
+    }
+
+    async fn host_with_entry(payload: EntryPayload) -> WebFixture {
         let dir = tempfile::tempdir().expect("tempdir");
         assert!(
             StdCommand::new("git")
@@ -259,16 +282,28 @@ mod tests {
                     .success()
             );
         }
-        let host = Host::fixed(vec![dir.path().to_path_buf()]);
-        let channel = host
-            .open_channel(
-                None,
-                "web-test",
-                Member::human("Opener", "o@example.com"),
-                None,
-            )
+        let member_home = tempfile::tempdir().expect("member home");
+        let host = Host::fixed_with_member_home(
+            vec![dir.path().to_path_buf()],
+            Some(member_home.path().to_path_buf()),
+        );
+        // The founder is the git user, so web writes are member writes.
+        let founder = Member::human("Web User", "web@example.com");
+        let opened = host
+            .open_channel(None, "web-test", founder.clone(), None)
             .await
             .expect("open channel");
+        let channel = opened.id;
+        let code = opened.founder_code.code;
+        // The bot is a granted member: its entry projects (Provisional /
+        // Pending) so the page renders an act form for it.
+        host.add_member(
+            "web-test",
+            &founder,
+            Member::agent("Bot", "bot@example.com"),
+        )
+        .await
+        .expect("add bot");
         let target = EntryId::new();
         let ledger = host.ledger_for(dir.path()).await.expect("ledger");
         ledger
@@ -283,7 +318,13 @@ mod tests {
             })
             .await
             .expect("append");
-        (dir, host, channel, target)
+        WebFixture {
+            _dirs: vec![dir, member_home],
+            host,
+            channel,
+            target,
+            code,
+        }
     }
 
     fn assertion() -> EntryPayload {
@@ -309,12 +350,14 @@ mod tests {
         entry: String,
         act: &str,
         rationale: &str,
+        code: &str,
     ) -> Response {
         verify(
             State(host),
             Path((channel, entry, act.to_string())),
             Form(ActForm {
                 rationale: rationale.into(),
+                code: code.into(),
             }),
         )
         .await
@@ -322,23 +365,27 @@ mod tests {
 
     #[tokio::test]
     async fn web_ratify_moves_standing_with_git_author() {
-        let (_dir, host, channel, target) = host_with_entry(assertion()).await;
+        let fx = host_with_entry(assertion()).await;
         let response = post_act(
-            host.clone(),
+            fx.host.clone(),
             "web-test".into(),
-            target.to_string(),
+            fx.target.to_string(),
             "ratify",
             "checked it",
+            &fx.code,
         )
         .await;
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
 
-        let resolution = host.resolve(&channel.to_string()).await.unwrap();
+        let resolution = fx.host.resolve(&fx.channel.to_string()).await.unwrap();
         let Resolution::Resolved { ledger, id, .. } = resolution else {
             panic!("channel resolves");
         };
         let view = ledger.lock().await.project(&id).await.unwrap();
-        assert!(matches!(view.standing(&target), Some(Standing::Ratified)));
+        assert!(matches!(
+            view.standing(&fx.target),
+            Some(Standing::Ratified)
+        ));
         // The act was authored as the repo's configured git user.
         let act_entry = view
             .entries
@@ -350,33 +397,42 @@ mod tests {
 
     #[tokio::test]
     async fn web_approve_opens_the_gate() {
-        let (_dir, host, channel, target) = host_with_entry(proposal()).await;
+        let fx = host_with_entry(proposal()).await;
         let response = post_act(
-            host.clone(),
-            channel.to_string(),
-            target.to_string(),
+            fx.host.clone(),
+            fx.channel.to_string(),
+            fx.target.to_string(),
             "approve",
             "lgtm",
+            &fx.code,
         )
         .await;
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
 
         let Resolution::Resolved { ledger, id, .. } =
-            host.resolve(&channel.to_string()).await.unwrap()
+            fx.host.resolve(&fx.channel.to_string()).await.unwrap()
         else {
             panic!("channel resolves");
         };
         let view = ledger.lock().await.project(&id).await.unwrap();
         assert!(matches!(
-            view.gate_status(&target),
+            view.gate_status(&fx.target),
             Some(GateStatus::Approved)
         ));
     }
 
     #[tokio::test]
     async fn empty_rationale_is_refused() {
-        let (_dir, host, _channel, target) = host_with_entry(assertion()).await;
-        let response = post_act(host, "web-test".into(), target.to_string(), "ratify", "  ").await;
+        let fx = host_with_entry(assertion()).await;
+        let response = post_act(
+            fx.host.clone(),
+            "web-test".into(),
+            fx.target.to_string(),
+            "ratify",
+            "  ",
+            &fx.code,
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -384,16 +440,72 @@ mod tests {
     async fn cross_kind_acts_are_refused() {
         // Approving an assertion (it's not a proposal) is a 400, not a
         // silently-dangling act.
-        let (_dir, host, _channel, target) = host_with_entry(assertion()).await;
-        let response = post_act(host, "web-test".into(), target.to_string(), "approve", "r").await;
+        let fx = host_with_entry(assertion()).await;
+        let response = post_act(
+            fx.host.clone(),
+            "web-test".into(),
+            fx.target.to_string(),
+            "approve",
+            "r",
+            &fx.code,
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
     async fn unknown_acts_are_404() {
-        let (_dir, host, _channel, target) = host_with_entry(assertion()).await;
-        let response = post_act(host, "web-test".into(), target.to_string(), "yolo", "r").await;
+        let fx = host_with_entry(assertion()).await;
+        let response = post_act(
+            fx.host.clone(),
+            "web-test".into(),
+            fx.target.to_string(),
+            "yolo",
+            "r",
+            &fx.code,
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn wrong_or_missing_member_codes_are_forbidden() {
+        // The guardrail of docs/adr/0017 on the web surface: the git-user
+        // author must present their member code.
+        let fx = host_with_entry(assertion()).await;
+        let response = post_act(
+            fx.host.clone(),
+            "web-test".into(),
+            fx.target.to_string(),
+            "ratify",
+            "r",
+            "WRONG0",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = post_act(
+            fx.host.clone(),
+            "web-test".into(),
+            fx.target.to_string(),
+            "ratify",
+            "r",
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // Nothing was appended: the assertion is still provisional.
+        let Resolution::Resolved { ledger, id, .. } =
+            fx.host.resolve(&fx.channel.to_string()).await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+        let view = ledger.lock().await.project(&id).await.unwrap();
+        assert!(matches!(
+            view.standing(&fx.target),
+            Some(Standing::Provisional)
+        ));
     }
 
     #[test]
@@ -413,6 +525,8 @@ mod tests {
             standings: std::iter::once((entry.id, junto_kernel::Standing::Provisional)).collect(),
             gate_status: Default::default(),
             entries: vec![entry.clone()],
+            party: Vec::new(),
+            unrecognized: Default::default(),
         };
         let html = crate::render::channel_html("web-test", &channel, &view);
         assert!(html.contains(&format!("/channels/{channel}/entries/{}/ratify", entry.id)));

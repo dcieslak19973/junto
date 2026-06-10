@@ -152,6 +152,9 @@ pub enum Resolution {
 /// The singleton host's shared state.
 pub struct Host {
     substrates: Substrates,
+    /// Where the machine-local member-code store lives (`docs/adr/0017`);
+    /// `None` means the user's junto home, resolved per use.
+    member_home_override: Option<PathBuf>,
     /// Ledgers opened so far, keyed by substrate repo path — cached so each
     /// repo has one append-serializing mutex for the host's lifetime.
     ledgers: Mutex<HashMap<PathBuf, SharedLedger>>,
@@ -162,12 +165,19 @@ impl Host {
     pub fn from_registry(junto_home: PathBuf) -> Arc<Self> {
         Arc::new(Self {
             substrates: Substrates::Registry(junto_home),
+            member_home_override: None,
             ledgers: Mutex::new(HashMap::new()),
         })
     }
 
     /// A host over a fixed substrate set (single-repo dev mode, tests).
     pub fn fixed(repos: Vec<PathBuf>) -> Arc<Self> {
+        Self::fixed_with_member_home(repos, None)
+    }
+
+    /// [`Host::fixed`] with an explicit member-code store location, so tests
+    /// never touch the real `~/.junto`.
+    pub fn fixed_with_member_home(repos: Vec<PathBuf>, member_home: Option<PathBuf>) -> Arc<Self> {
         // Canonicalize up front so path equality (e.g. open_channel's
         // membership check) is not defeated by symlinks or Windows' \\?\
         // prefix; a path that doesn't resolve is kept as-is and will fail
@@ -178,8 +188,21 @@ impl Host {
             .collect();
         Arc::new(Self {
             substrates: Substrates::Fixed(repos),
+            member_home_override: member_home,
             ledgers: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Where this host's member-code store lives (`docs/adr/0017`): the
+    /// machine registry's junto home, unless overridden (tests).
+    fn member_home(&self) -> Result<PathBuf> {
+        if let Some(home) = &self.member_home_override {
+            return Ok(home.clone());
+        }
+        match &self.substrates {
+            Substrates::Registry(junto_home) => Ok(junto_home.clone()),
+            Substrates::Fixed(_) => junto_home(),
+        }
     }
 
     /// The current substrate repos this host serves.
@@ -261,17 +284,18 @@ impl Host {
     /// Open a channel (`docs/adr/0014`/`0016`): mint its id (or accept a
     /// declared one — the grandfathering path for pre-0014 records), enforce
     /// name uniqueness within the home substrate, and append the
-    /// `ChannelOpened` genesis entry.
+    /// `ChannelOpened` genesis entry. The opener is the **founding member**
+    /// (`docs/adr/0017`), so their member code is minted alongside.
     ///
     /// `repo`: the home substrate; may be omitted when the host serves exactly
-    /// one. Returns the opened channel's id.
+    /// one.
     pub async fn open_channel(
         &self,
         repo: Option<&Path>,
         name: &str,
         opened_by: Member,
         declared_id: Option<ChannelId>,
-    ) -> Result<ChannelId> {
+    ) -> Result<OpenedChannel> {
         if name.trim().is_empty() {
             bail!("channel name must not be empty");
         }
@@ -321,15 +345,131 @@ impl Host {
             .append(LedgerEntry {
                 id: EntryId::new(),
                 channel: id,
-                author: opened_by,
+                author: opened_by.clone(),
                 timestamp: Timestamp::now(),
                 payload: EntryPayload::ChannelOpened {
                     name: name.to_string(),
                 },
             })
             .await?;
-        Ok(id)
+        // The opener is the founding member; mint their code so the founder
+        // can write through the code-checked surfaces (`docs/adr/0017`).
+        let founder_code = crate::members::mint(&self.member_home()?, &opened_by)?;
+        Ok(OpenedChannel { id, founder_code })
     }
+
+    /// Grant channel membership (`docs/adr/0017`): append a founder-authored
+    /// `MemberAdded` entry and mint the new member's machine-local code.
+    ///
+    /// Only the **founding member** (the genesis author) may grant — that is a
+    /// roster rule checked here; *authenticating* `granted_by` (their member
+    /// code) is the calling surface's concern: the MCP tool requires it, the
+    /// CLI does not (whoever can run commands on this machine can edit the
+    /// code store anyway).
+    pub async fn add_member(
+        &self,
+        channel: &str,
+        granted_by: &Member,
+        member: Member,
+    ) -> Result<crate::members::Minted> {
+        let resolution = self.resolve(channel).await?;
+        let (ledger, id) = match resolution {
+            Resolution::Resolved { ledger, id, .. } => (ledger, id),
+            Resolution::NotFound => bail!("no channel '{channel}' in any registered substrate"),
+            Resolution::Ambiguous(substrates) => bail!(
+                "channel name '{channel}' exists in several substrates ({substrates:?}); \
+                 address it by id"
+            ),
+        };
+        let mut guard = ledger.lock().await;
+        let view = guard.project(&id).await?;
+        let Some(founder) = view.party.first() else {
+            bail!(
+                "channel '{channel}' has no genesis, so it has no founding member to grant \
+                 membership (membership is not enforced on pre-genesis channels)"
+            );
+        };
+        if founder.email != granted_by.email {
+            bail!(
+                "only the founding member ({} <{}>) can grant membership in '{channel}' \
+                 (docs/adr/0017)",
+                founder.display_name,
+                founder.email
+            );
+        }
+
+        // Re-granting an existing member (the founder included) is a no-op on
+        // the roster — skip the entry, just make sure their code exists.
+        if view.party.iter().any(|m| m.email == member.email) {
+            return crate::members::mint(&self.member_home()?, &member);
+        }
+
+        guard
+            .append(LedgerEntry {
+                id: EntryId::new(),
+                channel: id,
+                author: granted_by.clone(),
+                timestamp: Timestamp::now(),
+                payload: EntryPayload::MemberAdded {
+                    member: member.clone(),
+                },
+            })
+            .await?;
+        crate::members::mint(&self.member_home()?, &member)
+    }
+
+    /// The write-surface guardrail (`docs/adr/0017`): refuse an author who is
+    /// not in the channel's Party, or whose member code is missing or wrong.
+    ///
+    /// A channel with no genesis has no Party and gets the legacy behaviour —
+    /// no membership or code enforcement. The projection remains the real
+    /// guardrail for entries that arrive by sync; this check just turns a
+    /// misconfigured author into a clear error instead of an orphaned entry.
+    pub fn authorize_write(
+        &self,
+        view: &ChannelView,
+        author: &Member,
+        code: Option<&str>,
+    ) -> Result<()> {
+        if view.party.is_empty() {
+            return Ok(());
+        }
+        if !view.party.iter().any(|member| member.email == author.email) {
+            bail!(
+                "{} <{}> is not a member of this channel — the founding member can grant \
+                 membership (junto add-member, or the add_member tool; docs/adr/0017)",
+                author.display_name,
+                author.email
+            );
+        }
+        let Some(code) = code else {
+            bail!(
+                "a member code is required to write as {} (it was printed when the member \
+                 was minted; docs/adr/0017)",
+                author.email
+            );
+        };
+        match crate::members::check(&self.member_home()?, &author.email, code)? {
+            crate::members::CodeCheck::Valid => Ok(()),
+            crate::members::CodeCheck::WrongCode => {
+                bail!("wrong member code for {}", author.email)
+            }
+            crate::members::CodeCheck::NoCodeOnFile => bail!(
+                "no member code minted on this machine for {} — mint one with \
+                 junto add-member (docs/adr/0017)",
+                author.email
+            ),
+        }
+    }
+}
+
+/// The result of opening a channel: its id, and the founding member's
+/// machine-local code (freshly minted, or pre-existing if the same identity
+/// already had one — codes are per identity per machine, `docs/adr/0017`).
+#[derive(Debug)]
+pub struct OpenedChannel {
+    pub id: ChannelId,
+    pub founder_code: crate::members::Minted,
 }
 
 /// Fold one projected channel into its discovery summary.
