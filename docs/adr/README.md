@@ -1,0 +1,22 @@
+# Architectural decision records
+
+Settled **architectural** decisions, one file each — extracted from `domain-model.md`'s former in-line decision log and **back-filled together**, so ADR cross-references point *backward only* and the file numbers are stable identifiers, not a strict timeline (each ADR's `Status:` line carries the actual decision date).
+
+| ADR | Decision |
+|---|---|
+| [0001](0001-ledger-is-the-durable-record.md) | The Ledger is the channel's durable record (one Ledger of entries; the old separate "Record" noun folded in). |
+| [0002](0002-ledger-entries-are-immutable.md) | Entries are immutable; correct by appending — standing is **derived by folding**, never stored (event-sourcing). |
+| [0003](0003-ledger-entry-content-model.md) | One entry envelope + a **closed `kind` set**; verification is itself an entry; kernel `Assertion` is minimal; `Park`/`Falsify` collapsed. |
+| [0004](0004-any-member-may-author-any-entry.md) | **Any Member (human or agent) may author any entry**; authority lives at the Gate/Verifier layer, not in authorship. |
+| [0005](0005-provenance-ref-uri-plus-digest.md) | A `ProvenanceRef` = URI + optional self-describing **content digest** (drift-detectable). |
+| [0006](0006-gate-engine-event-sourced.md) | The **Gate engine** is event-sourced into the Ledger (`Proposal`/`Approval`/`Rejection`; derived `GateStatus`; reject is *sticky*). |
+| [0007](0007-routing-stays-out-of-the-kernel.md) | **Routing stays out of the kernel**: it executes an `ApprovalRequirement`; the importable **Rubric** layer (future) decides it. |
+| [0008](0008-canonical-entry-serialization-is-jcs-json.md) | A `LedgerEntry`'s **canonical byte form** is **JCS / RFC 8785 JSON** (deterministic by spec, readable/diffable); newtypes re-validate on deserialize. |
+| [0009](0009-git-refs-substrate-ndjson-per-author.md) | The **git-refs substrate** stores an append-only **NDJSON log per author** under `refs/junto/<channel>/<author>` (local durable record; forge sync deferred). |
+| [0010](0010-canonical-order-and-dedup-by-entry-id.md) | Canonical order is **`(timestamp, author email, entry id)`** — a deterministic *total* order — and projection **dedups by `EntryId`** (substrates may hold duplicates). |
+| [0011](0011-sync-is-push-fetch-plus-convergent-union-merge.md) | **Sync** = push/fetch of author refs to any git remote; divergence (same author, two machines) reconciles by a **deterministic union-merge** — set union of immutable entries *is* the merge (no CRDT needed). |
+| [0012](0012-mcp-over-http-is-the-first-write-surface.md) | The first write surface is **MCP over streamable HTTP** (`junto serve`, localhost:1727). Identity is claimed, not verified — a recorded dogfood-era limit. *(Its UUIDv5 named-channel clause is superseded by 0014.)* |
+| [0013](0013-host-serves-the-read-surface-recall-via-hook.md) | The host serves the **read surface**: an HTML channel page (the first pixel of the one surface) + a markdown `/brief`. Agent **recall is a membership concern** (inject at join time, once modelled); a SessionStart hook is the bridge. |
+| [0014](0014-channel-identity-is-minted-names-are-substrate-scoped-labels.md) | **ChannelIds are minted (v4), globally unique**; channels are **repo-agnostic** with one **home substrate**; the **name is a substrate-scoped label** bound to the id by a genesis record when the channel is **opened** (an explicit, recorded act — no implicit create-on-first-write). Supersedes 0012's UUIDv5 clause. |
+| [0015](0015-one-host-per-machine-serving-many-substrates.md) | **One host per machine/user** (singleton, port 1727) serving **every registered home substrate** — a machine-local substrate registry (not a channel registry); bare names resolve across substrates, ambiguity errors, ids always resolve. The one surface stays one. |
+| [0016](0016-channel-lifecycle-acts-are-ledger-entries.md) | **Channel lifecycle acts are ledger entries**: the genesis is a `ChannelOpened` entry (first in the channel's ledger), not a substrate manifest; rename = a later corrective entry; fork/close anticipated as future entry kinds. Extends 0003's closed kind set. |
