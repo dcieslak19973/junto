@@ -41,6 +41,20 @@ That's the hook: *a junto is a small, diverse group that gets better at its work
 
 The wedge: **Ace also unifies — but locks you to GitHub + a central cloud + synchronous co-presence.** junto keeps ACE's good idea (the `channel`) and unifies **across vendors** (any forge / tracker / chat / agent-harness / execution backend), **terminal-less**, with a pluggable substrate. The honest cost: junto is therefore *"another app"* — the bet is **one unified pane beats five tabs.**
 
+✅ **Framing confirmed (Dan, 2026-06-09 — grill session, recorded in the `junto-dev` ledger):** one surface **remains the point**. A reviewer-proposed reframe ("the verified record is the moat; the surface is the delivery vehicle") was considered and rejected — the record is the *foundation*, but the pain users feel is tab-juggling and misalignment, and that is what junto sells. Consequence: the first human read surface is the first pixel of the point, not a side probe.
+
+## The single-player wedge (✅ Dan, 2026-06-09)
+
+How junto answers the *"another app"* cold-start: it is valuable to **one person + their agents** before any team joins — "one surface, starting solo." Settled in the grill session (full decisions + rejected alternatives live in the `junto-dev` ledger):
+
+- **Player:** the agent-heavy developer — the persona we dogfood daily.
+- **Lead job:** **decision memory** — *your repo remembers why.* Agents re-derive and contradict past decisions; CLAUDE.md bloats, ADRs are heavyweight, commit messages are write-only.
+- **The delta** over agent memory files: **verification states** — memory with *standing* (provisional / ratified / parked), where a ratified decision outranks a stray note and **parked dead-ends stop agents from re-trying them**.
+- **Recall is a membership concern:** joining a channel *means* receiving its context, injected by junto at join time once Channel/Party/Agent Session are modelled; until then a harness SessionStart hook injects the channel brief (`docs/adr/0013`).
+- **Gates solo** = the async + durable layer: the harness gates *mechanics* ("may I run this command"), junto gates *outcomes* ("should this merge") — see the position recorded on `pluggability.md` open question #1.
+
+Teams then grow out of the solo install: the record already syncs through the forge, so adding a second member is sharing refs, not adopting a platform.
+
 ---
 
 ## junto is workflow-general — coding is just one Playbook (🔵 core framing)

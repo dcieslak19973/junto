@@ -117,6 +117,7 @@ Settled **architectural** decisions live in [`adr/`](adr/), one file each — ex
 | [0010](adr/0010-canonical-order-and-dedup-by-entry-id.md) | Canonical order is **`(timestamp, author email, entry id)`** — a deterministic *total* order — and projection **dedups by `EntryId`** (substrates may hold duplicates). |
 | [0011](adr/0011-sync-is-push-fetch-plus-convergent-union-merge.md) | **Sync** = push/fetch of author refs to any git remote; divergence (same author, two machines) reconciles by a **deterministic union-merge** — set union of immutable entries *is* the merge (no CRDT needed). |
 | [0012](adr/0012-mcp-over-http-is-the-first-write-surface.md) | The first write surface is **MCP over streamable HTTP** (`junto serve`, localhost:1727); **named channels** derive their id via UUIDv5 (no registry). Identity is claimed, not verified — a recorded dogfood-era limit. |
+| [0013](adr/0013-host-serves-the-read-surface-recall-via-hook.md) | The host serves the **read surface**: an HTML channel page (the first pixel of the one surface) + a markdown `/brief`. Agent **recall is a membership concern** (inject at join time, once modelled); a SessionStart hook is the bridge. |
 
 **Settled naming** (low-stakes calls, already reflected in the tables above — recorded here only so the choice isn't re-litigated): **Agent Session** (over "Run"; always qualified) · **Playbook** (over "Channel Kind") · **Provenance** is a relation, not a standalone entity · keep **Gate** / **gate-routing** / **policy** distinct from agent **Policy Version**.
 

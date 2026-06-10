@@ -15,14 +15,10 @@
 //! single-user localhost surface; real member identity arrives with the Party
 //! work.
 
-use std::path::PathBuf;
-use std::sync::Arc;
-
 use junto_kernel::{
-    ApprovalRequirement, ChannelId, ChannelView, ContentDigest, EntryId, EntryPayload, GateStatus,
-    Ledger, LedgerEntry, Member, ProvenanceRef, Standing, Timestamp, Uri,
+    ApprovalRequirement, ChannelId, ContentDigest, EntryId, EntryPayload, LedgerEntry, Member,
+    ProvenanceRef, Timestamp, Uri,
 };
-use junto_substrate_git::GitRefsSubstrate;
 use rmcp::{
     ErrorData as McpError, ServerHandler,
     handler::server::wrapper::Parameters,
@@ -30,7 +26,9 @@ use rmcp::{
     tool, tool_handler, tool_router,
 };
 use serde::Deserialize;
-use tokio::sync::Mutex;
+
+use crate::render;
+use crate::web::SharedLedger;
 
 /// Whether a member is a person or an agent (the MCP-facing mirror of
 /// [`junto_kernel::MemberKind`]).
@@ -147,10 +145,10 @@ pub struct SyncRequest {
 }
 
 /// The MCP handler: the kernel ledger over the git-refs substrate, shared by
-/// every connected session.
+/// every connected session (and with the web read routes).
 #[derive(Clone)]
 pub struct JuntoMcp {
-    ledger: Arc<Mutex<Ledger<GitRefsSubstrate>>>,
+    ledger: SharedLedger,
 }
 
 /// Map a kernel error onto an MCP error (kernel messages are already
@@ -194,11 +192,10 @@ fn text(content: impl Into<String>) -> CallToolResult {
 
 #[tool_router]
 impl JuntoMcp {
-    /// A handler over the git repository at `repo`.
-    pub fn new(repo: impl Into<PathBuf>) -> Self {
-        Self {
-            ledger: Arc::new(Mutex::new(Ledger::new(GitRefsSubstrate::open(repo)))),
-        }
+    /// A handler over an existing shared ledger (the host shares one ledger
+    /// between the MCP tools and the web read routes).
+    pub fn from_ledger(ledger: SharedLedger) -> Self {
+        Self { ledger }
     }
 
     /// Append one entry and report its id.
@@ -386,7 +383,7 @@ impl JuntoMcp {
             .project(&channel)
             .await
             .map_err(internal)?;
-        Ok(text(render_view(&req.channel, &channel, &view)))
+        Ok(text(render::brief_markdown(&req.channel, &channel, &view)))
     }
 
     #[tool(
@@ -411,52 +408,6 @@ impl JuntoMcp {
             req.channel
         )))
     }
-}
-
-/// Render a projection as markdown for an agent (or a human reading the chat).
-fn render_view(name: &str, id: &ChannelId, view: &ChannelView) -> String {
-    use std::fmt::Write as _;
-
-    let mut out = format!("# channel '{name}' ({id})\n\n");
-    if view.entries.is_empty() {
-        out.push_str("(no entries)\n");
-        return out;
-    }
-    let _ = writeln!(out, "{} entries, canonical order:\n", view.entries.len());
-    for entry in &view.entries {
-        let when = entry.timestamp.as_millis();
-        let who = format!("{} <{}>", entry.author.display_name, entry.author.email);
-        let line = match &entry.payload {
-            EntryPayload::Assertion { statement, .. } => {
-                let standing = match view.standing(&entry.id) {
-                    Some(Standing::Provisional) => "provisional",
-                    Some(Standing::Ratified) => "ratified",
-                    Some(Standing::Parked) => "parked",
-                    Some(Standing::Superseded) => "superseded",
-                    None => "?",
-                };
-                format!("**assertion** [{standing}] — {statement}")
-            }
-            EntryPayload::Ratification { target, .. } => format!("ratification of `{target}`"),
-            EntryPayload::Park { target, .. } => format!("park of `{target}`"),
-            EntryPayload::Correction {
-                target, statement, ..
-            } => format!("correction of `{target}` — {statement}"),
-            EntryPayload::Proposal { action, .. } => {
-                let status = match view.gate_status(&entry.id) {
-                    Some(GateStatus::Pending) => "pending",
-                    Some(GateStatus::Approved) => "approved",
-                    Some(GateStatus::Rejected) => "rejected",
-                    None => "?",
-                };
-                format!("**proposal** [gate: {status}] — {action}")
-            }
-            EntryPayload::Approval { target, .. } => format!("approval of `{target}`"),
-            EntryPayload::Rejection { target, .. } => format!("rejection of `{target}`"),
-        };
-        let _ = writeln!(out, "- `{}` @{when} {who}: {line}", entry.id);
-    }
-    out
 }
 
 #[tool_handler]
@@ -485,6 +436,11 @@ mod tests {
     use tempfile::TempDir;
 
     fn init_repo() -> (TempDir, JuntoMcp) {
+        use junto_kernel::Ledger;
+        use junto_substrate_git::GitRefsSubstrate;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
         let dir = tempfile::tempdir().expect("tempdir");
         let ok = StdCommand::new("git")
             .args(["init", "-q"])
@@ -493,7 +449,9 @@ mod tests {
             .expect("git init")
             .success();
         assert!(ok);
-        let handler = JuntoMcp::new(dir.path().to_path_buf());
+        let handler = JuntoMcp::from_ledger(Arc::new(Mutex::new(Ledger::new(
+            GitRefsSubstrate::open(dir.path().to_path_buf()),
+        ))));
         (dir, handler)
     }
 
@@ -619,7 +577,7 @@ mod tests {
             .await
             .unwrap(),
         );
-        assert!(pending.contains("[gate: pending]"));
+        assert!(pending.contains("**proposal** [pending]"));
 
         mcp.approve(Parameters(ActRequest {
             channel: "junto-dev".into(),
@@ -637,7 +595,7 @@ mod tests {
             .await
             .unwrap(),
         );
-        assert!(approved.contains("[gate: approved]"));
+        assert!(approved.contains("**proposal** [approved]"));
     }
 
     #[tokio::test]

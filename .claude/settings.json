@@ -1,6 +1,18 @@
 {
-  "//": "Shared project hooks. Cross-platform: bare `cargo` invocations (on PATH everywhere), no shell operators or scripts. Runs from the session's project-root cwd. Personal/machine settings live in the gitignored settings.local.json.",
+  "//": "Shared project hooks. Cross-platform: bare `cargo`/`curl` invocations (on PATH everywhere), no shell operators or scripts. Runs from the session's project-root cwd. Personal/machine settings live in the gitignored settings.local.json.",
+  "//recall": "SessionStart injects the junto-dev channel brief into agent context — the recall bridge until membership-time injection exists (docs/adr/0013). -sf fails silently when `junto serve` isn't running; -m 2 keeps a hung host from stalling session start.",
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -sf -m 2 http://127.0.0.1:1727/channels/junto-dev/brief",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Edit|Write|MultiEdit",
