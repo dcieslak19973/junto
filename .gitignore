@@ -1,6 +1,9 @@
 # Rust
 /target/
 **/*.rs.bk
+# junto-desktop is its own workspace (docs/adr/0018), so its target dir is nested
+/crates/junto-desktop/target/
+/crates/junto-desktop/gen/
 
 # headroom runtime memory db (not source; lives at repo root)
 /headroom_memory.db

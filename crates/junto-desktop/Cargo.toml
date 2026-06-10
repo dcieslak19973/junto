@@ -1,0 +1,22 @@
+# junto-desktop — the human surface shell (docs/adr/0018).
+#
+# Deliberately its OWN workspace, excluded from the root one: Tauri's
+# dependency tree is enormous, and quarantining it keeps `cargo check
+# --workspace` and kernel CI fast. It has a dedicated CI job instead.
+[package]
+name = "junto-desktop"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+authors = ["Dan Cieslak <dcieslak@hotmail.com>"]
+description = "junto — the desktop shell over the junto host"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+
+[workspace]
+# standalone — see the header comment

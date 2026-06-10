@@ -49,3 +49,27 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+
+  # The desktop shell (docs/adr/0018) is its own workspace, quarantined from
+  # the kernel one because Tauri's dependency tree is enormous — so it gets
+  # its own job, on the app's target platforms only (Windows + macOS; Linux
+  # would need webkit2gtk system packages and isn't an app target yet).
+  desktop:
+    name: desktop shell (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/junto-desktop
+      - name: Format check
+        run: cargo fmt --manifest-path crates/junto-desktop/Cargo.toml --check
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --manifest-path crates/junto-desktop/Cargo.toml --all-targets -- -D warnings

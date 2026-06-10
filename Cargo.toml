@@ -4,6 +4,10 @@
 [workspace]
 resolver = "3"
 members = ["crates/junto-kernel", "crates/junto", "crates/junto-substrate-git"]
+# junto-desktop (the Tauri shell, docs/adr/0018) is its own workspace: Tauri's
+# dependency tree would slow every kernel `cargo check --workspace`/CI run.
+# It has a dedicated CI job; build it via --manifest-path.
+exclude = ["crates/junto-desktop"]
 
 [workspace.package]
 edition = "2024"
