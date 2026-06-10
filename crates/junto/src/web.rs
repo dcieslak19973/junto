@@ -17,7 +17,9 @@
 //! ([`crate::host::git_user`]) — identity stays claimed (`docs/adr/0012`),
 //! this is a default, not an identity system. Verification acts only:
 //! recording assertions and proposing actions remain agent (MCP) territory.
-//! Web writes ride to the remote on the next `sync_channel`.
+//! Each web write triggers a **best-effort background sync** with `origin` —
+//! the page is a terminal-less human's only affordance, so the durable record
+//! must not wait for an agent to run `sync_channel`.
 
 use std::sync::Arc;
 
@@ -225,6 +227,22 @@ async fn verify(
     if let Err(err) = guard.append(entry).await {
         return internal(format!("append failed: {err}"));
     }
+    drop(guard);
+
+    // Auto-sync, best-effort and non-blocking: the human write surface is
+    // terminal-less, so the page is the human's *only* affordance — without
+    // this their verification sits machine-local until some agent happens to
+    // run sync_channel. The redirect never waits on the network; a failed
+    // sync only delays (the entry is already durable in local refs and rides
+    // the next successful sync).
+    let sync_ledger = ledger.clone();
+    tokio::spawn(async move {
+        let mut guard = sync_ledger.lock().await;
+        if let Err(err) = guard.substrate_mut().sync("origin", &id).await {
+            tracing::warn!("auto-sync of channel {id} after a web write failed: {err:#}");
+        }
+    });
+
     // Back to the page, id-addressed (ids are URL-safe; names may not be).
     Redirect::to(&format!("/channels/{id}")).into_response()
 }
@@ -466,6 +484,65 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn web_writes_auto_sync_to_origin() {
+        // The fixture repo gets a bare `origin`; a web act must land there
+        // without anyone running sync_channel (the terminal-less human has no
+        // way to). The sync is a background task, so poll briefly.
+        let fx = host_with_entry(assertion()).await;
+        let repo = fx._dirs[0].path().to_path_buf();
+        let bare = tempfile::tempdir().expect("bare dir");
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q", "--bare"])
+                .current_dir(bare.path())
+                .status()
+                .expect("git init --bare")
+                .success()
+        );
+        assert!(
+            StdCommand::new("git")
+                .args([
+                    "remote",
+                    "add",
+                    "origin",
+                    &bare.path().display().to_string()
+                ])
+                .current_dir(&repo)
+                .status()
+                .expect("git remote add")
+                .success()
+        );
+
+        let response = post_act(
+            fx.host.clone(),
+            "web-test".into(),
+            fx.target.to_string(),
+            "ratify",
+            "checked",
+            &fx.code,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        // The web author's ref appears on the remote, carrying the act.
+        let expected = format!("refs/junto/{}/web%40example%2Ecom", fx.channel);
+        let mut synced = false;
+        for _ in 0..50 {
+            let out = StdCommand::new("git")
+                .args(["ls-remote", "origin", &expected])
+                .current_dir(&repo)
+                .output()
+                .expect("git ls-remote");
+            if !String::from_utf8_lossy(&out.stdout).trim().is_empty() {
+                synced = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(synced, "auto-sync pushed {expected} to origin");
     }
 
     #[tokio::test]
