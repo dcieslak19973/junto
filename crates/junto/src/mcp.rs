@@ -6,14 +6,21 @@
 //! the record — junto's designed agent integration path ("agents post via
 //! MCP", `docs/architecture.md` §Conversation).
 //!
-//! Channels are addressed by **name**; the name derives the [`ChannelId`]
-//! deterministically (`ChannelId::from_name`), so no machine needs a registry.
+//! Channels are addressed by **name or id** (`docs/adr/0014`): a name is a
+//! substrate-scoped label bound by the channel's `ChannelOpened` genesis
+//! entry, resolved by the host across every registered substrate; a raw id
+//! always resolves. A channel must be **opened** (`open_channel`) before
+//! anything can be recorded into it — there is no create-on-first-write.
 //!
 //! **Known dogfood-era limit — identity is claimed, not verified.** Every tool
 //! takes an `author`, and the server records whatever it is told (the kernel
 //! has no authn; authorship ≠ authority, `docs/adr/0004`). Fine for a
 //! single-user localhost surface; real member identity arrives with the Party
 //! work.
+
+use std::fmt::Write as _;
+use std::path::Path;
+use std::sync::Arc;
 
 use junto_kernel::{
     ApprovalRequirement, ChannelId, ContentDigest, EntryId, EntryPayload, LedgerEntry, Member,
@@ -27,8 +34,8 @@ use rmcp::{
 };
 use serde::Deserialize;
 
+use crate::host::{Host, Resolution, SharedLedger};
 use crate::render;
-use crate::web::SharedLedger;
 
 /// Whether a member is a person or an agent (the MCP-facing mirror of
 /// [`junto_kernel::MemberKind`]).
@@ -73,9 +80,26 @@ pub struct ProvenanceParam {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct OpenChannelRequest {
+    /// The channel's human-facing name — a label, unique within its home
+    /// substrate (docs/adr/0014).
+    pub name: String,
+    pub author: AuthorParam,
+    /// The home substrate repo path. May be omitted when the host serves
+    /// exactly one substrate.
+    pub repo: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListChannelsRequest {
+    /// Limit the listing to this substrate repo path. Omit for every
+    /// registered substrate.
+    pub repo: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RecordRequest {
-    /// Channel name (e.g. "junto-dev"). Names map to the same channel on
-    /// every machine.
+    /// Channel name (bound at open_channel) or raw channel id.
     pub channel: String,
     pub author: AuthorParam,
     /// The claim / decision / finding itself.
@@ -88,7 +112,7 @@ pub struct RecordRequest {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ActRequest {
-    /// Channel name.
+    /// Channel name or id.
     pub channel: String,
     pub author: AuthorParam,
     /// The id of the entry being acted on (shown by `view_channel`).
@@ -99,7 +123,7 @@ pub struct ActRequest {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CorrectRequest {
-    /// Channel name.
+    /// Channel name or id.
     pub channel: String,
     pub author: AuthorParam,
     /// The id of the entry being superseded.
@@ -112,7 +136,7 @@ pub struct CorrectRequest {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ProposeRequest {
-    /// Channel name.
+    /// Channel name or id.
     pub channel: String,
     pub author: AuthorParam,
     /// What is being proposed (a generic action descriptor, e.g.
@@ -132,28 +156,28 @@ pub struct ProposeRequest {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ViewRequest {
-    /// Channel name.
+    /// Channel name or id.
     pub channel: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SyncRequest {
-    /// Channel name.
+    /// Channel name or id.
     pub channel: String,
     /// Git remote to sync with (name, URL, or path). Defaults to "origin".
     pub remote: Option<String>,
 }
 
-/// The MCP handler: the kernel ledger over the git-refs substrate, shared by
-/// every connected session (and with the web read routes).
+/// The MCP handler: the singleton [`Host`] (`docs/adr/0015`), shared by every
+/// connected session and with the web read routes.
 #[derive(Clone)]
 pub struct JuntoMcp {
-    ledger: SharedLedger,
+    host: Arc<Host>,
 }
 
-/// Map a kernel error onto an MCP error (kernel messages are already
+/// Map an internal failure onto an MCP error (messages are already
 /// human-readable; nothing sensitive lives in them).
-fn internal(err: junto_kernel::Error) -> McpError {
+fn internal(err: impl std::fmt::Display) -> McpError {
     McpError::internal_error(err.to_string(), None)
 }
 
@@ -192,33 +216,96 @@ fn text(content: impl Into<String>) -> CallToolResult {
 
 #[tool_router]
 impl JuntoMcp {
-    /// A handler over an existing shared ledger (the host shares one ledger
-    /// between the MCP tools and the web read routes).
-    pub fn from_ledger(ledger: SharedLedger) -> Self {
-        Self { ledger }
+    /// A handler over the shared host (one per machine/user, docs/adr/0015).
+    pub fn new(host: Arc<Host>) -> Self {
+        Self { host }
+    }
+
+    /// Resolve a channel reference to its home ledger + id, mapping the
+    /// not-found / ambiguous outcomes onto agent-actionable errors.
+    async fn resolve(&self, channel: &str) -> Result<(SharedLedger, ChannelId), McpError> {
+        match self.host.resolve(channel).await.map_err(internal)? {
+            Resolution::Resolved { ledger, id, .. } => Ok((ledger, id)),
+            Resolution::NotFound => Err(invalid(format!(
+                "no channel '{channel}' in any registered substrate — open it first \
+                 (open_channel), or check list_channels"
+            ))),
+            Resolution::Ambiguous(substrates) => Err(invalid(format!(
+                "channel name '{channel}' exists in several substrates ({substrates:?}); \
+                 address it by id (see list_channels)"
+            ))),
+        }
     }
 
     /// Append one entry and report its id.
-    async fn append(&self, channel: &str, entry: LedgerEntry) -> Result<CallToolResult, McpError> {
+    async fn append(
+        &self,
+        channel: &str,
+        ledger: SharedLedger,
+        entry: LedgerEntry,
+    ) -> Result<CallToolResult, McpError> {
         let id = entry.id;
-        self.ledger
-            .lock()
-            .await
-            .append(entry)
-            .await
-            .map_err(internal)?;
+        ledger.lock().await.append(entry).await.map_err(internal)?;
         Ok(text(format!("recorded {id} in channel '{channel}'")))
     }
 
     /// Build the envelope for a fresh entry authored now.
-    fn entry(channel: &str, author: AuthorParam, payload: EntryPayload) -> LedgerEntry {
+    fn entry(channel: ChannelId, author: AuthorParam, payload: EntryPayload) -> LedgerEntry {
         LedgerEntry {
             id: EntryId::new(),
-            channel: ChannelId::from_name(channel),
+            channel,
             author: author.into(),
             timestamp: Timestamp::now(),
             payload,
         }
+    }
+
+    #[tool(
+        description = "Open a channel: mint its globally unique id and write the ChannelOpened genesis entry binding the name (unique within its home substrate). A channel must be opened before anything can be recorded into it. `repo` picks the home substrate; omit it when the host serves exactly one."
+    )]
+    async fn open_channel(
+        &self,
+        Parameters(req): Parameters<OpenChannelRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let repo = req.repo.as_deref().map(Path::new);
+        let id = self
+            .host
+            .open_channel(repo, &req.name, req.author.into(), None)
+            .await
+            .map_err(|err| invalid(err.to_string()))?;
+        Ok(text(format!("opened channel '{}' (id {id})", req.name)))
+    }
+
+    #[tool(
+        description = "List every channel across every registered home substrate (or one substrate via `repo`): name, id, home substrate, entry count, open (pending) gates, last activity. Most recently active first."
+    )]
+    async fn list_channels(
+        &self,
+        Parameters(req): Parameters<ListChannelsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut summaries = self.host.inventory().await.map_err(internal)?;
+        if let Some(repo) = req.repo {
+            let repo = dunce::canonicalize(Path::new(&repo))
+                .map_err(|err| invalid(format!("substrate repo {repo} not found: {err}")))?;
+            summaries.retain(|summary| summary.substrate == repo);
+        }
+        summaries.sort_by_key(|summary| std::cmp::Reverse(summary.last_activity));
+        if summaries.is_empty() {
+            return Ok(text("no channels in any registered substrate"));
+        }
+        let mut out = String::new();
+        for summary in summaries {
+            let _ = writeln!(
+                out,
+                "- {name} · id {id} · {substrate} · {entries} entries · {gates} open gates",
+                name = summary.name.as_deref().unwrap_or("(unopened)"),
+                id = summary.id,
+                substrate = summary.substrate.display(),
+                entries = summary.entry_count,
+                gates = summary.open_gates,
+            );
+        }
+        Ok(text(out))
     }
 
     #[tool(
@@ -228,9 +315,10 @@ impl JuntoMcp {
         &self,
         Parameters(req): Parameters<RecordRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let (ledger, channel) = self.resolve(&req.channel).await?;
         let provenance = parse_provenance(req.provenance)?;
         let entry = Self::entry(
-            &req.channel,
+            channel,
             req.author,
             EntryPayload::Assertion {
                 statement: req.statement,
@@ -238,7 +326,7 @@ impl JuntoMcp {
                 provenance,
             },
         );
-        self.append(&req.channel, entry).await
+        self.append(&req.channel, ledger, entry).await
     }
 
     #[tool(
@@ -248,16 +336,17 @@ impl JuntoMcp {
         &self,
         Parameters(req): Parameters<ActRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let (ledger, channel) = self.resolve(&req.channel).await?;
         let target = parse_entry_id(&req.target)?;
         let entry = Self::entry(
-            &req.channel,
+            channel,
             req.author,
             EntryPayload::Ratification {
                 target,
                 rationale: req.rationale,
             },
         );
-        self.append(&req.channel, entry).await
+        self.append(&req.channel, ledger, entry).await
     }
 
     #[tool(
@@ -267,16 +356,17 @@ impl JuntoMcp {
         &self,
         Parameters(req): Parameters<ActRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let (ledger, channel) = self.resolve(&req.channel).await?;
         let target = parse_entry_id(&req.target)?;
         let entry = Self::entry(
-            &req.channel,
+            channel,
             req.author,
             EntryPayload::Park {
                 target,
                 rationale: req.rationale,
             },
         );
-        self.append(&req.channel, entry).await
+        self.append(&req.channel, ledger, entry).await
     }
 
     #[tool(
@@ -286,9 +376,10 @@ impl JuntoMcp {
         &self,
         Parameters(req): Parameters<CorrectRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let (ledger, channel) = self.resolve(&req.channel).await?;
         let target = parse_entry_id(&req.target)?;
         let entry = Self::entry(
-            &req.channel,
+            channel,
             req.author,
             EntryPayload::Correction {
                 target,
@@ -296,7 +387,7 @@ impl JuntoMcp {
                 rationale: req.rationale,
             },
         );
-        self.append(&req.channel, entry).await
+        self.append(&req.channel, ledger, entry).await
     }
 
     #[tool(
@@ -306,6 +397,7 @@ impl JuntoMcp {
         &self,
         Parameters(req): Parameters<ProposeRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let (ledger, channel) = self.resolve(&req.channel).await?;
         let requirement = match (req.require_count, req.require_all_of) {
             (None, None) => ApprovalRequirement::Auto,
             (Some(n), None) => ApprovalRequirement::Count(n),
@@ -318,7 +410,7 @@ impl JuntoMcp {
         };
         let provenance = parse_provenance(req.provenance)?;
         let entry = Self::entry(
-            &req.channel,
+            channel,
             req.author,
             EntryPayload::Proposal {
                 action: req.action,
@@ -327,7 +419,7 @@ impl JuntoMcp {
                 requirement,
             },
         );
-        self.append(&req.channel, entry).await
+        self.append(&req.channel, ledger, entry).await
     }
 
     #[tool(
@@ -337,16 +429,17 @@ impl JuntoMcp {
         &self,
         Parameters(req): Parameters<ActRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let (ledger, channel) = self.resolve(&req.channel).await?;
         let target = parse_entry_id(&req.target)?;
         let entry = Self::entry(
-            &req.channel,
+            channel,
             req.author,
             EntryPayload::Approval {
                 target,
                 rationale: req.rationale,
             },
         );
-        self.append(&req.channel, entry).await
+        self.append(&req.channel, ledger, entry).await
     }
 
     #[tool(
@@ -356,16 +449,17 @@ impl JuntoMcp {
         &self,
         Parameters(req): Parameters<ActRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let (ledger, channel) = self.resolve(&req.channel).await?;
         let target = parse_entry_id(&req.target)?;
         let entry = Self::entry(
-            &req.channel,
+            channel,
             req.author,
             EntryPayload::Rejection {
                 target,
                 rationale: req.rationale,
             },
         );
-        self.append(&req.channel, entry).await
+        self.append(&req.channel, ledger, entry).await
     }
 
     #[tool(
@@ -375,15 +469,15 @@ impl JuntoMcp {
         &self,
         Parameters(req): Parameters<ViewRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let channel = ChannelId::from_name(&req.channel);
-        let view = self
-            .ledger
+        let (ledger, channel) = self.resolve(&req.channel).await?;
+        let view = ledger
             .lock()
             .await
             .project(&channel)
             .await
             .map_err(internal)?;
-        Ok(text(render::brief_markdown(&req.channel, &channel, &view)))
+        let name = view.name.clone().unwrap_or_else(|| req.channel.clone());
+        Ok(text(render::brief_markdown(&name, &channel, &view)))
     }
 
     #[tool(
@@ -393,10 +487,10 @@ impl JuntoMcp {
         &self,
         Parameters(req): Parameters<SyncRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let (ledger, channel) = self.resolve(&req.channel).await?;
         let remote = req.remote.unwrap_or_else(|| "origin".to_string());
-        let channel = ChannelId::from_name(&req.channel);
         // Sync lives on the substrate, not the generic Ledger; reach through.
-        self.ledger
+        ledger
             .lock()
             .await
             .substrate_mut()
@@ -418,11 +512,13 @@ impl ServerHandler for JuntoMcp {
         info.server_info.version = env!("CARGO_PKG_VERSION").into();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.instructions = Some(
-            "junto's ledger: record decisions/findings (assertions), verify them \
-             (ratify/park/correct), gate consequential actions (propose/approve/reject), \
-             inspect a channel (view_channel), and sync the durable record through a git \
-             remote (sync_channel). Channels are addressed by name. Always pass your own \
-             identity as `author` — agents author as themselves, never as their operator."
+            "junto's ledger: open channels (open_channel) and discover them (list_channels), \
+             record decisions/findings (assertions), verify them (ratify/park/correct), gate \
+             consequential actions (propose/approve/reject), inspect a channel (view_channel), \
+             and sync the durable record through a git remote (sync_channel). Channels are \
+             addressed by name (bound when opened) or id; a channel must be opened before \
+             recording into it. Always pass your own identity as `author` — agents author as \
+             themselves, never as their operator."
                 .to_string(),
         );
         info
@@ -435,24 +531,28 @@ mod tests {
     use std::process::Command as StdCommand;
     use tempfile::TempDir;
 
-    fn init_repo() -> (TempDir, JuntoMcp) {
-        use junto_kernel::Ledger;
-        use junto_substrate_git::GitRefsSubstrate;
-        use std::sync::Arc;
-        use tokio::sync::Mutex;
+    /// A host over `count` fresh single-purpose git repos.
+    fn init_host(count: usize) -> (Vec<TempDir>, JuntoMcp) {
+        let mut dirs = Vec::new();
+        let mut paths = Vec::new();
+        for _ in 0..count {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let ok = StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(dir.path())
+                .status()
+                .expect("git init")
+                .success();
+            assert!(ok);
+            paths.push(dir.path().to_path_buf());
+            dirs.push(dir);
+        }
+        let handler = JuntoMcp::new(Host::fixed(paths));
+        (dirs, handler)
+    }
 
-        let dir = tempfile::tempdir().expect("tempdir");
-        let ok = StdCommand::new("git")
-            .args(["init", "-q"])
-            .current_dir(dir.path())
-            .status()
-            .expect("git init")
-            .success();
-        assert!(ok);
-        let handler = JuntoMcp::from_ledger(Arc::new(Mutex::new(Ledger::new(
-            GitRefsSubstrate::open(dir.path().to_path_buf()),
-        ))));
-        (dir, handler)
+    fn init_repo() -> (Vec<TempDir>, JuntoMcp) {
+        init_host(1)
     }
 
     fn dan() -> AuthorParam {
@@ -469,6 +569,17 @@ mod tests {
             email: "claude@junto.invalid".into(),
             kind: AuthorKind::Agent,
         }
+    }
+
+    /// Open `name` in the host's only substrate.
+    async fn open(mcp: &JuntoMcp, name: &str) {
+        mcp.open_channel(Parameters(OpenChannelRequest {
+            name: name.into(),
+            author: dan(),
+            repo: None,
+        }))
+        .await
+        .expect("open channel");
     }
 
     /// Pull the single text block out of a tool result.
@@ -491,7 +602,8 @@ mod tests {
 
     #[tokio::test]
     async fn record_then_view_shows_the_assertion() {
-        let (_dir, mcp) = init_repo();
+        let (_dirs, mcp) = init_repo();
+        open(&mcp, "junto-dev").await;
         let recorded = mcp
             .record(Parameters(RecordRequest {
                 channel: "junto-dev".into(),
@@ -520,8 +632,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recording_into_an_unopened_channel_is_refused() {
+        let (_dirs, mcp) = init_repo();
+        let err = mcp
+            .record(Parameters(RecordRequest {
+                channel: "never-opened".into(),
+                author: claude(),
+                statement: "s".into(),
+                rationale: "r".into(),
+                provenance: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("no channel 'never-opened'"));
+    }
+
+    #[tokio::test]
+    async fn open_enforces_name_uniqueness_per_substrate() {
+        let (_dirs, mcp) = init_repo();
+        open(&mcp, "junto-dev").await;
+        let err = mcp
+            .open_channel(Parameters(OpenChannelRequest {
+                name: "junto-dev".into(),
+                author: dan(),
+                repo: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn channels_resolve_by_raw_id_too() {
+        let (_dirs, mcp) = init_repo();
+        open(&mcp, "junto-dev").await;
+        let listed = text_of(
+            &mcp.list_channels(Parameters(ListChannelsRequest { repo: None }))
+                .await
+                .unwrap(),
+        );
+        // "- junto-dev · id <uuid> · ..." → the uuid.
+        let id = listed
+            .split("id ")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .expect("channel id in listing")
+            .to_string();
+
+        let rendered = text_of(
+            &mcp.view_channel(Parameters(ViewRequest { channel: id }))
+                .await
+                .unwrap(),
+        );
+        assert!(rendered.contains("junto-dev"), "genesis names the channel");
+    }
+
+    #[tokio::test]
+    async fn ambiguous_names_across_substrates_ask_for_the_id() {
+        let (_dirs, mcp) = init_host(2);
+        let repos = mcp.host.substrate_paths().unwrap();
+        for repo in &repos {
+            mcp.open_channel(Parameters(OpenChannelRequest {
+                name: "dev".into(),
+                author: dan(),
+                repo: Some(repo.display().to_string()),
+            }))
+            .await
+            .unwrap();
+        }
+        let err = mcp
+            .view_channel(Parameters(ViewRequest {
+                channel: "dev".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("several substrates"));
+    }
+
+    #[tokio::test]
+    async fn list_channels_spans_substrates() {
+        let (_dirs, mcp) = init_host(2);
+        let repos = mcp.host.substrate_paths().unwrap();
+        mcp.open_channel(Parameters(OpenChannelRequest {
+            name: "alpha".into(),
+            author: dan(),
+            repo: Some(repos[0].display().to_string()),
+        }))
+        .await
+        .unwrap();
+        mcp.open_channel(Parameters(OpenChannelRequest {
+            name: "beta".into(),
+            author: dan(),
+            repo: Some(repos[1].display().to_string()),
+        }))
+        .await
+        .unwrap();
+
+        let listed = text_of(
+            &mcp.list_channels(Parameters(ListChannelsRequest { repo: None }))
+                .await
+                .unwrap(),
+        );
+        assert!(listed.contains("alpha"));
+        assert!(listed.contains("beta"));
+
+        // Substrate-scoped listing filters.
+        let scoped = text_of(
+            &mcp.list_channels(Parameters(ListChannelsRequest {
+                repo: Some(repos[0].display().to_string()),
+            }))
+            .await
+            .unwrap(),
+        );
+        assert!(scoped.contains("alpha"));
+        assert!(!scoped.contains("beta"));
+    }
+
+    #[tokio::test]
     async fn ratify_moves_standing() {
-        let (_dir, mcp) = init_repo();
+        let (_dirs, mcp) = init_repo();
+        open(&mcp, "junto-dev").await;
         let recorded = mcp
             .record(Parameters(RecordRequest {
                 channel: "junto-dev".into(),
@@ -555,7 +785,8 @@ mod tests {
 
     #[tokio::test]
     async fn propose_approve_opens_the_gate() {
-        let (_dir, mcp) = init_repo();
+        let (_dirs, mcp) = init_repo();
+        open(&mcp, "junto-dev").await;
         let proposed = mcp
             .propose(Parameters(ProposeRequest {
                 channel: "junto-dev".into(),
@@ -600,7 +831,9 @@ mod tests {
 
     #[tokio::test]
     async fn channels_are_isolated_by_name() {
-        let (_dir, mcp) = init_repo();
+        let (_dirs, mcp) = init_repo();
+        open(&mcp, "alpha").await;
+        open(&mcp, "beta").await;
         mcp.record(Parameters(RecordRequest {
             channel: "alpha".into(),
             author: claude(),
@@ -618,12 +851,13 @@ mod tests {
             .await
             .unwrap(),
         );
-        assert!(beta.contains("(no entries)"));
+        assert!(!beta.contains("only in alpha"));
     }
 
     #[tokio::test]
     async fn bad_inputs_are_invalid_params() {
-        let (_dir, mcp) = init_repo();
+        let (_dirs, mcp) = init_repo();
+        open(&mcp, "junto-dev").await;
         // Not a UUID target.
         let err = mcp
             .ratify(Parameters(ActRequest {

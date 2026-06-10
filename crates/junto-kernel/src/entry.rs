@@ -47,6 +47,17 @@ pub struct LedgerEntry {
 /// [`Correction`](EntryPayload::Correction) supersedes it with a restated claim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EntryPayload {
+    /// The channel's genesis: the recorded act of *opening* it, binding the
+    /// human-facing `name` to the envelope's (minted, globally unique) channel
+    /// id (`docs/adr/0014`, `docs/adr/0016`). Canonically the first entry in a
+    /// channel's ledger; the opener and the moment live on the envelope like
+    /// every other entry. First of the anticipated lifecycle family
+    /// (fork / close follow the same pattern when designed).
+    ChannelOpened {
+        /// The human-facing label — unique within the home substrate, *not*
+        /// identity (`docs/adr/0014`).
+        name: String,
+    },
     /// An original claim, decision, or finding. Alternatives considered live in
     /// `rationale` until a second Playbook proves a richer shape (`docs/adr/0003`).
     Assertion {
@@ -145,14 +156,17 @@ impl LedgerEntry {
 impl EntryPayload {
     /// The entry this payload acts upon, if it acts on a prior entry.
     ///
-    /// Returns `None` for the *subject* kinds — [`Assertion`](EntryPayload::Assertion)
-    /// and [`Proposal`](EntryPayload::Proposal), which target nothing — and
+    /// Returns `None` for the kinds that target nothing — the *subject* kinds
+    /// [`Assertion`](EntryPayload::Assertion) and [`Proposal`](EntryPayload::Proposal),
+    /// and the lifecycle act [`ChannelOpened`](EntryPayload::ChannelOpened) — and
     /// `Some(target)` for the acts that reference a prior entry (ratify / park /
     /// correct / approve / reject).
     #[must_use]
     pub fn target(&self) -> Option<EntryId> {
         match self {
-            EntryPayload::Assertion { .. } | EntryPayload::Proposal { .. } => None,
+            EntryPayload::ChannelOpened { .. }
+            | EntryPayload::Assertion { .. }
+            | EntryPayload::Proposal { .. } => None,
             EntryPayload::Ratification { target, .. }
             | EntryPayload::Park { target, .. }
             | EntryPayload::Correction { target, .. }

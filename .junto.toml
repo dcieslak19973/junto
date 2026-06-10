@@ -1,0 +1,4 @@
+# The project's ambient channel binding — which channel(s) sessions in this
+# checkout consult and record into. Per-worktree additions go in
+# .junto.local.toml (gitignored). See docs/adr/0014.
+channels = ["junto-dev"]
