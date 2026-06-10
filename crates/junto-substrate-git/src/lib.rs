@@ -517,6 +517,36 @@ impl SubstrateProvider for GitRefsSubstrate {
         }
         Ok(entries)
     }
+
+    async fn channels(&self) -> Result<Vec<ChannelId>> {
+        // Refnames are refs/junto/<channel-id>/<author-slug>; the channel id
+        // is the third path segment. Many author refs per channel → dedupe.
+        let out = self
+            .git(
+                &["for-each-ref", "--format=%(refname)", "refs/junto/"],
+                None,
+                &[],
+            )
+            .await?;
+        let text = String::from_utf8(out)
+            .map_err(|e| Error::Substrate(format!("for-each-ref output not utf-8: {e}")))?;
+        let mut seen = std::collections::HashSet::new();
+        let mut channels = Vec::new();
+        for refname in text.lines().filter(|l| !l.is_empty()) {
+            let Some(id_segment) = refname.split('/').nth(2) else {
+                continue;
+            };
+            let Ok(channel) = id_segment.parse::<ChannelId>() else {
+                // Tolerate foreign refs under refs/junto/ rather than failing
+                // the whole enumeration.
+                continue;
+            };
+            if seen.insert(channel) {
+                channels.push(channel);
+            }
+        }
+        Ok(channels)
+    }
 }
 
 /// Decode git command output (an oid or ref name) into a trimmed `String`.

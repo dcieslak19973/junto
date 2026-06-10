@@ -81,6 +81,9 @@ mod tests {
     fn round_trips_every_payload_kind() {
         let target = EntryId::new();
 
+        assert_round_trips(&entry(EntryPayload::ChannelOpened {
+            name: "junto-dev".into(),
+        }));
         // Assertion with a digest-bearing provenance ref.
         assert_round_trips(&entry(EntryPayload::Assertion {
             statement: "the sky is blue".into(),

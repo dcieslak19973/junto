@@ -50,6 +50,12 @@ pub enum Standing {
 /// [`GateStatus`] of each proposal.
 #[derive(Debug, Clone)]
 pub struct ChannelView {
+    /// The channel's human-facing name, from its `ChannelOpened` genesis entry
+    /// (`docs/adr/0014`/`0016`). `None` if no genesis is present (an unopened
+    /// dogfood-era channel, or a record synced before its genesis arrived).
+    /// If concurrent opens left multiple geneses, the canonically first wins —
+    /// deterministic on every replica, like all projection.
+    pub name: Option<String>,
     /// All entries, deduplicated by id, in canonical
     /// `(timestamp, author.email, id)` order.
     pub entries: Vec<LedgerEntry>,
@@ -94,6 +100,12 @@ impl<S: SubstrateProvider> Ledger<S> {
     /// backend's `sync`). Appends still go through [`Ledger::append`].
     pub fn substrate_mut(&mut self) -> &mut S {
         &mut self.substrate
+    }
+
+    /// Read access to the wrapped substrate — e.g. enumerating its channels
+    /// for discovery ([`SubstrateProvider::channels`]).
+    pub fn substrate(&self) -> &S {
+        &self.substrate
     }
 
     /// Append one immutable entry. The sole mutating operation.
@@ -141,8 +153,13 @@ impl<S: SubstrateProvider> Ledger<S> {
 
         let standings = Self::project_standings(&entries);
         let gate_status = Self::project_gates(&entries);
+        let name = entries.iter().find_map(|entry| match &entry.payload {
+            EntryPayload::ChannelOpened { name } => Some(name.clone()),
+            _ => None,
+        });
 
         Ok(ChannelView {
+            name,
             entries,
             standings,
             gate_status,
@@ -168,7 +185,8 @@ impl<S: SubstrateProvider> Ledger<S> {
                 EntryPayload::Park { .. } => Standing::Parked,
                 EntryPayload::Correction { .. } => Standing::Superseded,
                 // Not standing-bearing acts.
-                EntryPayload::Assertion { .. }
+                EntryPayload::ChannelOpened { .. }
+                | EntryPayload::Assertion { .. }
                 | EntryPayload::Proposal { .. }
                 | EntryPayload::Approval { .. }
                 | EntryPayload::Rejection { .. } => continue,
@@ -632,6 +650,88 @@ mod tests {
         let view_b = ledger.project(&channel_b).await.unwrap();
         assert_eq!(view_b.entries.len(), 1);
         assert_ne!(view_b.entries[0].id, in_a);
+    }
+
+    #[tokio::test]
+    async fn genesis_yields_channel_name_and_bears_no_standing() {
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let alice = Member::human("Alice", "alice@example.com");
+        let genesis = EntryId::new();
+        ledger
+            .append(entry(
+                genesis,
+                channel,
+                alice,
+                1,
+                EntryPayload::ChannelOpened {
+                    name: "slice-8".into(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert_eq!(view.name.as_deref(), Some("slice-8"));
+        // A lifecycle act is not an assertion: it carries no standing.
+        assert_eq!(view.standing(&genesis), None);
+    }
+
+    #[tokio::test]
+    async fn unopened_channel_has_no_name() {
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let alice = Member::human("Alice", "alice@example.com");
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                alice,
+                1,
+                assertion("recorded before any genesis"),
+            ))
+            .await
+            .unwrap();
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert_eq!(view.name, None);
+    }
+
+    #[tokio::test]
+    async fn duplicate_geneses_resolve_to_the_canonically_first() {
+        // Two machines opened the "same" channel concurrently and union-merged
+        // (docs/adr/0011): the canonically first genesis wins, deterministically.
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let alice = Member::human("Alice", "alice@example.com");
+        let bob = Member::human("Bob", "bob@example.com");
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                bob,
+                2,
+                EntryPayload::ChannelOpened {
+                    name: "later-name".into(),
+                },
+            ))
+            .await
+            .unwrap();
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                alice,
+                1,
+                EntryPayload::ChannelOpened {
+                    name: "first-name".into(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert_eq!(view.name.as_deref(), Some("first-name"));
     }
 
     // --- Gate engine ---

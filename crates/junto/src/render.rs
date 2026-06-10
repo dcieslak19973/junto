@@ -32,6 +32,60 @@ pub fn brief_markdown(name: &str, id: &ChannelId, view: &ChannelView) -> String 
     out
 }
 
+/// The channel index — every channel across every registered home substrate,
+/// the landing page of the one surface (`docs/adr/0015`).
+pub fn index_html(summaries: &[crate::host::ChannelSummary]) -> String {
+    let mut rows = String::new();
+    for summary in summaries {
+        let display_name = summary.name.as_deref().unwrap_or("(unopened)");
+        let link_target = summary
+            .name
+            .clone()
+            .unwrap_or_else(|| summary.id.to_string());
+        let gates = if summary.open_gates > 0 {
+            format!(
+                " <span class=\"badge pending\">{} open gate{}</span>",
+                summary.open_gates,
+                if summary.open_gates == 1 { "" } else { "s" }
+            )
+        } else {
+            String::new()
+        };
+        let when = summary
+            .last_activity
+            .map(|ts| iso_utc(ts.as_millis()))
+            .unwrap_or_default();
+        let _ = writeln!(
+            rows,
+            "<li class=\"entry\"><a href=\"/channels/{href}\">{name}</a>{gates} \
+             <span class=\"who\">{count} entries</span> \
+             <span class=\"when\">{when}</span>\
+             <div class=\"id\">{id} · {substrate}</div></li>",
+            href = escape_html(&link_target),
+            name = escape_html(display_name),
+            count = summary.entry_count,
+            when = escape_html(&when),
+            id = summary.id,
+            substrate = escape_html(&summary.substrate.display().to_string()),
+        );
+    }
+    let body = if summaries.is_empty() {
+        "<p>(no channels yet — open one with the open_channel tool or `junto open`)</p>".to_string()
+    } else {
+        format!("<ol class=\"ledger\">\n{rows}</ol>")
+    };
+    format!(
+        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <title>junto — channels</title>\n<style>{CSS}</style></head>\n\
+         <body><main>\n<h1>channels</h1>\n\
+         <p class=\"meta\">{count} channel{plural} across every registered substrate · \
+         read-only projection</p>\n\
+         {body}\n</main></body></html>\n",
+        count = summaries.len(),
+        plural = if summaries.len() == 1 { "" } else { "s" },
+    )
+}
+
 /// The human-facing read-only channel page.
 pub fn channel_html(name: &str, id: &ChannelId, view: &ChannelView) -> String {
     let mut rows = String::new();
@@ -120,6 +174,13 @@ impl Style for HtmlStyle {
 /// One entry described in the given style, with its derived state attached.
 fn describe(entry: &LedgerEntry, view: &ChannelView, style: impl Style) -> String {
     match &entry.payload {
+        EntryPayload::ChannelOpened { name } => {
+            format!(
+                "{} — channel '{}' opened",
+                style.emphasis("genesis"),
+                style.text(name)
+            )
+        }
         EntryPayload::Assertion { statement, .. } => {
             let standing = match view.standing(&entry.id) {
                 Some(Standing::Provisional) => "provisional",
@@ -223,6 +284,7 @@ mod tests {
             }
         }
         ChannelView {
+            name: None,
             entries,
             standings,
             gate_status,
@@ -232,7 +294,7 @@ mod tests {
     fn assertion(statement: &str) -> LedgerEntry {
         LedgerEntry {
             id: EntryId::new(),
-            channel: ChannelId::from_name("test"),
+            channel: ChannelId::new(),
             author: Member::human("Ada", "ada@example.com"),
             timestamp: Timestamp::from_millis(1_781_046_734_154),
             payload: EntryPayload::Assertion {
@@ -246,7 +308,7 @@ mod tests {
     #[test]
     fn html_escapes_user_content() {
         let view = view_with(vec![assertion("<script>alert('x')</script> & co")]);
-        let html = channel_html("test", &ChannelId::from_name("test"), &view);
+        let html = channel_html("test", &ChannelId::new(), &view);
         assert!(
             !html.contains("<script>alert"),
             "raw script must not appear"
@@ -258,7 +320,7 @@ mod tests {
     #[test]
     fn html_shows_standing_badge_and_timestamp() {
         let view = view_with(vec![assertion("claim")]);
-        let html = channel_html("test", &ChannelId::from_name("test"), &view);
+        let html = channel_html("test", &ChannelId::new(), &view);
         assert!(html.contains("badge provisional"));
         assert!(html.contains("2026-06-09"), "human-readable date: {html}");
     }
@@ -268,7 +330,7 @@ mod tests {
         let entry = assertion("claim");
         let id = entry.id.to_string();
         let view = view_with(vec![entry]);
-        let brief = brief_markdown("test", &ChannelId::from_name("test"), &view);
+        let brief = brief_markdown("test", &ChannelId::new(), &view);
         assert!(brief.contains(&id));
         assert!(brief.contains("[provisional]"));
     }
@@ -276,7 +338,7 @@ mod tests {
     #[test]
     fn empty_channel_renders_in_both_styles() {
         let view = view_with(vec![]);
-        let id = ChannelId::from_name("empty");
+        let id = ChannelId::new();
         assert!(brief_markdown("empty", &id, &view).contains("(no entries)"));
         assert!(channel_html("empty", &id, &view).contains("(no entries)"));
     }

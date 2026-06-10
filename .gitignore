@@ -10,3 +10,6 @@
 
 # Serena MCP per-machine project cache (tooling, not source)
 /.serena/
+
+# junto per-checkout channel binding (the committed binding is .junto.toml)
+.junto.local.toml

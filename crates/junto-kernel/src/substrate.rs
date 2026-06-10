@@ -40,6 +40,14 @@ pub trait SubstrateProvider {
     /// projection deduplicates by [`crate::EntryId`]). Returns an empty vec
     /// for an unknown channel.
     async fn entries(&self, channel: &ChannelId) -> Result<Vec<LedgerEntry>>;
+
+    /// Every channel with entries in this substrate, in no particular order.
+    ///
+    /// This is the discovery primitive (`docs/adr/0015`): a host enumerates a
+    /// substrate's channels, projects each, and reads its name from the
+    /// `ChannelOpened` genesis — the substrate is the registry of its own
+    /// channels (`docs/adr/0014`).
+    async fn channels(&self) -> Result<Vec<ChannelId>>;
 }
 
 /// An in-memory [`SubstrateProvider`] backed by a per-channel append log.
@@ -71,5 +79,9 @@ impl SubstrateProvider for InMemorySubstrate {
 
     async fn entries(&self, channel: &ChannelId) -> Result<Vec<LedgerEntry>> {
         Ok(self.by_channel.get(channel).cloned().unwrap_or_default())
+    }
+
+    async fn channels(&self) -> Result<Vec<ChannelId>> {
+        Ok(self.by_channel.keys().copied().collect())
     }
 }

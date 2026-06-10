@@ -18,8 +18,7 @@ junto-substrate-git = { path = "crates/junto-substrate-git" }
 # external (latest as of 2026-06-08)
 thiserror = "2.0.18"
 anyhow = "1.0.102"
-# `v5` derives named-channel ids (deterministic name → id, see kernel ids.rs)
-uuid = { version = "1.23.2", features = ["v4", "v5", "serde"] }
+uuid = { version = "1.23.2", features = ["v4", "serde"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 # JCS / RFC 8785 canonical JSON for the durable record (MIT; RFC-compliant
@@ -40,3 +39,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # human-readable timestamps on the channel read surface
 time = "0.3"
+# the machine-local substrate registry + per-repo channel binding files (docs/adr/0015)
+toml = "0.9"
+# canonicalize without Windows' \\?\ verbatim prefix (registry + human surfaces
+# show these paths; MIT/Apache)
+dunce = "1"
