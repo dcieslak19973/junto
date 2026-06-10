@@ -86,7 +86,10 @@ pub fn index_html(summaries: &[crate::host::ChannelSummary]) -> String {
     )
 }
 
-/// The human-facing read-only channel page.
+/// The human-facing channel page: the projected ledger, with verification
+/// forms (ratify/park on provisional assertions, approve/reject on pending
+/// proposals) — the human write surface. Forms post id-addressed URLs (ids
+/// are URL-safe; names may not be) and require a rationale.
 pub fn channel_html(name: &str, id: &ChannelId, view: &ChannelView) -> String {
     let mut rows = String::new();
     for entry in &view.entries {
@@ -94,7 +97,7 @@ pub fn channel_html(name: &str, id: &ChannelId, view: &ChannelView) -> String {
             rows,
             "<li class=\"entry\"><span class=\"when\">{}</span> \
              <span class=\"who\">{}</span> {}\
-             <div class=\"id\">{}</div></li>",
+             <div class=\"id\">{}</div>{}</li>",
             escape_html(&iso_utc(entry.timestamp.as_millis())),
             escape_html(&format!(
                 "{} <{}>",
@@ -102,6 +105,7 @@ pub fn channel_html(name: &str, id: &ChannelId, view: &ChannelView) -> String {
             )),
             describe(entry, view, HtmlStyle),
             entry.id,
+            verification_form(entry, view, id),
         );
     }
     let body = if view.entries.is_empty() {
@@ -120,6 +124,38 @@ pub fn channel_html(name: &str, id: &ChannelId, view: &ChannelView) -> String {
     )
 }
 
+/// The verification form for one entry, when its derived state awaits one:
+/// ratify/park for a provisional assertion, approve/reject for a pending
+/// proposal; empty otherwise. One rationale input feeds whichever button is
+/// pressed (`formaction` routes the second act).
+fn verification_form(entry: &LedgerEntry, view: &ChannelView, channel: &ChannelId) -> String {
+    let acts = match &entry.payload {
+        EntryPayload::Assertion { .. }
+            if matches!(view.standing(&entry.id), Some(Standing::Provisional)) =>
+        {
+            Some(("ratify", "park"))
+        }
+        EntryPayload::Proposal { .. }
+            if matches!(view.gate_status(&entry.id), Some(GateStatus::Pending)) =>
+        {
+            Some(("approve", "reject"))
+        }
+        _ => None,
+    };
+    let Some((accept, decline)) = acts else {
+        return String::new();
+    };
+    format!(
+        "<form class=\"act\" method=\"post\" \
+         action=\"/channels/{channel}/entries/{entry_id}/{accept}\">\
+         <input name=\"rationale\" placeholder=\"why — a rationale, not a checkbox\" required>\
+         <button>{accept}</button>\
+         <button formaction=\"/channels/{channel}/entries/{entry_id}/{decline}\">{decline}</button>\
+         </form>",
+        entry_id = entry.id,
+    )
+}
+
 const CSS: &str = "body{font-family:system-ui,sans-serif;margin:2rem auto;max-width:48rem;\
 padding:0 1rem;color:#1a1a1a}h1{margin-bottom:.25rem}.meta{color:#666;font-size:.85rem}\
 ol.ledger{list-style:none;padding:0}li.entry{padding:.6rem .2rem;border-bottom:1px solid #eee}\
@@ -129,7 +165,10 @@ ol.ledger{list-style:none;padding:0}li.entry{padding:.6rem .2rem;border-bottom:1
 text-transform:uppercase;letter-spacing:.03em}.provisional{background:#fff3cd}\
 .ratified{background:#d4edda}.parked{background:#e2e3e5}.superseded{background:#e2e3e5}\
 .pending{background:#fff3cd}.approved{background:#d4edda}.rejected{background:#f8d7da}\
-.kind{color:#888;font-size:.75rem;text-transform:uppercase;letter-spacing:.03em}";
+.kind{color:#888;font-size:.75rem;text-transform:uppercase;letter-spacing:.03em}\
+form.act{margin:.45rem 0 0}form.act input{font-size:.8rem;padding:.2rem .45rem;\
+width:22rem;max-width:60%}form.act button{font-size:.8rem;margin-left:.35rem;\
+padding:.2rem .7rem;cursor:pointer}";
 
 /// How [`describe`] should dress an entry: markdown backticks vs HTML spans.
 trait Style {

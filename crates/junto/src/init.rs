@@ -14,7 +14,6 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use junto_kernel::Member;
 
 use crate::{binding, host};
 
@@ -65,7 +64,7 @@ pub async fn run(repo: &Path, channel: Option<String>, open: bool) -> Result<()>
     );
 
     if open {
-        let opened_by = git_user(&repo)?;
+        let opened_by = host::git_user(&repo)?;
         let host = host::Host::fixed(vec![repo.clone()]);
         let id = host
             .open_channel(Some(&repo), &channel, opened_by, None)
@@ -80,25 +79,6 @@ pub async fn run(repo: &Path, channel: Option<String>, open: bool) -> Result<()>
          sessions get briefs via the SessionStart hook (`junto brief` must be on PATH)."
     );
     Ok(())
-}
-
-/// The opener's identity from the repo's git config — the natural author for
-/// a human-run, terminal-initiated act.
-fn git_user(repo: &Path) -> Result<Member> {
-    let get = |key: &str| -> Result<String> {
-        let out = std::process::Command::new("git")
-            .args(["-C", &repo.display().to_string(), "config", key])
-            .output()
-            .context("running git config")?;
-        if !out.status.success() {
-            bail!("git config {key} is unset; set it or open via the MCP tool");
-        }
-        Ok(String::from_utf8(out.stdout)
-            .context("git config output not utf-8")?
-            .trim()
-            .to_string())
-    };
-    Ok(Member::human(get("user.name")?, get("user.email")?))
 }
 
 /// Add junto's server entry to `.mcp.json`, preserving everything else.

@@ -142,7 +142,7 @@ async fn brief(dir: PathBuf) -> Result<()> {
     };
     for channel in channels {
         match host.resolve(&channel).await {
-            Ok(host::Resolution::Resolved { ledger, id }) => {
+            Ok(host::Resolution::Resolved { ledger, id, .. }) => {
                 match ledger.lock().await.project(&id).await {
                     Ok(view) => {
                         let name = view.name.clone().unwrap_or_else(|| channel.clone());
