@@ -87,6 +87,28 @@ pub fn register_substrate(junto_home: &Path, repo: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The machine user's identity from a repo's git config (repo-local first,
+/// global fallback — git's own precedence) — the default author for
+/// human-initiated acts (`junto open`, the web verification forms). This is
+/// deliberately *not* identity management: identity stays claimed
+/// (`docs/adr/0012`); git config is just the sensible machine-user default.
+pub fn git_user(repo: &Path) -> Result<Member> {
+    let get = |key: &str| -> Result<String> {
+        let out = std::process::Command::new("git")
+            .args(["-C", &repo.display().to_string(), "config", key])
+            .output()
+            .context("running git config")?;
+        if !out.status.success() {
+            bail!("git config {key} is unset");
+        }
+        Ok(String::from_utf8(out.stdout)
+            .context("git config output not utf-8")?
+            .trim()
+            .to_string())
+    };
+    Ok(Member::human(get("user.name")?, get("user.email")?))
+}
+
 /// Where a [`Host`] finds its substrates.
 enum Substrates {
     /// The machine registry under this junto home, re-read on each use so
@@ -114,7 +136,13 @@ pub struct ChannelSummary {
 /// The result of resolving a user-supplied channel reference.
 pub enum Resolution {
     /// Exactly one channel matched, in its home substrate's ledger.
-    Resolved { ledger: SharedLedger, id: ChannelId },
+    Resolved {
+        /// The home substrate repo (e.g. for deriving a default author from
+        /// its git config).
+        substrate: PathBuf,
+        ledger: SharedLedger,
+        id: ChannelId,
+    },
     /// No registered substrate has a channel by that name or id.
     NotFound,
     /// The name exists in more than one substrate; the caller must qualify.
@@ -197,7 +225,11 @@ impl Host {
                 let ledger = self.ledger_for(&repo).await?;
                 let known = ledger.lock().await.substrate().channels().await?;
                 if known.contains(&id) {
-                    return Ok(Resolution::Resolved { ledger, id });
+                    return Ok(Resolution::Resolved {
+                        substrate: repo,
+                        ledger,
+                        id,
+                    });
                 }
             }
             return Ok(Resolution::NotFound);
@@ -214,7 +246,11 @@ impl Host {
             1 => {
                 let hit = matches.remove(0);
                 let ledger = self.ledger_for(&hit.substrate).await?;
-                Ok(Resolution::Resolved { ledger, id: hit.id })
+                Ok(Resolution::Resolved {
+                    substrate: hit.substrate,
+                    ledger,
+                    id: hit.id,
+                })
             }
             _ => Ok(Resolution::Ambiguous(
                 matches.into_iter().map(|hit| hit.substrate).collect(),
