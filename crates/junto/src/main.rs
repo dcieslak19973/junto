@@ -17,7 +17,7 @@ mod web;
 
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use junto_kernel::{ChannelId, Member};
 use rmcp::transport::streamable_http_server::{
@@ -83,6 +83,15 @@ enum Command {
         /// user).
         #[arg(long)]
         open: bool,
+        /// Also grant this agent membership (docs/adr/0017) and write its
+        /// code relay into the checkout. Requires the channel to be open
+        /// (pass --open, or run on an already-opened channel) and the repo's
+        /// git user to be its founder. Pass with --agent-email.
+        #[arg(long, requires = "agent_email")]
+        agent_name: Option<String>,
+        /// The agent's email (the stable identity key). Pass with --agent-name.
+        #[arg(long, requires = "agent_name")]
+        agent_email: Option<String>,
     },
     /// Print the briefs of every channel this checkout is bound to
     /// (.junto.toml + .junto.local.toml) — the SessionStart recall hook
@@ -116,6 +125,11 @@ enum Command {
         /// The granter's email. Defaults to the home substrate's git user.
         #[arg(long)]
         author_email: Option<String>,
+        /// Also write the new member's code into this checkout's gitignored
+        /// .junto.local.toml (the code relay, docs/adr/0017) so the session
+        /// brief carries it — no hand-copying.
+        #[arg(long)]
+        checkout: Option<PathBuf>,
     },
 }
 
@@ -140,7 +154,15 @@ async fn main() -> Result<()> {
             repo,
             channel,
             open,
-        } => init::run(&repo, channel, open).await,
+            agent_name,
+            agent_email,
+        } => {
+            let agent = match (agent_name, agent_email) {
+                (Some(name), Some(email)) => Some(Member::agent(name, email)),
+                _ => None,
+            };
+            init::run(&repo, channel, open, agent).await
+        }
         Command::Brief { dir } => brief(dir).await,
         Command::AddMember {
             email,
@@ -149,7 +171,19 @@ async fn main() -> Result<()> {
             channel,
             author_name,
             author_email,
-        } => add_member(channel, email, name, kind, author_name, author_email).await,
+            checkout,
+        } => {
+            add_member(
+                channel,
+                email,
+                name,
+                kind,
+                author_name,
+                author_email,
+                checkout,
+            )
+            .await
+        }
     }
 }
 
@@ -164,6 +198,7 @@ async fn add_member(
     kind: String,
     author_name: Option<String>,
     author_email: Option<String>,
+    checkout: Option<PathBuf>,
 ) -> Result<()> {
     let member = match kind.as_str() {
         "human" => Member::human(&name, &email),
@@ -188,11 +223,21 @@ async fn add_member(
     };
     let minted = host.add_member(&channel, &granted_by, member).await?;
     println!("added {email} to channel '{channel}'");
-    if minted.newly_minted {
+    if let Some(checkout) = checkout {
+        let checkout = dunce::canonicalize(&checkout)
+            .with_context(|| format!("checkout {} not found", checkout.display()))?;
+        binding::write_local_member_code(&checkout, &minted.code)?;
         println!(
-            "their member code is {} — hand it to them once (for an agent: put it in \
-             .junto.local.toml as member_code so the session brief carries it)",
-            minted.code
+            "wrote their code relay into {} ({} — gitignored; the session brief carries it)",
+            checkout.display(),
+            binding::LOCAL_BINDING
+        );
+    } else if minted.newly_minted {
+        println!(
+            "their member code is {} — hand it to them once (for an agent: pass --checkout \
+             <dir> to write it into that checkout's {} so the session brief carries it)",
+            minted.code,
+            binding::LOCAL_BINDING
         );
     } else {
         println!("they already had a member code on this machine; it still applies");

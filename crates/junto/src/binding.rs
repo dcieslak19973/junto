@@ -65,6 +65,24 @@ pub fn local_member_code(checkout_dir: &Path) -> Result<Option<String>> {
     Ok(read_binding(&checkout_dir.join(LOCAL_BINDING))?.member_code)
 }
 
+/// Write (or update) the **local** binding's member code — the code relay
+/// (`docs/adr/0017`): the granted agent's code lands in the gitignored local
+/// file so the session brief can hand it to the agent. Preserves any local
+/// channel additions already present.
+pub fn write_local_member_code(checkout_dir: &Path, code: &str) -> Result<()> {
+    let path = checkout_dir.join(LOCAL_BINDING);
+    let mut file = read_binding(&path)?;
+    file.member_code = Some(code.to_string());
+    let body = format!(
+        "# This checkout's local junto binding (gitignored — see {PROJECT_BINDING} for the\n\
+         # committed project binding). member_code is this checkout's agent code\n\
+         # (docs/adr/0017); `junto brief` relays it into agent context at session start.\n{}",
+        toml::to_string_pretty(&file).context("serializing local binding")?
+    );
+    std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
 /// Write the committed project binding.
 pub fn write_project_binding(checkout_dir: &Path, channels: &[String]) -> Result<()> {
     let file = BindingFile {
@@ -117,5 +135,42 @@ mod tests {
             bound_channels(dir.path()).unwrap(),
             vec!["alpha".to_string()]
         );
+    }
+
+    #[test]
+    fn member_code_relay_preserves_local_channels() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(LOCAL_BINDING),
+            "channels = [\"my-worktree-inquiry\"]\n",
+        )
+        .unwrap();
+
+        write_local_member_code(dir.path(), "Abc123").unwrap();
+        // Overwriting with a new code keeps working too.
+        write_local_member_code(dir.path(), "Xyz789").unwrap();
+
+        assert_eq!(
+            local_member_code(dir.path()).unwrap().as_deref(),
+            Some("Xyz789")
+        );
+        assert_eq!(
+            bound_channels(dir.path()).unwrap(),
+            vec!["my-worktree-inquiry".to_string()],
+            "local channel additions survive the relay write"
+        );
+    }
+
+    #[test]
+    fn member_code_is_only_read_from_the_local_file() {
+        // A code in the committed file would be a secret in the repo — it is
+        // deliberately ignored (docs/adr/0017).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(PROJECT_BINDING),
+            "channels = [\"x\"]\nmember_code = \"Leaked\"\n",
+        )
+        .unwrap();
+        assert_eq!(local_member_code(dir.path()).unwrap(), None);
     }
 }
