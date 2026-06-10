@@ -289,7 +289,7 @@ impl JuntoMcp {
                 .map_err(|err| invalid(format!("substrate repo {repo} not found: {err}")))?;
             summaries.retain(|summary| summary.substrate == repo);
         }
-        summaries.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
+        summaries.sort_by_key(|summary| std::cmp::Reverse(summary.last_activity));
         if summaries.is_empty() {
             return Ok(text("no channels in any registered substrate"));
         }

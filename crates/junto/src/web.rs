@@ -80,7 +80,7 @@ async fn index_page(State(host): State<Arc<Host>>) -> Response {
     match host.inventory().await {
         Ok(mut summaries) => {
             // Most recently active first — the resumption order.
-            summaries.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
+            summaries.sort_by_key(|summary| std::cmp::Reverse(summary.last_activity));
             Html(render::index_html(&summaries)).into_response()
         }
         Err(err) => internal(format!("listing channels: {err}")),
