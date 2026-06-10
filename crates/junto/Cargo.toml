@@ -27,6 +27,8 @@ tracing-subscriber.workspace = true
 time.workspace = true
 toml.workspace = true
 dunce.workspace = true
+# member-code minting (docs/adr/0017) reuses the workspace's entropy source
+uuid.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal"] }
 
 [dev-dependencies]

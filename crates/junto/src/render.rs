@@ -7,13 +7,32 @@
 //! - [`channel_html`] — the **human** read path: the first pixel of junto's
 //!   one surface, a read-only projection page served by the host.
 
-use junto_kernel::{ChannelId, ChannelView, EntryPayload, GateStatus, LedgerEntry, Standing};
+use junto_kernel::{
+    ChannelId, ChannelView, EntryPayload, GateStatus, LedgerEntry, Member, MemberKind, Standing,
+};
 use std::fmt::Write as _;
+
+/// `Name <email>` plus an `(agent)` marker — humans are the unmarked case.
+fn member_label(member: &Member) -> String {
+    let marker = match member.kind {
+        MemberKind::Human => "",
+        MemberKind::Agent => " (agent)",
+    };
+    format!("{} <{}>{marker}", member.display_name, member.email)
+}
 
 /// The agent-facing markdown brief: every entry in canonical order, with ids
 /// (the targets for ratify/park/correct/approve/reject) and derived states.
 pub fn brief_markdown(name: &str, id: &ChannelId, view: &ChannelView) -> String {
     let mut out = format!("# channel '{name}' ({id})\n\n");
+    if !view.party.is_empty() {
+        let roster: Vec<String> = view.party.iter().map(member_label).collect();
+        let _ = writeln!(
+            out,
+            "party (founder first; only members' entries count — docs/adr/0017): {}\n",
+            roster.join(", ")
+        );
+    }
     if view.entries.is_empty() {
         out.push_str("(no entries)\n");
         return out;
@@ -22,9 +41,14 @@ pub fn brief_markdown(name: &str, id: &ChannelId, view: &ChannelView) -> String 
     for entry in &view.entries {
         let when = entry.timestamp.as_millis();
         let who = format!("{} <{}>", entry.author.display_name, entry.author.email);
+        let marker = if view.unrecognized.contains(&entry.id) {
+            " [unrecognized author — not in the party; excluded from projection]"
+        } else {
+            ""
+        };
         let _ = writeln!(
             out,
-            "- `{}` @{when} {who}: {}",
+            "- `{}` @{when} {who}:{marker} {}",
             entry.id,
             describe(entry, view, MarkdownStyle)
         );
@@ -93,10 +117,16 @@ pub fn index_html(summaries: &[crate::host::ChannelSummary]) -> String {
 pub fn channel_html(name: &str, id: &ChannelId, view: &ChannelView) -> String {
     let mut rows = String::new();
     for entry in &view.entries {
+        let unrecognized_badge = if view.unrecognized.contains(&entry.id) {
+            "<span class=\"badge unrecognized\" title=\"author is not in the party; \
+             excluded from standings and gates (docs/adr/0017)\">unrecognized</span> "
+        } else {
+            ""
+        };
         let _ = writeln!(
             rows,
             "<li class=\"entry\"><span class=\"when\">{}</span> \
-             <span class=\"who\">{}</span> {}\
+             <span class=\"who\">{}</span> {unrecognized_badge}{}\
              <div class=\"id\">{}</div>{}</li>",
             escape_html(&iso_utc(entry.timestamp.as_millis())),
             escape_html(&format!(
@@ -113,12 +143,26 @@ pub fn channel_html(name: &str, id: &ChannelId, view: &ChannelView) -> String {
     } else {
         format!("<ol class=\"ledger\">\n{rows}</ol>")
     };
+    let party = if view.party.is_empty() {
+        String::new()
+    } else {
+        let roster: Vec<String> = view
+            .party
+            .iter()
+            .map(|member| escape_html(&member_label(member)))
+            .collect();
+        format!(
+            "<p class=\"meta\">party: {} <span title=\"founder first; only members' \
+             entries count (docs/adr/0017)\">·</span></p>\n",
+            roster.join(", ")
+        )
+    };
     format!(
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
          <title>junto — {name}</title>\n<style>{CSS}</style></head>\n\
          <body><main>\n<h1>{name}</h1>\n\
          <p class=\"meta\">channel {id} · {count} entries · read-only projection</p>\n\
-         {body}\n</main></body></html>\n",
+         {party}{body}\n</main></body></html>\n",
         name = escape_html(name),
         count = view.entries.len(),
     )
@@ -149,6 +193,8 @@ fn verification_form(entry: &LedgerEntry, view: &ChannelView, channel: &ChannelI
         "<form class=\"act\" method=\"post\" \
          action=\"/channels/{channel}/entries/{entry_id}/{accept}\">\
          <input name=\"rationale\" placeholder=\"why — a rationale, not a checkbox\" required>\
+         <input name=\"code\" class=\"code\" placeholder=\"member code\" \
+         title=\"your machine-local member code (docs/adr/0017)\">\
          <button>{accept}</button>\
          <button formaction=\"/channels/{channel}/entries/{entry_id}/{decline}\">{decline}</button>\
          </form>",
@@ -165,9 +211,11 @@ ol.ledger{list-style:none;padding:0}li.entry{padding:.6rem .2rem;border-bottom:1
 text-transform:uppercase;letter-spacing:.03em}.provisional{background:#fff3cd}\
 .ratified{background:#d4edda}.parked{background:#e2e3e5}.superseded{background:#e2e3e5}\
 .pending{background:#fff3cd}.approved{background:#d4edda}.rejected{background:#f8d7da}\
+.unrecognized{background:#f8d7da}\
 .kind{color:#888;font-size:.75rem;text-transform:uppercase;letter-spacing:.03em}\
 form.act{margin:.45rem 0 0}form.act input{font-size:.8rem;padding:.2rem .45rem;\
-width:22rem;max-width:60%}form.act button{font-size:.8rem;margin-left:.35rem;\
+width:22rem;max-width:60%}form.act input.code{width:6.5rem;margin-left:.35rem}\
+form.act button{font-size:.8rem;margin-left:.35rem;\
 padding:.2rem .7rem;cursor:pointer}";
 
 /// How [`describe`] should dress an entry: markdown backticks vs HTML spans.
@@ -218,6 +266,13 @@ fn describe(entry: &LedgerEntry, view: &ChannelView, style: impl Style) -> Strin
                 "{} — channel '{}' opened",
                 style.emphasis("genesis"),
                 style.text(name)
+            )
+        }
+        EntryPayload::MemberAdded { member } => {
+            format!(
+                "{} — {}",
+                style.emphasis("member added"),
+                style.text(&member_label(member))
             )
         }
         EntryPayload::Assertion { statement, .. } => {
@@ -325,6 +380,8 @@ mod tests {
         ChannelView {
             name: None,
             entries,
+            party: Vec::new(),
+            unrecognized: std::collections::HashSet::new(),
             standings,
             gate_status,
         }

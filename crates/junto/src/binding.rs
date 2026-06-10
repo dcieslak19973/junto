@@ -30,6 +30,11 @@ pub struct BindingFile {
     /// Channel names (or raw ids) this checkout is bound to.
     #[serde(default)]
     pub channels: Vec<String>,
+    /// This checkout's agent member code (`docs/adr/0017`) — only honored
+    /// from the **local** (gitignored) file, so the secret never reaches the
+    /// repo; `junto brief` relays it into agent context at session start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_code: Option<String>,
 }
 
 /// Read one binding file; a missing file is an empty binding.
@@ -54,10 +59,17 @@ pub fn bound_channels(checkout_dir: &Path) -> Result<Vec<String>> {
     Ok(channels)
 }
 
+/// The agent member code from the **local** binding file only (the committed
+/// file is in the repo; a secret there would sync — `docs/adr/0017`).
+pub fn local_member_code(checkout_dir: &Path) -> Result<Option<String>> {
+    Ok(read_binding(&checkout_dir.join(LOCAL_BINDING))?.member_code)
+}
+
 /// Write the committed project binding.
 pub fn write_project_binding(checkout_dir: &Path, channels: &[String]) -> Result<()> {
     let file = BindingFile {
         channels: channels.to_vec(),
+        member_code: None,
     };
     let path = checkout_dir.join(PROJECT_BINDING);
     let body = format!(

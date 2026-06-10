@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    EntryId, EntryPayload, GateStatus, LedgerEntry, Result, SubstrateProvider,
+    EntryId, EntryPayload, GateStatus, LedgerEntry, Member, Result, SubstrateProvider,
     gate::ApprovalRequirement, ids::ChannelId,
 };
 
@@ -57,8 +57,21 @@ pub struct ChannelView {
     /// deterministic on every replica, like all projection.
     pub name: Option<String>,
     /// All entries, deduplicated by id, in canonical
-    /// `(timestamp, author.email, id)` order.
+    /// `(timestamp, author.email, id)` order — including unrecognized ones,
+    /// which are never dropped (`docs/adr/0017`).
     pub entries: Vec<LedgerEntry>,
+    /// The **Party** — the channel's members (`docs/adr/0017`): the founding
+    /// member (the genesis author) first, then members granted by
+    /// founder-authored [`EntryPayload::MemberAdded`] entries, in grant order.
+    /// Empty when the channel has no genesis (a dogfood-era channel, or a
+    /// record synced before its genesis arrived) — in which case membership is
+    /// not enforced and every entry projects.
+    pub party: Vec<Member>,
+    /// Entries whose author is not in the [`party`](ChannelView::party) —
+    /// retained and surfaced, but excluded from standings and gate folding
+    /// (`docs/adr/0017`: visibility beats mystery). Always empty when `party`
+    /// is empty.
+    pub unrecognized: HashSet<EntryId>,
     /// Current standing per assertion [`EntryId`].
     pub standings: HashMap<EntryId, Standing>,
     /// Current gate status per proposal [`EntryId`].
@@ -151,9 +164,29 @@ impl<S: SubstrateProvider> Ledger<S> {
         let mut seen = HashSet::new();
         entries.retain(|entry| seen.insert(entry.id));
 
-        let standings = Self::project_standings(&entries);
-        let gate_status = Self::project_gates(&entries);
-        let name = entries.iter().find_map(|entry| match &entry.payload {
+        let party = Self::project_party(&entries);
+        // The membership check is set-based, not temporal (`docs/adr/0017`):
+        // an entry counts iff its author is in the Party, wherever the grant
+        // falls in canonical order. No genesis ⇒ no Party ⇒ no enforcement.
+        let unrecognized: HashSet<EntryId> = if party.is_empty() {
+            HashSet::new()
+        } else {
+            let member_emails: HashSet<&str> =
+                party.iter().map(|member| member.email.as_str()).collect();
+            entries
+                .iter()
+                .filter(|entry| !member_emails.contains(entry.author.email.as_str()))
+                .map(|entry| entry.id)
+                .collect()
+        };
+        let recognized: Vec<&LedgerEntry> = entries
+            .iter()
+            .filter(|entry| !unrecognized.contains(&entry.id))
+            .collect();
+
+        let standings = Self::project_standings(&recognized);
+        let gate_status = Self::project_gates(&recognized);
+        let name = recognized.iter().find_map(|entry| match &entry.payload {
             EntryPayload::ChannelOpened { name } => Some(name.clone()),
             _ => None,
         });
@@ -161,13 +194,44 @@ impl<S: SubstrateProvider> Ledger<S> {
         Ok(ChannelView {
             name,
             entries,
+            party,
+            unrecognized,
             standings,
             gate_status,
         })
     }
 
-    /// Fold the assertion standings out of an ordered entry list.
-    fn project_standings(entries: &[LedgerEntry]) -> HashMap<EntryId, Standing> {
+    /// Fold the **Party** out of an ordered entry list (`docs/adr/0017`): the
+    /// genesis author is the founding member; founder-authored
+    /// [`EntryPayload::MemberAdded`] entries extend the roster (re-adding an
+    /// existing member is a no-op). A `MemberAdded` from anyone else has no
+    /// roster effect. With concurrent geneses the canonically first wins,
+    /// consistent with the name projection. No genesis ⇒ empty Party.
+    fn project_party(entries: &[LedgerEntry]) -> Vec<Member> {
+        let Some(founder) = entries.iter().find_map(|entry| {
+            matches!(entry.payload, EntryPayload::ChannelOpened { .. })
+                .then(|| entry.author.clone())
+        }) else {
+            return Vec::new();
+        };
+
+        let mut emails: HashSet<String> = HashSet::from([founder.email.clone()]);
+        let mut party = vec![founder.clone()];
+        for entry in entries {
+            if let EntryPayload::MemberAdded { member } = &entry.payload
+                && entry.author.email == founder.email
+                && emails.insert(member.email.clone())
+            {
+                party.push(member.clone());
+            }
+        }
+        party
+    }
+
+    /// Fold the assertion standings out of an ordered list of *recognized*
+    /// entries (refs, because projection filters the canonical list by
+    /// membership without cloning).
+    fn project_standings(entries: &[&LedgerEntry]) -> HashMap<EntryId, Standing> {
         let mut standings: HashMap<EntryId, Standing> = HashMap::new();
 
         // Every assertion exists, provisionally.
@@ -186,6 +250,7 @@ impl<S: SubstrateProvider> Ledger<S> {
                 EntryPayload::Correction { .. } => Standing::Superseded,
                 // Not standing-bearing acts.
                 EntryPayload::ChannelOpened { .. }
+                | EntryPayload::MemberAdded { .. }
                 | EntryPayload::Assertion { .. }
                 | EntryPayload::Proposal { .. }
                 | EntryPayload::Approval { .. }
@@ -201,8 +266,10 @@ impl<S: SubstrateProvider> Ledger<S> {
         standings
     }
 
-    /// Fold the proposal gate statuses out of an ordered entry list.
-    fn project_gates(entries: &[LedgerEntry]) -> HashMap<EntryId, GateStatus> {
+    /// Fold the proposal gate statuses out of an ordered list of *recognized*
+    /// entries — so only members' approvals and rejections count
+    /// (`docs/adr/0017`).
+    fn project_gates(entries: &[&LedgerEntry]) -> HashMap<EntryId, GateStatus> {
         // Per proposal: its requirement, the distinct emails that approved it,
         // and whether it has been rejected.
         let mut requirements: HashMap<EntryId, &ApprovalRequirement> = HashMap::new();
@@ -1056,5 +1123,227 @@ mod tests {
         assert!(view_b.gate_status(&prop_a).is_none());
         let view_a = ledger.project(&channel_a).await.unwrap();
         assert_eq!(view_a.gate_status(&prop_a), Some(GateStatus::Approved));
+    }
+
+    // ---- the Party & membership filter (docs/adr/0017) ----
+
+    fn genesis(name: &str) -> EntryPayload {
+        EntryPayload::ChannelOpened { name: name.into() }
+    }
+
+    fn member_added(member: &Member) -> EntryPayload {
+        EntryPayload::MemberAdded {
+            member: member.clone(),
+        }
+    }
+
+    /// A channel with a genesis by `founder` at t=0.
+    async fn opened_channel(founder: &Member) -> (Ledger<InMemorySubstrate>, ChannelId) {
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                founder.clone(),
+                0,
+                genesis("party-test"),
+            ))
+            .await
+            .unwrap();
+        (ledger, channel)
+    }
+
+    #[tokio::test]
+    async fn founder_comes_from_genesis_and_grants_extend_the_party() {
+        let dan = Member::human("Dan", "dan@example.com");
+        let agent = Member::agent("Agent", "agent@example.com");
+        let (mut ledger, channel) = opened_channel(&dan).await;
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                dan.clone(),
+                1,
+                member_added(&agent),
+            ))
+            .await
+            .unwrap();
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert_eq!(view.party, vec![dan, agent]);
+        assert!(view.unrecognized.is_empty());
+    }
+
+    #[tokio::test]
+    async fn non_member_acts_are_unrecognized_and_do_not_count() {
+        let dan = Member::human("Dan", "dan@example.com");
+        let stranger = Member::agent("Stranger", "stranger@example.com");
+        let (mut ledger, channel) = opened_channel(&dan).await;
+
+        let claim = EntryId::new();
+        ledger
+            .append(entry(claim, channel, dan.clone(), 1, assertion("x holds")))
+            .await
+            .unwrap();
+        // A stranger's ratification must not move the standing...
+        let stray = EntryId::new();
+        ledger
+            .append(entry(
+                stray,
+                channel,
+                stranger.clone(),
+                2,
+                EntryPayload::Ratification {
+                    target: claim,
+                    rationale: "drive-by".into(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert_eq!(view.standing(&claim), Some(Standing::Provisional));
+        // ...but the entry is retained and surfaced, never dropped.
+        assert!(view.entries.iter().any(|e| e.id == stray));
+        assert!(view.unrecognized.contains(&stray));
+    }
+
+    #[tokio::test]
+    async fn non_member_approval_does_not_open_a_gate() {
+        let dan = Member::human("Dan", "dan@example.com");
+        let stranger = Member::agent("Stranger", "stranger@example.com");
+        let (mut ledger, channel) = opened_channel(&dan).await;
+
+        let prop = EntryId::new();
+        ledger
+            .append(entry(
+                prop,
+                channel,
+                dan.clone(),
+                1,
+                proposal(ApprovalRequirement::Count(1)),
+            ))
+            .await
+            .unwrap();
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                stranger,
+                2,
+                EntryPayload::Approval {
+                    target: prop,
+                    rationale: "lgtm".into(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert_eq!(view.gate_status(&prop), Some(GateStatus::Pending));
+    }
+
+    #[tokio::test]
+    async fn member_added_by_non_founder_has_no_roster_effect() {
+        let dan = Member::human("Dan", "dan@example.com");
+        let agent = Member::agent("Agent", "agent@example.com");
+        let interloper = Member::agent("Interloper", "interloper@example.com");
+        let (mut ledger, channel) = opened_channel(&dan).await;
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                dan.clone(),
+                1,
+                member_added(&agent),
+            ))
+            .await
+            .unwrap();
+        // A member who is not the founder cannot extend the party.
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                agent.clone(),
+                2,
+                member_added(&interloper),
+            ))
+            .await
+            .unwrap();
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert_eq!(view.party, vec![dan, agent]);
+    }
+
+    #[tokio::test]
+    async fn membership_check_is_set_based_not_temporal() {
+        // An entry written *before* its author's grant still counts
+        // (docs/adr/0017: convergence over strictness; clock skew between
+        // machines must not invalidate real work).
+        let dan = Member::human("Dan", "dan@example.com");
+        let agent = Member::agent("Agent", "agent@example.com");
+        let (mut ledger, channel) = opened_channel(&dan).await;
+
+        let early = EntryId::new();
+        ledger
+            .append(entry(
+                early,
+                channel,
+                agent.clone(),
+                1,
+                assertion("written before the grant"),
+            ))
+            .await
+            .unwrap();
+        ledger
+            .append(entry(EntryId::new(), channel, dan, 2, member_added(&agent)))
+            .await
+            .unwrap();
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert!(view.unrecognized.is_empty());
+        assert_eq!(view.standing(&early), Some(Standing::Provisional));
+    }
+
+    #[tokio::test]
+    async fn re_adding_a_member_is_idempotent() {
+        let dan = Member::human("Dan", "dan@example.com");
+        let agent = Member::agent("Agent", "agent@example.com");
+        let (mut ledger, channel) = opened_channel(&dan).await;
+        for millis in [1, 2] {
+            ledger
+                .append(entry(
+                    EntryId::new(),
+                    channel,
+                    dan.clone(),
+                    millis,
+                    member_added(&agent),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert_eq!(view.party, vec![dan, agent]);
+    }
+
+    #[tokio::test]
+    async fn no_genesis_means_no_enforcement() {
+        // Legacy fallback: a channel without a genesis (dogfood-era, or synced
+        // before its genesis arrived) projects everything.
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let anyone = Member::agent("Anyone", "anyone@example.com");
+        let claim = EntryId::new();
+        ledger
+            .append(entry(claim, channel, anyone, 1, assertion("still counts")))
+            .await
+            .unwrap();
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert!(view.party.is_empty());
+        assert!(view.unrecognized.is_empty());
+        assert_eq!(view.standing(&claim), Some(Standing::Provisional));
     }
 }

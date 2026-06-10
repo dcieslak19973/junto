@@ -11,6 +11,7 @@ mod binding;
 mod host;
 mod init;
 mod mcp;
+mod members;
 mod render;
 mod web;
 
@@ -91,6 +92,31 @@ enum Command {
         #[arg(long, default_value = ".")]
         dir: PathBuf,
     },
+    /// Grant channel membership (docs/adr/0017): append a founder-authored
+    /// MemberAdded entry and mint the new member's machine-local code. The
+    /// granter is the home substrate's git user, who must be the channel's
+    /// founding member.
+    AddMember {
+        /// The new member's email (the stable identity key).
+        email: String,
+        /// The new member's display name.
+        #[arg(long)]
+        name: String,
+        /// "human" or "agent".
+        #[arg(long, default_value = "agent")]
+        kind: String,
+        /// Channel name or id.
+        #[arg(long)]
+        channel: String,
+        /// The granter's display name. Defaults to the home substrate's git
+        /// user — override when the founder's recorded identity differs from
+        /// git config (identity is claimed; the terminal is the trust anchor).
+        #[arg(long)]
+        author_name: Option<String>,
+        /// The granter's email. Defaults to the home substrate's git user.
+        #[arg(long)]
+        author_email: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -116,7 +142,62 @@ async fn main() -> Result<()> {
             open,
         } => init::run(&repo, channel, open).await,
         Command::Brief { dir } => brief(dir).await,
+        Command::AddMember {
+            email,
+            name,
+            kind,
+            channel,
+            author_name,
+            author_email,
+        } => add_member(channel, email, name, kind, author_name, author_email).await,
     }
+}
+
+/// Grant channel membership from the terminal (`docs/adr/0017`). The granter
+/// defaults to the home substrate's git user — the founder check happens in
+/// the host. No code is demanded here: whoever can run commands on this
+/// machine can edit the code store anyway; codes guard the network surfaces.
+async fn add_member(
+    channel: String,
+    email: String,
+    name: String,
+    kind: String,
+    author_name: Option<String>,
+    author_email: Option<String>,
+) -> Result<()> {
+    let member = match kind.as_str() {
+        "human" => Member::human(&name, &email),
+        "agent" => Member::agent(&name, &email),
+        other => bail!("--kind must be 'human' or 'agent', not '{other}'"),
+    };
+    let host = host::Host::from_registry(host::junto_home()?);
+    let substrate = match host.resolve(&channel).await? {
+        host::Resolution::Resolved { substrate, .. } => substrate,
+        host::Resolution::NotFound => {
+            bail!("no channel '{channel}' in any registered substrate")
+        }
+        host::Resolution::Ambiguous(substrates) => bail!(
+            "channel name '{channel}' exists in several substrates ({substrates:?}); \
+             address it by id"
+        ),
+    };
+    let granted_by = match (author_name, author_email) {
+        (Some(name), Some(email)) => Member::human(name, email),
+        (None, None) => host::git_user(&substrate)?,
+        _ => bail!("pass both --author-name and --author-email, or neither"),
+    };
+    let minted = host.add_member(&channel, &granted_by, member).await?;
+    println!("added {email} to channel '{channel}'");
+    if minted.newly_minted {
+        println!(
+            "their member code is {} — hand it to them once (for an agent: put it in \
+             .junto.local.toml as member_code so the session brief carries it)",
+            minted.code
+        );
+    } else {
+        println!("they already had a member code on this machine; it still applies");
+    }
+    Ok(())
 }
 
 /// Print the briefs of every channel this checkout is bound to. Best-effort by
@@ -162,6 +243,16 @@ async fn brief(dir: PathBuf) -> Result<()> {
             }
             Err(err) => eprintln!("junto brief: resolving '{channel}': {err:#}"),
         }
+    }
+    // Relay this checkout's agent member code into session context, if the
+    // operator put one in the local (gitignored) binding (docs/adr/0017).
+    match binding::local_member_code(&dir) {
+        Ok(Some(code)) => println!(
+            "\nyour member code is {code} — pass it as `code` on junto write tools \
+             (record/ratify/park/correct/propose/approve/reject)."
+        ),
+        Ok(None) => {}
+        Err(err) => eprintln!("junto brief: reading member code: {err:#}"),
     }
     Ok(())
 }
@@ -230,8 +321,10 @@ async fn open(
         )
         .await?;
     println!(
-        "opened channel '{name}' (id {opened}) in {}",
+        "opened channel '{name}' (id {}) in {}",
+        opened.id,
         repo.display()
     );
+    init::print_founder_code(&opened);
     Ok(())
 }
