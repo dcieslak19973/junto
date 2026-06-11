@@ -1,0 +1,19 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "junto",
+  "version": "0.1.0",
+  "identifier": "dev.junto.desktop",
+  "build": {
+    "frontendDist": "http://127.0.0.1:1727/"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": false,
+    "icon": ["icons/icon.ico", "icons/icon.png"]
+  }
+}
