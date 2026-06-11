@@ -283,7 +283,8 @@ pub fn brief_markdown(name: &str, id: &ChannelId, view: &ChannelView) -> String 
         out,
         "\n({folded} verification acts folded into the lines above; {superseded} superseded \
          entries collapsed into their corrections; {} parked dead-ends and {} rejected \
-         proposals in the full transcript — surfaced on demand, not re-tried silently)",
+         proposals omitted — call the `dead_ends` tool before re-trying an approach that \
+         may have been tried)",
         parked.len(),
         rejected.len(),
     );
@@ -310,6 +311,88 @@ fn recent_line(entry: &LedgerEntry) -> String {
         EntryPayload::Approval { target, .. } => format!("approved `{}`", short(target)),
         EntryPayload::Rejection { target, .. } => format!("rejected `{}`", short(target)),
     }
+}
+
+/// The on-demand dead-end surface — the counterpart of the scaled brief's
+/// deliberate omission (Dan, 2026-06-11: a dead-end belongs in recall when
+/// its path starts coming back from the dead). Every parked assertion and
+/// rejected proposal, with who killed it and why; `about` filters by
+/// case-insensitive substring for territory checks.
+pub fn dead_ends_markdown(name: &str, view: &ChannelView, about: Option<&str>) -> String {
+    // The killing act's rationale is the value here: collect them verbatim.
+    let mut kills: std::collections::HashMap<EntryId, (&LedgerEntry, &str)> = Default::default();
+    for entry in &view.entries {
+        match &entry.payload {
+            EntryPayload::Park { target, rationale }
+            | EntryPayload::Rejection { target, rationale } => {
+                kills.insert(*target, (entry, rationale));
+            }
+            _ => {}
+        }
+    }
+
+    let needle = about.map(str::to_lowercase);
+    let mut out = format!("# dead-ends in '{name}'\n\n");
+    let mut total = 0usize;
+    let mut shown = 0usize;
+    for entry in &view.entries {
+        let (label, text) = match &entry.payload {
+            EntryPayload::Assertion { statement, .. }
+                if view.standing(&entry.id) == Some(Standing::Parked) =>
+            {
+                ("parked", statement)
+            }
+            EntryPayload::Proposal { action, .. }
+                if view.gate_status(&entry.id) == Some(GateStatus::Rejected) =>
+            {
+                ("rejected", action)
+            }
+            _ => continue,
+        };
+        total += 1;
+        let kill = kills.get(&entry.id);
+        if let Some(needle) = &needle {
+            let haystack = format!(
+                "{text} {}",
+                kill.map(|(_, rationale)| *rationale).unwrap_or_default()
+            )
+            .to_lowercase();
+            if !haystack.contains(needle) {
+                continue;
+            }
+        }
+        shown += 1;
+        let _ = writeln!(
+            out,
+            "- `{}` [{label}] {} <{}>: {text}",
+            entry.id, entry.author.display_name, entry.author.email
+        );
+        if let Some((act, rationale)) = kill {
+            let _ = writeln!(
+                out,
+                "  {label} by {} @{}: {rationale}",
+                act.author.display_name,
+                act.timestamp.as_millis()
+            );
+        }
+    }
+    if total == 0 {
+        out.push_str("(no dead-ends — nothing parked or rejected in this channel)\n");
+    } else if shown == 0 {
+        let _ = writeln!(
+            out,
+            "(none of the {total} dead-ends match '{}' — but substring matching is crude: \
+             when in doubt, view the unfiltered list)",
+            about.unwrap_or_default()
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "\n({shown} of {total} dead-ends shown — do not re-try these without surfacing \
+             the prior park/rejection to the party)"
+        );
+    }
+    out
 }
 
 /// The full transcript: every entry in canonical order with ids and derived

@@ -133,7 +133,10 @@ fn write_convention(repo: &Path, channel: &str) -> Result<()> {
          \n\
          **Consult before deciding, record after:** before making or recommending a decision \
          in territory the brief covers, check it — do not contradict a **ratified** entry or \
-         re-try a **parked** dead-end without surfacing it to your operator first. After a \
+         re-try a **parked** dead-end without surfacing it to your operator first. The brief \
+         carries state, not history: parked and rejected paths are omitted from it, so \
+         **before attempting an approach that may have been tried, call the `dead_ends` \
+         tool** (optionally with `about`) — it lists what died here and why. After a \
          consequential decision, `record` it via the junto MCP tools with real rationale and \
          provenance (PR/issue links, file paths); propose consequential *actions* through a \
          gate (`propose`) for a human to approve. **Frame the verifier's decision**: pass \

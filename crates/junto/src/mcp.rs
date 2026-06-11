@@ -256,6 +256,15 @@ pub struct ViewRequest {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DeadEndsRequest {
+    /// Channel name or id.
+    pub channel: String,
+    /// Optional case-insensitive substring filter over statements and
+    /// park/rejection rationales — a crude territory check; omit to list all.
+    pub about: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SyncRequest {
     /// Channel name or id.
     pub channel: String,
@@ -730,6 +739,28 @@ impl JuntoMcp {
     }
 
     #[tool(
+        description = "Surface a channel's dead-ends: parked assertions and rejected proposals, each with who killed it and why. The scaled brief deliberately omits these — call this BEFORE proposing or attempting an approach that may have been tried, especially when entering territory you did not work recently. Optional 'about' filters by substring (crude — when in doubt, read the unfiltered list). Do not re-try a listed dead-end without surfacing it to the party first."
+    )]
+    async fn dead_ends(
+        &self,
+        Parameters(req): Parameters<DeadEndsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let (ledger, channel) = self.resolve(&req.channel).await?;
+        let view = ledger
+            .lock()
+            .await
+            .project(&channel)
+            .await
+            .map_err(internal)?;
+        let name = view.name.clone().unwrap_or_else(|| req.channel.clone());
+        Ok(text(render::dead_ends_markdown(
+            &name,
+            &view,
+            req.about.as_deref(),
+        )))
+    }
+
+    #[tool(
         description = "Sync a channel's record with a git remote (default: origin): fetch every member's entries, reconcile, and push your own. Run after recording so the durable record leaves this machine."
     )]
     async fn sync_channel(
@@ -776,7 +807,10 @@ impl ServerHandler for JuntoMcp {
              checkable evidence — and the decline option must be the steelman, the \
              strongest concrete reason to park/reject, never a strawman. The full frame \
              is recorded, unchosen options included (docs/adr/0019). Verification targets \
-             accept unambiguous id prefixes (6+ chars)."
+             accept unambiguous id prefixes (6+ chars). The brief carries state, not \
+             history: before re-trying an approach that may have been tried, call \
+             `dead_ends` — parked and rejected paths are omitted from the brief and \
+             surface there, with why they died."
                 .to_string(),
         );
         info
@@ -1082,6 +1116,89 @@ mod tests {
             .unwrap(),
         );
         assert!(rendered.contains("[ratified]"));
+    }
+
+    #[tokio::test]
+    async fn dead_ends_surface_parked_paths_with_why() {
+        let (dirs, mcp) = init_repo();
+        open(&mcp, &dirs, "junto-dev").await;
+        let recorded = mcp
+            .record(Parameters(RecordRequest {
+                channel: "junto-dev".into(),
+                author: claude(),
+                code: code_of(&dirs, claude()),
+                statement: "use polling for sync".into(),
+                rationale: "simple".into(),
+                provenance: None,
+                frame: None,
+            }))
+            .await
+            .unwrap();
+        let id = recorded_id(&recorded);
+        mcp.park(Parameters(ActRequest {
+            channel: "junto-dev".into(),
+            author: dan(),
+            code: code_of(&dirs, dan()),
+            target: id.clone(),
+            rationale: "polling burned CPU and missed updates".into(),
+        }))
+        .await
+        .unwrap();
+
+        // The scaled brief gives the dead-end no standing section (it may
+        // still flash by in the "recently" tail while fresh); the dead_ends
+        // tool carries it with the park rationale — the why-it-died is the
+        // value.
+        let brief = text_of(
+            &mcp.view_channel(Parameters(ViewRequest {
+                channel: "junto-dev".into(),
+                full: false,
+            }))
+            .await
+            .unwrap(),
+        );
+        let standing_sections = brief.split("## recently").next().unwrap();
+        assert!(
+            !standing_sections.contains("use polling for sync"),
+            "{brief}"
+        );
+        assert!(brief.contains("1 parked dead-ends"), "{brief}");
+
+        let listed = text_of(
+            &mcp.dead_ends(Parameters(DeadEndsRequest {
+                channel: "junto-dev".into(),
+                about: None,
+            }))
+            .await
+            .unwrap(),
+        );
+        assert!(listed.contains("use polling for sync"), "{listed}");
+        assert!(
+            listed.contains("polling burned CPU and missed updates"),
+            "{listed}"
+        );
+        assert!(listed.contains(&id), "full id for acting on it: {listed}");
+
+        // The substring filter matches against statement and kill rationale;
+        // a miss says so rather than rendering an empty page.
+        let hit = text_of(
+            &mcp.dead_ends(Parameters(DeadEndsRequest {
+                channel: "junto-dev".into(),
+                about: Some("POLLING".into()),
+            }))
+            .await
+            .unwrap(),
+        );
+        assert!(hit.contains("use polling for sync"), "{hit}");
+        let miss = text_of(
+            &mcp.dead_ends(Parameters(DeadEndsRequest {
+                channel: "junto-dev".into(),
+                about: Some("kubernetes".into()),
+            }))
+            .await
+            .unwrap(),
+        );
+        assert!(miss.contains("none of the 1 dead-ends match"), "{miss}");
     }
 
     #[tokio::test]
