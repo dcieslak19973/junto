@@ -200,6 +200,43 @@ substrate) — and the items come from *any* playbook, addressed to *specific
 members*, human or agent. The dashboards above are panes of glass; the focus
 board is a pane of glass **over a record**.
 
+### Lessons from their failures and successes
+
+1. **Be the place attention goes, not a predictor of when to interrupt**
+   (AUI's fate). Horvitz's systems inferred attention from sensors and tried
+   to time interruptions — invasive, brittle, never shipped broadly. A
+   pull surface the human visits at natural boundaries needs no inference,
+   and matches the interruption research besides.
+2. **The unit-of-work signal must be zero-effort** (Mylyn's fate). Mylyn's
+   measured productivity gains depended on users manually activating "the
+   task I'm on" — that friction capped adoption. In junto the bookkeeping is
+   done by the *agents* (channel binding, recorded entries); the human never
+   declares context.
+3. **Platform-neutral or die with the platform** (Mylyn/Tasktop again). The
+   task context lived inside Eclipse; when developers moved editors, it
+   couldn't follow. junto's record is git refs, its surface is HTTP — no
+   host platform to die with.
+4. **Items must be act-shaped, and acting must *resolve* them in the system
+   of record** (GitHub notifications' fate). A notification whose only verb
+   is *dismiss* refills forever; volume without semantics buries the user;
+   and third-party repairs (Octobox) are stuck mirroring a record they
+   cannot change. The focus board's items each carry their act inline, and
+   the act *is* a state change in the record itself.
+5. **Semantics beat inference.** Gmail's Priority Inbox guesses importance
+   from an adversarial stream and gets gamed. junto's urgency is derived
+   from gate/standing *semantics* — a pending gate blocks an agent, by
+   definition, no model required.
+6. **The unit is the inquiry, not the agent** — and plan for verification
+   asymmetry (the agent-command-center risk). A kanban of agent sessions
+   makes the fleet the subject; junto already chose the Channel as the unit
+   with Agent Sessions subordinate. Deeper: agents produce verifiable work
+   far faster than humans can verify it, so an attention surface that
+   assumes every item deserves human eyes becomes a slop inbox. The escape
+   is already in the design — gate routing (`adr/0004`/`0007`) lets
+   playbooks route routine verification to evals and agent verifiers,
+   reserving human attention for consequential gates. The board must make
+   that routing visible rather than pretend humans scale.
+
 ## ⚠️ Finding a person's optimum (anticipated, not designed)
 
 junto's ledger records what no productivity tool can see from the outside:
