@@ -87,13 +87,12 @@ fn internal(message: String) -> Response {
 }
 
 async fn index_page(State(host): State<Arc<Host>>) -> Response {
-    match host.inventory().await {
-        Ok(mut summaries) => {
+    // One projection sweep yields both the board and the cards — projection
+    // is the page's whole cost, so it must not run twice.
+    match host.overview().await {
+        Ok((mut summaries, attention)) => {
             // Most recently active first — the resumption order.
             summaries.sort_by_key(|summary| std::cmp::Reverse(summary.last_activity));
-            // The focus board leads the page; an attention failure must not
-            // take the index down with it.
-            let attention = host.attention().await.unwrap_or_default();
             Html(render::index_html(&summaries, &attention)).into_response()
         }
         Err(err) => internal(format!("listing channels: {err}")),
@@ -326,11 +325,14 @@ async fn verify(
     // this their verification sits machine-local until some agent happens to
     // run sync_channel. The redirect never waits on the network; a failed
     // sync only delays (the entry is already durable in local refs and rides
-    // the next successful sync).
-    let sync_ledger = ledger.clone();
+    // the next successful sync). It runs on a *fresh* substrate handle, not
+    // the shared ledger: holding the ledger lock across a network push would
+    // stall the very page the redirect lands on (git itself serializes
+    // concurrent ref updates, so no shared lock is needed).
+    let repo = substrate.clone();
     tokio::spawn(async move {
-        let mut guard = sync_ledger.lock().await;
-        if let Err(err) = guard.substrate_mut().sync("origin", &id).await {
+        let mut fresh = junto_substrate_git::GitRefsSubstrate::open(repo);
+        if let Err(err) = fresh.sync("origin", &id).await {
             tracing::warn!("auto-sync of channel {id} after a web write failed: {err:#}");
         }
     });
@@ -845,5 +847,11 @@ mod tests {
         let html = crate::render::channel_html(&[], "web-test", &channel, &view);
         assert!(html.contains(&format!("/channels/{channel}/entries/{}/ratify", entry.id)));
         assert!(html.contains("name=\"rationale\""));
+        // The act-feedback enhancement ships with every page: a submitted act
+        // shows "recording…" instead of reading as a dead click.
+        assert!(
+            html.contains("recording\\u2026"),
+            "act feedback script present"
+        );
     }
 }
