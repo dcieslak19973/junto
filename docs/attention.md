@@ -49,6 +49,16 @@ The attention design must generalize without rework:
 - **"Waiting on you" vs "waiting on others"** are different facts and render
   differently: my board leads with what blocks *on me*; what I'm waiting
   *for* (a teammate's approval, an agent mid-task) is visible but quiet.
+- **Show who you are blocking — by name** (Dan, 2026-06-10). The reciprocal
+  view: every gate knows its proposer, so an attention item can say
+  *blocking: Claude Code for 3h; Sarah's side-quest queued behind it*. An
+  item framed as a person (or agent) kept waiting is psychologically a
+  different object than a row in a list — social accountability is one of
+  the few forces that reliably beats inbox apathy, and it gives the
+  "waiting on others" view its teeth: what I see as *waiting quietly* on my
+  board is, symmetrically, *me on someone else's blocking line*. Derivable
+  today from the proposer on the entry; gets sharper when routing can name
+  the awaited member.
 - **Agents are members with attention too.** An agent blocked on a pending
   gate is the canonical highest-urgency item on the *human's* board — and
   symmetrically, the surface can show what each agent is currently waiting
