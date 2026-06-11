@@ -249,6 +249,10 @@ pub struct AddMemberRequest {
 pub struct ViewRequest {
     /// Channel name or id.
     pub channel: String,
+    /// True for the full transcript (every entry in canonical order); the
+    /// default is the scaled brief — state, not history.
+    #[serde(default)]
+    pub full: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -703,7 +707,7 @@ impl JuntoMcp {
     }
 
     #[tool(
-        description = "Project a channel's ledger: every entry in canonical order with derived standings (assertions) and gate statuses (proposals), rendered as markdown. Entry ids shown here are the targets for ratify/park/correct/approve/reject."
+        description = "Project a channel's ledger as markdown. Default: the scaled brief — state, not history (open items with full ids, standing decisions tiered newest-first, verification acts folded into their targets). Pass full=true for the complete transcript: every entry in canonical order, including parked dead-ends and superseded bodies — consult it before re-trying old territory or overturning a settled decision. Entry ids are the targets for ratify/park/correct/approve/reject."
     )]
     async fn view_channel(
         &self,
@@ -717,7 +721,12 @@ impl JuntoMcp {
             .await
             .map_err(internal)?;
         let name = view.name.clone().unwrap_or_else(|| req.channel.clone());
-        Ok(text(render::brief_markdown(&name, &channel, &view)))
+        let rendered = if req.full {
+            render::transcript_markdown(&name, &channel, &view)
+        } else {
+            render::brief_markdown(&name, &channel, &view)
+        };
+        Ok(text(rendered))
     }
 
     #[tool(
@@ -903,6 +912,7 @@ mod tests {
         let view = mcp
             .view_channel(Parameters(ViewRequest {
                 channel: "junto-dev".into(),
+                full: true,
             }))
             .await
             .unwrap();
@@ -963,9 +973,12 @@ mod tests {
             .to_string();
 
         let rendered = text_of(
-            &mcp.view_channel(Parameters(ViewRequest { channel: id }))
-                .await
-                .unwrap(),
+            &mcp.view_channel(Parameters(ViewRequest {
+                channel: id,
+                full: true,
+            }))
+            .await
+            .unwrap(),
         );
         assert!(rendered.contains("junto-dev"), "genesis names the channel");
     }
@@ -986,6 +999,7 @@ mod tests {
         let err = mcp
             .view_channel(Parameters(ViewRequest {
                 channel: "dev".into(),
+                full: true,
             }))
             .await
             .unwrap_err();
@@ -1062,6 +1076,7 @@ mod tests {
         let rendered = text_of(
             &mcp.view_channel(Parameters(ViewRequest {
                 channel: "junto-dev".into(),
+                full: true,
             }))
             .await
             .unwrap(),
@@ -1092,6 +1107,7 @@ mod tests {
         let pending = text_of(
             &mcp.view_channel(Parameters(ViewRequest {
                 channel: "junto-dev".into(),
+                full: true,
             }))
             .await
             .unwrap(),
@@ -1111,6 +1127,7 @@ mod tests {
         let approved = text_of(
             &mcp.view_channel(Parameters(ViewRequest {
                 channel: "junto-dev".into(),
+                full: true,
             }))
             .await
             .unwrap(),
@@ -1138,6 +1155,7 @@ mod tests {
         let beta = text_of(
             &mcp.view_channel(Parameters(ViewRequest {
                 channel: "beta".into(),
+                full: true,
             }))
             .await
             .unwrap(),
@@ -1315,6 +1333,7 @@ mod tests {
         let rendered = text_of(
             &mcp.view_channel(Parameters(ViewRequest {
                 channel: "junto-dev".into(),
+                full: true,
             }))
             .await
             .unwrap(),
@@ -1356,6 +1375,7 @@ mod tests {
         let rendered = text_of(
             &mcp.view_channel(Parameters(ViewRequest {
                 channel: "junto-dev".into(),
+                full: true,
             }))
             .await
             .unwrap(),
@@ -1468,6 +1488,7 @@ mod tests {
         let rendered = text_of(
             &mcp.view_channel(Parameters(ViewRequest {
                 channel: "junto-dev".into(),
+                full: true,
             }))
             .await
             .unwrap(),
