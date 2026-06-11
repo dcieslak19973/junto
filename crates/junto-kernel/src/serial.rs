@@ -92,6 +92,7 @@ mod tests {
             statement: "the sky is blue".into(),
             rationale: "observed at noon".into(),
             provenance: vec![provenance_with_digest()],
+            frame: None,
         }));
         // Assertion with a digest-less provenance ref (exercises the omitted field).
         assert_round_trips(&entry(EntryPayload::Assertion {
@@ -100,6 +101,28 @@ mod tests {
             provenance: vec![ProvenanceRef::new(
                 Uri::new("file://notes.md").expect("uri"),
             )],
+            frame: None,
+        }));
+        // Assertion carrying a decision frame (docs/adr/0019) — the frame
+        // round-trips, unchosen options included.
+        assert_round_trips(&entry(EntryPayload::Assertion {
+            statement: "the fix holds".into(),
+            rationale: "tests pass".into(),
+            provenance: vec![],
+            frame: Some(crate::DecisionFrame {
+                options: vec![
+                    crate::FrameOption {
+                        label: "verified".into(),
+                        act: crate::FrameAct::Ratify,
+                        rationale: "CI green and reviewed".into(),
+                    },
+                    crate::FrameOption {
+                        label: "not convinced".into(),
+                        act: crate::FrameAct::Park,
+                        rationale: "evidence insufficient".into(),
+                    },
+                ],
+            }),
         }));
         assert_round_trips(&entry(EntryPayload::Ratification {
             target,
@@ -127,6 +150,7 @@ mod tests {
                 action: "merge PR #1".into(),
                 rationale: "ready".into(),
                 provenance: vec![provenance_with_digest()],
+                frame: None,
                 requirement,
             }));
         }
@@ -141,11 +165,27 @@ mod tests {
     }
 
     #[test]
+    fn absent_frame_leaves_canonical_bytes_unchanged() {
+        // docs/adr/0019: the frame field is omitted entirely when absent, so
+        // every pre-frame entry's canonical bytes — and thus dedup, ordering,
+        // and any future content addressing — are untouched.
+        let e = entry(EntryPayload::Assertion {
+            statement: "no frame".into(),
+            rationale: "plain".into(),
+            provenance: vec![],
+            frame: None,
+        });
+        let json = String::from_utf8(e.to_canonical_bytes().expect("serialize")).expect("utf8");
+        assert!(!json.contains("\"frame\""), "{json}");
+    }
+
+    #[test]
     fn serialization_is_deterministic() {
         let e = entry(EntryPayload::Assertion {
             statement: "stable".into(),
             rationale: "twice".into(),
             provenance: vec![provenance_with_digest()],
+            frame: None,
         });
         assert_eq!(
             e.to_canonical_bytes().expect("first"),
@@ -159,6 +199,7 @@ mod tests {
             statement: "x".into(),
             rationale: "y".into(),
             provenance: vec![],
+            frame: None,
         });
         let json = String::from_utf8(e.to_canonical_bytes().expect("serialize")).expect("utf8");
         // JCS sorts object keys; the envelope keys must appear alphabetically,
@@ -179,6 +220,7 @@ mod tests {
             statement: "multi".into(),
             rationale: "line one\r\nline two".into(),
             provenance: vec![],
+            frame: None,
         });
         let bytes = e.to_canonical_bytes().expect("serialize");
         assert!(

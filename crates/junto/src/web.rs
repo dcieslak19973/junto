@@ -400,6 +400,7 @@ mod tests {
             statement: "claim".into(),
             rationale: "because".into(),
             provenance: vec![],
+            frame: None,
         }
     }
 
@@ -408,6 +409,7 @@ mod tests {
             action: "merge it".into(),
             rationale: "ready".into(),
             provenance: vec![],
+            frame: None,
             requirement: ApprovalRequirement::Count(1),
         }
     }

@@ -136,10 +136,13 @@ fn write_convention(repo: &Path, channel: &str) -> Result<()> {
          re-try a **parked** dead-end without surfacing it to your operator first. After a \
          consequential decision, `record` it via the junto MCP tools with real rationale and \
          provenance (PR/issue links, file paths); propose consequential *actions* through a \
-         gate (`propose`) for a human to approve. Author as **yourself** (your own name/email, \
-         kind agent), never as your operator, and pass your member code — the brief's last \
-         line — as `code` on every write. Sync with `sync_channel` (remote `origin`) after \
-         recording.\n"
+         gate (`propose`) for a human to approve. **Frame the verifier's decision**: pass \
+         `frame` (2–4 options, each with a `label`, an `act`, and a drafted `rationale`) so \
+         the verifier chooses between articulated positions instead of facing a blank box — \
+         the full frame is recorded, unchosen options included. Author as **yourself** (your \
+         own name/email, kind agent), never as your operator, and pass your member code — \
+         the brief's last line — as `code` on every write. Sync with `sync_channel` (remote \
+         `origin`) after recording.\n"
     );
     std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
     println!("wrote the consult/record convention ({CONVENTION_FILE})");

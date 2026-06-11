@@ -36,6 +36,42 @@ pub struct LedgerEntry {
     pub payload: EntryPayload,
 }
 
+/// Which verification act choosing a [`FrameOption`] performs
+/// (`docs/adr/0019`). Which acts are *coherent* for an entry kind —
+/// ratify/park on assertions, approve/reject on proposals — is a write-
+/// surface concern; the kernel stores what it is given (`docs/adr/0004`'s
+/// spirit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FrameAct {
+    Ratify,
+    Park,
+    Approve,
+    Reject,
+}
+
+/// One articulated position in a [`DecisionFrame`]: choosing it performs
+/// `act` with `rationale` as the (editable) draft.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameOption {
+    /// The choice as the verifier reads it, e.g. "ship it".
+    pub label: String,
+    /// The verification act this option performs.
+    pub act: FrameAct,
+    /// The drafted rationale the verifier adopts by choosing (and may edit).
+    pub rationale: String,
+}
+
+/// A decision frame (`docs/adr/0019`): the proposer articulates the
+/// verifier's decision space. Durable **including the options not chosen** —
+/// alternatives-considered as structure, the richer shape `docs/adr/0003`
+/// anticipated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionFrame {
+    /// The articulated positions, 2–4 by convention (enforced at the write
+    /// surfaces, not here).
+    pub options: Vec<FrameOption>,
+}
+
 /// The closed set of entry kinds (`docs/adr/0003`).
 ///
 /// An [`Assertion`](EntryPayload::Assertion) is an original claim/decision/
@@ -68,7 +104,7 @@ pub enum EntryPayload {
         member: Member,
     },
     /// An original claim, decision, or finding. Alternatives considered live in
-    /// `rationale` until a second Playbook proves a richer shape (`docs/adr/0003`).
+    /// `rationale` — or, structurally, in the optional `frame` (`docs/adr/0019`).
     Assertion {
         /// The claim itself.
         statement: String,
@@ -76,6 +112,11 @@ pub enum EntryPayload {
         rationale: String,
         /// Evidence backing the claim (`docs/adr/0005`).
         provenance: Vec<ProvenanceRef>,
+        /// The proposer's articulation of the verifier's choices
+        /// (`docs/adr/0019`). Omitted from the canonical bytes when absent,
+        /// so every pre-frame entry's bytes are unchanged.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        frame: Option<DecisionFrame>,
     },
     /// Accepts a prior entry: moves its standing to ratified.
     Ratification {
@@ -124,6 +165,10 @@ pub enum EntryPayload {
         /// What the gate requires before approval — recorded here so the gate
         /// is auditable from the log alone.
         requirement: ApprovalRequirement,
+        /// The proposer's articulation of the approver's choices
+        /// (`docs/adr/0019`). Omitted from the canonical bytes when absent.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        frame: Option<DecisionFrame>,
     },
     /// Approves a [`Proposal`](EntryPayload::Proposal). Distinct from
     /// [`Ratification`](EntryPayload::Ratification): approve/reject pass-or-block

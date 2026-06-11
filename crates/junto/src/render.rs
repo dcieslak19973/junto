@@ -72,10 +72,13 @@ fn describe_markdown(entry: &LedgerEntry, view: &ChannelView) -> String {
         EntryPayload::MemberAdded { member } => {
             format!("**member added** — {}", member_label(member))
         }
-        EntryPayload::Assertion { statement, .. } => {
+        EntryPayload::Assertion {
+            statement, frame, ..
+        } => {
             format!(
-                "**assertion** [{}] — {statement}",
-                standing_label(view, entry)
+                "**assertion** [{}] — {statement}{}",
+                standing_label(view, entry),
+                frame_markdown(frame.as_ref())
             )
         }
         EntryPayload::Ratification { target, .. } => format!("ratification of `{target}`"),
@@ -83,11 +86,39 @@ fn describe_markdown(entry: &LedgerEntry, view: &ChannelView) -> String {
         EntryPayload::Correction {
             target, statement, ..
         } => format!("correction of `{target}` — {statement}"),
-        EntryPayload::Proposal { action, .. } => {
-            format!("**proposal** [{}] — {action}", gate_label(view, entry))
+        EntryPayload::Proposal { action, frame, .. } => {
+            format!(
+                "**proposal** [{}] — {action}{}",
+                gate_label(view, entry),
+                frame_markdown(frame.as_ref())
+            )
         }
         EntryPayload::Approval { target, .. } => format!("approval of `{target}`"),
         EntryPayload::Rejection { target, .. } => format!("rejection of `{target}`"),
+    }
+}
+
+/// A decision frame on one brief line, so agent verifiers see the options
+/// too (`docs/adr/0019`).
+fn frame_markdown(frame: Option<&junto_kernel::DecisionFrame>) -> String {
+    let Some(frame) = frame else {
+        return String::new();
+    };
+    let options: Vec<String> = frame
+        .options
+        .iter()
+        .map(|option| format!("\"{}\"→{}", option.label, frame_act_route(option.act)))
+        .collect();
+    format!(" [options: {}]", options.join(" · "))
+}
+
+/// The act route segment a [`junto_kernel::FrameAct`] maps to.
+fn frame_act_route(act: junto_kernel::FrameAct) -> &'static str {
+    match act {
+        junto_kernel::FrameAct::Ratify => "ratify",
+        junto_kernel::FrameAct::Park => "park",
+        junto_kernel::FrameAct::Approve => "approve",
+        junto_kernel::FrameAct::Reject => "reject",
     }
 }
 
@@ -380,7 +411,7 @@ fn attention_item(item: &crate::host::AttentionItem, channel: &ChannelId, back: 
         when = escape_html(&iso_utc(entry.timestamp.as_millis())),
         text = escape_html(&text),
         why = escape_html(&rationale),
-        form = act_form(entry.id, channel, accept, decline, back),
+        form = act_forms_with_frame(entry, channel, accept, decline, back),
     )
 }
 
@@ -476,6 +507,7 @@ fn entry_card(entry: &LedgerEntry, view: &ChannelView, channel: &ChannelId) -> S
             statement,
             rationale,
             provenance,
+            ..
         } => (
             "assertion",
             Some(standing_label(view, entry)),
@@ -631,13 +663,60 @@ fn verification_form(entry: &LedgerEntry, view: &ChannelView, channel: &ChannelI
     let Some((accept, decline)) = acts else {
         return String::new();
     };
-    act_form(
-        entry.id,
+    act_forms_with_frame(
+        entry,
         channel,
         accept,
         decline,
         &format!("/channels/{channel}"),
     )
+}
+
+/// The act forms for one pending/provisional entry: the decision frame's
+/// one-click options first (each with its drafted, editable rationale —
+/// `docs/adr/0019`), then the plain free-text form.
+fn act_forms_with_frame(
+    entry: &LedgerEntry,
+    channel: &ChannelId,
+    accept: &str,
+    decline: &str,
+    back: &str,
+) -> String {
+    let frame = match &entry.payload {
+        EntryPayload::Assertion { frame, .. } | EntryPayload::Proposal { frame, .. } => {
+            frame.as_ref()
+        }
+        _ => None,
+    };
+    let mut out = String::new();
+    if let Some(frame) = frame {
+        for option in &frame.options {
+            let route = frame_act_route(option.act);
+            // Render only options coherent with this entry's pending acts —
+            // incoherent frames are refused at record time, but synced
+            // entries are trusted no further than rendering.
+            if route != accept && route != decline {
+                continue;
+            }
+            let _ = write!(
+                out,
+                "<form class=\"act option\" method=\"post\" \
+                 action=\"/channels/{channel}/entries/{entry_id}/{route}\">\
+                 <input type=\"hidden\" name=\"back\" value=\"{back}\">\
+                 <button class=\"primary\">{label}</button>\
+                 <input name=\"rationale\" value=\"{draft}\" required \
+                 title=\"the drafted rationale — edit before choosing if it isn't quite yours\">\
+                 <input name=\"code\" class=\"code\" placeholder=\"member code\">\
+                 </form>",
+                entry_id = entry.id,
+                back = escape_html(back),
+                label = escape_html(&option.label),
+                draft = escape_html(&option.rationale),
+            );
+        }
+    }
+    out.push_str(&act_form(entry.id, channel, accept, decline, back));
+    out
 }
 
 /// The act form itself: one rationale input feeding whichever button is
@@ -767,7 +846,10 @@ form.act button{background:var(--panel);color:var(--soft);border:1px solid var(-
 border-radius:.45rem;padding:.32rem .85rem;font-size:.84rem;cursor:pointer}\
 form.act button:hover{color:var(--text);border-color:var(--accent)}\
 form.act button.primary{background:rgba(137,180,250,.15);color:var(--accent);\
-border-color:rgba(137,180,250,.4)}";
+border-color:rgba(137,180,250,.4)}\
+form.act.option{border-top:0;padding-top:0;margin-top:.45rem}\
+form.act.option button.primary{flex:none;min-width:7rem}\
+form.act.option input[name=rationale]{color:var(--soft);font-style:italic}";
 
 /// Minimal HTML escaping for text interpolated into the page.
 fn escape_html(text: &str) -> String {
@@ -840,6 +922,7 @@ mod tests {
                 statement: statement.into(),
                 rationale: "r".into(),
                 provenance: vec![],
+                frame: None,
             },
         }
     }
@@ -878,6 +961,7 @@ mod tests {
                 provenance: vec![junto_kernel::ProvenanceRef::new(
                     junto_kernel::Uri::new("https://example.com/pr/1").expect("uri"),
                 )],
+                frame: None,
             },
         };
         let view = view_with(vec![entry]);
@@ -903,6 +987,48 @@ mod tests {
         let id = ChannelId::new();
         assert!(brief_markdown("empty", &id, &view).contains("(no entries)"));
         assert!(channel_html(&[], "empty", &id, &view).contains("(no entries)"));
+    }
+
+    #[test]
+    fn framed_entries_render_one_click_options() {
+        // docs/adr/0019: a decision frame becomes one-click acts with the
+        // drafted rationale editable in place; the free-text form remains.
+        let entry = LedgerEntry {
+            id: EntryId::new(),
+            channel: ChannelId::new(),
+            author: Member::agent("Bot", "bot@example.com"),
+            timestamp: Timestamp::from_millis(1_781_046_734_154),
+            payload: EntryPayload::Assertion {
+                statement: "the fix holds".into(),
+                rationale: "tests pass".into(),
+                provenance: vec![],
+                frame: Some(junto_kernel::DecisionFrame {
+                    options: vec![
+                        junto_kernel::FrameOption {
+                            label: "verified".into(),
+                            act: junto_kernel::FrameAct::Ratify,
+                            rationale: "CI green and reviewed".into(),
+                        },
+                        junto_kernel::FrameOption {
+                            label: "not convinced".into(),
+                            act: junto_kernel::FrameAct::Park,
+                            rationale: "evidence insufficient".into(),
+                        },
+                    ],
+                }),
+            },
+        };
+        let id = entry.id;
+        let channel = entry.channel;
+        let view = view_with(vec![entry]);
+        let html = channel_html(&[], "test", &channel, &view);
+        assert!(html.contains(">verified</button>"), "{html}");
+        assert!(html.contains("value=\"CI green and reviewed\""));
+        assert!(html.contains(&format!("/channels/{channel}/entries/{id}/park")));
+        assert!(
+            html.contains("placeholder=\"why — a rationale, not a checkbox\""),
+            "free-text form remains"
+        );
     }
 
     #[test]
