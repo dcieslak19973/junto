@@ -202,10 +202,36 @@ kinds, decided when concrete):
   parked;
 - the focus board nests side-quests under their parent (shallow tree).
 
+### ⚠️ Convergence — channels form a DAG (Dan, 2026-06-10)
+
+Fork has a dual: **two channels may converge**. Entries are immutable
+canonical bytes *including their channel id* (`adr/0002`/`adr/0008`), so
+histories can never literally merge — convergence is therefore a **recorded
+act, not a mutation** (a merge commit, never a rebase): either channel B
+closes *into* A (a closing entry in B, a receiving entry in A, provenance
+both ways), or both close into a new channel whose genesis names two
+predecessors. Nothing moves on the substrate.
+
+- Fork and converge are edges of one **channel lineage DAG**; side-quests
+  (fork then merge back to parent) and independent convergence are the same
+  algebra. The brief-inheritance question is thereby *one* mechanism —
+  recall follows lineage edges with summarization — not two.
+- Convergence **retires WIP** (two boards become one) but forces a ceremony
+  with real content: the converging channel's pending gates cannot dangle in
+  a closed channel — each must be resolved, explicitly re-proposed into the
+  continuation (with provenance), or explicitly abandoned. Honest disposal
+  of open questions, forced at exactly the right moment.
+- **Naming**: "join" is taken — `domain-model.md` uses join/invite for Party
+  membership. The channel act is **converge** (not "merge", which drags git
+  baggage about histories combining — precisely what does not happen).
+- When designed, `adr/0016`'s lifecycle family likely grows as one algebra:
+  forked / closed / converged.
+
 ⚠️ Open when forking is designed: does the child inherit the parent's Party
 at fork time (likely: yes, forker = founder)? Does a checkout bound to the
 parent get briefs for open side-quests? Are closed side-quests shown
-anywhere by default?
+anywhere by default? Who founds a convergence's continuation channel, and is
+its Party the union of its predecessors'?
 
 ## Prior art (assessed 2026-06-10)
 
