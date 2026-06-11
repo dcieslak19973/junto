@@ -203,14 +203,28 @@ async fn verify(
         Ok(view) => view,
         Err(err) => return internal(format!("projection failed: {err}")),
     };
+    // The rationale is cloned into the payload: the original is still needed
+    // for the retry page if the member-code check refuses the act below.
     let payload = match act.as_str() {
         "ratify" | "park" if view.standing(&target).is_some() => match act.as_str() {
-            "ratify" => EntryPayload::Ratification { target, rationale },
-            _ => EntryPayload::Park { target, rationale },
+            "ratify" => EntryPayload::Ratification {
+                target,
+                rationale: rationale.clone(),
+            },
+            _ => EntryPayload::Park {
+                target,
+                rationale: rationale.clone(),
+            },
         },
         "approve" | "reject" if view.gate_status(&target).is_some() => match act.as_str() {
-            "approve" => EntryPayload::Approval { target, rationale },
-            _ => EntryPayload::Rejection { target, rationale },
+            "approve" => EntryPayload::Approval {
+                target,
+                rationale: rationale.clone(),
+            },
+            _ => EntryPayload::Rejection {
+                target,
+                rationale: rationale.clone(),
+            },
         },
         "ratify" | "park" => {
             return (
@@ -254,7 +268,45 @@ async fn verify(
         Some(typed.clone())
     };
     if let Err(err) = host.authorize_write(&view, &author, code.as_deref()) {
-        return (StatusCode::FORBIDDEN, format!("{err:#}")).into_response();
+        // A code mishap must not cost the human their work: keep the typed
+        // rationale, explain the refusal in place, and ask only for the code.
+        // If the failing code came from the remember-cookie, the human typed
+        // nothing wrong — forget the stale cookie so retyping takes.
+        drop(guard); // inventory() re-locks the ledgers below
+        let cookie_was_stale = typed.is_empty() && remembered.is_some();
+        let subject = view
+            .entries
+            .iter()
+            .find(|e| e.id == target)
+            .and_then(|entry| match &entry.payload {
+                EntryPayload::Assertion { statement, .. } => Some(statement.clone()),
+                EntryPayload::Proposal { action, .. } => Some(action.clone()),
+                _ => None,
+            });
+        let mut nav = host.inventory().await.unwrap_or_default();
+        nav.sort_by_key(|summary| std::cmp::Reverse(summary.last_activity));
+        let back = safe_back(&form.back)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("/channels/{id}"));
+        let page = Html(render::act_retry_html(
+            &nav,
+            &render::ActRetry {
+                channel: &id,
+                name: view.name.as_deref().unwrap_or(&channel),
+                entry: target,
+                act: &act,
+                rationale: &rationale,
+                back: &back,
+                message: &format!("{err:#}"),
+                subject: subject.as_deref(),
+                cookie_forgotten: cookie_was_stale,
+            },
+        ));
+        if cookie_was_stale {
+            let clear = format!("{CODE_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
+            return (StatusCode::FORBIDDEN, [(header::SET_COOKIE, clear)], page).into_response();
+        }
+        return (StatusCode::FORBIDDEN, page).into_response();
     }
 
     let entry = LedgerEntry {
@@ -678,21 +730,44 @@ mod tests {
         assert!(synced, "auto-sync pushed {expected} to origin");
     }
 
+    /// The response body as text, for asserting on rendered pages.
+    async fn body_text(response: Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        String::from_utf8(bytes.to_vec()).expect("utf-8 body")
+    }
+
     #[tokio::test]
     async fn wrong_or_missing_member_codes_are_forbidden() {
         // The guardrail of docs/adr/0017 on the web surface: the git-user
-        // author must present their member code.
+        // author must present their member code. The refusal is a retry page
+        // that keeps the typed rationale — a wrong code costs one retyped
+        // code, never a retyped why.
         let fx = host_with_entry(assertion()).await;
         let response = post_act(
             fx.host.clone(),
             "web-test".into(),
             fx.target.to_string(),
             "ratify",
-            "r",
+            "checked the diff carefully",
             "WRONG0",
         )
         .await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let page = body_text(response).await;
+        assert!(
+            page.contains("checked the diff carefully"),
+            "the typed rationale survives the refusal"
+        );
+        assert!(
+            page.contains(&format!("/entries/{}/ratify", fx.target)),
+            "the page re-offers the same act"
+        );
+        assert!(
+            page.contains("web@example.com"),
+            "the refusal names whose code is expected"
+        );
 
         let response = post_act(
             fx.host.clone(),
@@ -716,6 +791,35 @@ mod tests {
             view.standing(&fx.target),
             Some(Standing::Provisional)
         ));
+    }
+
+    #[tokio::test]
+    async fn stale_remembered_code_is_forgotten() {
+        // A wrong code that came from the remember-cookie is the cookie's
+        // fault, not the human's: the refusal clears the cookie and says so,
+        // so the next typed code actually takes.
+        let fx = host_with_entry(assertion()).await;
+        let response = post_act_with(
+            fx.host.clone(),
+            "web-test".into(),
+            fx.target.to_string(),
+            "ratify",
+            "checked",
+            "", // nothing typed —
+            "/",
+            Some("STALE0"), // — the cookie supplied the (wrong) code
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let clear = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .expect("clearing cookie set")
+            .to_string();
+        assert!(clear.contains("Max-Age=0"), "cookie cleared: {clear}");
+        let page = body_text(response).await;
+        assert!(page.contains("forgotten"), "the page explains the clearing");
     }
 
     #[test]
