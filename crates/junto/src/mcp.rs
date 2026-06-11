@@ -222,8 +222,10 @@ pub struct ProposeRequest {
     pub rationale: String,
     /// Evidence backing the proposal.
     pub provenance: Option<Vec<ProvenanceParam>>,
-    /// Require this many distinct approvers. Omit (with `require_all_of`
-    /// also omitted) for an auto-approved gate.
+    /// Require this many distinct approvers. Omitted (with `require_all_of`
+    /// also omitted) defaults to **1** — a human gate is the path of least
+    /// resistance (finding 8bd55552). Pass an explicit 0 for an
+    /// auto-approved gate.
     pub require_count: Option<u32>,
     /// Require every one of these members to approve. Mutually exclusive
     /// with `require_count`.
@@ -633,7 +635,7 @@ impl JuntoMcp {
     }
 
     #[tool(
-        description = "Propose a consequential action for a Gate. The gate's requirement is recorded on the proposal: omit both `require_count` and `require_all_of` for auto-approval, or require N distinct approvers / a specific set of members. Approvals accumulate; one rejection blocks (sticky)."
+        description = "Propose a consequential action for a Gate. The gate's requirement is recorded on the proposal: omitted, it defaults to one approver (a human gate); pass require_count 0 to ask explicitly for an auto-approved gate, N for N distinct approvers, or require_all_of for a specific set of members. Approvals accumulate; one rejection blocks (sticky)."
     )]
     async fn propose(
         &self,
@@ -644,7 +646,11 @@ impl JuntoMcp {
         self.authorize(&ledger, &channel, &author, req.code.as_deref())
             .await?;
         let requirement = match (req.require_count, req.require_all_of) {
-            (None, None) => ApprovalRequirement::Auto,
+            // The omitted requirement is a human gate, not a self-opening
+            // one: auto-approval must be asked for explicitly (finding
+            // 8bd55552 — a gate intended for a human silently auto-approved).
+            (None, None) => ApprovalRequirement::Count(1),
+            (Some(0), None) => ApprovalRequirement::Auto,
             (Some(n), None) => ApprovalRequirement::Count(n),
             (None, Some(members)) => {
                 ApprovalRequirement::AllOf(members.into_iter().map(Member::from).collect())
@@ -1203,6 +1209,56 @@ mod tests {
             .unwrap(),
         );
         assert!(miss.contains("none of the 1 dead-ends resemble"), "{miss}");
+    }
+
+    #[tokio::test]
+    async fn omitted_requirement_is_a_human_gate_and_auto_is_explicit() {
+        // Finding 8bd55552: an omitted requirement must not self-approve.
+        let (dirs, mcp) = init_repo();
+        open(&mcp, &dirs, "junto-dev").await;
+        let propose = async |count: Option<u32>| {
+            let proposed = mcp
+                .propose(Parameters(ProposeRequest {
+                    channel: "junto-dev".into(),
+                    author: claude(),
+                    code: code_of(&dirs, claude()),
+                    action: format!("action with require_count {count:?}"),
+                    rationale: "r".into(),
+                    frame: None,
+                    provenance: None,
+                    require_count: count,
+                    require_all_of: None,
+                }))
+                .await
+                .unwrap();
+            recorded_id(&proposed)
+        };
+        let defaulted = propose(None).await;
+        let auto = propose(Some(0)).await;
+
+        let rendered = text_of(
+            &mcp.view_channel(Parameters(ViewRequest {
+                channel: "junto-dev".into(),
+                full: true,
+            }))
+            .await
+            .unwrap(),
+        );
+        let line_of = |id: &str| {
+            rendered
+                .lines()
+                .find(|l| l.contains(id))
+                .unwrap()
+                .to_string()
+        };
+        assert!(
+            line_of(&defaulted).contains("[pending]"),
+            "omitted requirement waits for a human: {rendered}"
+        );
+        assert!(
+            line_of(&auto).contains("[approved]"),
+            "require_count 0 is the explicit auto gate: {rendered}"
+        );
     }
 
     #[tokio::test]
