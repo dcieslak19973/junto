@@ -313,11 +313,38 @@ fn recent_line(entry: &LedgerEntry) -> String {
     }
 }
 
+/// The most dead-ends one `dead_ends` call returns — the output is bounded
+/// no matter how much history accumulates (🔵).
+const DEAD_ENDS_LIMIT: usize = 5;
+
+/// Lowercased word tokens for the dead-end similarity ranking: alphanumeric
+/// runs of 3+ chars (shorter ones are mostly stopword noise).
+fn tokens(text: &str) -> std::collections::HashSet<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| word.len() >= 3)
+        .map(str::to_string)
+        .collect()
+}
+
+/// One dead-end (a parked assertion or rejected proposal) plus its killing
+/// act, gathered for ranking.
+struct DeadEnd<'a> {
+    entry: &'a LedgerEntry,
+    label: &'static str,
+    text: &'a str,
+    kill: Option<(&'a LedgerEntry, &'a str)>,
+}
+
 /// The on-demand dead-end surface — the counterpart of the scaled brief's
 /// deliberate omission (Dan, 2026-06-11: a dead-end belongs in recall when
-/// its path starts coming back from the dead). Every parked assertion and
-/// rejected proposal, with who killed it and why; `about` filters by
-/// case-insensitive substring for territory checks.
+/// its path starts coming back from the dead). With `about`, a **similarity
+/// search**: dead-ends ranked by token overlap with the query, rare words
+/// weighing more (IDF) — lexical, local, deterministic; an embedding-based
+/// `MemoryProvider` is the designed upgrade path (`docs/pluggability.md`).
+/// Without `about`, the most recent dead-ends. Either way the output is
+/// bounded at [`DEAD_ENDS_LIMIT`] — recall surfaces must not grow with the
+/// record.
 pub fn dead_ends_markdown(name: &str, view: &ChannelView, about: Option<&str>) -> String {
     // The killing act's rationale is the value here: collect them verbatim.
     let mut kills: std::collections::HashMap<EntryId, (&LedgerEntry, &str)> = Default::default();
@@ -331,67 +358,125 @@ pub fn dead_ends_markdown(name: &str, view: &ChannelView, about: Option<&str>) -
         }
     }
 
-    let needle = about.map(str::to_lowercase);
+    let dead_ends: Vec<DeadEnd> = view
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            let (label, text) = match &entry.payload {
+                EntryPayload::Assertion { statement, .. }
+                    if view.standing(&entry.id) == Some(Standing::Parked) =>
+                {
+                    ("parked", statement.as_str())
+                }
+                EntryPayload::Proposal { action, .. }
+                    if view.gate_status(&entry.id) == Some(GateStatus::Rejected) =>
+                {
+                    ("rejected", action.as_str())
+                }
+                _ => return None,
+            };
+            Some(DeadEnd {
+                entry,
+                label,
+                text,
+                kill: kills.get(&entry.id).copied(),
+            })
+        })
+        .collect();
+
     let mut out = format!("# dead-ends in '{name}'\n\n");
-    let mut total = 0usize;
-    let mut shown = 0usize;
-    for entry in &view.entries {
-        let (label, text) = match &entry.payload {
-            EntryPayload::Assertion { statement, .. }
-                if view.standing(&entry.id) == Some(Standing::Parked) =>
-            {
-                ("parked", statement)
-            }
-            EntryPayload::Proposal { action, .. }
-                if view.gate_status(&entry.id) == Some(GateStatus::Rejected) =>
-            {
-                ("rejected", action)
-            }
-            _ => continue,
-        };
-        total += 1;
-        let kill = kills.get(&entry.id);
-        if let Some(needle) = &needle {
-            let haystack = format!(
-                "{text} {}",
-                kill.map(|(_, rationale)| *rationale).unwrap_or_default()
-            )
-            .to_lowercase();
-            if !haystack.contains(needle) {
-                continue;
-            }
+    let total = dead_ends.len();
+    if total == 0 {
+        out.push_str("(no dead-ends — nothing parked or rejected in this channel)\n");
+        return out;
+    }
+
+    // Each dead-end's searchable text: the claim plus why it was killed.
+    let docs: Vec<std::collections::HashSet<String>> = dead_ends
+        .iter()
+        .map(|dead_end| {
+            tokens(&format!(
+                "{} {}",
+                dead_end.text,
+                dead_end.kill.map(|(_, why)| why).unwrap_or_default()
+            ))
+        })
+        .collect();
+
+    let ranked: Vec<&DeadEnd> = match about.map(tokens) {
+        Some(query) if !query.is_empty() => {
+            // IDF-weighted token overlap, normalized against doc length so
+            // long dead-ends don't win by surface area. Crude next to
+            // embeddings, but local, deterministic, and dependency-free.
+            let idf = |token: &str| {
+                let with = docs.iter().filter(|doc| doc.contains(token)).count();
+                ((1.0 + total as f64) / (1.0 + with as f64)).ln() + 1.0
+            };
+            let mut scored: Vec<(f64, &DeadEnd)> = dead_ends
+                .iter()
+                .zip(&docs)
+                .filter_map(|(dead_end, doc)| {
+                    let score: f64 = query
+                        .iter()
+                        .filter(|token| doc.contains(*token))
+                        .map(|token| idf(token))
+                        .sum();
+                    (score > 0.0).then(|| (score / (doc.len() as f64).sqrt(), dead_end))
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+            scored
+                .into_iter()
+                .take(DEAD_ENDS_LIMIT)
+                .map(|(_, dead_end)| dead_end)
+                .collect()
         }
-        shown += 1;
+        // No query: the most recent dead-ends (entries are in canonical,
+        // oldest-first order).
+        _ => dead_ends.iter().rev().take(DEAD_ENDS_LIMIT).collect(),
+    };
+
+    if ranked.is_empty() {
         let _ = writeln!(
             out,
-            "- `{}` [{label}] {} <{}>: {text}",
-            entry.id, entry.author.display_name, entry.author.email
+            "(none of the {total} dead-ends resemble '{}' — the match is lexical, so try \
+             other words for the same idea before concluding the territory is untried)",
+            about.unwrap_or_default()
         );
-        if let Some((act, rationale)) = kill {
+        return out;
+    }
+
+    for dead_end in &ranked {
+        let _ = writeln!(
+            out,
+            "- `{}` [{}] {} <{}>: {}",
+            dead_end.entry.id,
+            dead_end.label,
+            dead_end.entry.author.display_name,
+            dead_end.entry.author.email,
+            dead_end.text
+        );
+        if let Some((act, rationale)) = dead_end.kill {
             let _ = writeln!(
                 out,
-                "  {label} by {} @{}: {rationale}",
+                "  {} by {} @{}: {rationale}",
+                dead_end.label,
                 act.author.display_name,
                 act.timestamp.as_millis()
             );
         }
     }
-    if total == 0 {
-        out.push_str("(no dead-ends — nothing parked or rejected in this channel)\n");
-    } else if shown == 0 {
-        let _ = writeln!(
-            out,
-            "(none of the {total} dead-ends match '{}' — but substring matching is crude: \
-             when in doubt, view the unfiltered list)",
-            about.unwrap_or_default()
-        );
+    let how = if about.is_some() {
+        "most similar first"
     } else {
-        let _ = writeln!(
-            out,
-            "\n({shown} of {total} dead-ends shown — do not re-try these without surfacing \
-             the prior park/rejection to the party)"
-        );
-    }
+        "most recent first"
+    };
+    let _ = writeln!(
+        out,
+        "\n({} of {total} dead-ends, {how} — do not re-try these without surfacing the \
+         prior park/rejection to the party)",
+        ranked.len()
+    );
     out
 }
 

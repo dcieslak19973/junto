@@ -20,8 +20,9 @@ demand through the `dead_ends` MCP tool.
 ## How
 
 Call `mcp__junto__dead_ends` with the channel (default here: `junto-dev`). Pass
-`about` with a keyword to filter, but the matching is a crude substring — when in
-doubt, read the unfiltered list.
+`about` describing the approach you're considering — dead-ends come back ranked by
+similarity, top few only. The match is lexical (token overlap), so if a first query
+misses, try other words for the same idea before concluding the territory is untried.
 
 ## What to do with a hit
 

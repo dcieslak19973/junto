@@ -259,8 +259,10 @@ pub struct ViewRequest {
 pub struct DeadEndsRequest {
     /// Channel name or id.
     pub channel: String,
-    /// Optional case-insensitive substring filter over statements and
-    /// park/rejection rationales — a crude territory check; omit to list all.
+    /// Describe the approach you are about to try; dead-ends are ranked by
+    /// lexical similarity against it (statements + park/rejection
+    /// rationales). Omit for the most recent dead-ends. Output is always
+    /// bounded to the top few.
     pub about: Option<String>,
 }
 
@@ -739,7 +741,7 @@ impl JuntoMcp {
     }
 
     #[tool(
-        description = "Surface a channel's dead-ends: parked assertions and rejected proposals, each with who killed it and why. The scaled brief deliberately omits these — call this BEFORE proposing or attempting an approach that may have been tried, especially when entering territory you did not work recently. Optional 'about' filters by substring (crude — when in doubt, read the unfiltered list). Do not re-try a listed dead-end without surfacing it to the party first."
+        description = "Surface a channel's dead-ends: parked assertions and rejected proposals, each with who killed it and why. The scaled brief deliberately omits these — call this BEFORE proposing or attempting an approach that may have been tried. Pass 'about' describing the approach: dead-ends come back ranked by similarity, top few only; omit it for the most recent. The match is lexical — try other words for the same idea before concluding territory is untried. Do not re-try a listed dead-end without surfacing it to the party first."
     )]
     async fn dead_ends(
         &self,
@@ -1179,26 +1181,97 @@ mod tests {
         );
         assert!(listed.contains(&id), "full id for acting on it: {listed}");
 
-        // The substring filter matches against statement and kill rationale;
+        // Similarity ranks against statement and kill rationale (the kill's
+        // words count: "missed updates" lives only in the park rationale);
         // a miss says so rather than rendering an empty page.
         let hit = text_of(
             &mcp.dead_ends(Parameters(DeadEndsRequest {
                 channel: "junto-dev".into(),
-                about: Some("POLLING".into()),
+                about: Some("sync via POLLING missed updates".into()),
             }))
             .await
             .unwrap(),
         );
         assert!(hit.contains("use polling for sync"), "{hit}");
+        assert!(hit.contains("most similar first"), "{hit}");
         let miss = text_of(
             &mcp.dead_ends(Parameters(DeadEndsRequest {
                 channel: "junto-dev".into(),
-                about: Some("kubernetes".into()),
+                about: Some("kubernetes operator".into()),
             }))
             .await
             .unwrap(),
         );
-        assert!(miss.contains("none of the 1 dead-ends match"), "{miss}");
+        assert!(miss.contains("none of the 1 dead-ends resemble"), "{miss}");
+    }
+
+    #[tokio::test]
+    async fn dead_ends_are_ranked_and_bounded() {
+        // Eight dead-ends; a query about websockets must put the websocket
+        // park first, and the output must stay within the top-5 bound no
+        // matter how the record grows.
+        let (dirs, mcp) = init_repo();
+        open(&mcp, &dirs, "junto-dev").await;
+        let park = async |statement: &str, why: &str| {
+            let recorded = mcp
+                .record(Parameters(RecordRequest {
+                    channel: "junto-dev".into(),
+                    author: claude(),
+                    code: code_of(&dirs, claude()),
+                    statement: statement.into(),
+                    rationale: "r".into(),
+                    provenance: None,
+                    frame: None,
+                }))
+                .await
+                .unwrap();
+            mcp.park(Parameters(ActRequest {
+                channel: "junto-dev".into(),
+                author: dan(),
+                code: code_of(&dirs, dan()),
+                target: recorded_id(&recorded),
+                rationale: why.into(),
+            }))
+            .await
+            .unwrap();
+        };
+        park(
+            "stream entries over websockets",
+            "websocket reconnect storms",
+        )
+        .await;
+        for i in 0..7 {
+            park(&format!("approach number {i}"), "did not pan out").await;
+        }
+
+        let ranked = text_of(
+            &mcp.dead_ends(Parameters(DeadEndsRequest {
+                channel: "junto-dev".into(),
+                about: Some("push updates with websockets".into()),
+            }))
+            .await
+            .unwrap(),
+        );
+        let first_item = ranked.lines().find(|l| l.starts_with("- ")).unwrap();
+        assert!(
+            first_item.contains("stream entries over websockets"),
+            "{ranked}"
+        );
+
+        let recent = text_of(
+            &mcp.dead_ends(Parameters(DeadEndsRequest {
+                channel: "junto-dev".into(),
+                about: None,
+            }))
+            .await
+            .unwrap(),
+        );
+        let items = recent.lines().filter(|l| l.starts_with("- ")).count();
+        assert_eq!(items, 5, "bounded without a query: {recent}");
+        assert!(
+            recent.contains("5 of 8 dead-ends, most recent first"),
+            "{recent}"
+        );
     }
 
     #[tokio::test]
