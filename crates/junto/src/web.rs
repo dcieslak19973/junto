@@ -101,7 +101,11 @@ async fn channel_page(State(host): State<Arc<Host>>, Path(channel): Path<String>
     match project(&host, &channel).await {
         Ok((id, view)) => {
             let name = view.name.clone().unwrap_or_else(|| channel.clone());
-            Html(render::channel_html(&name, &id, &view)).into_response()
+            // The sidebar: every channel, most recently active first —
+            // best-effort, an empty nav never blocks the page itself.
+            let mut nav = host.inventory().await.unwrap_or_default();
+            nav.sort_by_key(|summary| std::cmp::Reverse(summary.last_activity));
+            Html(render::channel_html(&nav, &name, &id, &view)).into_response()
         }
         Err(response) => response,
     }
@@ -605,7 +609,7 @@ mod tests {
             party: Vec::new(),
             unrecognized: Default::default(),
         };
-        let html = crate::render::channel_html("web-test", &channel, &view);
+        let html = crate::render::channel_html(&[], "web-test", &channel, &view);
         assert!(html.contains(&format!("/channels/{channel}/entries/{}/ratify", entry.id)));
         assert!(html.contains("name=\"rationale\""));
     }
