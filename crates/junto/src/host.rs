@@ -267,31 +267,21 @@ impl Host {
             .clone())
     }
 
-    /// Every channel across every served substrate, projected into summaries.
-    pub async fn inventory(&self) -> Result<Vec<ChannelSummary>> {
+    /// One projection sweep serving everything the index page needs: channel
+    /// summaries *and* the focus board's attention groups (`docs/attention.md`:
+    /// every act awaiting a member, grouped by inquiry — gate-bearing inquiries
+    /// first, recency within a tier; within a group gates before verifications,
+    /// oldest first). Projection is the expensive step (git reads per channel),
+    /// so the page must pay for it once, not once per concern.
+    pub async fn overview(&self) -> Result<(Vec<ChannelSummary>, Vec<AttentionGroup>)> {
         let mut summaries = Vec::new();
-        for repo in self.substrate_paths()? {
-            let ledger = self.ledger_for(&repo).await?;
-            let guard = ledger.lock().await;
-            for id in guard.substrate().channels().await? {
-                let view = guard.project(&id).await?;
-                summaries.push(summarize(&id, &view, &repo));
-            }
-        }
-        Ok(summaries)
-    }
-
-    /// The focus board's content (`docs/attention.md`): every act awaiting a
-    /// member, grouped by inquiry — channels with blocked proposers (pending
-    /// gates) first, then by recency of need. Within a group: gates before
-    /// verifications, oldest (longest-waiting) first.
-    pub async fn attention(&self) -> Result<Vec<AttentionGroup>> {
         let mut groups = Vec::new();
         for repo in self.substrate_paths()? {
             let ledger = self.ledger_for(&repo).await?;
             let guard = ledger.lock().await;
             for id in guard.substrate().channels().await? {
                 let view = guard.project(&id).await?;
+                summaries.push(summarize(&id, &view, &repo));
                 let group = attention_for_view(&id, &view);
                 if !group.items.is_empty() {
                     groups.push(group);
@@ -307,7 +297,12 @@ impl Host {
                 std::cmp::Reverse(latest),
             )
         });
-        Ok(groups)
+        Ok((summaries, groups))
+    }
+
+    /// Every channel across every served substrate, projected into summaries.
+    pub async fn inventory(&self) -> Result<Vec<ChannelSummary>> {
+        Ok(self.overview().await?.0)
     }
 
     /// Resolve a channel reference — a name bound by a genesis entry, or a raw

@@ -7,9 +7,11 @@
 //!   ids, states, full text.
 //! - [`index_html`] / [`channel_html`] — the **human** read path: the pages
 //!   the desktop shell frames (`docs/adr/0018`). Server-rendered with shared
-//!   app chrome (sidebar navigation, dark theme) and zero JS — `<details>`
-//!   carries the expand/collapse. Its information design is product surface
-//!   (`docs/adr/0013`), reviewed as such.
+//!   app chrome (sidebar navigation, dark theme) and almost no JS —
+//!   `<details>` carries the expand/collapse; the single inline script is
+//!   act feedback ([`ACT_FEEDBACK_SCRIPT`]), pure progressive enhancement.
+//!   Its information design is product surface (`docs/adr/0013`), reviewed
+//!   as such.
 
 use junto_kernel::{
     ChannelId, ChannelView, EntryPayload, GateStatus, LedgerEntry, Member, MemberKind,
@@ -187,7 +189,7 @@ fn page_shell(
          <div class=\"side-label\">channels</div>\n{links}\
          </nav>\n\
          <main>\n{content}</main>\n\
-         </div></body></html>\n",
+         </div>{ACT_FEEDBACK_SCRIPT}</body></html>\n",
         title = escape_html(title),
     )
 }
@@ -818,9 +820,23 @@ pub fn act_retry_html(nav: &[ChannelSummary], retry: &ActRetry<'_>) -> String {
     )
 }
 
+/// The one deliberate exception to the no-JS posture: a verification act is
+/// a POST whose round trip includes git writes and a projection, long enough
+/// that a silent button reads as a dead click. This inline script marks the
+/// pressed act button "recording…" and disables the form's buttons — pure
+/// progressive enhancement (the form submits identically without it), inline
+/// and offline like everything else on the page. The disabling is deferred a
+/// tick so it can never interfere with the browser collecting the form data.
+const ACT_FEEDBACK_SCRIPT: &str = "<script>document.addEventListener('submit',function(e)\
+{var f=e.target;if(!f.classList||!f.classList.contains('act'))return;\
+var b=e.submitter;setTimeout(function(){f.classList.add('busy');\
+f.querySelectorAll('button').forEach(function(x){x.disabled=true});\
+if(b){b.textContent='recording\\u2026'}},0)});</script>";
+
 /// The dark theme, keyed to the app icon palette (`docs/adr/0018`): one CSS
-/// blob, no JS, no external assets — the pages must render identically in
-/// the desktop shell's webview and a plain browser, offline.
+/// blob, no external assets — the pages must render identically in
+/// the desktop shell's webview and a plain browser, offline. (JS: a single
+/// inline act-feedback script, [`ACT_FEEDBACK_SCRIPT`] — nothing else.)
 const CSS: &str = "\
 :root{--bg:#11111b;--panel:#181825;--card:#1e1e2e;--border:#313244;--text:#cdd6f4;\
 --muted:#7f849c;--soft:#a6adc8;--accent:#89b4fa;--green:#a6e3a1;--yellow:#f9e2af;\
@@ -924,6 +940,8 @@ border-color:rgba(137,180,250,.4)}\
 form.act.option{border-top:0;padding-top:0;margin-top:.45rem}\
 form.act.option button.primary{flex:none;min-width:7rem}\
 form.act.option input[name=rationale]{color:var(--soft);font-style:italic}\
+form.act.busy{opacity:.65}\
+form.act button:disabled{cursor:wait}\
 .refusal{color:var(--red);font-size:.9rem;margin:.55rem 0 0;white-space:pre-wrap;\
 overflow-wrap:anywhere}\
 .hint{color:var(--muted);font-size:.82rem;margin:.55rem 0 0}\
