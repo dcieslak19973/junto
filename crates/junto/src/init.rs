@@ -137,9 +137,12 @@ fn write_convention(repo: &Path, channel: &str) -> Result<()> {
          consequential decision, `record` it via the junto MCP tools with real rationale and \
          provenance (PR/issue links, file paths); propose consequential *actions* through a \
          gate (`propose`) for a human to approve. **Frame the verifier's decision**: pass \
-         `frame` (2–4 options, each with a `label`, an `act`, and a drafted `rationale`) so \
-         the verifier chooses between articulated positions instead of facing a blank box — \
-         the full frame is recorded, unchosen options included. Author as **yourself** (your \
+         `frame` (2–4 options, each with a `label`, an `act`, and a drafted `rationale`). \
+         Options must be substantively different *positions about the claim* — tied to \
+         checkable evidence, not moods — and the decline option must be the **steelman**: \
+         the strongest concrete reason to park or reject, never a strawman. A frame whose \
+         decline option you would be embarrassed to choose is a biased frame. The full \
+         frame is recorded, unchosen options included. Author as **yourself** (your \
          own name/email, kind agent), never as your operator, and pass your member code — \
          the brief's last line — as `code` on every write. Sync with `sync_channel` (remote \
          `origin`) after recording.\n"

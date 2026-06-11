@@ -762,10 +762,12 @@ impl ServerHandler for JuntoMcp {
              operator — plus your member code as `code`: writes require membership in the \
              channel's Party and the matching machine-local code (your operator hands you \
              the code when minting you as a member; docs/adr/0017). When you record or \
-             propose, include a decision `frame` (2–4 options with drafted rationales) so \
-             the verifier chooses between articulated positions; the full frame is recorded, \
-             unchosen options included (docs/adr/0019). Verification targets accept \
-             unambiguous id prefixes (6+ chars)."
+             propose, include a decision `frame` (2–4 options with drafted rationales): \
+             options must be substantively different positions about the claim, tied to \
+             checkable evidence — and the decline option must be the steelman, the \
+             strongest concrete reason to park/reject, never a strawman. The full frame \
+             is recorded, unchosen options included (docs/adr/0019). Verification targets \
+             accept unambiguous id prefixes (6+ chars)."
                 .to_string(),
         );
         info
