@@ -98,6 +98,18 @@ costs and how a surface should respect it:
   and lets ordering do the nudging. Limits, if any, are personal and
   discovered (below), never hardcoded.
 
+⚠️ **Honest scope note on the citations** (from the 2026-06-10 adversarial
+review): Leroy's experiments use short lab tasks with forced mid-task
+switches, and the ~25-minute figure concerns resuming interrupted *deep
+work* — neither directly measures scanning a triage list, so group-by-
+inquiry is a design judgment these findings *support*, not one they prove.
+The ~20%-per-project figure is Weinberg's practitioner observation (1992),
+not peer-reviewed. The supertasker/WMC work concerns *simultaneous*
+dual-tasking on a seconds timescale, stretched here to project-level WIP.
+And there is counter-literature (task variety aiding motivation,
+interleaving aiding incubation) this doc does not survey. Suggestive, not
+dispositive — held with appropriate looseness.
+
 Citations:
 - Leroy, S. (2009). *Why is it so hard to do my work? The challenge of
   attention residue when switching between work tasks.* OBHDP 109(2).
@@ -130,6 +142,35 @@ The index leads with a **needs-you board** above the channel cards:
 - **A cleared state per inquiry** — the closure moment the residue research
   asks for.
 - Channel pages get the same items as an attention strip above the ledger.
+
+## 🔵 Decision frames — making verification worth doing
+
+The attack on the rubber-stamping tension (below), inspired by the
+multiple-choice-plus-your-own pattern agent harnesses use well (Dan,
+2026-06-10): **the proposer frames the verification**. What makes the
+pattern work is not the buttons — it is that the party requesting the
+decision does the work of articulating the decision space.
+
+- A `propose`/`record` may carry an optional **decision frame**: 2–4
+  options, each mapping to an act (approve / reject / ratify / park) with a
+  **drafted rationale** the verifier adopts by choosing (and may edit), plus
+  **what to check first** — links to the diff, the CI run, the evidence —
+  rendered inside the attention item. Free-text remains available always.
+- ✅ **The full frame is recorded durably** (Dan, 2026-06-10) — including
+  the options *not* chosen. The unchosen options are "alternatives
+  considered" become structural rather than prose: exactly the richer shape
+  `adr/0003` deferred until something proved the need. Lives as an optional
+  field on the entry payload (a field, not a new kind — short ADR when
+  built).
+- Why it chips at rubber-stamping: blank-box friction makes "lgtm" the
+  cheapest act; choosing between substantively different pre-drafted
+  positions is low-friction *and* high-signal — the cheapest action now
+  leaves a meaningful record. A lazy verifier can still always pick option
+  one, but the floor rises, and the **override/edit rate is measurable** —
+  a standing signal of whether an agent's framing is honest (self-
+  improvement playbook food).
+- Items without a frame fall back to the plain form; frame quality becomes
+  part of what makes an agent a good collaborator.
 
 ## 🔵 Side-quests (forking) — the supply side of attention
 
@@ -260,3 +301,51 @@ Connections and cautions:
   the record itself); nothing leaves the substrate the person already owns.
 - Not designed further until the focus board has produced real usage data to
   analyze.
+
+## ⚠️ Known tensions (adversarial review, 2026-06-10)
+
+Held openly so the next design round inherits the sharpened version:
+
+1. **Verification asymmetry vs. the board's own content.** Lesson 6 says
+   most verification must eventually route to evals/agent verifiers — yet
+   the board's bulk is provisional assertions awaiting human ratify. The doc
+   does not yet resolve whether verification debt is real debt (the board
+   drowns at agent speed) or tolerable (then it should not render as
+   urgent). Decision frames raise the floor; they do not resolve the
+   asymmetry. **This is junto's instance of the industry's central unsolved
+   problem** — representable here (verification is a first-class, measurable
+   act) in a way it is nowhere else, which is the position to work it from.
+2. **Cleared states cut both ways.** Closure reduces residue *and* imports
+   inbox-zero psychology — processing-for-clearance is the rubber-stamp
+   gradient. Mitigation: decision frames + measuring override rates; watch
+   for ratify-latency collapsing to seconds.
+3. **"Gates block agents" is currently aspirational.** Dogfood agents build
+   optimistically and gates ratify retroactively (every slice 10–14 was
+   built before approval). Optimistic execution is a *legitimate* policy
+   (merge-then-validate is real engineering), but the urgency hierarchy
+   must say which policy is in force — blocking vs. optimistic is a
+   per-playbook knob to make explicit, and stale gates need an aging model.
+4. **Member-scoped routing awaits the Rubric layer** (`adr/0007`). Today's
+   requirements (`Count(N)`) address everyone — and an item addressed to
+   everyone invites diffusion of responsibility in a multihuman Party.
+   Until routing can say *whom* a gate awaits, multihuman boards are
+   under-specified.
+5. **The "private mirror" is posture, not enforcement.** Gate-open→act
+   latency per member is computable from the shared record by anyone with
+   the repo — that is the substrate working as designed, git-blame-like.
+   The leaderboard risk is structural; naming it honestly beats pretending
+   locality of analysis makes the data private.
+6. **Our own lesson 3 indicts the current bridges.** The recall hook and
+   convention file are Claude-Code-shaped (SessionStart, CLAUDE.md) —
+   dogfood-era pragmatism that must stay quarantined behind the
+   AgentHarnessAdapter seam, or junto dies with a host platform exactly the
+   way Mylyn did.
+7. **Pure pull may not survive multihuman SLAs.** The surviving triage
+   successes are pull+push hybrids; a gate that sits unseen for days
+   because nobody opened the app is a real failure mode. Notification
+   affordances will eventually be needed — designed against lesson 1, not
+   in ignorance of it.
+8. **Side-quest recall sharding is load-bearing** (also flagged above):
+   per-channel briefs + many small channels could fragment the decision
+   memory the wedge exists to provide. Brief-inheritance across the
+   fork relationship must be designed *with* forking, not after it.
