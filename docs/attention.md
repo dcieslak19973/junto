@@ -263,7 +263,7 @@ continuation channel, and is its Party the union of its predecessors'?
 
 ## Prior art (assessed 2026-06-10)
 
-Four lineages, each validating a piece of the design — and one gap none of
+Five lineages, each validating a piece of the design — and one gap none of
 them fill:
 
 1. **Academic attention management — Microsoft Research's AUI project
@@ -296,6 +296,23 @@ them fill:
    <https://cognition.ai/blog/devin-101-automatic-pr-reviews-with-the-devin-api>.
    They have the agents-in-flight framing — for one vendor's agents, on one
    vendor's servers, for code only.
+5. **Practitioner evidence — the hand-rolled version (Zack Proser / WorkOS,
+   2025–26).** Proser's "untethered" workflow is this document lived out,
+   built from duct tape: a morning desk session setting up *verification
+   gates* (lint/build checks, screenshot verification, CLAUDE.md rule
+   enforcement), voice-dispatching tasks, then walking away while agents
+   work; phone- and watch-sized check-ins through the day; an afternoon
+   pass of review and merge approvals. His thesis is the personal-optimum
+   section in a practitioner's words — *"the agents scale infinitely, but
+   your nervous system doesn't"* — with a burnout warning attached
+   (his estimate: ~18 months for fleet-running devs without intentional
+   workflow design), and he reports a ~90% drop in perceived
+   context-switching from *classifying and routing* signals instead of
+   reading streams.
+   <https://www.youtube.com/watch?v=so9l_MwS2yg>,
+   <https://zackproser.com/blog/aie-london-untethered-productivity>.
+   Validates the demand and the persona (the agent-heavy developer the
+   wedge targets) from lived experience rather than a product pitch.
 
 **The gap junto fills:** in every lineage above, the attention item is
 ephemeral — a notification to dismiss, a session to close. In junto, acting
@@ -341,6 +358,16 @@ board is a pane of glass **over a record**.
    playbooks route routine verification to evals and agent verifiers,
    reserving human attention for consequential gates. The board must make
    that routing visible rather than pretend humans scale.
+7. **The walk-away workflow already exists; what's missing is the record**
+   (the practitioner lesson). Proser proves one human can keep a fleet
+   shipping from a phone — by hand-building gates, signal filters, and
+   review passes for himself. Every piece is ephemeral and single-player:
+   the verification act leaves nothing durable behind, so a teammate (or a
+   future agent, or Proser-in-six-months) inherits none of the rationale or
+   the parked dead-ends. The focus board's job is to be that same
+   glanceable check-in surface with the act *writing the record* — and
+   decision frames are what make a phone-sized glance actionable: one
+   meaningful choice instead of reconstructing context on a small screen.
 
 ## ⚠️ Finding a person's optimum (anticipated, not designed)
 
@@ -361,6 +388,12 @@ Connections and cautions:
 - Per the individual-differences research above, the point is *personal*
   measurement precisely because population averages and self-assessment both
   mislead.
+- Practitioner corroboration: prior-art lineage 5 (Proser) is this section's
+  thesis from the field — *"the agents scale infinitely, but your nervous
+  system doesn't"* — including the cost of ignoring it (his burnout
+  estimate), and a working example of the daily rhythm the board should
+  serve: gates set up at the desk, glanced at from anywhere, cleared in
+  batches at natural boundaries.
 - Privacy posture: the analysis is machine-local (the same trust domain as
   the record itself); nothing leaves the substrate the person already owns.
 - Not designed further until the focus board has produced real usage data to
