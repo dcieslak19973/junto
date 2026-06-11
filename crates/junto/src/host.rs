@@ -131,6 +131,11 @@ pub struct ChannelSummary {
     pub last_activity: Option<Timestamp>,
     /// Pending proposals — the "needs your attention" signal.
     pub open_gates: usize,
+    /// The Party's size (`docs/adr/0017`); 0 for pre-genesis channels.
+    pub members: usize,
+    /// A one-line preview of the most recent entry — the resumption cue on
+    /// the index ("where was I?").
+    pub latest: Option<String>,
 }
 
 /// The result of resolving a user-supplied channel reference.
@@ -485,5 +490,31 @@ fn summarize(id: &ChannelId, view: &ChannelView, substrate: &Path) -> ChannelSum
             .values()
             .filter(|status| **status == GateStatus::Pending)
             .count(),
+        members: view.party.len(),
+        latest: view.entries.last().map(preview),
     }
+}
+
+/// One entry as a one-line resumption cue: its kind, then a snippet of its
+/// most telling text.
+fn preview(entry: &LedgerEntry) -> String {
+    let (kind, text) = match &entry.payload {
+        EntryPayload::ChannelOpened { name } => ("genesis", format!("channel '{name}' opened")),
+        EntryPayload::MemberAdded { member } => ("member added", member.display_name.clone()),
+        EntryPayload::Assertion { statement, .. } => ("assertion", statement.clone()),
+        EntryPayload::Ratification { rationale, .. } => ("ratification", rationale.clone()),
+        EntryPayload::Park { rationale, .. } => ("park", rationale.clone()),
+        EntryPayload::Correction { statement, .. } => ("correction", statement.clone()),
+        EntryPayload::Proposal { action, .. } => ("proposal", action.clone()),
+        EntryPayload::Approval { rationale, .. } => ("approval", rationale.clone()),
+        EntryPayload::Rejection { rationale, .. } => ("rejection", rationale.clone()),
+    };
+    const LIMIT: usize = 160;
+    let snippet: String = text.chars().take(LIMIT).collect();
+    let ellipsis = if text.chars().count() > LIMIT {
+        "…"
+    } else {
+        ""
+    };
+    format!("{kind} — {snippet}{ellipsis}")
 }

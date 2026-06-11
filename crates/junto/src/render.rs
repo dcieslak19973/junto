@@ -162,7 +162,9 @@ fn page_shell(
 }
 
 /// The channel index — every channel across every registered home substrate,
-/// the landing page of the one surface (`docs/adr/0015`).
+/// the landing page of the one surface (`docs/adr/0015`). Designed as a
+/// resumption dashboard: per channel, what needs you (open gates), who is on
+/// it, how alive it is, and a glimpse of the latest entry.
 pub fn index_html(summaries: &[ChannelSummary]) -> String {
     let mut cards = String::new();
     for summary in summaries {
@@ -180,21 +182,35 @@ pub fn index_html(summaries: &[ChannelSummary]) -> String {
         } else {
             "<span class=\"badge quiet\">no open gates</span>".to_string()
         };
+        let preview = summary
+            .latest
+            .as_deref()
+            .map(|latest| format!("<div class=\"preview\">{}</div>", escape_html(latest)))
+            .unwrap_or_default();
         let when = summary
             .last_activity
-            .map(|ts| iso_utc(ts.as_millis()))
+            .map(|ts| format!(" · active {}", escape_html(&ago(ts.as_millis()))))
             .unwrap_or_default();
+        let members = if summary.members > 0 {
+            format!(
+                " · {} member{}",
+                summary.members,
+                if summary.members == 1 { "" } else { "s" }
+            )
+        } else {
+            String::new()
+        };
         let _ = writeln!(
             cards,
-            "<a class=\"card-link\" href=\"/channels/{href}\"><article class=\"card\">\
-             <header><h2>{name}</h2>{gates}</header>\
-             <div class=\"meta-line\">{count} entries · last activity {when}</div>\
+            "<a class=\"card-link\" href=\"/channels/{href}\"><article class=\"card chan-card\">\
+             <header><h2>{name}</h2><span class=\"spacer\"></span>{gates}</header>\
+             {preview}\
+             <div class=\"meta-line\">{count} entries{members}{when}</div>\
              <footer class=\"id\">{id} · {substrate}</footer>\
              </article></a>",
             href = escape_html(&href),
             name = escape_html(display_name),
             count = summary.entry_count,
-            when = escape_html(&when),
             id = summary.id,
             substrate = escape_html(&summary.substrate.display().to_string()),
         );
@@ -204,16 +220,39 @@ pub fn index_html(summaries: &[ChannelSummary]) -> String {
          `junto open`</p>"
             .to_string()
     } else {
-        cards
+        format!("<div class=\"cards\">{cards}</div>")
+    };
+    let open_gates: usize = summaries.iter().map(|summary| summary.open_gates).sum();
+    let attention = if open_gates > 0 {
+        format!(
+            " · <span class=\"attention\">{open_gates} gate{} awaiting verification</span>",
+            if open_gates == 1 { "" } else { "s" }
+        )
+    } else {
+        String::new()
     };
     let content = format!(
         "<h1>channels</h1>\n\
-         <p class=\"meta\">{count} channel{plural} across every registered substrate · \
-         read-only projection</p>\n{body}",
+         <p class=\"meta\">{count} channel{plural} across every registered substrate\
+         {attention}</p>\n{body}",
         count = summaries.len(),
         plural = if summaries.len() == 1 { "" } else { "s" },
     );
     page_shell("junto — channels", summaries, None, &content)
+}
+
+/// Milliseconds-epoch → a human resumption cue ("12m ago"), falling back to
+/// the date once it stops being recent.
+fn ago(millis: i64) -> String {
+    let now = junto_kernel::Timestamp::now().as_millis();
+    let minutes = now.saturating_sub(millis) / 60_000;
+    match minutes {
+        ..=0 => "just now".to_string(),
+        1..=59 => format!("{minutes}m ago"),
+        60..=1439 => format!("{}h ago", minutes / 60),
+        1440..=43_199 => format!("{}d ago", minutes / 1440),
+        _ => iso_utc(millis),
+    }
 }
 
 /// The human-facing channel page: the projected ledger as entry cards, with
@@ -501,8 +540,17 @@ border-radius:.7rem;padding:.12rem .6rem;background:var(--panel)}\
 .card{background:var(--card);border:1px solid var(--border);border-radius:.65rem;\
 padding:.8rem .95rem;margin-bottom:.7rem}\
 .card.flagged{border-color:var(--red)}\
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(24rem,100%),1fr));\
+gap:.8rem}\
+.cards>*{min-width:0}\
+.chan-card{margin:0;padding:1rem 1.1rem;height:100%;min-width:0;\
+transition:border-color .12s,transform .12s}\
+.chan-card h2{font-size:1.12rem}\
+.preview{color:var(--soft);font-size:.84rem;margin-top:.55rem;line-height:1.45;\
+display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}\
+.attention{color:var(--yellow)}\
 .card-link{text-decoration:none;color:inherit;display:block}\
-.card-link:hover .card{border-color:var(--accent)}\
+.card-link:hover .card{border-color:var(--accent);transform:translateY(-1px)}\
 .card header{display:flex;align-items:center;gap:.55rem;flex-wrap:wrap}\
 .spacer{flex:1}\
 .kind{font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;color:var(--accent);\
@@ -531,7 +579,9 @@ details p{margin:.4rem 0 0;color:var(--soft);white-space:pre-wrap}\
 details ul{margin:.4rem 0 0;padding-left:1.2rem;color:var(--soft)}\
 details a{color:var(--accent)}\
 footer.id{color:#45475a;font-size:.68rem;\
-font-family:ui-monospace,'Cascadia Mono',Consolas,monospace;margin-top:.55rem}\
+font-family:ui-monospace,'Cascadia Mono',Consolas,monospace;margin-top:.55rem;\
+overflow-wrap:anywhere}\
+.statement,.preview,.meta-line{overflow-wrap:anywhere}\
 form.act{display:flex;gap:.45rem;flex-wrap:wrap;margin-top:.65rem;padding-top:.65rem;\
 border-top:1px solid var(--border)}\
 form.act input{flex:1;min-width:10rem;background:var(--bg);color:var(--text);\
@@ -692,6 +742,8 @@ mod tests {
                 entry_count: 3,
                 last_activity: None,
                 open_gates: 2,
+                members: 2,
+                latest: Some("assertion — the latest finding".into()),
             },
             ChannelSummary {
                 id: other,
@@ -700,6 +752,8 @@ mod tests {
                 entry_count: 1,
                 last_activity: None,
                 open_gates: 0,
+                members: 1,
+                latest: None,
             },
         ];
         let view = view_with(vec![]);
