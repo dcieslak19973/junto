@@ -1317,7 +1317,6 @@ fn act_forms_with_frame(
                  <button class=\"primary\">{label}</button>\
                  <input name=\"rationale\" value=\"{draft}\" required \
                  title=\"the drafted rationale — edit before choosing if it isn't quite yours\">\
-                 <input name=\"code\" class=\"code\" placeholder=\"member code\">\
                  </form>",
                 entry_id = entry.id,
                 back = escape_html(back),
@@ -1331,8 +1330,10 @@ fn act_forms_with_frame(
 }
 
 /// The act form itself: one rationale input feeding whichever button is
-/// pressed, the member code (blank uses the remembered one), and the
-/// return path the route redirects to afterwards.
+/// pressed, and the return path the route redirects to afterwards. No member
+/// code: the host derives the author from git config and authorizes
+/// membership itself (the codes guard the agent-facing MCP surface, where
+/// identity is claimed — not the human surface, where the host claims it).
 fn act_form(
     entry_id: junto_kernel::EntryId,
     channel: &ChannelId,
@@ -1345,87 +1346,10 @@ fn act_form(
          action=\"/channels/{channel}/entries/{entry_id}/{accept}\">\
          <input type=\"hidden\" name=\"back\" value=\"{back}\">\
          <input name=\"rationale\" placeholder=\"why — a rationale, not a checkbox\" required>\
-         <input name=\"code\" class=\"code\" placeholder=\"member code\" \
-         title=\"your machine-local member code (docs/adr/0017); blank reuses the one \
-         remembered from your last act\">\
          <button class=\"primary\">{accept}</button>\
          <button formaction=\"/channels/{channel}/entries/{entry_id}/{decline}\">{decline}</button>\
          </form>",
         back = escape_html(back),
-    )
-}
-
-/// Everything the act-retry page needs to re-offer a refused verification
-/// act without losing the human's work (`docs/adr/0017` guardrail meets
-/// `docs/attention.md`: the surface routes attention, it must not tax it).
-pub struct ActRetry<'a> {
-    pub channel: &'a ChannelId,
-    /// The channel's display name, for orientation.
-    pub name: &'a str,
-    pub entry: junto_kernel::EntryId,
-    /// The act being retried (already validated by the route: ratify / park /
-    /// approve / reject).
-    pub act: &'a str,
-    /// The rationale the human already typed — carried over verbatim.
-    pub rationale: &'a str,
-    /// The safe local path to return to after the act succeeds.
-    pub back: &'a str,
-    /// The guardrail's refusal, verbatim — it names the author identity whose
-    /// code is expected, which is the usual confusion.
-    pub message: &'a str,
-    /// An excerpt of the entry being acted on, for orientation.
-    pub subject: Option<&'a str>,
-    /// True when the failing code came from the remember-cookie (now being
-    /// cleared): the human typed nothing wrong, the stale memory did.
-    pub cookie_forgotten: bool,
-}
-
-/// The recovery page for a verification act refused at the member-code
-/// guardrail: a wrong code costs one retyped code, never a retyped rationale.
-pub fn act_retry_html(nav: &[ChannelSummary], retry: &ActRetry<'_>) -> String {
-    let subject = retry
-        .subject
-        .map(|text| format!("<p class=\"statement clamp\">{}</p>", escape_html(text)))
-        .unwrap_or_default();
-    let forgotten = if retry.cookie_forgotten {
-        "<p class=\"hint\">that code came from your last act, remembered — it no longer \
-         matches, so it has been forgotten. Type the current one below.</p>"
-    } else {
-        ""
-    };
-    let content = format!(
-        "<h1>not recorded — member code needed</h1>\
-         <p class=\"meta\">{name} · your {act} and its rationale are kept below; \
-         only the code is needed</p>\
-         <div class=\"card flagged\">{subject}\
-         <p class=\"refusal\">{message}</p>{forgotten}\
-         <form class=\"act\" method=\"post\" \
-         action=\"/channels/{channel}/entries/{entry}/{act}\">\
-         <input type=\"hidden\" name=\"back\" value=\"{back}\">\
-         <input name=\"rationale\" value=\"{rationale}\" required>\
-         <input name=\"code\" class=\"code\" placeholder=\"member code\" autofocus required>\
-         <button class=\"primary\">{act}</button>\
-         </form>\
-         <p class=\"hint\">member codes are machine-local accident-proofing \
-         (docs/adr/0017): yours was printed when you were minted and lives in \
-         <code>~/.junto/members.toml</code> — note the code belongs to the author \
-         identity named above, not to whoever is at the keyboard. Lost it? \
-         <code>junto add-member</code> re-mints a fresh one for the same member.</p>\
-         </div>\
-         <p><a class=\"back-link\" href=\"{back}\">go back without acting</a></p>",
-        name = escape_html(retry.name),
-        act = escape_html(retry.act),
-        channel = retry.channel,
-        entry = retry.entry,
-        back = escape_html(retry.back),
-        rationale = escape_html(retry.rationale),
-        message = escape_html(retry.message),
-    );
-    page_shell(
-        "member code needed — junto",
-        nav,
-        Some(retry.channel),
-        &content,
     )
 }
 
@@ -1544,7 +1468,6 @@ border-top:1px solid var(--border)}\
 form.act input{flex:1;min-width:10rem;background:var(--bg);color:var(--text);\
 border:1px solid var(--border);border-radius:.45rem;padding:.32rem .6rem;font-size:.84rem}\
 form.act input:focus{outline:1px solid var(--accent)}\
-form.act input.code{flex:none;width:8.2rem}\
 form.act button{background:var(--panel);color:var(--soft);border:1px solid var(--border);\
 border-radius:.45rem;padding:.32rem .85rem;font-size:.84rem;cursor:pointer}\
 form.act button:hover{color:var(--text);border-color:var(--accent)}\
@@ -1555,9 +1478,6 @@ form.act.option button.primary{flex:none;min-width:7rem}\
 form.act.option input[name=rationale]{color:var(--soft);font-style:italic}\
 form.act.busy{opacity:.65}\
 form.act button:disabled{cursor:wait}\
-.refusal{color:var(--red);font-size:.9rem;margin:.55rem 0 0;white-space:pre-wrap;\
-overflow-wrap:anywhere}\
-.hint{color:var(--muted);font-size:.82rem;margin:.55rem 0 0}\
 a.back-link{color:var(--muted);font-size:.84rem}\
 a.back-link:hover{color:var(--soft)}";
 
