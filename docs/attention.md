@@ -182,6 +182,26 @@ decision does the work of articulating the decision space.
 - Items without a frame fall back to the plain form; frame quality becomes
   part of what makes an agent a good collaborator.
 
+**What makes a frame meaningful** (Dan's verdict on the first live frame,
+2026-06-11: "the choices are not meaningful — maybe because they were
+previously generated"):
+
+- Options must be **substantively different positions about the claim** —
+  tied to checkable evidence ("park if the canonical-bytes test wasn't
+  extended"), never restatements of yes/no or claims about the mechanism
+  itself.
+- The decline option must be the **steelman** — the strongest concrete
+  reason a reasonable verifier would park or reject. The proposer wants
+  approval, so the natural failure mode is a strong accept option beside a
+  strawman decline; a frame whose decline option the verifier would be
+  embarrassed to choose is a biased frame.
+- **Frames are priors, structurally.** Written at record time, they encode
+  what the proposer anticipated; the verifier's real concern often emerges
+  from what checking *finds*, which no pre-generated option contains. That
+  is inherent — it is why the draft is editable and free-text always
+  remains, and why persistent chosen-vs-drafted divergence (or persistent
+  decline-option avoidance) indicts the framing, not the verifier.
+
 ## 🔵 Side-quests (divergence) — the supply side of attention
 
 > Naming (Dan, 2026-06-10): the lifecycle pair is **diverge / converge** —

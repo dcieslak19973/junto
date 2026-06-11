@@ -629,6 +629,7 @@ mod tests {
                 statement: statement.into(),
                 rationale: "because".into(),
                 provenance: vec![],
+                frame: None,
             },
         }
     }
@@ -824,6 +825,7 @@ mod tests {
                 statement: "x".into(),
                 rationale: "line one\r\nline two".into(),
                 provenance: vec![],
+                frame: None,
             },
         };
         substrate.append(entry.clone()).await.unwrap();

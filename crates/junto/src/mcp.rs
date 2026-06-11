@@ -79,6 +79,65 @@ pub struct ProvenanceParam {
     pub digest: Option<String>,
 }
 
+/// One option in a decision frame (`docs/adr/0019`): the proposer
+/// articulates the verifier's choices; the full frame is recorded durably,
+/// unchosen options included.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct FrameOptionParam {
+    /// The choice as the verifier reads it, e.g. "ship it".
+    pub label: String,
+    /// "ratify" | "park" on assertions; "approve" | "reject" on proposals.
+    pub act: String,
+    /// The drafted rationale the verifier adopts (and may edit) by choosing.
+    pub rationale: String,
+}
+
+/// Parse and validate a decision frame for the given target kind: 2–4
+/// options, each act coherent with the entry kind (`docs/adr/0019`).
+fn parse_frame(
+    options: Option<Vec<FrameOptionParam>>,
+    kind: TargetKind,
+) -> Result<Option<junto_kernel::DecisionFrame>, McpError> {
+    let Some(options) = options else {
+        return Ok(None);
+    };
+    if !(2..=4).contains(&options.len()) {
+        return Err(invalid(format!(
+            "a decision frame carries 2–4 options, got {}",
+            options.len()
+        )));
+    }
+    let parsed = options
+        .into_iter()
+        .map(|option| {
+            let act = match (kind, option.act.as_str()) {
+                (TargetKind::Assertion, "ratify") => junto_kernel::FrameAct::Ratify,
+                (TargetKind::Assertion, "park") => junto_kernel::FrameAct::Park,
+                (TargetKind::Proposal, "approve") => junto_kernel::FrameAct::Approve,
+                (TargetKind::Proposal, "reject") => junto_kernel::FrameAct::Reject,
+                (TargetKind::Assertion, other) => {
+                    return Err(invalid(format!(
+                        "frame act '{other}' is not coherent for an assertion \
+                         (ratify or park)"
+                    )));
+                }
+                (TargetKind::Proposal, other) => {
+                    return Err(invalid(format!(
+                        "frame act '{other}' is not coherent for a proposal \
+                         (approve or reject)"
+                    )));
+                }
+            };
+            Ok(junto_kernel::FrameOption {
+                label: option.label,
+                act,
+                rationale: option.rationale,
+            })
+        })
+        .collect::<Result<Vec<_>, McpError>>()?;
+    Ok(Some(junto_kernel::DecisionFrame { options: parsed }))
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct OpenChannelRequest {
     /// The channel's human-facing name — a label, unique within its home
@@ -111,6 +170,11 @@ pub struct RecordRequest {
     pub rationale: String,
     /// Evidence backing the claim.
     pub provenance: Option<Vec<ProvenanceParam>>,
+    /// A decision frame for the verifier (docs/adr/0019): 2–4 options, each
+    /// "ratify" or "park" with a drafted rationale. Strongly encouraged —
+    /// the verifier chooses between articulated positions instead of facing
+    /// a blank box, and the frame is recorded durably.
+    pub frame: Option<Vec<FrameOptionParam>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -164,6 +228,9 @@ pub struct ProposeRequest {
     /// Require every one of these members to approve. Mutually exclusive
     /// with `require_count`.
     pub require_all_of: Option<Vec<AuthorParam>>,
+    /// A decision frame for the approver (docs/adr/0019): 2–4 options, each
+    /// "approve" or "reject" with a drafted rationale. Strongly encouraged.
+    pub frame: Option<Vec<FrameOptionParam>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -463,6 +530,7 @@ impl JuntoMcp {
         self.authorize(&ledger, &channel, &author, req.code.as_deref())
             .await?;
         let provenance = parse_provenance(req.provenance)?;
+        let frame = parse_frame(req.frame, TargetKind::Assertion)?;
         let entry = Self::entry(
             channel,
             author,
@@ -470,6 +538,7 @@ impl JuntoMcp {
                 statement: req.statement,
                 rationale: req.rationale,
                 provenance,
+                frame,
             },
         );
         self.append(&req.channel, ledger, entry).await
@@ -570,6 +639,7 @@ impl JuntoMcp {
             }
         };
         let provenance = parse_provenance(req.provenance)?;
+        let frame = parse_frame(req.frame, TargetKind::Proposal)?;
         let entry = Self::entry(
             channel,
             author,
@@ -577,6 +647,7 @@ impl JuntoMcp {
                 action: req.action,
                 rationale: req.rationale,
                 provenance,
+                frame,
                 requirement,
             },
         );
@@ -690,7 +761,13 @@ impl ServerHandler for JuntoMcp {
              your own identity as `author` — agents author as themselves, never as their \
              operator — plus your member code as `code`: writes require membership in the \
              channel's Party and the matching machine-local code (your operator hands you \
-             the code when minting you as a member; docs/adr/0017)."
+             the code when minting you as a member; docs/adr/0017). When you record or \
+             propose, include a decision `frame` (2–4 options with drafted rationales): \
+             options must be substantively different positions about the claim, tied to \
+             checkable evidence — and the decline option must be the steelman, the \
+             strongest concrete reason to park/reject, never a strawman. The full frame \
+             is recorded, unchosen options included (docs/adr/0019). Verification targets \
+             accept unambiguous id prefixes (6+ chars)."
                 .to_string(),
         );
         info
@@ -813,6 +890,7 @@ mod tests {
                 code: code_of(&dirs, claude()),
                 statement: "the sky is blue".into(),
                 rationale: "observed".into(),
+                frame: None,
                 provenance: Some(vec![ProvenanceParam {
                     uri: "https://example.com/sky".into(),
                     digest: Some("sha256:deadbeef".into()),
@@ -844,6 +922,7 @@ mod tests {
                 code: None,
                 statement: "s".into(),
                 rationale: "r".into(),
+                frame: None,
                 provenance: None,
             }))
             .await
@@ -963,6 +1042,7 @@ mod tests {
                 code: code_of(&dirs, claude()),
                 statement: "claim".into(),
                 rationale: "because".into(),
+                frame: None,
                 provenance: None,
             }))
             .await
@@ -1000,6 +1080,7 @@ mod tests {
                 code: code_of(&dirs, claude()),
                 action: "merge slice 7".into(),
                 rationale: "tests green".into(),
+                frame: None,
                 provenance: None,
                 require_count: Some(1),
                 require_all_of: None,
@@ -1048,6 +1129,7 @@ mod tests {
             code: code_of(&dirs, claude()),
             statement: "only in alpha".into(),
             rationale: "r".into(),
+            frame: None,
             provenance: None,
         }))
         .await
@@ -1088,6 +1170,7 @@ mod tests {
                 code: code_of(&dirs, claude()),
                 action: "a".into(),
                 rationale: "r".into(),
+                frame: None,
                 provenance: None,
                 require_count: Some(1),
                 require_all_of: Some(vec![dan()]),
@@ -1104,6 +1187,7 @@ mod tests {
                 code: code_of(&dirs, claude()),
                 statement: "s".into(),
                 rationale: "r".into(),
+                frame: None,
                 provenance: Some(vec![ProvenanceParam {
                     uri: "https://x".into(),
                     digest: Some("deadbeef".into()),
@@ -1135,6 +1219,7 @@ mod tests {
                 code: code_of(&dirs, claude()),
                 statement: "s".into(),
                 rationale: "r".into(),
+                frame: None,
                 provenance: None,
             }))
             .await
@@ -1154,6 +1239,7 @@ mod tests {
                 code: Some("WRONG0".into()),
                 statement: "s".into(),
                 rationale: "r".into(),
+                frame: None,
                 provenance: None,
             }))
             .await
@@ -1167,6 +1253,7 @@ mod tests {
                 code: None,
                 statement: "s".into(),
                 rationale: "r".into(),
+                frame: None,
                 provenance: None,
             }))
             .await
@@ -1240,6 +1327,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn decision_frames_record_and_render() {
+        let (dirs, mcp) = init_repo();
+        open(&mcp, &dirs, "junto-dev").await;
+        mcp.record(Parameters(RecordRequest {
+            channel: "junto-dev".into(),
+            author: claude(),
+            code: code_of(&dirs, claude()),
+            statement: "the fix holds".into(),
+            rationale: "tests pass".into(),
+            provenance: None,
+            frame: Some(vec![
+                FrameOptionParam {
+                    label: "verified".into(),
+                    act: "ratify".into(),
+                    rationale: "CI green and reviewed".into(),
+                },
+                FrameOptionParam {
+                    label: "not convinced".into(),
+                    act: "park".into(),
+                    rationale: "evidence insufficient".into(),
+                },
+            ]),
+        }))
+        .await
+        .unwrap();
+
+        let rendered = text_of(
+            &mcp.view_channel(Parameters(ViewRequest {
+                channel: "junto-dev".into(),
+            }))
+            .await
+            .unwrap(),
+        );
+        assert!(rendered.contains("\"verified\"→ratify"), "{rendered}");
+        assert!(rendered.contains("\"not convinced\"→park"), "{rendered}");
+
+        // Incoherent act for the kind is refused at record time.
+        let err = mcp
+            .record(Parameters(RecordRequest {
+                channel: "junto-dev".into(),
+                author: claude(),
+                code: code_of(&dirs, claude()),
+                statement: "s".into(),
+                rationale: "r".into(),
+                provenance: None,
+                frame: Some(vec![
+                    FrameOptionParam {
+                        label: "a".into(),
+                        act: "approve".into(),
+                        rationale: "r".into(),
+                    },
+                    FrameOptionParam {
+                        label: "b".into(),
+                        act: "park".into(),
+                        rationale: "r".into(),
+                    },
+                ]),
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("not coherent"), "{}", err.message);
+
+        // A one-option frame is no frame at all.
+        let err = mcp
+            .record(Parameters(RecordRequest {
+                channel: "junto-dev".into(),
+                author: claude(),
+                code: code_of(&dirs, claude()),
+                statement: "s".into(),
+                rationale: "r".into(),
+                provenance: None,
+                frame: Some(vec![FrameOptionParam {
+                    label: "only".into(),
+                    act: "ratify".into(),
+                    rationale: "r".into(),
+                }]),
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("2–4 options"), "{}", err.message);
+    }
+
+    #[tokio::test]
     async fn act_targets_must_exist_and_bear_the_right_kind() {
         // Finding 5f625741: a fabricated target id must be refused at the
         // interactive surface, not silently recorded as dangling junk.
@@ -1252,6 +1422,7 @@ mod tests {
                 code: code_of(&dirs, claude()),
                 statement: "claim".into(),
                 rationale: "because".into(),
+                frame: None,
                 provenance: None,
             }))
             .await

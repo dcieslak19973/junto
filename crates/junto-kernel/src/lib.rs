@@ -31,7 +31,7 @@ pub mod serial;
 pub mod substrate;
 pub mod time;
 
-pub use entry::{EntryPayload, LedgerEntry};
+pub use entry::{DecisionFrame, EntryPayload, FrameAct, FrameOption, LedgerEntry};
 pub use error::{Error, Result};
 pub use gate::{ApprovalRequirement, GateStatus};
 pub use ids::{ChannelId, EntryId};

@@ -345,6 +345,7 @@ mod tests {
             statement: statement.into(),
             rationale: "because".into(),
             provenance: Vec::new(),
+            frame: None,
         }
     }
 
@@ -808,6 +809,7 @@ mod tests {
             action: "push the diff".into(),
             rationale: "ready".into(),
             provenance: Vec::new(),
+            frame: None,
             requirement,
         }
     }
