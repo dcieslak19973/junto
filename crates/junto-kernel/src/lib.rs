@@ -4,9 +4,10 @@
 //! the ubiquitous language and `CLAUDE.md` for the hard constraints.
 //!
 //! The kernel owns only the nouns that every Playbook shares. **Modelled so
-//! far:** Member, Provenance, the Gate engine, and the Ledger (and its
-//! entries). **Planned, not yet modelled:** Channel (today just a [`ChannelId`]),
-//! Party, Message, Artifact, Agent Session, Outcome, and Event. It contains
+//! far:** Member, Provenance, the Gate engine, the Ledger (and its entries),
+//! and Agent Sessions with their Artifacts (as ledger entries — [`session`]).
+//! **Planned, not yet modelled:** Channel (today just a [`ChannelId`]),
+//! Message, Outcome, and Event. It contains
 //! **no playbook-specific logic and no vendor names**: those live in playbook
 //! crates and behind adapter traits, respectively.
 //!
@@ -28,6 +29,7 @@ pub mod ledger;
 pub mod member;
 pub mod provenance;
 pub mod serial;
+pub mod session;
 pub mod substrate;
 pub mod time;
 
@@ -38,6 +40,7 @@ pub use ids::{ChannelId, EntryId};
 pub use ledger::{ChannelView, Ledger, Standing};
 pub use member::{Member, MemberKind};
 pub use provenance::{ContentDigest, ProvenanceRef, Uri};
+pub use session::{SessionState, SessionView};
 pub use substrate::{InMemorySubstrate, SubstrateProvider};
 pub use time::Timestamp;
 

@@ -17,7 +17,7 @@
 
 use junto_kernel::{
     ChannelId, ChannelView, EntryId, EntryPayload, GateStatus, LedgerEntry, Member, MemberKind,
-    ProvenanceRef, Standing,
+    ProvenanceRef, SessionState, Standing,
 };
 use std::fmt::Write as _;
 
@@ -310,6 +310,15 @@ fn recent_line(entry: &LedgerEntry) -> String {
         EntryPayload::Park { target, .. } => format!("parked `{}`", short(target)),
         EntryPayload::Approval { target, .. } => format!("approved `{}`", short(target)),
         EntryPayload::Rejection { target, .. } => format!("rejected `{}`", short(target)),
+        EntryPayload::SessionStarted { intent, .. } => {
+            format!("started a session: {}", clamp(intent, TAIL_CLAMP))
+        }
+        EntryPayload::SessionUpdated { target, .. } => {
+            format!("updated session `{}`", short(target))
+        }
+        EntryPayload::ArtifactAttached { description, .. } => {
+            format!("attached artifact: {}", clamp(description, TAIL_CLAMP))
+        }
     }
 }
 
@@ -548,6 +557,30 @@ fn describe_markdown(entry: &LedgerEntry, view: &ChannelView) -> String {
         }
         EntryPayload::Approval { target, .. } => format!("approval of `{target}`"),
         EntryPayload::Rejection { target, .. } => format!("rejection of `{target}`"),
+        EntryPayload::SessionStarted { intent } => {
+            format!(
+                "**agent session** [{}] — {intent}",
+                session_label(view, entry)
+            )
+        }
+        EntryPayload::SessionUpdated {
+            target,
+            state,
+            note,
+        } => {
+            format!(
+                "session update of `{target}` → {} — {note}",
+                session_state_label(*state)
+            )
+        }
+        EntryPayload::ArtifactAttached {
+            target,
+            kind,
+            description,
+            ..
+        } => {
+            format!("**artifact** ({kind}) on session `{target}` — {description}")
+        }
     }
 }
 
@@ -594,6 +627,23 @@ fn gate_label(view: &ChannelView, entry: &LedgerEntry) -> &'static str {
         Some(GateStatus::Rejected) => "rejected",
         None => "unknown",
     }
+}
+
+/// A [`SessionState`] as a lowercase label (badge class + display text).
+fn session_state_label(state: SessionState) -> &'static str {
+    match state {
+        SessionState::Working => "working",
+        SessionState::Blocked => "blocked",
+        SessionState::AwaitingApproval => "awaiting-approval",
+        SessionState::Done => "done",
+        SessionState::Error => "error",
+    }
+}
+
+/// An Agent Session's derived state as a lowercase label.
+fn session_label(view: &ChannelView, entry: &LedgerEntry) -> &'static str {
+    view.session(&entry.id)
+        .map_or("unknown", |session| session_state_label(session.state))
 }
 
 // ---- the human pages (the pixels the desktop shell frames) ----
@@ -925,10 +975,11 @@ pub fn channel_html(
             attention_group(&strip_group, &format!("/channels/{id}"), false)
         )
     };
+    let sessions = sessions_section(view);
     let content = format!(
         "<h1>{name}</h1>\n\
          <p class=\"meta\">channel {id} · {count} entries · read-only projection</p>\n\
-         {party}{strip}<h2 class=\"board-head\">the ledger</h2>\n{body}",
+         {party}{strip}{sessions}<h2 class=\"board-head\">the ledger</h2>\n{body}",
         name = escape_html(name),
         count = view.entries.len(),
     );
@@ -1026,6 +1077,39 @@ fn entry_card(entry: &LedgerEntry, view: &ChannelView, channel: &ChannelId) -> S
             None,
             Some(*target),
         ),
+        EntryPayload::SessionStarted { intent } => (
+            "agent session",
+            Some(session_label(view, entry)),
+            Some(intent.clone()),
+            None,
+            None,
+            None,
+        ),
+        EntryPayload::SessionUpdated {
+            target,
+            state,
+            note,
+        } => (
+            "session update",
+            Some(session_state_label(*state)),
+            None,
+            Some(note.as_str()),
+            None,
+            Some(*target),
+        ),
+        EntryPayload::ArtifactAttached {
+            target,
+            kind,
+            description,
+            provenance,
+        } => (
+            "artifact",
+            None,
+            Some(format!("({kind}) {description}")),
+            None,
+            Some(provenance.as_slice()),
+            Some(*target),
+        ),
     };
 
     let badge = badge
@@ -1073,6 +1157,80 @@ fn entry_card(entry: &LedgerEntry, view: &ChannelView, channel: &ChannelId) -> S
         id = entry.id,
         form = verification_form(entry, view, channel),
     )
+}
+
+/// The "agent sessions" board: one card per session, newest first — state
+/// badge, intent, and the artifacts it produced (the verifiable outputs a
+/// human reviews instead of scrollback). Empty when the channel has none.
+fn sessions_section(view: &ChannelView) -> String {
+    // Sessions render newest-first; entries are already canonical, so walk
+    // them in reverse and pick the session subjects.
+    let mut cards = String::new();
+    for entry in view.entries.iter().rev() {
+        let EntryPayload::SessionStarted { intent } = &entry.payload else {
+            continue;
+        };
+        let Some(session) = view.session(&entry.id) else {
+            continue; // unrecognized author: the card stays in the ledger list
+        };
+        let state = session_state_label(session.state);
+        let mut artifacts = String::new();
+        for artifact_id in &session.artifacts {
+            let Some(artifact) = view.entries.iter().find(|e| e.id == *artifact_id) else {
+                continue;
+            };
+            let EntryPayload::ArtifactAttached {
+                kind,
+                description,
+                provenance,
+                ..
+            } = &artifact.payload
+            else {
+                continue;
+            };
+            let _ = writeln!(
+                artifacts,
+                "<li><span class=\"kind\">{kind}</span> {description}{prov}</li>",
+                kind = escape_html(kind),
+                description = escape_html(description),
+                prov = if provenance.is_empty() {
+                    String::new()
+                } else {
+                    provenance_details(provenance)
+                },
+            );
+        }
+        let artifacts = if artifacts.is_empty() {
+            String::new()
+        } else {
+            format!("<ul class=\"artifacts\">{artifacts}</ul>")
+        };
+        let _ = writeln!(
+            cards,
+            "<article class=\"card\">\
+             <header><span class=\"kind\">agent session</span>\
+             <span class=\"badge {state}\">{state}</span>\
+             <span class=\"spacer\"></span>\
+             <span class=\"who\" title=\"{email}\">{who}</span>\
+             <span class=\"when\">{when}</span></header>\
+             <div class=\"statement\">{intent}</div>\
+             {artifacts}\
+             <footer class=\"id\">{id}</footer></article>",
+            email = escape_html(&entry.author.email),
+            who = escape_html(&entry.author.display_name),
+            when = escape_html(&iso_utc(entry.timestamp.as_millis())),
+            intent = escape_html(intent),
+            id = entry.id,
+        );
+    }
+    if cards.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<section class=\"board\"><h2 class=\"board-head\">agent sessions</h2>\n\
+             {cards}</section>\n"
+        )
+    }
 }
 
 /// The provenance list, collapsed by default; http(s) URIs become links.
@@ -1352,17 +1510,21 @@ display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hi
 font-weight:650}\
 .badge{font-size:.7rem;font-weight:600;padding:.08rem .55rem;border-radius:.6rem;\
 text-transform:uppercase;letter-spacing:.04em;border:1px solid transparent}\
-.provisional,.pending{color:var(--yellow);background:rgba(249,226,175,.12);\
+.provisional,.pending,.awaiting-approval{color:var(--yellow);background:rgba(249,226,175,.12);\
 border-color:rgba(249,226,175,.3)}\
-.ratified,.approved{color:var(--green);background:rgba(166,227,161,.12);\
+.ratified,.approved,.done{color:var(--green);background:rgba(166,227,161,.12);\
 border-color:rgba(166,227,161,.3)}\
 .parked,.superseded,.quiet{color:var(--gray);background:rgba(147,153,178,.12);\
 border-color:rgba(147,153,178,.3)}\
-.rejected,.unrecognized{color:var(--red);background:rgba(243,139,168,.12);\
+.rejected,.unrecognized,.error,.blocked{color:var(--red);background:rgba(243,139,168,.12);\
 border-color:rgba(243,139,168,.3)}\
+.working{color:var(--accent);background:rgba(137,180,250,.12);\
+border-color:rgba(137,180,250,.3)}\
 .who{color:var(--soft);font-size:.82rem}\
 .when{color:var(--muted);font-size:.76rem}\
 .statement{margin:.55rem 0 0;white-space:pre-wrap}\
+.artifacts{margin:.55rem 0 0;padding-left:1.1rem;font-size:.86rem}\
+.artifacts li{margin:.2rem 0}\
 .meta-line{color:var(--muted);font-size:.8rem;margin-top:.45rem}\
 .target{color:var(--muted);font-size:.82rem;margin-top:.5rem}\
 code{font:.82em ui-monospace,'Cascadia Mono',Consolas,monospace;color:var(--soft);\
@@ -1457,6 +1619,7 @@ mod tests {
             unrecognized: std::collections::HashSet::new(),
             standings,
             gate_status,
+            sessions: HashMap::new(),
         }
     }
 
@@ -1484,6 +1647,47 @@ mod tests {
             timestamp: Timestamp::from_millis(1_781_046_734_155),
             payload,
         }
+    }
+
+    #[test]
+    fn channel_page_shows_sessions_with_their_artifacts() {
+        let agent = Member::agent("Coder", "coder@junto.local");
+        let session = LedgerEntry {
+            id: EntryId::new(),
+            channel: ChannelId::new(),
+            author: agent.clone(),
+            timestamp: Timestamp::from_millis(1_781_046_734_154),
+            payload: EntryPayload::SessionStarted {
+                intent: "fix the flaky sync test".into(),
+            },
+        };
+        let artifact = LedgerEntry {
+            id: EntryId::new(),
+            channel: ChannelId::new(),
+            author: agent,
+            timestamp: Timestamp::from_millis(1_781_046_734_155),
+            payload: EntryPayload::ArtifactAttached {
+                target: session.id,
+                kind: "diff".into(),
+                description: "the fix as a unified diff".into(),
+                provenance: vec![],
+            },
+        };
+        let mut view = view_with(vec![session.clone(), artifact.clone()]);
+        view.sessions.insert(
+            session.id,
+            junto_kernel::SessionView {
+                state: SessionState::Blocked,
+                artifacts: vec![artifact.id],
+            },
+        );
+
+        let channel = ChannelId::new();
+        let html = channel_html(&[], "t", &channel, &view);
+        assert!(html.contains("agent sessions"), "{html}");
+        assert!(html.contains("fix the flaky sync test"), "{html}");
+        assert!(html.contains("badge blocked"), "{html}");
+        assert!(html.contains("the fix as a unified diff"), "{html}");
     }
 
     #[test]
@@ -1545,6 +1749,7 @@ mod tests {
             unrecognized: Default::default(),
             standings,
             gate_status,
+            sessions: Default::default(),
         };
         let brief = brief_markdown("t", &ChannelId::new(), &view);
 
@@ -1578,6 +1783,7 @@ mod tests {
             unrecognized: Default::default(),
             standings,
             gate_status: Default::default(),
+            sessions: Default::default(),
         };
         let brief = brief_markdown("t", &ChannelId::new(), &view);
 

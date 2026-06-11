@@ -843,6 +843,7 @@ mod tests {
             entries: vec![entry.clone()],
             party: Vec::new(),
             unrecognized: Default::default(),
+            sessions: Default::default(),
         };
         let html = crate::render::channel_html(&[], "web-test", &channel, &view);
         assert!(html.contains(&format!("/channels/{channel}/entries/{}/ratify", entry.id)));
