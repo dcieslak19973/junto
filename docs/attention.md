@@ -37,6 +37,31 @@ of three: the kernel is contributor #1, so no framework yet).
 them*". Which gates await *you* is gate-routing/roles territory
 (`adr/0007`); dogfood-era, the board is simply the machine user's.
 
+## ✅ Multihuman + multiagent from the start
+
+junto is a **multihuman-multiagent collaborative environment** — the solo
+wedge is a Party of one human plus their agents, not the design ceiling.
+The attention design must generalize without rework:
+
+- **Each member has their own board.** Attention routing follows gate
+  routing: when a playbook says *this gate needs a human approver from set
+  X*, the item lands on those members' boards — and on no one else's.
+- **"Waiting on you" vs "waiting on others"** are different facts and render
+  differently: my board leads with what blocks *on me*; what I'm waiting
+  *for* (a teammate's approval, an agent mid-task) is visible but quiet.
+- **Agents are members with attention too.** An agent blocked on a pending
+  gate is the canonical highest-urgency item on the *human's* board — and
+  symmetrically, the surface can show what each agent is currently waiting
+  on, so a stalled fleet is diagnosable at a glance.
+- **The Party's load is eventually visible** (⚠️ open: how much, to whom):
+  if every gate routes to the one architect, the surface is where that
+  bottleneck becomes obvious. Side-quests distribute across the Party — a
+  fork can be *someone else's* inquiry from birth.
+- The personal-optimum measurement (below) is per-member by construction —
+  it must never become a comparative leaderboard (⚠️ note: a measurement
+  that affects people changes behavior; this stays a private mirror, not a
+  management report).
+
 ## ✅ Not a queue — a focus board (what the research says)
 
 A flat queue implies a linear list you drain to zero. Real work is several
@@ -130,6 +155,50 @@ kinds, decided when concrete):
 at fork time (likely: yes, forker = founder)? Does a checkout bound to the
 parent get briefs for open side-quests? Are closed side-quests shown
 anywhere by default?
+
+## Prior art (assessed 2026-06-10)
+
+Four lineages, each validating a piece of the design — and one gap none of
+them fill:
+
+1. **Academic attention management — Microsoft Research's AUI project
+   (1998–2003).** Horvitz et al. treated human attention as the central
+   organizing construct of computing: *Priorities* ranked email by inferred
+   urgency; the *Notification Platform* modeled the cost of interrupting you
+   right now (Bayesian, sensor-driven).
+   <http://erichorvitz.com/cacm-attention.htm>,
+   <https://www.microsoft.com/en-us/research/publication/attention-sensitive-alerting/>.
+   The intellectual ancestor of the personal-optimum idea — but they
+   *inferred* attention from sensors, top-down; junto can *measure* decision
+   latency from its own ledger, bottom-up.
+2. **Task-focused interfaces — Eclipse Mylyn (Kersten, 2005; later
+   Tasktop).** Gave every artifact a degree-of-interest relative to the
+   *active task* and filtered the whole IDE around it — proof that
+   organizing the surface around the unit of work measurably helps.
+   <https://en.wikipedia.org/wiki/Task-focused_interface>. The ancestor of
+   group-by-inquiry and side-quests; it never escaped the IDE.
+3. **Dev-work triage inboxes.** GitHub notifications and the repair
+   ecosystem they spawned (Octobox, Graphite's PR inbox with its
+   needs-your-review / waiting-on-others split, Linear Triage, Gmail
+   Priority Inbox before them all). They validate the demand — and they are
+   all *notification streams*: items vanish when dismissed, nothing durable
+   remains, each covers one tool.
+4. **Agent command centers (the contemporary lane).** Devin Desktop's
+   kanban-style Agent Command Center ("plan, delegate, review, ship from one
+   surface") and its PR-review inbox; OpenAI Codex's and Cursor's dashboards
+   of agent runs awaiting review.
+   <https://www.fixedlabs.ai/blog/devin-desktop-review>,
+   <https://cognition.ai/blog/devin-101-automatic-pr-reviews-with-the-devin-api>.
+   They have the agents-in-flight framing — for one vendor's agents, on one
+   vendor's servers, for code only.
+
+**The gap junto fills:** in every lineage above, the attention item is
+ephemeral — a notification to dismiss, a session to close. In junto, acting
+on an attention item **writes a provenance-bound entry into a durable record
+the Party owns** (rationale, identity, gate semantics, on a vendor-neutral
+substrate) — and the items come from *any* playbook, addressed to *specific
+members*, human or agent. The dashboards above are panes of glass; the focus
+board is a pane of glass **over a record**.
 
 ## ⚠️ Finding a person's optimum (anticipated, not designed)
 
