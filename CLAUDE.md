@@ -145,6 +145,7 @@ The full table is [`docs/domain-model.md`](docs/domain-model.md) — **read it b
 - [`docs/domain-model.md`](docs/domain-model.md) — the ubiquitous language (nouns & verbs)
 - [`docs/architecture.md`](docs/architecture.md) — substrate, sync, governance, gotchas
 - [`docs/pluggability.md`](docs/pluggability.md) — the vendor-neutral adapter boundaries
+- [`docs/attention.md`](docs/attention.md) — the human surface as an **attention router**: the focus board, side-quests (forking), personal-optimum measurement — with the research citations
 - [`docs/self-improving-harness.md`](docs/self-improving-harness.md) — the self-improvement Playbook (evals = the crux)
 - `docs/worked-example-*.md` — three Playbooks walked end-to-end
 
