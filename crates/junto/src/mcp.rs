@@ -249,6 +249,21 @@ pub struct AddMemberRequest {
 pub struct ViewRequest {
     /// Channel name or id.
     pub channel: String,
+    /// True for the full transcript (every entry in canonical order); the
+    /// default is the scaled brief — state, not history.
+    #[serde(default)]
+    pub full: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DeadEndsRequest {
+    /// Channel name or id.
+    pub channel: String,
+    /// Describe the approach you are about to try; dead-ends are ranked by
+    /// lexical similarity against it (statements + park/rejection
+    /// rationales). Omit for the most recent dead-ends. Output is always
+    /// bounded to the top few.
+    pub about: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -703,7 +718,7 @@ impl JuntoMcp {
     }
 
     #[tool(
-        description = "Project a channel's ledger: every entry in canonical order with derived standings (assertions) and gate statuses (proposals), rendered as markdown. Entry ids shown here are the targets for ratify/park/correct/approve/reject."
+        description = "Project a channel's ledger as markdown. Default: the scaled brief — state, not history (open items with full ids, standing decisions tiered newest-first, verification acts folded into their targets). Pass full=true for the complete transcript: every entry in canonical order, including parked dead-ends and superseded bodies — consult it before re-trying old territory or overturning a settled decision. Entry ids are the targets for ratify/park/correct/approve/reject."
     )]
     async fn view_channel(
         &self,
@@ -717,7 +732,34 @@ impl JuntoMcp {
             .await
             .map_err(internal)?;
         let name = view.name.clone().unwrap_or_else(|| req.channel.clone());
-        Ok(text(render::brief_markdown(&name, &channel, &view)))
+        let rendered = if req.full {
+            render::transcript_markdown(&name, &channel, &view)
+        } else {
+            render::brief_markdown(&name, &channel, &view)
+        };
+        Ok(text(rendered))
+    }
+
+    #[tool(
+        description = "Surface a channel's dead-ends: parked assertions and rejected proposals, each with who killed it and why. The scaled brief deliberately omits these — call this BEFORE proposing or attempting an approach that may have been tried. Pass 'about' describing the approach: dead-ends come back ranked by similarity, top few only; omit it for the most recent. The match is lexical — try other words for the same idea before concluding territory is untried. Do not re-try a listed dead-end without surfacing it to the party first."
+    )]
+    async fn dead_ends(
+        &self,
+        Parameters(req): Parameters<DeadEndsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let (ledger, channel) = self.resolve(&req.channel).await?;
+        let view = ledger
+            .lock()
+            .await
+            .project(&channel)
+            .await
+            .map_err(internal)?;
+        let name = view.name.clone().unwrap_or_else(|| req.channel.clone());
+        Ok(text(render::dead_ends_markdown(
+            &name,
+            &view,
+            req.about.as_deref(),
+        )))
     }
 
     #[tool(
@@ -767,7 +809,10 @@ impl ServerHandler for JuntoMcp {
              checkable evidence — and the decline option must be the steelman, the \
              strongest concrete reason to park/reject, never a strawman. The full frame \
              is recorded, unchosen options included (docs/adr/0019). Verification targets \
-             accept unambiguous id prefixes (6+ chars)."
+             accept unambiguous id prefixes (6+ chars). The brief carries state, not \
+             history: before re-trying an approach that may have been tried, call \
+             `dead_ends` — parked and rejected paths are omitted from the brief and \
+             surface there, with why they died."
                 .to_string(),
         );
         info
@@ -903,6 +948,7 @@ mod tests {
         let view = mcp
             .view_channel(Parameters(ViewRequest {
                 channel: "junto-dev".into(),
+                full: true,
             }))
             .await
             .unwrap();
@@ -963,9 +1009,12 @@ mod tests {
             .to_string();
 
         let rendered = text_of(
-            &mcp.view_channel(Parameters(ViewRequest { channel: id }))
-                .await
-                .unwrap(),
+            &mcp.view_channel(Parameters(ViewRequest {
+                channel: id,
+                full: true,
+            }))
+            .await
+            .unwrap(),
         );
         assert!(rendered.contains("junto-dev"), "genesis names the channel");
     }
@@ -986,6 +1035,7 @@ mod tests {
         let err = mcp
             .view_channel(Parameters(ViewRequest {
                 channel: "dev".into(),
+                full: true,
             }))
             .await
             .unwrap_err();
@@ -1062,11 +1112,166 @@ mod tests {
         let rendered = text_of(
             &mcp.view_channel(Parameters(ViewRequest {
                 channel: "junto-dev".into(),
+                full: true,
             }))
             .await
             .unwrap(),
         );
         assert!(rendered.contains("[ratified]"));
+    }
+
+    #[tokio::test]
+    async fn dead_ends_surface_parked_paths_with_why() {
+        let (dirs, mcp) = init_repo();
+        open(&mcp, &dirs, "junto-dev").await;
+        let recorded = mcp
+            .record(Parameters(RecordRequest {
+                channel: "junto-dev".into(),
+                author: claude(),
+                code: code_of(&dirs, claude()),
+                statement: "use polling for sync".into(),
+                rationale: "simple".into(),
+                provenance: None,
+                frame: None,
+            }))
+            .await
+            .unwrap();
+        let id = recorded_id(&recorded);
+        mcp.park(Parameters(ActRequest {
+            channel: "junto-dev".into(),
+            author: dan(),
+            code: code_of(&dirs, dan()),
+            target: id.clone(),
+            rationale: "polling burned CPU and missed updates".into(),
+        }))
+        .await
+        .unwrap();
+
+        // The scaled brief gives the dead-end no standing section (it may
+        // still flash by in the "recently" tail while fresh); the dead_ends
+        // tool carries it with the park rationale — the why-it-died is the
+        // value.
+        let brief = text_of(
+            &mcp.view_channel(Parameters(ViewRequest {
+                channel: "junto-dev".into(),
+                full: false,
+            }))
+            .await
+            .unwrap(),
+        );
+        let standing_sections = brief.split("## recently").next().unwrap();
+        assert!(
+            !standing_sections.contains("use polling for sync"),
+            "{brief}"
+        );
+        assert!(brief.contains("1 parked dead-ends"), "{brief}");
+
+        let listed = text_of(
+            &mcp.dead_ends(Parameters(DeadEndsRequest {
+                channel: "junto-dev".into(),
+                about: None,
+            }))
+            .await
+            .unwrap(),
+        );
+        assert!(listed.contains("use polling for sync"), "{listed}");
+        assert!(
+            listed.contains("polling burned CPU and missed updates"),
+            "{listed}"
+        );
+        assert!(listed.contains(&id), "full id for acting on it: {listed}");
+
+        // Similarity ranks against statement and kill rationale (the kill's
+        // words count: "missed updates" lives only in the park rationale);
+        // a miss says so rather than rendering an empty page.
+        let hit = text_of(
+            &mcp.dead_ends(Parameters(DeadEndsRequest {
+                channel: "junto-dev".into(),
+                about: Some("sync via POLLING missed updates".into()),
+            }))
+            .await
+            .unwrap(),
+        );
+        assert!(hit.contains("use polling for sync"), "{hit}");
+        assert!(hit.contains("most similar first"), "{hit}");
+        let miss = text_of(
+            &mcp.dead_ends(Parameters(DeadEndsRequest {
+                channel: "junto-dev".into(),
+                about: Some("kubernetes operator".into()),
+            }))
+            .await
+            .unwrap(),
+        );
+        assert!(miss.contains("none of the 1 dead-ends resemble"), "{miss}");
+    }
+
+    #[tokio::test]
+    async fn dead_ends_are_ranked_and_bounded() {
+        // Eight dead-ends; a query about websockets must put the websocket
+        // park first, and the output must stay within the top-5 bound no
+        // matter how the record grows.
+        let (dirs, mcp) = init_repo();
+        open(&mcp, &dirs, "junto-dev").await;
+        let park = async |statement: &str, why: &str| {
+            let recorded = mcp
+                .record(Parameters(RecordRequest {
+                    channel: "junto-dev".into(),
+                    author: claude(),
+                    code: code_of(&dirs, claude()),
+                    statement: statement.into(),
+                    rationale: "r".into(),
+                    provenance: None,
+                    frame: None,
+                }))
+                .await
+                .unwrap();
+            mcp.park(Parameters(ActRequest {
+                channel: "junto-dev".into(),
+                author: dan(),
+                code: code_of(&dirs, dan()),
+                target: recorded_id(&recorded),
+                rationale: why.into(),
+            }))
+            .await
+            .unwrap();
+        };
+        park(
+            "stream entries over websockets",
+            "websocket reconnect storms",
+        )
+        .await;
+        for i in 0..7 {
+            park(&format!("approach number {i}"), "did not pan out").await;
+        }
+
+        let ranked = text_of(
+            &mcp.dead_ends(Parameters(DeadEndsRequest {
+                channel: "junto-dev".into(),
+                about: Some("push updates with websockets".into()),
+            }))
+            .await
+            .unwrap(),
+        );
+        let first_item = ranked.lines().find(|l| l.starts_with("- ")).unwrap();
+        assert!(
+            first_item.contains("stream entries over websockets"),
+            "{ranked}"
+        );
+
+        let recent = text_of(
+            &mcp.dead_ends(Parameters(DeadEndsRequest {
+                channel: "junto-dev".into(),
+                about: None,
+            }))
+            .await
+            .unwrap(),
+        );
+        let items = recent.lines().filter(|l| l.starts_with("- ")).count();
+        assert_eq!(items, 5, "bounded without a query: {recent}");
+        assert!(
+            recent.contains("5 of 8 dead-ends, most recent first"),
+            "{recent}"
+        );
     }
 
     #[tokio::test]
@@ -1092,6 +1297,7 @@ mod tests {
         let pending = text_of(
             &mcp.view_channel(Parameters(ViewRequest {
                 channel: "junto-dev".into(),
+                full: true,
             }))
             .await
             .unwrap(),
@@ -1111,6 +1317,7 @@ mod tests {
         let approved = text_of(
             &mcp.view_channel(Parameters(ViewRequest {
                 channel: "junto-dev".into(),
+                full: true,
             }))
             .await
             .unwrap(),
@@ -1138,6 +1345,7 @@ mod tests {
         let beta = text_of(
             &mcp.view_channel(Parameters(ViewRequest {
                 channel: "beta".into(),
+                full: true,
             }))
             .await
             .unwrap(),
@@ -1315,6 +1523,7 @@ mod tests {
         let rendered = text_of(
             &mcp.view_channel(Parameters(ViewRequest {
                 channel: "junto-dev".into(),
+                full: true,
             }))
             .await
             .unwrap(),
@@ -1356,6 +1565,7 @@ mod tests {
         let rendered = text_of(
             &mcp.view_channel(Parameters(ViewRequest {
                 channel: "junto-dev".into(),
+                full: true,
             }))
             .await
             .unwrap(),
@@ -1468,6 +1678,7 @@ mod tests {
         let rendered = text_of(
             &mcp.view_channel(Parameters(ViewRequest {
                 channel: "junto-dev".into(),
+                full: true,
             }))
             .await
             .unwrap(),

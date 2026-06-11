@@ -3,8 +3,10 @@
 //! Two audiences, one source of truth (the [`ChannelView`] projection):
 //! - [`brief_markdown`] — the **agent** read path: the MCP `view_channel`
 //!   tool and the `/channels/{name}/brief` endpoint the SessionStart recall
-//!   hook injects into agent context (`docs/adr/0013`). Deliberately plain:
-//!   ids, states, full text.
+//!   hook injects into agent context (`docs/adr/0013`). **Scaled**: state,
+//!   not history — recall must not grow linearly with the record. The full
+//!   transcript ([`transcript_markdown`]) stays one call away
+//!   (`view_channel` with `full: true`).
 //! - [`index_html`] / [`channel_html`] — the **human** read path: the pages
 //!   the desktop shell frames (`docs/adr/0018`). Server-rendered with shared
 //!   app chrome (sidebar navigation, dark theme) and almost no JS —
@@ -14,7 +16,7 @@
 //!   as such.
 
 use junto_kernel::{
-    ChannelId, ChannelView, EntryPayload, GateStatus, LedgerEntry, Member, MemberKind,
+    ChannelId, ChannelView, EntryId, EntryPayload, GateStatus, LedgerEntry, Member, MemberKind,
     ProvenanceRef, Standing,
 };
 use std::fmt::Write as _;
@@ -30,9 +32,458 @@ fn member_label(member: &Member) -> String {
     format!("{} <{}>{marker}", member.display_name, member.email)
 }
 
-/// The agent-facing markdown brief: every entry in canonical order, with ids
-/// (the targets for ratify/park/correct/approve/reject) and derived states.
+/// Tier knobs for the scaled brief (🔵): how much settled history a newcomer
+/// is handed before the rest decays to a count and a pointer.
+const BRIEF_RECENT_FULL: usize = 10;
+const BRIEF_OLDER_CLAMPED: usize = 15;
+const BRIEF_SANCTIONED_RECENT: usize = 5;
+const BRIEF_RECENT_TAIL: usize = 5;
+/// Clamp width (chars) for tiered-down statements; a sentence boundary wins.
+const BRIEF_CLAMP: usize = 200;
+
+/// Trim `text` to its first sentence, or hard-cut at `max` chars with an
+/// ellipsis — the tiered-down rendering of settled statements (the claim
+/// survives; the body stays one `view_channel` away).
+fn clamp(text: &str, max: usize) -> String {
+    let text = text.trim();
+    if let Some(pos) = text.find(". ")
+        && pos < max
+    {
+        return text[..=pos].trim_end().to_string();
+    }
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let cut: String = text.chars().take(max).collect();
+    format!("{}…", cut.trim_end())
+}
+
+/// The first 8 chars of an entry id — enough for the MCP tools' git-style
+/// prefix resolution (≥6 hex chars), a fraction of the bytes.
+fn short(id: &junto_kernel::EntryId) -> String {
+    let full = id.to_string();
+    full.chars().take(8).collect()
+}
+
+/// One verification act recorded against a target, for folding into the
+/// target's own brief line instead of renting a line of its own. (The act's
+/// rationale stays in the full transcript — the brief carries the verdict
+/// and the verifier.)
+struct ActNote<'a> {
+    verb: &'static str,
+    author: &'a Member,
+}
+
+/// Every verification act in the view, grouped by target.
+fn act_notes(view: &ChannelView) -> std::collections::HashMap<EntryId, Vec<ActNote<'_>>> {
+    let mut notes: std::collections::HashMap<EntryId, Vec<ActNote>> = Default::default();
+    for entry in &view.entries {
+        let (verb, target) = match &entry.payload {
+            EntryPayload::Ratification { target, .. } => ("ratified", target),
+            EntryPayload::Park { target, .. } => ("parked", target),
+            EntryPayload::Approval { target, .. } => ("approved", target),
+            EntryPayload::Rejection { target, .. } => ("rejected", target),
+            _ => continue,
+        };
+        notes.entry(*target).or_default().push(ActNote {
+            verb,
+            author: &entry.author,
+        });
+    }
+    notes
+}
+
+/// The last act of a given verb against a target, e.g. who ratified it.
+fn last_act<'a>(
+    notes: &'a std::collections::HashMap<EntryId, Vec<ActNote<'a>>>,
+    target: &EntryId,
+    verb: &str,
+) -> Option<&'a ActNote<'a>> {
+    notes
+        .get(target)?
+        .iter()
+        .rev()
+        .find(|note| note.verb == verb)
+}
+
+/// The agent-facing **scaled brief**: state, not history. Acts fold into
+/// their targets, superseded bodies collapse, and old resolved material
+/// decays by tier (recent ratified in full → older clamped → oldest a count)
+/// — recall must not grow linearly with the record (`docs/adr/0013`; the
+/// full transcript stays one call away via [`transcript_markdown`]).
+///
+/// Retention classes: open items and parked/rejected entries never decay
+/// (the former are actionable, the latter exist to prevent re-treads);
+/// ratified decisions tier down; sanctioned (approved) actions decay
+/// fastest — a delivered action is a completion record, embodied in the
+/// work itself.
 pub fn brief_markdown(name: &str, id: &ChannelId, view: &ChannelView) -> String {
+    let mut out = format!("# channel '{name}' ({id}) — brief\n\n");
+    if !view.party.is_empty() {
+        let roster: Vec<String> = view.party.iter().map(member_label).collect();
+        let _ = writeln!(
+            out,
+            "party (founder first; only members' entries count — docs/adr/0017): {}\n",
+            roster.join(", ")
+        );
+    }
+    if view.entries.is_empty() {
+        out.push_str("(no entries)\n");
+        return out;
+    }
+    out.push_str(
+        "State, not history: verification acts are folded into their targets and old \
+         resolved material decays out. The full transcript is one call away \
+         (`view_channel` with `full: true`).\n\n",
+    );
+
+    let notes = act_notes(view);
+
+    // Partition the live entries by what a newcomer needs them for. Genesis,
+    // membership, and act entries don't rent lines: the party line and the
+    // folded notes carry them.
+    let mut open: Vec<&LedgerEntry> = Vec::new();
+    let mut ratified: Vec<&LedgerEntry> = Vec::new();
+    let mut parked: Vec<&LedgerEntry> = Vec::new();
+    let mut approved: Vec<&LedgerEntry> = Vec::new();
+    let mut rejected: Vec<&LedgerEntry> = Vec::new();
+    let mut superseded = 0usize;
+    for entry in &view.entries {
+        match &entry.payload {
+            EntryPayload::Assertion { .. } => match view.standing(&entry.id) {
+                Some(Standing::Provisional) => open.push(entry),
+                Some(Standing::Ratified) => ratified.push(entry),
+                Some(Standing::Parked) => parked.push(entry),
+                // Collapsed: the correction carries the live text.
+                Some(Standing::Superseded) => superseded += 1,
+                None => {}
+            },
+            // A correction is the live text of settled territory.
+            EntryPayload::Correction { .. } => ratified.push(entry),
+            EntryPayload::Proposal { .. } => match view.gate_status(&entry.id) {
+                Some(GateStatus::Pending) => open.push(entry),
+                Some(GateStatus::Approved) => approved.push(entry),
+                Some(GateStatus::Rejected) => rejected.push(entry),
+                None => {}
+            },
+            _ => {}
+        }
+    }
+
+    // Needs attention — full ids and full detail: these are the act targets.
+    out.push_str("## needs attention — act by id (ratify/park · approve/reject)\n\n");
+    if open.is_empty() {
+        out.push_str("(nothing pending)\n");
+    } else {
+        for entry in &open {
+            let _ = writeln!(
+                out,
+                "- `{}` @{} {}: {}",
+                entry.id,
+                entry.timestamp.as_millis(),
+                member_label(&entry.author),
+                describe_markdown(entry, view)
+            );
+            if let EntryPayload::Assertion { rationale, .. }
+            | EntryPayload::Proposal { rationale, .. } = &entry.payload
+            {
+                let _ = writeln!(out, "  why: {rationale}");
+            }
+        }
+    }
+
+    // Standing decisions, newest first: recent in full, older clamped to the
+    // claim, the rest a count.
+    out.push_str(
+        "\n## standing decisions (newest first — do not contradict without surfacing)\n\n",
+    );
+    if ratified.is_empty() {
+        out.push_str("(none yet)\n");
+    }
+    for (index, entry) in ratified.iter().rev().enumerate() {
+        if index >= BRIEF_RECENT_FULL + BRIEF_OLDER_CLAMPED {
+            let _ = writeln!(
+                out,
+                "- …and {} older standing decisions (consult the full transcript before \
+                 overturning settled territory)",
+                ratified.len() - index
+            );
+            break;
+        }
+        let (text, correction_of) = match &entry.payload {
+            EntryPayload::Assertion { statement, .. } => (statement.as_str(), None),
+            EntryPayload::Correction {
+                target, statement, ..
+            } => (statement.as_str(), Some(*target)),
+            _ => continue,
+        };
+        let body = if index < BRIEF_RECENT_FULL {
+            text.to_string()
+        } else {
+            clamp(text, BRIEF_CLAMP)
+        };
+        let corrects = correction_of
+            .map(|target| format!(" (correction of `{}`)", short(&target)))
+            .unwrap_or_default();
+        let by = last_act(&notes, &entry.id, "ratified")
+            .map(|note| format!(" — ratified by {}", note.author.display_name))
+            .unwrap_or_default();
+        let _ = writeln!(out, "- `{}`{corrects} {body}{by}", short(&entry.id));
+    }
+
+    // Parked dead-ends and rejected proposals are *resolved*: they do not
+    // rent standing lines (Dan, 2026-06-11 — a dead-end belongs in recall at
+    // the moment a path starts coming back from the dead, which is a
+    // relevance trigger, not a standing section). Fresh ones still surface
+    // in the "recently" tail; all of them live in the full transcript, and
+    // the footer counts keep their existence visible.
+
+    // Sanctioned actions decay fastest: once delivered they are completion
+    // records, embodied in the work itself.
+    if !approved.is_empty() {
+        out.push_str("\n## sanctioned actions (approved gates; newest first)\n\n");
+        for (index, entry) in approved.iter().rev().enumerate() {
+            if index >= BRIEF_SANCTIONED_RECENT {
+                let _ = writeln!(
+                    out,
+                    "- …and {} older sanctioned actions",
+                    approved.len() - index
+                );
+                break;
+            }
+            let EntryPayload::Proposal { action, .. } = &entry.payload else {
+                continue;
+            };
+            let by = last_act(&notes, &entry.id, "approved")
+                .map(|note| format!(" — approved by {}", note.author.display_name))
+                .unwrap_or_default();
+            let _ = writeln!(
+                out,
+                "- `{}` {}{by}",
+                short(&entry.id),
+                clamp(action, BRIEF_CLAMP)
+            );
+        }
+    }
+
+    // A short chronological tail for resumption: what just happened here.
+    out.push_str("\n## recently\n\n");
+    let tail_start = view.entries.len().saturating_sub(BRIEF_RECENT_TAIL);
+    for entry in &view.entries[tail_start..] {
+        let _ = writeln!(
+            out,
+            "- {} {}",
+            entry.author.display_name,
+            recent_line(entry)
+        );
+    }
+
+    let folded: usize = notes.values().map(Vec::len).sum();
+    let _ = writeln!(
+        out,
+        "\n({folded} verification acts folded into the lines above; {superseded} superseded \
+         entries collapsed into their corrections; {} parked dead-ends and {} rejected \
+         proposals omitted — call the `dead_ends` tool before re-trying an approach that \
+         may have been tried)",
+        parked.len(),
+        rejected.len(),
+    );
+    out
+}
+
+/// One entry as a clamped one-liner for the brief's "recently" tail.
+fn recent_line(entry: &LedgerEntry) -> String {
+    const TAIL_CLAMP: usize = 80;
+    match &entry.payload {
+        EntryPayload::ChannelOpened { name } => format!("opened channel '{name}'"),
+        EntryPayload::MemberAdded { member } => {
+            format!("added member {}", member.display_name)
+        }
+        EntryPayload::Assertion { statement, .. } => {
+            format!("asserted: {}", clamp(statement, TAIL_CLAMP))
+        }
+        EntryPayload::Proposal { action, .. } => {
+            format!("proposed: {}", clamp(action, TAIL_CLAMP))
+        }
+        EntryPayload::Correction { target, .. } => format!("corrected `{}`", short(target)),
+        EntryPayload::Ratification { target, .. } => format!("ratified `{}`", short(target)),
+        EntryPayload::Park { target, .. } => format!("parked `{}`", short(target)),
+        EntryPayload::Approval { target, .. } => format!("approved `{}`", short(target)),
+        EntryPayload::Rejection { target, .. } => format!("rejected `{}`", short(target)),
+    }
+}
+
+/// The most dead-ends one `dead_ends` call returns — the output is bounded
+/// no matter how much history accumulates (🔵).
+const DEAD_ENDS_LIMIT: usize = 5;
+
+/// Lowercased word tokens for the dead-end similarity ranking: alphanumeric
+/// runs of 3+ chars (shorter ones are mostly stopword noise).
+fn tokens(text: &str) -> std::collections::HashSet<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| word.len() >= 3)
+        .map(str::to_string)
+        .collect()
+}
+
+/// One dead-end (a parked assertion or rejected proposal) plus its killing
+/// act, gathered for ranking.
+struct DeadEnd<'a> {
+    entry: &'a LedgerEntry,
+    label: &'static str,
+    text: &'a str,
+    kill: Option<(&'a LedgerEntry, &'a str)>,
+}
+
+/// The on-demand dead-end surface — the counterpart of the scaled brief's
+/// deliberate omission (Dan, 2026-06-11: a dead-end belongs in recall when
+/// its path starts coming back from the dead). With `about`, a **similarity
+/// search**: dead-ends ranked by token overlap with the query, rare words
+/// weighing more (IDF) — lexical, local, deterministic; an embedding-based
+/// `MemoryProvider` is the designed upgrade path (`docs/pluggability.md`).
+/// Without `about`, the most recent dead-ends. Either way the output is
+/// bounded at [`DEAD_ENDS_LIMIT`] — recall surfaces must not grow with the
+/// record.
+pub fn dead_ends_markdown(name: &str, view: &ChannelView, about: Option<&str>) -> String {
+    // The killing act's rationale is the value here: collect them verbatim.
+    let mut kills: std::collections::HashMap<EntryId, (&LedgerEntry, &str)> = Default::default();
+    for entry in &view.entries {
+        match &entry.payload {
+            EntryPayload::Park { target, rationale }
+            | EntryPayload::Rejection { target, rationale } => {
+                kills.insert(*target, (entry, rationale));
+            }
+            _ => {}
+        }
+    }
+
+    let dead_ends: Vec<DeadEnd> = view
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            let (label, text) = match &entry.payload {
+                EntryPayload::Assertion { statement, .. }
+                    if view.standing(&entry.id) == Some(Standing::Parked) =>
+                {
+                    ("parked", statement.as_str())
+                }
+                EntryPayload::Proposal { action, .. }
+                    if view.gate_status(&entry.id) == Some(GateStatus::Rejected) =>
+                {
+                    ("rejected", action.as_str())
+                }
+                _ => return None,
+            };
+            Some(DeadEnd {
+                entry,
+                label,
+                text,
+                kill: kills.get(&entry.id).copied(),
+            })
+        })
+        .collect();
+
+    let mut out = format!("# dead-ends in '{name}'\n\n");
+    let total = dead_ends.len();
+    if total == 0 {
+        out.push_str("(no dead-ends — nothing parked or rejected in this channel)\n");
+        return out;
+    }
+
+    // Each dead-end's searchable text: the claim plus why it was killed.
+    let docs: Vec<std::collections::HashSet<String>> = dead_ends
+        .iter()
+        .map(|dead_end| {
+            tokens(&format!(
+                "{} {}",
+                dead_end.text,
+                dead_end.kill.map(|(_, why)| why).unwrap_or_default()
+            ))
+        })
+        .collect();
+
+    let ranked: Vec<&DeadEnd> = match about.map(tokens) {
+        Some(query) if !query.is_empty() => {
+            // IDF-weighted token overlap, normalized against doc length so
+            // long dead-ends don't win by surface area. Crude next to
+            // embeddings, but local, deterministic, and dependency-free.
+            let idf = |token: &str| {
+                let with = docs.iter().filter(|doc| doc.contains(token)).count();
+                ((1.0 + total as f64) / (1.0 + with as f64)).ln() + 1.0
+            };
+            let mut scored: Vec<(f64, &DeadEnd)> = dead_ends
+                .iter()
+                .zip(&docs)
+                .filter_map(|(dead_end, doc)| {
+                    let score: f64 = query
+                        .iter()
+                        .filter(|token| doc.contains(*token))
+                        .map(|token| idf(token))
+                        .sum();
+                    (score > 0.0).then(|| (score / (doc.len() as f64).sqrt(), dead_end))
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+            scored
+                .into_iter()
+                .take(DEAD_ENDS_LIMIT)
+                .map(|(_, dead_end)| dead_end)
+                .collect()
+        }
+        // No query: the most recent dead-ends (entries are in canonical,
+        // oldest-first order).
+        _ => dead_ends.iter().rev().take(DEAD_ENDS_LIMIT).collect(),
+    };
+
+    if ranked.is_empty() {
+        let _ = writeln!(
+            out,
+            "(none of the {total} dead-ends resemble '{}' — the match is lexical, so try \
+             other words for the same idea before concluding the territory is untried)",
+            about.unwrap_or_default()
+        );
+        return out;
+    }
+
+    for dead_end in &ranked {
+        let _ = writeln!(
+            out,
+            "- `{}` [{}] {} <{}>: {}",
+            dead_end.entry.id,
+            dead_end.label,
+            dead_end.entry.author.display_name,
+            dead_end.entry.author.email,
+            dead_end.text
+        );
+        if let Some((act, rationale)) = dead_end.kill {
+            let _ = writeln!(
+                out,
+                "  {} by {} @{}: {rationale}",
+                dead_end.label,
+                act.author.display_name,
+                act.timestamp.as_millis()
+            );
+        }
+    }
+    let how = if about.is_some() {
+        "most similar first"
+    } else {
+        "most recent first"
+    };
+    let _ = writeln!(
+        out,
+        "\n({} of {total} dead-ends, {how} — do not re-try these without surfacing the \
+         prior park/rejection to the party)",
+        ranked.len()
+    );
+    out
+}
+
+/// The full transcript: every entry in canonical order with ids and derived
+/// states — the detail path behind the scaled [`brief_markdown`]
+/// (`view_channel` with `full: true`).
+pub fn transcript_markdown(name: &str, id: &ChannelId, view: &ChannelView) -> String {
     let mut out = format!("# channel '{name}' ({id})\n\n");
     if !view.party.is_empty() {
         let roster: Vec<String> = view.party.iter().map(member_label).collect();
@@ -1022,6 +1473,132 @@ mod tests {
                 frame: None,
             },
         }
+    }
+
+    /// A verification act entry by Dan, for fold-into-target tests.
+    fn act(payload: EntryPayload) -> LedgerEntry {
+        LedgerEntry {
+            id: EntryId::new(),
+            channel: ChannelId::new(),
+            author: Member::human("Dan", "dan@example.com"),
+            timestamp: Timestamp::from_millis(1_781_046_734_155),
+            payload,
+        }
+    }
+
+    #[test]
+    fn scaled_brief_folds_acts_and_decays_resolved() {
+        let ratified = assertion("The sky is blue. Checked at noon.");
+        let parked = assertion("Cold fusion works");
+        let superseded = assertion("old text of the claim");
+        let correction = LedgerEntry {
+            id: EntryId::new(),
+            channel: ChannelId::new(),
+            author: Member::human("Ada", "ada@example.com"),
+            timestamp: Timestamp::from_millis(1_781_046_734_154),
+            payload: EntryPayload::Correction {
+                target: superseded.id,
+                statement: "new text of the claim".into(),
+                rationale: "fixed".into(),
+            },
+        };
+        let proposal = LedgerEntry {
+            id: EntryId::new(),
+            channel: ChannelId::new(),
+            author: Member::human("Ada", "ada@example.com"),
+            timestamp: Timestamp::from_millis(1_781_046_734_154),
+            payload: EntryPayload::Proposal {
+                action: "merge the fix".into(),
+                rationale: "ready".into(),
+                provenance: vec![],
+                frame: None,
+                requirement: junto_kernel::ApprovalRequirement::Count(1),
+            },
+        };
+        let acts = vec![
+            act(EntryPayload::Ratification {
+                target: ratified.id,
+                rationale: "verified".into(),
+            }),
+            act(EntryPayload::Park {
+                target: parked.id,
+                rationale: "dead end".into(),
+            }),
+            act(EntryPayload::Approval {
+                target: proposal.id,
+                rationale: "go".into(),
+            }),
+        ];
+        let standings: HashMap<_, _> = [
+            (ratified.id, Standing::Ratified),
+            (parked.id, Standing::Parked),
+            (superseded.id, Standing::Superseded),
+        ]
+        .into();
+        let gate_status: HashMap<_, _> = [(proposal.id, GateStatus::Approved)].into();
+        let mut entries = vec![parked, superseded, ratified, proposal, correction];
+        entries.extend(acts);
+        let view = ChannelView {
+            name: Some("t".into()),
+            entries,
+            party: Vec::new(),
+            unrecognized: Default::default(),
+            standings,
+            gate_status,
+        };
+        let brief = brief_markdown("t", &ChannelId::new(), &view);
+
+        // Acts fold into their targets instead of renting lines.
+        assert!(brief.contains("ratified by Dan"), "{brief}");
+        assert!(!brief.contains("ratification of"), "{brief}");
+        // The superseded body collapses; the correction carries the live text.
+        assert!(!brief.contains("old text of the claim"), "{brief}");
+        assert!(brief.contains("new text of the claim"), "{brief}");
+        assert!(brief.contains("(correction of"), "{brief}");
+        // Parked dead-ends do not rent standing lines — counted, not shown.
+        assert!(!brief.contains("Cold fusion"), "{brief}");
+        assert!(brief.contains("1 parked dead-ends"), "{brief}");
+        // Approved proposals appear as sanctioned actions with their approver.
+        assert!(brief.contains("merge the fix"), "{brief}");
+        assert!(brief.contains("approved by Dan"), "{brief}");
+    }
+
+    #[test]
+    fn scaled_brief_tiers_standing_decisions() {
+        // 30 ratified decisions: newest 10 render in full, the next 15 clamp
+        // to the first sentence, the oldest 5 decay to a count.
+        let entries: Vec<LedgerEntry> = (0..30)
+            .map(|i| assertion(&format!("decision {i:02} settled. extra body {i:02}")))
+            .collect();
+        let standings: HashMap<_, _> = entries.iter().map(|e| (e.id, Standing::Ratified)).collect();
+        let view = ChannelView {
+            name: Some("t".into()),
+            entries,
+            party: Vec::new(),
+            unrecognized: Default::default(),
+            standings,
+            gate_status: Default::default(),
+        };
+        let brief = brief_markdown("t", &ChannelId::new(), &view);
+
+        assert!(brief.contains("extra body 29"), "newest in full: {brief}");
+        assert!(
+            brief.contains("extra body 20"),
+            "10th newest in full: {brief}"
+        );
+        assert!(
+            brief.contains("decision 05 settled."),
+            "clamped keeps claim"
+        );
+        assert!(
+            !brief.contains("extra body 05"),
+            "clamped drops body: {brief}"
+        );
+        assert!(
+            !brief.contains("decision 04 settled"),
+            "oldest omitted: {brief}"
+        );
+        assert!(brief.contains("…and 5 older standing decisions"), "{brief}");
     }
 
     #[test]
