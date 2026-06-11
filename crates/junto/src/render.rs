@@ -17,7 +17,7 @@ use junto_kernel::{
 };
 use std::fmt::Write as _;
 
-use crate::host::ChannelSummary;
+use crate::host::{AttentionGroup, AttentionKind, ChannelSummary};
 
 /// `Name <email>` plus an `(agent)` marker — humans are the unmarked case.
 fn member_label(member: &Member) -> String {
@@ -162,10 +162,10 @@ fn page_shell(
 }
 
 /// The channel index — every channel across every registered home substrate,
-/// the landing page of the one surface (`docs/adr/0015`). Designed as a
-/// resumption dashboard: per channel, what needs you (open gates), who is on
-/// it, how alive it is, and a glimpse of the latest entry.
-pub fn index_html(summaries: &[ChannelSummary]) -> String {
+/// the landing page of the one surface (`docs/adr/0015`). Leads with the
+/// focus board (what needs you, grouped by inquiry — `docs/attention.md`),
+/// then the channel cards: who is on each, how alive it is, the latest entry.
+pub fn index_html(summaries: &[ChannelSummary], attention: &[AttentionGroup]) -> String {
     let mut cards = String::new();
     for summary in summaries {
         let display_name = summary.name.as_deref().unwrap_or("(unopened)");
@@ -223,7 +223,7 @@ pub fn index_html(summaries: &[ChannelSummary]) -> String {
         format!("<div class=\"cards\">{cards}</div>")
     };
     let open_gates: usize = summaries.iter().map(|summary| summary.open_gates).sum();
-    let attention = if open_gates > 0 {
+    let gates_note = if open_gates > 0 {
         format!(
             " · <span class=\"attention\">{open_gates} gate{} awaiting verification</span>",
             if open_gates == 1 { "" } else { "s" }
@@ -234,9 +234,10 @@ pub fn index_html(summaries: &[ChannelSummary]) -> String {
     let content = format!(
         "<h1>channels</h1>\n\
          <p class=\"meta\">{count} channel{plural} across every registered substrate\
-         {attention}</p>\n{body}",
+         {gates_note}</p>\n{board}\n<h2 class=\"board-head\">all channels</h2>\n{body}",
         count = summaries.len(),
         plural = if summaries.len() == 1 { "" } else { "s" },
+        board = focus_board(attention, "/"),
     );
     page_shell("junto — channels", summaries, None, &content)
 }
@@ -244,15 +245,143 @@ pub fn index_html(summaries: &[ChannelSummary]) -> String {
 /// Milliseconds-epoch → a human resumption cue ("12m ago"), falling back to
 /// the date once it stops being recent.
 fn ago(millis: i64) -> String {
+    match wait_time(millis) {
+        Some(duration) => format!("{duration} ago"),
+        None => iso_utc(millis),
+    }
+}
+
+/// Milliseconds-epoch → elapsed duration ("12m", "3h", "5d"); `None` once it
+/// is old enough that a date reads better.
+fn wait_time(millis: i64) -> Option<String> {
     let now = junto_kernel::Timestamp::now().as_millis();
     let minutes = now.saturating_sub(millis) / 60_000;
     match minutes {
-        ..=0 => "just now".to_string(),
-        1..=59 => format!("{minutes}m ago"),
-        60..=1439 => format!("{}h ago", minutes / 60),
-        1440..=43_199 => format!("{}d ago", minutes / 1440),
-        _ => iso_utc(millis),
+        ..=0 => Some("moments".to_string()),
+        1..=59 => Some(format!("{minutes}m")),
+        60..=1439 => Some(format!("{}h", minutes / 60)),
+        1440..=43_199 => Some(format!("{}d", minutes / 1440)),
+        _ => None,
     }
+}
+
+// ---- the focus board (docs/attention.md) ----
+
+/// The needs-you board: every act awaiting the member, grouped by inquiry —
+/// never a flat list. Renders the load line, the groups (gate-bearing
+/// inquiries first, as ordered by the host), and an all-clear empty state.
+/// `back` is where the inline act forms return after acting.
+pub fn focus_board(groups: &[AttentionGroup], back: &str) -> String {
+    if groups.is_empty() {
+        return "<section class=\"board\"><h2 class=\"board-head\">needs you</h2>\
+                <p class=\"all-clear\">all clear — nothing awaits your verification</p>\
+                </section>\n"
+            .to_string();
+    }
+    let item_count: usize = groups.iter().map(|group| group.items.len()).sum();
+    let mut sections = String::new();
+    for group in groups {
+        let _ = writeln!(sections, "{}", attention_group(group, back, true));
+    }
+    format!(
+        "<section class=\"board\"><h2 class=\"board-head\">needs you</h2>\
+         <p class=\"meta\">{inquiries} inquir{ies} in flight · {item_count} item{s} \
+         awaiting your act</p>\n{sections}</section>\n",
+        inquiries = groups.len(),
+        ies = if groups.len() == 1 { "y" } else { "ies" },
+        s = if item_count == 1 { "" } else { "s" },
+    )
+}
+
+/// One inquiry's attention strip — used inside the board and atop the
+/// channel page (where the heading already names the channel).
+pub fn attention_group(group: &AttentionGroup, back: &str, titled: bool) -> String {
+    let mut items = String::new();
+    for item in &group.items {
+        let _ = writeln!(items, "{}", attention_item(item, &group.channel, back));
+    }
+    let title = if titled {
+        let display_name = group
+            .name
+            .clone()
+            .unwrap_or_else(|| group.channel.to_string());
+        format!(
+            "<h3 class=\"attn-chan\"><a href=\"/channels/{href}\">{name}</a> \
+             <span class=\"count\">{count} need{s} you</span></h3>\n",
+            href = escape_html(&display_name),
+            name = escape_html(&display_name),
+            count = group.items.len(),
+            s = if group.items.len() == 1 { "s" } else { "" },
+        )
+    } else {
+        String::new()
+    };
+    format!("<section class=\"attn-group\">{title}{items}</section>")
+}
+
+/// One act awaiting the member: what it is, who it keeps waiting and for how
+/// long (`docs/attention.md` — blocking-whom, by name), the content, and the
+/// act inline.
+fn attention_item(item: &crate::host::AttentionItem, channel: &ChannelId, back: &str) -> String {
+    let entry = &item.entry;
+    let waiting = wait_time(entry.timestamp.as_millis())
+        .unwrap_or_else(|| format!("since {}", iso_utc(entry.timestamp.as_millis())));
+    let (kind, badge, blocking, text, rationale, accept, decline) =
+        match (&item.kind, &entry.payload) {
+            (
+                AttentionKind::Gate,
+                EntryPayload::Proposal {
+                    action, rationale, ..
+                },
+            ) => (
+                "proposal",
+                "pending",
+                format!(
+                    "<div class=\"blocking\">blocking <b>{}</b> for {waiting}</div>",
+                    escape_html(&entry.author.display_name)
+                ),
+                action.clone(),
+                rationale.clone(),
+                "approve",
+                "reject",
+            ),
+            (
+                _,
+                EntryPayload::Assertion {
+                    statement,
+                    rationale,
+                    ..
+                },
+            ) => (
+                "assertion",
+                "provisional",
+                format!(
+                    "<div class=\"blocking quiet-block\">{} · unverified for {waiting}</div>",
+                    escape_html(&entry.author.display_name)
+                ),
+                statement.clone(),
+                rationale.clone(),
+                "ratify",
+                "park",
+            ),
+            // The host only emits the two shapes above; render anything else inert.
+            _ => return String::new(),
+        };
+    format!(
+        "<article class=\"card attn\">\
+         <header><span class=\"kind\">{kind}</span>\
+         <span class=\"badge {badge}\">{badge}</span>\
+         <span class=\"spacer\"></span>\
+         <span class=\"when\">{when}</span></header>\
+         {blocking}\
+         <div class=\"statement clamp\">{text}</div>\
+         <details class=\"why\"><summary>why</summary><p>{why}</p></details>\
+         {form}</article>",
+        when = escape_html(&iso_utc(entry.timestamp.as_millis())),
+        text = escape_html(&text),
+        why = escape_html(&rationale),
+        form = act_form(entry.id, channel, accept, decline, back),
+    )
 }
 
 /// The human-facing channel page: the projected ledger as entry cards, with
@@ -301,10 +430,21 @@ pub fn channel_html(
             chips.join("")
         )
     };
+    // The channel's own attention strip: what here awaits the member, above
+    // the full ledger (docs/attention.md).
+    let strip_group = crate::host::attention_for_view(id, view);
+    let strip = if strip_group.items.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<section class=\"board\"><h2 class=\"board-head\">needs you here</h2>\n{}</section>\n",
+            attention_group(&strip_group, &format!("/channels/{id}"), false)
+        )
+    };
     let content = format!(
         "<h1>{name}</h1>\n\
          <p class=\"meta\">channel {id} · {count} entries · read-only projection</p>\n\
-         {party}{body}",
+         {party}{strip}<h2 class=\"board-head\">the ledger</h2>\n{body}",
         name = escape_html(name),
         count = view.entries.len(),
     );
@@ -491,16 +631,37 @@ fn verification_form(entry: &LedgerEntry, view: &ChannelView, channel: &ChannelI
     let Some((accept, decline)) = acts else {
         return String::new();
     };
+    act_form(
+        entry.id,
+        channel,
+        accept,
+        decline,
+        &format!("/channels/{channel}"),
+    )
+}
+
+/// The act form itself: one rationale input feeding whichever button is
+/// pressed, the member code (blank uses the remembered one), and the
+/// return path the route redirects to afterwards.
+fn act_form(
+    entry_id: junto_kernel::EntryId,
+    channel: &ChannelId,
+    accept: &str,
+    decline: &str,
+    back: &str,
+) -> String {
     format!(
         "<form class=\"act\" method=\"post\" \
          action=\"/channels/{channel}/entries/{entry_id}/{accept}\">\
+         <input type=\"hidden\" name=\"back\" value=\"{back}\">\
          <input name=\"rationale\" placeholder=\"why — a rationale, not a checkbox\" required>\
          <input name=\"code\" class=\"code\" placeholder=\"member code\" \
-         title=\"your machine-local member code (docs/adr/0017)\">\
+         title=\"your machine-local member code (docs/adr/0017); blank reuses the one \
+         remembered from your last act\">\
          <button class=\"primary\">{accept}</button>\
          <button formaction=\"/channels/{channel}/entries/{entry_id}/{decline}\">{decline}</button>\
          </form>",
-        entry_id = entry.id,
+        back = escape_html(back),
     )
 }
 
@@ -535,6 +696,20 @@ h1{margin:0 0 .2rem;font-size:1.45rem}h2{margin:0;font-size:1.02rem}\
 .meta{color:var(--muted);font-size:.82rem;margin:0 0 1.1rem}\
 .empty{color:var(--muted)}\
 .party{display:flex;flex-wrap:wrap;gap:.4rem;margin:0 0 1.2rem}\
+.board{margin:0 0 1.6rem}\
+.board-head{font-size:.78rem;text-transform:uppercase;letter-spacing:.08em;\
+color:var(--muted);margin:1.4rem 0 .6rem}\
+.all-clear{color:var(--green);font-size:.9rem}\
+.attn-group{margin:0 0 1rem}\
+.attn-chan{font-size:.95rem;margin:0 0 .45rem}\
+.attn-chan a{color:var(--text);text-decoration:none}\
+.attn-chan a:hover{color:var(--accent)}\
+.count{font-size:.72rem;font-weight:600;color:var(--yellow);margin-left:.4rem}\
+.card.attn{border-left:2px solid var(--yellow)}\
+.blocking{color:var(--yellow);font-size:.84rem;margin-top:.5rem}\
+.blocking.quiet-block{color:var(--muted)}\
+.clamp{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;\
+overflow:hidden}\
 .chip{font-size:.74rem;color:var(--soft);border:1px solid var(--border);\
 border-radius:.7rem;padding:.12rem .6rem;background:var(--panel)}\
 .card{background:var(--card);border:1px solid var(--border);border-radius:.65rem;\

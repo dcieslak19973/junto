@@ -91,7 +91,10 @@ async fn index_page(State(host): State<Arc<Host>>) -> Response {
         Ok(mut summaries) => {
             // Most recently active first — the resumption order.
             summaries.sort_by_key(|summary| std::cmp::Reverse(summary.last_activity));
-            Html(render::index_html(&summaries)).into_response()
+            // The focus board leads the page; an attention failure must not
+            // take the index down with it.
+            let attention = host.attention().await.unwrap_or_default();
+            Html(render::index_html(&summaries, &attention)).into_response()
         }
         Err(err) => internal(format!("listing channels: {err}")),
     }
@@ -118,15 +121,41 @@ async fn channel_page(State(host): State<Arc<Host>>, Path(channel): Path<String>
 struct ActForm {
     rationale: String,
     /// The member code of the machine user (required once the channel has a
-    /// Party; blank tolerated for pre-genesis channels).
+    /// Party; blank falls back to the code remembered in the cookie).
     #[serde(default)]
     code: String,
+    /// Where to return after acting (the focus board sets "/"); only local
+    /// paths are honored.
+    #[serde(default)]
+    back: String,
+}
+
+/// The cookie that remembers the member code after a successful act, so a
+/// batch of verifications is N clicks, not N pastes (`docs/attention.md`).
+/// HttpOnly, SameSite=Strict, localhost-only host — the same machine-local
+/// accident-proofing posture as the code store itself (`docs/adr/0017`).
+const CODE_COOKIE: &str = "junto_member_code";
+
+/// The remembered member code from the request's cookies, if any.
+fn remembered_code(headers: &axum::http::HeaderMap) -> Option<String> {
+    let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
+    cookies.split(';').find_map(|pair| {
+        let (name, value) = pair.trim().split_once('=')?;
+        (name == CODE_COOKIE).then(|| value.to_string())
+    })
+}
+
+/// A safe local redirect target: an absolute path on this host, nothing that
+/// a browser could read as a different origin.
+fn safe_back(back: &str) -> Option<&str> {
+    (back.starts_with('/') && !back.starts_with("//")).then_some(back)
 }
 
 /// Append one verification act from the channel page's forms.
 async fn verify(
     State(host): State<Arc<Host>>,
     Path((channel, entry, act)): Path<(String, String, String)>,
+    headers: axum::http::HeaderMap,
     Form(form): Form<ActForm>,
 ) -> Response {
     let rationale = form.rationale.trim().to_string();
@@ -214,10 +243,17 @@ async fn verify(
     };
 
     // The write-surface guardrail (docs/adr/0017): the author must be in the
-    // channel's Party and present their member code.
-    let code = form.code.trim();
-    let code = (!code.is_empty()).then_some(code);
-    if let Err(err) = host.authorize_write(&view, &author, code) {
+    // channel's Party and present their member code — typed, or remembered
+    // from the last successful act (docs/attention.md: batch verification is
+    // N clicks, not N pastes).
+    let typed = form.code.trim().to_string();
+    let remembered = remembered_code(&headers);
+    let code = if typed.is_empty() {
+        remembered.clone()
+    } else {
+        Some(typed.clone())
+    };
+    if let Err(err) = host.authorize_write(&view, &author, code.as_deref()) {
         return (StatusCode::FORBIDDEN, format!("{err:#}")).into_response();
     }
 
@@ -247,8 +283,18 @@ async fn verify(
         }
     });
 
-    // Back to the page, id-addressed (ids are URL-safe; names may not be).
-    Redirect::to(&format!("/channels/{id}")).into_response()
+    // Back where the act came from (the focus board sends "/"), defaulting
+    // to the channel page, id-addressed (ids are URL-safe; names may not be).
+    let destination = safe_back(&form.back)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("/channels/{id}"));
+    // Remember a freshly typed, just-validated code for the next act.
+    if !typed.is_empty() && remembered.as_deref() != Some(typed.as_str()) {
+        let cookie =
+            format!("{CODE_COOKIE}={typed}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000");
+        return ([(header::SET_COOKIE, cookie)], Redirect::to(&destination)).into_response();
+    }
+    Redirect::to(&destination).into_response()
 }
 
 async fn channel_brief(State(host): State<Arc<Host>>, Path(channel): Path<String>) -> Response {
@@ -374,12 +420,35 @@ mod tests {
         rationale: &str,
         code: &str,
     ) -> Response {
+        post_act_with(host, channel, entry, act, rationale, code, "", None).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn post_act_with(
+        host: Arc<Host>,
+        channel: String,
+        entry: String,
+        act: &str,
+        rationale: &str,
+        code: &str,
+        back: &str,
+        cookie: Option<&str>,
+    ) -> Response {
+        let mut headers = axum::http::HeaderMap::new();
+        if let Some(cookie) = cookie {
+            headers.insert(
+                header::COOKIE,
+                format!("{CODE_COOKIE}={cookie}").parse().unwrap(),
+            );
+        }
         verify(
             State(host),
             Path((channel, entry, act.to_string())),
+            headers,
             Form(ActForm {
                 rationale: rationale.into(),
                 code: code.into(),
+                back: back.into(),
             }),
         )
         .await
@@ -488,6 +557,64 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn remembered_code_and_back_path() {
+        // First act: typed code + back to the board — the response carries
+        // both the redirect to "/" and the remember-cookie.
+        let fx = host_with_entry(assertion()).await;
+        let response = post_act_with(
+            fx.host.clone(),
+            "web-test".into(),
+            fx.target.to_string(),
+            "ratify",
+            "checked",
+            &fx.code,
+            "/",
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("/")
+        );
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .expect("remember-cookie set");
+        assert!(cookie.contains(&format!("{CODE_COOKIE}={}", fx.code)));
+        assert!(cookie.contains("HttpOnly"));
+
+        // Second act: blank code, cookie supplies it; a hostile back path is
+        // ignored in favor of the channel page.
+        let fx2 = host_with_entry(proposal()).await;
+        let response = post_act_with(
+            fx2.host.clone(),
+            "web-test".into(),
+            fx2.target.to_string(),
+            "approve",
+            "lgtm",
+            "",
+            "//evil.example.com",
+            Some(&fx2.code),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap();
+        assert!(
+            location.starts_with("/channels/"),
+            "hostile back ignored: {location}"
+        );
     }
 
     #[tokio::test]

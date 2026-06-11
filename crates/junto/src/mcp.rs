@@ -23,8 +23,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use junto_kernel::{
-    ApprovalRequirement, ChannelId, ContentDigest, EntryId, EntryPayload, LedgerEntry, Member,
-    ProvenanceRef, Timestamp, Uri,
+    ApprovalRequirement, ChannelId, ChannelView, ContentDigest, EntryId, EntryPayload, LedgerEntry,
+    Member, ProvenanceRef, Timestamp, Uri,
 };
 use rmcp::{
     ErrorData as McpError, ServerHandler,
@@ -209,10 +209,62 @@ fn invalid(message: impl Into<String>) -> McpError {
     McpError::invalid_params(message.into(), None)
 }
 
-/// Parse an entry id string from a tool argument.
-fn parse_entry_id(raw: &str) -> Result<EntryId, McpError> {
-    raw.parse()
-        .map_err(|_| invalid(format!("'{raw}' is not an entry id (expected a UUID)")))
+/// What kind of entry a verification act may target — mirrors the web
+/// route's cross-kind refusal.
+#[derive(Clone, Copy)]
+enum TargetKind {
+    /// ratify / park / correct act on assertions (standing-bearing).
+    Assertion,
+    /// approve / reject act on proposals (gate-bearing).
+    Proposal,
+}
+
+/// Resolve an act's target against the channel projection: a full id must
+/// *exist* and bear the right kind, and a git-style unambiguous id prefix is
+/// accepted — so agents stop reproducing full UUIDs from memory (a fabricated
+/// id was accepted silently here once; junto-dev entry `5f625741`). Dangling
+/// tolerance remains a *projection* property for entries arriving by sync;
+/// an interactive surface can and does tell the author immediately.
+fn resolve_target(view: &ChannelView, raw: &str, kind: TargetKind) -> Result<EntryId, McpError> {
+    let described = match kind {
+        TargetKind::Assertion => "an assertion (ratify/park/correct targets)",
+        TargetKind::Proposal => "a proposal (approve/reject targets)",
+    };
+    let bears_kind = |id: &EntryId| match kind {
+        TargetKind::Assertion => view.standing(id).is_some(),
+        TargetKind::Proposal => view.gate_status(id).is_some(),
+    };
+
+    if let Ok(id) = raw.parse::<EntryId>() {
+        return if bears_kind(&id) {
+            Ok(id)
+        } else {
+            Err(invalid(format!(
+                "{id} is not {described} in this channel — check the id against view_channel"
+            )))
+        };
+    }
+
+    // A prefix: unambiguous within the right kind, at least 6 chars.
+    if raw.len() < 6 || !raw.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return Err(invalid(format!(
+            "'{raw}' is not an entry id (expected a UUID or an id prefix of 6+ hex chars)"
+        )));
+    }
+    let mut matches = view
+        .entries
+        .iter()
+        .map(|entry| entry.id)
+        .filter(|id| id.to_string().starts_with(raw) && bears_kind(id));
+    match (matches.next(), matches.next()) {
+        (Some(id), None) => Ok(id),
+        (Some(a), Some(b)) => Err(invalid(format!(
+            "id prefix '{raw}' is ambiguous (at least {a} and {b}); give more characters"
+        ))),
+        (None, _) => Err(invalid(format!(
+            "no entry matching '{raw}' is {described} in this channel — check view_channel"
+        ))),
+    }
 }
 
 /// Convert provenance params, validating each URI/digest.
@@ -274,14 +326,16 @@ impl JuntoMcp {
     }
 
     /// The write-surface guardrail (`docs/adr/0017`): project the channel and
-    /// refuse a non-member author or a missing/wrong member code.
+    /// refuse a non-member author or a missing/wrong member code. Returns the
+    /// projection so callers can validate act targets against it without
+    /// re-projecting.
     async fn authorize(
         &self,
         ledger: &SharedLedger,
         channel: &ChannelId,
         author: &Member,
         code: Option<&str>,
-    ) -> Result<(), McpError> {
+    ) -> Result<ChannelView, McpError> {
         let view = ledger
             .lock()
             .await
@@ -290,7 +344,8 @@ impl JuntoMcp {
             .map_err(internal)?;
         self.host
             .authorize_write(&view, author, code)
-            .map_err(|err| invalid(err.to_string()))
+            .map_err(|err| invalid(err.to_string()))?;
+        Ok(view)
     }
 
     /// Build the envelope for a fresh entry authored now.
@@ -429,9 +484,10 @@ impl JuntoMcp {
     ) -> Result<CallToolResult, McpError> {
         let author: Member = req.author.into();
         let (ledger, channel) = self.resolve(&req.channel).await?;
-        self.authorize(&ledger, &channel, &author, req.code.as_deref())
+        let view = self
+            .authorize(&ledger, &channel, &author, req.code.as_deref())
             .await?;
-        let target = parse_entry_id(&req.target)?;
+        let target = resolve_target(&view, &req.target, TargetKind::Assertion)?;
         let entry = Self::entry(
             channel,
             author,
@@ -452,9 +508,10 @@ impl JuntoMcp {
     ) -> Result<CallToolResult, McpError> {
         let author: Member = req.author.into();
         let (ledger, channel) = self.resolve(&req.channel).await?;
-        self.authorize(&ledger, &channel, &author, req.code.as_deref())
+        let view = self
+            .authorize(&ledger, &channel, &author, req.code.as_deref())
             .await?;
-        let target = parse_entry_id(&req.target)?;
+        let target = resolve_target(&view, &req.target, TargetKind::Assertion)?;
         let entry = Self::entry(
             channel,
             author,
@@ -475,9 +532,10 @@ impl JuntoMcp {
     ) -> Result<CallToolResult, McpError> {
         let author: Member = req.author.into();
         let (ledger, channel) = self.resolve(&req.channel).await?;
-        self.authorize(&ledger, &channel, &author, req.code.as_deref())
+        let view = self
+            .authorize(&ledger, &channel, &author, req.code.as_deref())
             .await?;
-        let target = parse_entry_id(&req.target)?;
+        let target = resolve_target(&view, &req.target, TargetKind::Assertion)?;
         let entry = Self::entry(
             channel,
             author,
@@ -534,9 +592,10 @@ impl JuntoMcp {
     ) -> Result<CallToolResult, McpError> {
         let author: Member = req.author.into();
         let (ledger, channel) = self.resolve(&req.channel).await?;
-        self.authorize(&ledger, &channel, &author, req.code.as_deref())
+        let view = self
+            .authorize(&ledger, &channel, &author, req.code.as_deref())
             .await?;
-        let target = parse_entry_id(&req.target)?;
+        let target = resolve_target(&view, &req.target, TargetKind::Proposal)?;
         let entry = Self::entry(
             channel,
             author,
@@ -557,9 +616,10 @@ impl JuntoMcp {
     ) -> Result<CallToolResult, McpError> {
         let author: Member = req.author.into();
         let (ledger, channel) = self.resolve(&req.channel).await?;
-        self.authorize(&ledger, &channel, &author, req.code.as_deref())
+        let view = self
+            .authorize(&ledger, &channel, &author, req.code.as_deref())
             .await?;
-        let target = parse_entry_id(&req.target)?;
+        let target = resolve_target(&view, &req.target, TargetKind::Proposal)?;
         let entry = Self::entry(
             channel,
             author,
@@ -1177,6 +1237,71 @@ mod tests {
             1,
             "one grant entry, not two: {rendered}"
         );
+    }
+
+    #[tokio::test]
+    async fn act_targets_must_exist_and_bear_the_right_kind() {
+        // Finding 5f625741: a fabricated target id must be refused at the
+        // interactive surface, not silently recorded as dangling junk.
+        let (dirs, mcp) = init_repo();
+        open(&mcp, &dirs, "junto-dev").await;
+        let recorded = mcp
+            .record(Parameters(RecordRequest {
+                channel: "junto-dev".into(),
+                author: claude(),
+                code: code_of(&dirs, claude()),
+                statement: "claim".into(),
+                rationale: "because".into(),
+                provenance: None,
+            }))
+            .await
+            .unwrap();
+        let id = recorded_id(&recorded);
+
+        // A well-formed UUID that names no entry is refused.
+        let err = mcp
+            .ratify(Parameters(ActRequest {
+                channel: "junto-dev".into(),
+                author: dan(),
+                code: code_of(&dirs, dan()),
+                target: EntryId::new().to_string(),
+                rationale: "r".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("not an assertion"), "{}", err.message);
+
+        // Approving an assertion (wrong kind) is refused.
+        let err = mcp
+            .approve(Parameters(ActRequest {
+                channel: "junto-dev".into(),
+                author: dan(),
+                code: code_of(&dirs, dan()),
+                target: id.clone(),
+                rationale: "r".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("not a proposal"), "{}", err.message);
+
+        // An unambiguous prefix resolves and the act lands.
+        mcp.ratify(Parameters(ActRequest {
+            channel: "junto-dev".into(),
+            author: dan(),
+            code: code_of(&dirs, dan()),
+            target: id[..8].to_string(),
+            rationale: "checked, by prefix".into(),
+        }))
+        .await
+        .unwrap();
+        let rendered = text_of(
+            &mcp.view_channel(Parameters(ViewRequest {
+                channel: "junto-dev".into(),
+            }))
+            .await
+            .unwrap(),
+        );
+        assert!(rendered.contains("[ratified]"), "{rendered}");
     }
 
     #[tokio::test]

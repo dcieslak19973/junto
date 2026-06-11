@@ -138,6 +138,44 @@ pub struct ChannelSummary {
     pub latest: Option<String>,
 }
 
+/// What kind of act an [`AttentionItem`] awaits (`docs/attention.md`:
+/// gates first — they block the proposer — then verification debt).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttentionKind {
+    /// A pending proposal awaiting approve/reject; its author is blocked.
+    Gate,
+    /// A provisional assertion awaiting ratify/park.
+    Verification,
+}
+
+/// One act awaiting a member on the focus board.
+#[derive(Debug, Clone)]
+pub struct AttentionItem {
+    pub kind: AttentionKind,
+    /// The pending proposal or provisional assertion itself.
+    pub entry: LedgerEntry,
+}
+
+/// One inquiry's group on the focus board — items are never interleaved
+/// across inquiries (`docs/attention.md`: switching is the cost).
+#[derive(Debug, Clone)]
+pub struct AttentionGroup {
+    pub channel: ChannelId,
+    pub name: Option<String>,
+    /// Gates first, then verifications; oldest first within each (longest
+    /// waiting at the top).
+    pub items: Vec<AttentionItem>,
+}
+
+impl AttentionGroup {
+    /// Whether this inquiry has a blocked proposer (its urgency tier).
+    pub fn has_gates(&self) -> bool {
+        self.items
+            .iter()
+            .any(|item| item.kind == AttentionKind::Gate)
+    }
+}
+
 /// The result of resolving a user-supplied channel reference.
 pub enum Resolution {
     /// Exactly one channel matched, in its home substrate's ledger.
@@ -241,6 +279,35 @@ impl Host {
             }
         }
         Ok(summaries)
+    }
+
+    /// The focus board's content (`docs/attention.md`): every act awaiting a
+    /// member, grouped by inquiry — channels with blocked proposers (pending
+    /// gates) first, then by recency of need. Within a group: gates before
+    /// verifications, oldest (longest-waiting) first.
+    pub async fn attention(&self) -> Result<Vec<AttentionGroup>> {
+        let mut groups = Vec::new();
+        for repo in self.substrate_paths()? {
+            let ledger = self.ledger_for(&repo).await?;
+            let guard = ledger.lock().await;
+            for id in guard.substrate().channels().await? {
+                let view = guard.project(&id).await?;
+                let group = attention_for_view(&id, &view);
+                if !group.items.is_empty() {
+                    groups.push(group);
+                }
+            }
+        }
+        // Urgency tiers: gate-bearing inquiries first; recency within a tier
+        // (the inquiry whose need arose latest leads, matching resumption).
+        groups.sort_by_key(|group| {
+            let latest = group.items.iter().map(|item| item.entry.timestamp).max();
+            (
+                std::cmp::Reverse(group.has_gates()),
+                std::cmp::Reverse(latest),
+            )
+        });
+        Ok(groups)
     }
 
     /// Resolve a channel reference — a name bound by a genesis entry, or a raw
@@ -475,6 +542,44 @@ impl Host {
 pub struct OpenedChannel {
     pub id: ChannelId,
     pub founder_code: crate::members::Minted,
+}
+
+/// One channel's attention items from an already-projected view — used by
+/// [`Host::attention`] and by the channel page's attention strip (which has
+/// the view in hand and must not re-project).
+pub fn attention_for_view(id: &ChannelId, view: &ChannelView) -> AttentionGroup {
+    let mut gates = Vec::new();
+    let mut verifications = Vec::new();
+    for entry in &view.entries {
+        match &entry.payload {
+            EntryPayload::Proposal { .. }
+                if view.gate_status(&entry.id) == Some(GateStatus::Pending) =>
+            {
+                gates.push(AttentionItem {
+                    kind: AttentionKind::Gate,
+                    entry: entry.clone(),
+                });
+            }
+            EntryPayload::Assertion { .. }
+                if view.standing(&entry.id) == Some(junto_kernel::Standing::Provisional) =>
+            {
+                verifications.push(AttentionItem {
+                    kind: AttentionKind::Verification,
+                    entry: entry.clone(),
+                });
+            }
+            _ => {}
+        }
+    }
+    // Oldest first within each kind: the longest-waiting item leads.
+    gates.sort_by_key(|item| item.entry.timestamp);
+    verifications.sort_by_key(|item| item.entry.timestamp);
+    gates.extend(verifications);
+    AttentionGroup {
+        channel: *id,
+        name: view.name.clone(),
+        items: gates,
+    }
 }
 
 /// Fold one projected channel into its discovery summary.
