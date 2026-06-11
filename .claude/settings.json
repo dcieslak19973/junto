@@ -16,14 +16,29 @@
     "PostToolUse": [
       {
         "matcher": "Edit|Write|MultiEdit",
+        "//": "The `if` filters fire cargo only for Rust-relevant files — doc/config edits spawn nothing (no console flash on Windows, no wasted clippy run). Per-tool `if` rules because a rule names its tool.",
         "hooks": [
           {
             "type": "command",
+            "if": "Edit(**/*.{rs,toml})",
             "command": "cargo fmt --quiet",
             "timeout": 60
           },
           {
             "type": "command",
+            "if": "Edit(**/*.{rs,toml})",
+            "command": "cargo clippy --workspace --all-targets --quiet -- -D warnings",
+            "timeout": 120
+          },
+          {
+            "type": "command",
+            "if": "Write(**/*.{rs,toml})",
+            "command": "cargo fmt --quiet",
+            "timeout": 60
+          },
+          {
+            "type": "command",
+            "if": "Write(**/*.{rs,toml})",
             "command": "cargo clippy --workspace --all-targets --quiet -- -D warnings",
             "timeout": 120
           }

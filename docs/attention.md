@@ -66,7 +66,7 @@ The attention design must generalize without rework:
 - **The Party's load is eventually visible** (⚠️ open: how much, to whom):
   if every gate routes to the one architect, the surface is where that
   bottleneck becomes obvious. Side-quests distribute across the Party — a
-  fork can be *someone else's* inquiry from birth.
+  diverged channel can be *someone else's* inquiry from birth.
 - The personal-optimum measurement (below) is per-member by construction —
   it must never become a comparative leaderboard (⚠️ note: a measurement
   that affects people changes behavior; this stays a private mirror, not a
@@ -182,29 +182,37 @@ decision does the work of articulating the decision space.
 - Items without a frame fall back to the plain form; frame quality becomes
   part of what makes an agent a good collaborator.
 
-## 🔵 Side-quests (forking) — the supply side of attention
+## 🔵 Side-quests (divergence) — the supply side of attention
+
+> Naming (Dan, 2026-06-10): the lifecycle pair is **diverge / converge** —
+> symmetric, DAG-native, and free of loaded baggage: git's "fork" implies a
+> *copy of history* (exactly wrong here), and "split" implies the parent
+> halves or stops — when in fact the parent flows on while a new inquiry
+> departs from a point. "Side-quest" is the friendly name for the common
+> diverge-then-converge-back-to-parent pattern. (`adr/0016` said "fork" when
+> anticipating the family; the verb is settled as diverge when designed.)
 
 The focus board shows the load; **side-quests are how load gets honest**.
-A tangent mid-inquiry ("the UI looks barebones") becomes a *forked child
+A tangent mid-inquiry ("the UI looks barebones") becomes a *diverged child
 channel*: its own ledger and gates, pursued, then **closed with its outcome
 recorded back into the parent** (an entry citing the child — record-style,
 not a merge). The parent ledger stays the spine; tangents stop polluting it
 and become *retirable as units* — a dead side-quest parks whole, instead of
 leaving orphan provisional entries scattered in the main channel.
 
-Mechanics anticipated by `adr/0016` (fork/close as future lifecycle entry
-kinds, decided when concrete):
+Mechanics anticipated by `adr/0016` (lifecycle entry kinds, decided when
+concrete):
 
-- the child's genesis-adjacent entry records *forked from parent, at this
+- the child's genesis-adjacent entry records *diverged from parent, at this
   point*; the parent gets a matching entry — both ledgers carry the
   relationship with provenance both ways;
-- the child's **Outcome** (`domain-model.md`) is concrete: merged-back or
+- the child's **Outcome** (`domain-model.md`) is concrete: converged-back or
   parked;
 - the focus board nests side-quests under their parent (shallow tree).
 
 ### ⚠️ Convergence — channels form a DAG (Dan, 2026-06-10)
 
-Fork has a dual: **two channels may converge**. Entries are immutable
+Divergence has a dual: **two channels may converge**. Entries are immutable
 canonical bytes *including their channel id* (`adr/0002`/`adr/0008`), so
 histories can never literally merge — convergence is therefore a **recorded
 act, not a mutation** (a merge commit, never a rebase): either channel B
@@ -212,9 +220,9 @@ closes *into* A (a closing entry in B, a receiving entry in A, provenance
 both ways), or both close into a new channel whose genesis names two
 predecessors. Nothing moves on the substrate.
 
-- Fork and converge are edges of one **channel lineage DAG**; side-quests
-  (fork then merge back to parent) and independent convergence are the same
-  algebra. The brief-inheritance question is thereby *one* mechanism —
+- Diverge and converge are edges of one **channel lineage DAG**; side-quests
+  (diverge then converge back to parent) and independent convergence are the
+  same algebra. The brief-inheritance question is thereby *one* mechanism —
   recall follows lineage edges with summarization — not two.
 - Convergence **retires WIP** (two boards become one) but forces a ceremony
   with real content: the converging channel's pending gates cannot dangle in
@@ -222,16 +230,16 @@ predecessors. Nothing moves on the substrate.
   continuation (with provenance), or explicitly abandoned. Honest disposal
   of open questions, forced at exactly the right moment.
 - **Naming**: "join" is taken — `domain-model.md` uses join/invite for Party
-  membership. The channel act is **converge** (not "merge", which drags git
-  baggage about histories combining — precisely what does not happen).
+  membership — and "merge" drags git baggage about histories combining,
+  precisely what does not happen. The pair is **diverge / converge**.
 - When designed, `adr/0016`'s lifecycle family likely grows as one algebra:
-  forked / closed / converged.
+  diverged / closed / converged.
 
-⚠️ Open when forking is designed: does the child inherit the parent's Party
-at fork time (likely: yes, forker = founder)? Does a checkout bound to the
-parent get briefs for open side-quests? Are closed side-quests shown
-anywhere by default? Who founds a convergence's continuation channel, and is
-its Party the union of its predecessors'?
+⚠️ Open when divergence is designed: does the child inherit the parent's
+Party at divergence time (likely: yes, the diverger = founder)? Does a
+checkout bound to the parent get briefs for open side-quests? Are closed
+side-quests shown anywhere by default? Who founds a convergence's
+continuation channel, and is its Party the union of its predecessors'?
 
 ## Prior art (assessed 2026-06-10)
 
@@ -384,4 +392,4 @@ Held openly so the next design round inherits the sharpened version:
 8. **Side-quest recall sharding is load-bearing** (also flagged above):
    per-channel briefs + many small channels could fragment the decision
    memory the wedge exists to provide. Brief-inheritance across the
-   fork relationship must be designed *with* forking, not after it.
+   lineage DAG must be designed *with* divergence, not after it.
