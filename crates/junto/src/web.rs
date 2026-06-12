@@ -10,16 +10,17 @@
 //!   recall hook curls this into agent context, and anything else that wants
 //!   the projection without an MCP handshake can too.
 //!
-//! And one POST — the **human write surface**: verification acts (ratify /
-//! park / approve / reject) submitted from the channel page's forms, so the
-//! human's slow loop happens on the one surface instead of through an agent
-//! relaying it. Authored as the machine user's git identity
-//! ([`crate::host::git_user`]) — identity stays claimed (`docs/adr/0012`),
-//! this is a default, not an identity system. Verification acts only:
-//! recording assertions and proposing actions remain agent (MCP) territory.
-//! Each web write triggers a **best-effort background sync** with `origin` —
-//! the page is a terminal-less human's only affordance, so the durable record
-//! must not wait for an agent to run `sync_channel`.
+//! And the POSTs — the **human write surface**: verification acts (ratify /
+//! park / approve / reject) from the channel page's forms, opening a channel
+//! (`/channels`, from the index form or a channel page's contextual
+//! open-an-inquiry-here form), and setting a repo up as a home substrate
+//! (`/repos` — the terminal-less `junto init`). All authored as the machine
+//! user's git identity ([`crate::host::git_user`]) — identity stays claimed
+//! (`docs/adr/0012`), this is a default, not an identity system. Recording
+//! assertions and proposing actions remain agent (MCP) territory.
+//! Each verification act triggers a **best-effort background sync** with
+//! `origin` — the page is a terminal-less human's only affordance, so the
+//! durable record must not wait for an agent to run `sync_channel`.
 
 use std::sync::Arc;
 
@@ -41,6 +42,7 @@ pub fn router(host: Arc<Host>) -> Router {
     Router::new()
         .route("/", get(index_page))
         .route("/channels", post(open_channel))
+        .route("/repos", post(setup_repo))
         .route("/channels/{channel}", get(channel_page))
         .route("/channels/{channel}/brief", get(channel_brief))
         .route("/channels/{channel}/entries/{entry}/{act}", post(verify))
@@ -48,14 +50,22 @@ pub fn router(host: Arc<Host>) -> Router {
 }
 
 /// Resolve and project a channel reference, or surface the failure as an
-/// appropriate HTTP status.
-async fn project(host: &Host, channel: &str) -> Result<(ChannelId, ChannelView), Response> {
+/// appropriate HTTP status. Also yields the home substrate path — the
+/// channel page's contextual open-an-inquiry form prefills it.
+async fn project(
+    host: &Host,
+    channel: &str,
+) -> Result<(ChannelId, ChannelView, std::path::PathBuf), Response> {
     let resolution = host
         .resolve(channel)
         .await
         .map_err(|err| internal(format!("resolving '{channel}': {err}")))?;
-    let (ledger, id) = match resolution {
-        Resolution::Resolved { ledger, id, .. } => (ledger, id),
+    let (ledger, id, substrate) = match resolution {
+        Resolution::Resolved {
+            ledger,
+            id,
+            substrate,
+        } => (ledger, id, substrate),
         Resolution::NotFound => {
             return Err((
                 StatusCode::NOT_FOUND,
@@ -80,7 +90,7 @@ async fn project(host: &Host, channel: &str) -> Result<(ChannelId, ChannelView),
         .project(&id)
         .await
         .map_err(|err| internal(format!("projection failed: {err}")))?;
-    Ok((id, view))
+    Ok((id, view, substrate))
 }
 
 fn internal(message: String) -> Response {
@@ -165,15 +175,65 @@ async fn open_channel(
     }
 }
 
+/// The form body for setting a repo up as a home substrate.
+#[derive(Debug, Deserialize)]
+struct SetupRepoForm {
+    /// Filesystem path to a git repository on this machine.
+    path: String,
+    /// The ambient channel's name; empty defaults to the repo's directory
+    /// name (mirroring `junto init`).
+    #[serde(default)]
+    channel: String,
+}
+
+/// Set a repo up from the index page — the terminal-less `junto init`
+/// (constraint #2: the host runs as the machine user, so it can do
+/// everything the CLI did): register the substrate, wire the agent harness,
+/// bind and **open** the ambient channel, then land on its page. The
+/// agent-membership grant stays on `junto add-member` for now.
+async fn setup_repo(State(host): State<Arc<Host>>, Form(form): Form<SetupRepoForm>) -> Response {
+    let path = std::path::PathBuf::from(form.path.trim());
+    if form.path.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "a repo path is required").into_response();
+    }
+    let channel = match form.channel.trim() {
+        "" => None,
+        name => Some(name.to_string()),
+    };
+    if let Err(err) = crate::init::run(&path, channel.clone(), true, None).await {
+        return (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response();
+    }
+    // Land on the ambient channel's page (init derived its name from the
+    // directory when none was given — re-derive the same way).
+    let ambient = match channel {
+        Some(name) => name,
+        None => match path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+        {
+            Some(name) => name,
+            None => return Redirect::to("/").into_response(),
+        },
+    };
+    match host.resolve(&ambient).await {
+        Ok(Resolution::Resolved { id, .. }) => {
+            Redirect::to(&format!("/channels/{id}")).into_response()
+        }
+        // Ambiguous (the name exists elsewhere too) or anything unexpected:
+        // the index shows the new substrate either way.
+        _ => Redirect::to("/").into_response(),
+    }
+}
+
 async fn channel_page(State(host): State<Arc<Host>>, Path(channel): Path<String>) -> Response {
     match project(&host, &channel).await {
-        Ok((id, view)) => {
+        Ok((id, view, substrate)) => {
             let name = view.name.clone().unwrap_or_else(|| channel.clone());
             // The sidebar: every channel, most recently active first —
             // best-effort, an empty nav never blocks the page itself.
             let mut nav = host.inventory().await.unwrap_or_default();
             nav.sort_by_key(|summary| std::cmp::Reverse(summary.last_activity));
-            Html(render::channel_html(&nav, &name, &id, &view)).into_response()
+            Html(render::channel_html(&nav, &name, &id, &view, &substrate)).into_response()
         }
         Err(response) => response,
     }
@@ -348,7 +408,7 @@ async fn verify(
 
 async fn channel_brief(State(host): State<Arc<Host>>, Path(channel): Path<String>) -> Response {
     match project(&host, &channel).await {
-        Ok((id, view)) => {
+        Ok((id, view, _substrate)) => {
             let name = view.name.clone().unwrap_or_else(|| channel.clone());
             (
                 [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
@@ -708,6 +768,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn setup_repo_runs_init_and_lands_on_the_ambient_channel() {
+        // The terminal-less `junto init`: registering from the form leaves
+        // the repo wired (harness config, binding) with its ambient channel
+        // open, and the redirect lands on that channel's page.
+        let home = crate::host::test_home::HomeGuard::new();
+        let repo = tempfile::tempdir().expect("repo dir");
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(repo.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        for (key, value) in [("user.name", "Web User"), ("user.email", "web@example.com")] {
+            assert!(
+                StdCommand::new("git")
+                    .args(["config", key, value])
+                    .current_dir(repo.path())
+                    .status()
+                    .expect("git config")
+                    .success()
+            );
+        }
+        let host = Host::from_registry(home.path().to_path_buf());
+
+        let response = setup_repo(
+            State(host.clone()),
+            Form(SetupRepoForm {
+                path: repo.path().display().to_string(),
+                channel: "ambient-test".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .expect("redirect")
+            .to_string();
+        assert!(location.starts_with("/channels/"), "{location}");
+
+        // The substrate is registered and the ambient channel is open with
+        // the git user as founder; the harness wiring exists in the repo.
+        let Resolution::Resolved { id, ledger, .. } = host.resolve("ambient-test").await.unwrap()
+        else {
+            panic!("ambient channel resolves");
+        };
+        assert_eq!(location, format!("/channels/{id}"));
+        let view = ledger.lock().await.project(&id).await.unwrap();
+        assert_eq!(view.party[0].email, "web@example.com");
+        assert!(repo.path().join(".mcp.json").exists());
+
+        // A non-repo path is refused with the reason.
+        let not_a_repo = tempfile::tempdir().expect("dir");
+        let response = setup_repo(
+            State(host),
+            Form(SetupRepoForm {
+                path: not_a_repo.path().display().to_string(),
+                channel: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let page = body_text(response).await;
+        assert!(page.contains("not a git repository"), "{page}");
+    }
+
+    #[tokio::test]
     async fn the_index_form_opens_a_channel() {
         // The human-surface counterpart of the open_channel tool: post a
         // name, the host picks its only substrate and the git user as
@@ -853,7 +983,13 @@ mod tests {
             unrecognized: Default::default(),
             sessions: Default::default(),
         };
-        let html = crate::render::channel_html(&[], "web-test", &channel, &view);
+        let html = crate::render::channel_html(
+            &[],
+            "web-test",
+            &channel,
+            &view,
+            std::path::Path::new("/repo"),
+        );
         assert!(html.contains(&format!("/channels/{channel}/entries/{}/ratify", entry.id)));
         assert!(html.contains("name=\"rationale\""));
         // The act-feedback enhancement ships with every page: a submitted act

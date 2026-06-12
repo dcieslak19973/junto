@@ -805,13 +805,30 @@ pub fn index_html(
         "<h1>channels</h1>\n\
          <p class=\"meta\">{count} channel{plural} across every registered substrate\
          {gates_note}</p>\n{board}\n<h2 class=\"board-head\">all channels</h2>\n{body}\n\
-         {open_form}",
+         {open_form}{repo_form}",
         count = summaries.len(),
         plural = if summaries.len() == 1 { "" } else { "s" },
         board = focus_board(attention, "/"),
         open_form = open_channel_form(substrates),
+        repo_form = setup_repo_form(),
     );
     page_shell("junto — channels", summaries, None, &content)
+}
+
+/// The set-up-a-repo form: the terminal-less `junto init`. Registers the
+/// repo as a home substrate, wires the agent harness, and opens its ambient
+/// channel (named after the directory unless overridden).
+fn setup_repo_form() -> String {
+    "<section class=\"board\"><h2 class=\"board-head\">set up a repo</h2>\n\
+     <form class=\"act open-channel\" method=\"post\" action=\"/repos\">\
+     <input name=\"path\" placeholder=\"path to a git repo, e.g. D:\\git\\my-project\" required>\
+     <input name=\"channel\" placeholder=\"ambient channel name (default: the directory name)\">\
+     <button class=\"primary\">set up</button>\
+     </form>\
+     <p class=\"meta\">registers the repo as a home substrate, wires the agent harness \
+     (.mcp.json + recall hook), and opens its ambient channel — everything `junto init` \
+     does except granting an agent membership</p></section>"
+        .to_string()
 }
 
 /// The open-a-channel form: name plus, when the host serves several
@@ -996,11 +1013,14 @@ fn attention_item(item: &crate::host::AttentionItem, channel: &ChannelId, back: 
 /// are URL-safe; names may not be) and require a rationale.
 ///
 /// `nav` feeds the sidebar; pass `&[]` where navigation is irrelevant.
+/// `substrate` is this channel's home substrate, prefilled (hidden) into the
+/// contextual open-an-inquiry form.
 pub fn channel_html(
     nav: &[ChannelSummary],
     name: &str,
     id: &ChannelId,
     view: &ChannelView,
+    substrate: &std::path::Path,
 ) -> String {
     let mut cards = String::new();
     for entry in &view.entries {
@@ -1064,12 +1084,30 @@ pub fn channel_html(
         parked = shape.parked.len(),
         rejected = shape.rejected.len(),
     );
+    // No picker, no decision: a sibling inquiry opens in this channel's own
+    // home substrate (a storage fact the form carries, not a choice).
+    let open_here = format!(
+        "<section class=\"board\"><h2 class=\"board-head\">open an inquiry here</h2>\n\
+         <form class=\"act open-channel\" method=\"post\" action=\"/channels\">\
+         <input type=\"hidden\" name=\"repo\" value=\"{repo}\">\
+         <input name=\"name\" placeholder=\"a name for a new unit of inquiry in \
+         {repo_label}\" required>\
+         <button class=\"primary\">open</button>\
+         </form></section>",
+        repo = escape_html(&substrate.display().to_string()),
+        repo_label = escape_html(
+            &substrate
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| substrate.display().to_string())
+        ),
+    );
     let content = format!(
         "<h1>{name}</h1>\n\
          <p class=\"meta\">channel {id} · {count} entries · read-only projection</p>\n\
          {party}{strip}{sessions}{standing}{recently}{footer}\
          <details class=\"ledger\"><summary class=\"board-head\">the full ledger \
-         ({count} entries)</summary>\n{body}</details>",
+         ({count} entries)</summary>\n{body}</details>\n{open_here}",
         name = escape_html(name),
         count = view.entries.len(),
     );
@@ -1829,7 +1867,7 @@ mod tests {
         );
 
         let channel = ChannelId::new();
-        let html = channel_html(&[], "t", &channel, &view);
+        let html = channel_html(&[], "t", &channel, &view, std::path::Path::new("/repo"));
         assert!(html.contains("agent sessions"), "{html}");
         assert!(html.contains("fix the flaky sync test"), "{html}");
         assert!(html.contains("badge blocked"), "{html}");
@@ -1849,7 +1887,13 @@ mod tests {
         let mut view = view_with(vec![decision.clone(), ratify]);
         view.standings.insert(decision.id, Standing::Ratified);
 
-        let html = channel_html(&[], "t", &ChannelId::new(), &view);
+        let html = channel_html(
+            &[],
+            "t",
+            &ChannelId::new(),
+            &view,
+            std::path::Path::new("/repo"),
+        );
         assert!(html.contains("standing decisions"), "{html}");
         assert!(html.contains("the settled claim"), "{html}");
         assert!(html.contains("ratified by Dan"), "{html}");
@@ -1882,6 +1926,25 @@ mod tests {
     }
 
     #[test]
+    fn channel_page_offers_open_an_inquiry_here() {
+        // The contextual form carries the channel's home substrate hidden —
+        // a sibling inquiry opens in the same repo, no picker.
+        let view = view_with(vec![]);
+        let html = channel_html(
+            &[],
+            "t",
+            &ChannelId::new(),
+            &view,
+            std::path::Path::new("/repo/wmux"),
+        );
+        assert!(html.contains("open an inquiry here"), "{html}");
+        assert!(
+            html.contains("type=\"hidden\" name=\"repo\" value=\"/repo/wmux\""),
+            "{html}"
+        );
+    }
+
+    #[test]
     fn cards_carry_their_entry_family() {
         // Decisions, work, and acts are visually distinct families: the card
         // class drives the chip color and edge tint, so a ledger scans by
@@ -1904,7 +1967,13 @@ mod tests {
             rationale: "verified".into(),
         });
         let view = view_with(vec![decision, work, act]);
-        let html = channel_html(&[], "t", &ChannelId::new(), &view);
+        let html = channel_html(
+            &[],
+            "t",
+            &ChannelId::new(),
+            &view,
+            std::path::Path::new("/repo"),
+        );
         assert!(html.contains("card fam-decision"), "{html}");
         assert!(html.contains("card fam-work"), "{html}");
         assert!(html.contains("card fam-act"), "{html}");
@@ -2030,7 +2099,13 @@ mod tests {
     #[test]
     fn html_escapes_user_content() {
         let view = view_with(vec![assertion("<script>alert('x')</script> & co")]);
-        let html = channel_html(&[], "test", &ChannelId::new(), &view);
+        let html = channel_html(
+            &[],
+            "test",
+            &ChannelId::new(),
+            &view,
+            std::path::Path::new("/repo"),
+        );
         assert!(
             !html.contains("<script>alert"),
             "raw script must not appear"
@@ -2042,7 +2117,13 @@ mod tests {
     #[test]
     fn html_shows_standing_badge_and_timestamp() {
         let view = view_with(vec![assertion("claim")]);
-        let html = channel_html(&[], "test", &ChannelId::new(), &view);
+        let html = channel_html(
+            &[],
+            "test",
+            &ChannelId::new(),
+            &view,
+            std::path::Path::new("/repo"),
+        );
         assert!(html.contains("badge provisional"));
         assert!(html.contains("2026-06-09"), "human-readable date: {html}");
     }
@@ -2065,7 +2146,13 @@ mod tests {
             },
         };
         let view = view_with(vec![entry]);
-        let html = channel_html(&[], "test", &ChannelId::new(), &view);
+        let html = channel_html(
+            &[],
+            "test",
+            &ChannelId::new(),
+            &view,
+            std::path::Path::new("/repo"),
+        );
         assert!(html.contains("because the tests prove it"));
         assert!(html.contains("provenance (1)"));
         assert!(html.contains("https://example.com/pr/1"));
@@ -2086,7 +2173,10 @@ mod tests {
         let view = view_with(vec![]);
         let id = ChannelId::new();
         assert!(brief_markdown("empty", &id, &view).contains("(no entries)"));
-        assert!(channel_html(&[], "empty", &id, &view).contains("(no entries)"));
+        assert!(
+            channel_html(&[], "empty", &id, &view, std::path::Path::new("/repo"))
+                .contains("(no entries)")
+        );
     }
 
     #[test]
@@ -2121,7 +2211,7 @@ mod tests {
         let id = entry.id;
         let channel = entry.channel;
         let view = view_with(vec![entry]);
-        let html = channel_html(&[], "test", &channel, &view);
+        let html = channel_html(&[], "test", &channel, &view, std::path::Path::new("/repo"));
         assert!(html.contains(">verified</button>"), "{html}");
         assert!(html.contains("value=\"CI green and reviewed\""));
         assert!(html.contains(&format!("/channels/{channel}/entries/{id}/park")));
@@ -2158,7 +2248,7 @@ mod tests {
             },
         ];
         let view = view_with(vec![]);
-        let html = channel_html(&nav, "alpha", &active, &view);
+        let html = channel_html(&nav, "alpha", &active, &view, std::path::Path::new("/repo"));
         assert!(html.contains("chan active"));
         assert!(html.contains("alpha"));
         assert!(html.contains("beta"));

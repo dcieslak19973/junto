@@ -636,3 +636,40 @@ fn preview(entry: &LedgerEntry) -> String {
     };
     format!("{kind} — {snippet}{ellipsis}")
 }
+
+/// Test support for anything that touches `JUNTO_HOME`: the env var is
+/// process-global and cargo runs tests in parallel threads, so every test
+/// that sets it must hold the **one** lock — a per-module lock would still
+/// race against other modules' tests.
+#[cfg(test)]
+pub(crate) mod test_home {
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Points `JUNTO_HOME` at a fresh temp dir for the guard's lifetime,
+    /// serialized across the whole test process.
+    pub(crate) struct HomeGuard {
+        dir: tempfile::TempDir,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl HomeGuard {
+        pub(crate) fn new() -> Self {
+            let lock = HOME_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let dir = tempfile::tempdir().expect("temp junto home");
+            unsafe { std::env::set_var("JUNTO_HOME", dir.path()) };
+            Self { dir, _lock: lock }
+        }
+
+        pub(crate) fn path(&self) -> &std::path::Path {
+            self.dir.path()
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("JUNTO_HOME") };
+        }
+    }
+}
