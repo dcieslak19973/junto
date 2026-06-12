@@ -106,6 +106,62 @@ fn last_act<'a>(
         .find(|note| note.verb == verb)
 }
 
+/// The scaled brief's partition of a channel's live entries — what a
+/// returning member needs each entry *for*. Shared by the agent brief
+/// ([`brief_markdown`]) and the human channel page ([`channel_html`]): one
+/// information design, two renderings (`docs/adr/0013`).
+struct BriefShape<'a> {
+    /// Provisional assertions and pending proposals — the act targets.
+    open: Vec<&'a LedgerEntry>,
+    /// Ratified assertions plus corrections (the live text of settled
+    /// territory), in canonical order.
+    ratified: Vec<&'a LedgerEntry>,
+    /// Parked dead-ends — resolved, surfaced on demand, never decayed away.
+    parked: Vec<&'a LedgerEntry>,
+    /// Approved proposals — sanctioned actions, the fastest-decaying class.
+    approved: Vec<&'a LedgerEntry>,
+    /// Rejected proposals — resolved like parked.
+    rejected: Vec<&'a LedgerEntry>,
+    /// Superseded assertions, collapsed into their corrections.
+    superseded: usize,
+}
+
+/// Partition the live entries by what a newcomer needs them for. Genesis,
+/// membership, act, and session entries don't rent lines here: the party
+/// line, the folded notes, and the sessions board carry them.
+fn brief_shape(view: &ChannelView) -> BriefShape<'_> {
+    let mut shape = BriefShape {
+        open: Vec::new(),
+        ratified: Vec::new(),
+        parked: Vec::new(),
+        approved: Vec::new(),
+        rejected: Vec::new(),
+        superseded: 0,
+    };
+    for entry in &view.entries {
+        match &entry.payload {
+            EntryPayload::Assertion { .. } => match view.standing(&entry.id) {
+                Some(Standing::Provisional) => shape.open.push(entry),
+                Some(Standing::Ratified) => shape.ratified.push(entry),
+                Some(Standing::Parked) => shape.parked.push(entry),
+                // Collapsed: the correction carries the live text.
+                Some(Standing::Superseded) => shape.superseded += 1,
+                None => {}
+            },
+            // A correction is the live text of settled territory.
+            EntryPayload::Correction { .. } => shape.ratified.push(entry),
+            EntryPayload::Proposal { .. } => match view.gate_status(&entry.id) {
+                Some(GateStatus::Pending) => shape.open.push(entry),
+                Some(GateStatus::Approved) => shape.approved.push(entry),
+                Some(GateStatus::Rejected) => shape.rejected.push(entry),
+                None => {}
+            },
+            _ => {}
+        }
+    }
+    shape
+}
+
 /// The agent-facing **scaled brief**: state, not history. Acts fold into
 /// their targets, superseded bodies collapse, and old resolved material
 /// decays by tier (recent ratified in full → older clamped → oldest a count)
@@ -138,37 +194,14 @@ pub fn brief_markdown(name: &str, id: &ChannelId, view: &ChannelView) -> String 
     );
 
     let notes = act_notes(view);
-
-    // Partition the live entries by what a newcomer needs them for. Genesis,
-    // membership, and act entries don't rent lines: the party line and the
-    // folded notes carry them.
-    let mut open: Vec<&LedgerEntry> = Vec::new();
-    let mut ratified: Vec<&LedgerEntry> = Vec::new();
-    let mut parked: Vec<&LedgerEntry> = Vec::new();
-    let mut approved: Vec<&LedgerEntry> = Vec::new();
-    let mut rejected: Vec<&LedgerEntry> = Vec::new();
-    let mut superseded = 0usize;
-    for entry in &view.entries {
-        match &entry.payload {
-            EntryPayload::Assertion { .. } => match view.standing(&entry.id) {
-                Some(Standing::Provisional) => open.push(entry),
-                Some(Standing::Ratified) => ratified.push(entry),
-                Some(Standing::Parked) => parked.push(entry),
-                // Collapsed: the correction carries the live text.
-                Some(Standing::Superseded) => superseded += 1,
-                None => {}
-            },
-            // A correction is the live text of settled territory.
-            EntryPayload::Correction { .. } => ratified.push(entry),
-            EntryPayload::Proposal { .. } => match view.gate_status(&entry.id) {
-                Some(GateStatus::Pending) => open.push(entry),
-                Some(GateStatus::Approved) => approved.push(entry),
-                Some(GateStatus::Rejected) => rejected.push(entry),
-                None => {}
-            },
-            _ => {}
-        }
-    }
+    let BriefShape {
+        open,
+        ratified,
+        parked,
+        approved,
+        rejected,
+        superseded,
+    } = brief_shape(view);
 
     // Needs attention — full ids and full detail: these are the act targets.
     out.push_str("## needs attention — act by id (ratify/park · approve/reject)\n\n");
@@ -976,14 +1009,133 @@ pub fn channel_html(
         )
     };
     let sessions = sessions_section(view);
+    // The human brief: the same scaled shape the agent brief carries
+    // (state, not history), rendered as the page — with the full transcript
+    // collapsed below instead of *being* the page.
+    let shape = brief_shape(view);
+    let notes = act_notes(view);
+    let standing = standing_decisions_section(&shape, &notes);
+    let recently = recently_section(view);
+    let folded: usize = notes.values().map(Vec::len).sum();
+    let footer = format!(
+        "<p class=\"meta\">{folded} verification acts folded into the lines above · \
+         {superseded} superseded entries collapsed into their corrections · \
+         {parked} parked dead-ends and {rejected} rejected proposals in the full \
+         ledger below</p>\n",
+        superseded = shape.superseded,
+        parked = shape.parked.len(),
+        rejected = shape.rejected.len(),
+    );
     let content = format!(
         "<h1>{name}</h1>\n\
          <p class=\"meta\">channel {id} · {count} entries · read-only projection</p>\n\
-         {party}{strip}{sessions}<h2 class=\"board-head\">the ledger</h2>\n{body}",
+         {party}{strip}{sessions}{standing}{recently}{footer}\
+         <details class=\"ledger\"><summary class=\"board-head\">the full ledger \
+         ({count} entries)</summary>\n{body}</details>",
         name = escape_html(name),
         count = view.entries.len(),
     );
     page_shell(&format!("junto — {name}"), nav, Some(id), &content)
+}
+
+/// The human rendering of the brief's "standing decisions" tier: recent
+/// ratified decisions in full, older ones clamped to their first line, the
+/// oldest a count — each with who ratified it. Mirrors [`brief_markdown`]'s
+/// tiers exactly; the full bodies live in the collapsed ledger below.
+fn standing_decisions_section(
+    shape: &BriefShape<'_>,
+    notes: &std::collections::HashMap<EntryId, Vec<ActNote<'_>>>,
+) -> String {
+    if shape.ratified.is_empty() {
+        return String::new();
+    }
+    let mut items = String::new();
+    for (index, entry) in shape.ratified.iter().rev().enumerate() {
+        if index >= BRIEF_RECENT_FULL + BRIEF_OLDER_CLAMPED {
+            let _ = writeln!(
+                items,
+                "<li class=\"older\">…and {} older standing decisions (in the full \
+                 ledger below)</li>",
+                shape.ratified.len() - index
+            );
+            break;
+        }
+        let (text, corrects) = match &entry.payload {
+            EntryPayload::Assertion { statement, .. } => (statement.as_str(), String::new()),
+            EntryPayload::Correction {
+                target, statement, ..
+            } => (
+                statement.as_str(),
+                format!(
+                    " <span class=\"by\">(correction of <code>{}</code>)</span>",
+                    short(target)
+                ),
+            ),
+            _ => continue,
+        };
+        let body = if index < BRIEF_RECENT_FULL {
+            text.to_string()
+        } else {
+            clamp(text, BRIEF_CLAMP)
+        };
+        let by = last_act(notes, &entry.id, "ratified")
+            .map(|note| {
+                format!(
+                    " <span class=\"by\">— ratified by {}</span>",
+                    escape_html(&note.author.display_name)
+                )
+            })
+            .unwrap_or_default();
+        let _ = writeln!(
+            items,
+            "<li><code>{id}</code>{corrects} {body}{by}</li>",
+            id = short(&entry.id),
+            body = escape_html(&body),
+        );
+    }
+    format!(
+        "<section class=\"board\"><h2 class=\"board-head\">standing decisions \
+         (newest first)</h2>\n<ul class=\"standing\">{items}</ul></section>\n"
+    )
+}
+
+/// The human rendering of the brief's "recently" tail: the last few entries
+/// as one-liners, for resumption — what just happened here.
+fn recently_section(view: &ChannelView) -> String {
+    if view.entries.is_empty() {
+        return String::new();
+    }
+    let mut items = String::new();
+    let tail_start = view.entries.len().saturating_sub(BRIEF_RECENT_TAIL);
+    for entry in view.entries[tail_start..].iter().rev() {
+        let _ = writeln!(
+            items,
+            "<li><span class=\"when\">{when}</span> {who} {line}</li>",
+            when = escape_html(&iso_utc(entry.timestamp.as_millis())),
+            who = escape_html(&entry.author.display_name),
+            line = backticks_to_code(&recent_line(entry)),
+        );
+    }
+    format!(
+        "<section class=\"board\"><h2 class=\"board-head\">recently</h2>\n\
+         <ul class=\"standing\">{items}</ul></section>\n"
+    )
+}
+
+/// Escape text for HTML, rendering markdown-style `backtick` spans as
+/// `<code>` — the brief's one-liners are written for both surfaces.
+fn backticks_to_code(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (index, piece) in text.split('`').enumerate() {
+        if index % 2 == 1 && !piece.is_empty() {
+            out.push_str("<code>");
+            out.push_str(&escape_html(piece));
+            out.push_str("</code>");
+        } else {
+            out.push_str(&escape_html(piece));
+        }
+    }
+    out
 }
 
 /// The visual family of an entry kind, so the ledger scans by what an entry
@@ -1424,6 +1576,12 @@ h1{margin:0 0 .2rem;font-size:1.45rem}h2{margin:0;font-size:1.02rem}\
 .board-head{font-size:.78rem;text-transform:uppercase;letter-spacing:.08em;\
 color:var(--muted);margin:1.4rem 0 .6rem}\
 .all-clear{color:var(--green);font-size:.9rem}\
+ul.standing{list-style:none;margin:0;padding:0;font-size:.9rem;line-height:1.55}\
+ul.standing li{margin:.3rem 0;overflow-wrap:anywhere}\
+ul.standing .by,ul.standing li.older{color:var(--muted)}\
+details.ledger{margin-top:1.6rem}\
+details.ledger>summary{cursor:pointer;user-select:none}\
+details.ledger>summary:hover{color:var(--soft)}\
 .attn-group{margin:0 0 1rem}\
 .attn-chan{font-size:.95rem;margin:0 0 .45rem}\
 .attn-chan a{color:var(--text);text-decoration:none}\
@@ -1634,6 +1792,30 @@ mod tests {
         assert!(html.contains("fix the flaky sync test"), "{html}");
         assert!(html.contains("badge blocked"), "{html}");
         assert!(html.contains("the fix as a unified diff"), "{html}");
+    }
+
+    #[test]
+    fn channel_page_is_a_brief_with_the_ledger_collapsed() {
+        // The human brief mirrors the agent brief's shape: standing decisions
+        // tiered with their ratifier, a "recently" tail, and the full ledger
+        // demoted to a collapsed transcript instead of being the page.
+        let decision = assertion("the settled claim");
+        let ratify = act(EntryPayload::Ratification {
+            target: decision.id,
+            rationale: "verified".into(),
+        });
+        let mut view = view_with(vec![decision.clone(), ratify]);
+        view.standings.insert(decision.id, Standing::Ratified);
+
+        let html = channel_html(&[], "t", &ChannelId::new(), &view);
+        assert!(html.contains("standing decisions"), "{html}");
+        assert!(html.contains("the settled claim"), "{html}");
+        assert!(html.contains("ratified by Dan"), "{html}");
+        assert!(html.contains("recently"), "{html}");
+        assert!(
+            html.contains("<details class=\"ledger\">"),
+            "the transcript is collapsed: {html}"
+        );
     }
 
     #[test]
