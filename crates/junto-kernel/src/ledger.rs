@@ -199,9 +199,24 @@ impl<S: SubstrateProvider> Ledger<S> {
         let standings = Self::project_standings(&recognized);
         let gate_status = Self::project_gates(&recognized);
         let sessions = Self::project_sessions(&recognized);
-        let name = recognized.iter().find_map(|entry| match &entry.payload {
-            EntryPayload::ChannelOpened { name } => Some(name.clone()),
+        // The current name: the (canonically first) genesis binding, unless a
+        // later Correction targeting the genesis superseded it — rename is a
+        // corrective entry, not mutable metadata (docs/adr/0014/0016).
+        let genesis = recognized.iter().find_map(|entry| match &entry.payload {
+            EntryPayload::ChannelOpened { name } => Some((entry.id, name.clone())),
             _ => None,
+        });
+        let name = genesis.map(|(genesis_id, mut name)| {
+            for entry in &recognized {
+                if let EntryPayload::Correction {
+                    target, statement, ..
+                } = &entry.payload
+                    && *target == genesis_id
+                {
+                    name = statement.clone();
+                }
+            }
+            name
         });
 
         Ok(ChannelView {
@@ -821,6 +836,64 @@ mod tests {
 
         let view = ledger.project(&channel).await.unwrap();
         assert_eq!(view.name, None);
+    }
+
+    #[tokio::test]
+    async fn correcting_the_genesis_renames_the_channel() {
+        // Rename is a corrective entry superseding the genesis binding
+        // (docs/adr/0016) — last applicable wins, and a non-member's attempt
+        // has no effect.
+        let dan = Member::human("Dan", "dan@example.com");
+        let stranger = Member::agent("Stranger", "stranger@example.com");
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let genesis = EntryId::new();
+        ledger
+            .append(entry(
+                genesis,
+                channel,
+                dan.clone(),
+                0,
+                EntryPayload::ChannelOpened {
+                    name: "first-name".into(),
+                },
+            ))
+            .await
+            .unwrap();
+        for (millis, new_name) in [(1, "second-name"), (2, "third-name")] {
+            ledger
+                .append(entry(
+                    EntryId::new(),
+                    channel,
+                    dan.clone(),
+                    millis,
+                    EntryPayload::Correction {
+                        target: genesis,
+                        statement: new_name.into(),
+                        rationale: "renamed".into(),
+                    },
+                ))
+                .await
+                .unwrap();
+        }
+        // A stranger's rename does not count (docs/adr/0017).
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                stranger,
+                3,
+                EntryPayload::Correction {
+                    target: genesis,
+                    statement: "hijacked".into(),
+                    rationale: "drive-by".into(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert_eq!(view.name.as_deref(), Some("third-name"));
     }
 
     #[tokio::test]

@@ -44,6 +44,7 @@ pub fn router(host: Arc<Host>) -> Router {
         .route("/channels", post(open_channel))
         .route("/repos", post(setup_repo))
         .route("/channels/{channel}", get(channel_page))
+        .route("/channels/{channel}/rename", post(rename_channel))
         .route("/channels/{channel}/brief", get(channel_brief))
         .route("/channels/{channel}/entries/{entry}/{act}", post(verify))
         .with_state(host)
@@ -237,6 +238,115 @@ async fn channel_page(State(host): State<Arc<Host>>, Path(channel): Path<String>
         }
         Err(response) => response,
     }
+}
+
+/// The form body for renaming a channel.
+#[derive(Debug, Deserialize)]
+struct RenameForm {
+    /// The new name — a label, unique within the home substrate
+    /// (`docs/adr/0014`).
+    name: String,
+    /// Why the rename. A rationale, not a checkbox.
+    rationale: String,
+}
+
+/// Rename a channel: append a [`EntryPayload::Correction`] targeting the
+/// `ChannelOpened` genesis — the corrective-entry rename ADR 0016 anticipated,
+/// not mutable metadata. The projection resolves the current name as
+/// "genesis unless corrected, last applicable wins"; links stay id-addressed,
+/// so nothing breaks.
+async fn rename_channel(
+    State(host): State<Arc<Host>>,
+    Path(channel): Path<String>,
+    Form(form): Form<RenameForm>,
+) -> Response {
+    let new_name = form.name.trim().to_string();
+    if new_name.is_empty() {
+        return (StatusCode::BAD_REQUEST, "a channel needs a name").into_response();
+    }
+    if new_name.parse::<ChannelId>().is_ok() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "a channel name must not look like a channel id",
+        )
+            .into_response();
+    }
+    let rationale = form.rationale.trim().to_string();
+    if rationale.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "a rationale is required — it's a rationale, not a checkbox",
+        )
+            .into_response();
+    }
+
+    let (id, view, substrate) = match project(&host, &channel).await {
+        Ok(projected) => projected,
+        Err(response) => return response,
+    };
+    // Name uniqueness within the home substrate, same rule open_channel
+    // enforces (docs/adr/0014: names are substrate-scoped labels).
+    let taken = host.inventory().await.unwrap_or_default().iter().any(|s| {
+        s.substrate == substrate && s.id != id && s.name.as_deref() == Some(new_name.as_str())
+    });
+    if taken {
+        return (
+            StatusCode::CONFLICT,
+            format!("a channel named '{new_name}' already exists in this substrate"),
+        )
+            .into_response();
+    }
+    let author = match crate::host::git_user(&substrate) {
+        Ok(author) => author,
+        Err(err) => {
+            return internal(format!(
+                "no author identity: {err} (set git config user.name / user.email)"
+            ));
+        }
+    };
+    if let Err(err) = host.authorize_human_write(&view, &author) {
+        return (StatusCode::FORBIDDEN, format!("{err:#}")).into_response();
+    }
+    let Some(genesis) = view
+        .entries
+        .iter()
+        .find(|entry| matches!(entry.payload, EntryPayload::ChannelOpened { .. }))
+        .map(|entry| entry.id)
+    else {
+        return (
+            StatusCode::CONFLICT,
+            "this channel has no genesis entry (pre-0014 record) — it cannot be renamed",
+        )
+            .into_response();
+    };
+
+    let ledger = match host.ledger_for(&substrate).await {
+        Ok(ledger) => ledger,
+        Err(err) => return internal(format!("opening the ledger: {err}")),
+    };
+    let entry = LedgerEntry {
+        id: EntryId::new(),
+        channel: id,
+        author,
+        timestamp: Timestamp::now(),
+        payload: EntryPayload::Correction {
+            target: genesis,
+            statement: new_name,
+            rationale,
+        },
+    };
+    if let Err(err) = ledger.lock().await.append(entry).await {
+        return internal(format!("append failed: {err}"));
+    }
+    // Best-effort background sync, same as verification acts.
+    let repo = substrate.clone();
+    tokio::spawn(async move {
+        let mut fresh = junto_substrate_git::GitRefsSubstrate::open(repo);
+        if let Err(err) = fresh.sync("origin", &id).await {
+            tracing::warn!("auto-sync of channel {id} after a rename failed: {err:#}");
+        }
+    });
+    Redirect::to(&format!("/channels/{id}")).into_response()
 }
 
 /// The form body of a verification act: just the rationale — the act and
@@ -835,6 +945,55 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let page = body_text(response).await;
         assert!(page.contains("not a git repository"), "{page}");
+    }
+
+    #[tokio::test]
+    async fn rename_supersedes_the_genesis_binding() {
+        let fx = host_with_entry(assertion()).await;
+        let response = rename_channel(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(RenameForm {
+                name: "better-name".into(),
+                rationale: "the inquiry sharpened".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        // The new name resolves; the old one no longer does.
+        let Resolution::Resolved { ledger, id, .. } = fx.host.resolve("better-name").await.unwrap()
+        else {
+            panic!("renamed channel resolves by its new name");
+        };
+        assert_eq!(id, fx.channel);
+        let view = ledger.lock().await.project(&id).await.unwrap();
+        assert_eq!(view.name.as_deref(), Some("better-name"));
+        assert!(matches!(
+            fx.host.resolve("web-test").await.unwrap(),
+            Resolution::NotFound
+        ));
+
+        // Renaming onto a taken name is a conflict.
+        let response = open_channel(
+            State(fx.host.clone()),
+            Form(OpenChannelForm {
+                name: "other".into(),
+                repo: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let response = rename_channel(
+            State(fx.host.clone()),
+            Path("better-name".into()),
+            Form(RenameForm {
+                name: "other".into(),
+                rationale: "collide".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]

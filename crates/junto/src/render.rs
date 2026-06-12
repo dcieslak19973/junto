@@ -148,8 +148,13 @@ fn brief_shape(view: &ChannelView) -> BriefShape<'_> {
                 Some(Standing::Superseded) => shape.superseded += 1,
                 None => {}
             },
-            // A correction is the live text of settled territory.
-            EntryPayload::Correction { .. } => shape.ratified.push(entry),
+            // A correction of an assertion is the live text of settled
+            // territory. A correction of anything else (the genesis — a
+            // rename, docs/adr/0016) is not a decision and rents no line.
+            EntryPayload::Correction { target, .. } if view.standings.contains_key(target) => {
+                shape.ratified.push(entry);
+            }
+            EntryPayload::Correction { .. } => {}
             EntryPayload::Proposal { .. } => match view.gate_status(&entry.id) {
                 Some(GateStatus::Pending) => shape.open.push(entry),
                 Some(GateStatus::Approved) => shape.approved.push(entry),
@@ -689,29 +694,55 @@ fn page_shell(
     active: Option<&ChannelId>,
     content: &str,
 ) -> String {
-    let mut links = String::new();
+    // Channels group under their home substrate (labelled by directory
+    // name), groups ordered by first appearance in `nav` — which arrives
+    // most-recently-active first, so the busiest repo tops the sidebar. A
+    // storage fact used as a reading aid, not scope (docs/domain-model.md).
+    let mut group_order: Vec<&std::path::PathBuf> = Vec::new();
     for summary in nav {
-        let display_name = summary.name.as_deref().unwrap_or("(unopened)");
-        let href = summary
-            .name
-            .clone()
-            .unwrap_or_else(|| summary.id.to_string());
-        let class = if active == Some(&summary.id) {
-            "chan active"
-        } else {
-            "chan"
-        };
-        let gates = if summary.open_gates > 0 {
-            format!("<span class=\"gatecount\">{}</span>", summary.open_gates)
-        } else {
-            String::new()
-        };
-        let _ = writeln!(
-            links,
-            "<a class=\"{class}\" href=\"/channels/{href}\"><span class=\"chan-name\">{name}</span>{gates}</a>",
-            href = escape_html(&href),
-            name = escape_html(display_name),
-        );
+        if !group_order.contains(&&summary.substrate) {
+            group_order.push(&summary.substrate);
+        }
+    }
+    let mut links = String::new();
+    for substrate in group_order {
+        if nav.iter().any(|s| &s.substrate != substrate) {
+            // Only label groups when there is more than one substrate —
+            // a single-repo host needs no heading.
+            let label = substrate
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| substrate.display().to_string());
+            let _ = writeln!(
+                links,
+                "<div class=\"side-sub\" title=\"{path}\">{label}</div>",
+                path = escape_html(&substrate.display().to_string()),
+                label = escape_html(&label),
+            );
+        }
+        for summary in nav.iter().filter(|s| &s.substrate == substrate) {
+            let display_name = summary.name.as_deref().unwrap_or("(unopened)");
+            let href = summary
+                .name
+                .clone()
+                .unwrap_or_else(|| summary.id.to_string());
+            let class = if active == Some(&summary.id) {
+                "chan active"
+            } else {
+                "chan"
+            };
+            let gates = if summary.open_gates > 0 {
+                format!("<span class=\"gatecount\">{}</span>", summary.open_gates)
+            } else {
+                String::new()
+            };
+            let _ = writeln!(
+                links,
+                "<a class=\"{class}\" href=\"/channels/{href}\"><span class=\"chan-name\">{name}</span>{gates}</a>",
+                href = escape_html(&href),
+                name = escape_html(display_name),
+            );
+        }
     }
     format!(
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
@@ -1102,10 +1133,22 @@ pub fn channel_html(
                 .unwrap_or_else(|| substrate.display().to_string())
         ),
     );
+    // Rename: a corrective entry superseding the genesis binding
+    // (docs/adr/0016) — collapsed behind the title so it never competes with
+    // the brief.
+    let rename = format!(
+        "<details class=\"rename\"><summary>rename this channel</summary>\
+         <form class=\"act\" method=\"post\" action=\"/channels/{id}/rename\">\
+         <input name=\"name\" value=\"{name}\" required>\
+         <input name=\"rationale\" placeholder=\"why — a rationale, not a checkbox\" required>\
+         <button class=\"primary\">rename</button>\
+         </form></details>\n",
+        name = escape_html(name),
+    );
     let content = format!(
         "<h1>{name}</h1>\n\
          <p class=\"meta\">channel {id} · {count} entries · read-only projection</p>\n\
-         {party}{strip}{sessions}{standing}{recently}{footer}\
+         {rename}{party}{strip}{sessions}{standing}{recently}{footer}\
          <details class=\"ledger\"><summary class=\"board-head\">the full ledger \
          ({count} entries)</summary>\n{body}</details>\n{open_here}",
         name = escape_html(name),
@@ -1642,6 +1685,8 @@ a.chan:hover{background:var(--card);color:var(--text)}\
 a.chan.active{background:var(--card);color:var(--text);outline:1px solid var(--border)}\
 a.chan.open-link{color:var(--muted);font-size:.84rem;margin-top:.35rem}\
 a.chan.open-link:hover{color:var(--accent)}\
+.side-sub{font-size:.68rem;text-transform:uppercase;letter-spacing:.07em;\
+color:var(--muted);margin:.7rem 0 .15rem;padding:0 .55rem}\
 .chan-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\
 .gatecount{flex:none;font-size:.7rem;font-weight:650;color:var(--bg);background:var(--yellow);\
 border-radius:.6rem;padding:0 .45rem}\
@@ -1923,6 +1968,61 @@ mod tests {
         );
         assert!(many.contains("name=\"repo\""), "{many}");
         assert!(many.contains("/repo/b"), "{many}");
+    }
+
+    #[test]
+    fn channel_page_offers_rename() {
+        let view = view_with(vec![]);
+        let channel = ChannelId::new();
+        let html = channel_html(&[], "old-name", &channel, &view, std::path::Path::new("/r"));
+        assert!(html.contains("rename this channel"), "{html}");
+        assert!(
+            html.contains(&format!("/channels/{channel}/rename")),
+            "{html}"
+        );
+        assert!(html.contains("value=\"old-name\""), "{html}");
+    }
+
+    #[test]
+    fn sidebar_groups_channels_by_substrate() {
+        let nav = vec![
+            ChannelSummary {
+                id: ChannelId::new(),
+                name: Some("alpha".into()),
+                substrate: std::path::PathBuf::from("/repo/one"),
+                entry_count: 1,
+                last_activity: None,
+                open_gates: 0,
+                members: 1,
+                latest: None,
+            },
+            ChannelSummary {
+                id: ChannelId::new(),
+                name: Some("beta".into()),
+                substrate: std::path::PathBuf::from("/repo/two"),
+                entry_count: 1,
+                last_activity: None,
+                open_gates: 0,
+                members: 1,
+                latest: None,
+            },
+        ];
+        let view = view_with(vec![]);
+        let html = channel_html(&nav, "alpha", &nav[0].id, &view, std::path::Path::new("/r"));
+        assert!(html.contains("<div class=\"side-sub\""), "{html}");
+        assert!(html.contains(">one</div>"), "{html}");
+        assert!(html.contains(">two</div>"), "{html}");
+
+        // A single-substrate host gets no group headings.
+        let solo = vec![nav[0].clone()];
+        let html = channel_html(
+            &solo,
+            "alpha",
+            &solo[0].id,
+            &view,
+            std::path::Path::new("/r"),
+        );
+        assert!(!html.contains("<div class=\"side-sub\""), "{html}");
     }
 
     #[test]
