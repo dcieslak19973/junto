@@ -732,7 +732,11 @@ fn page_shell(
 /// the landing page of the one surface (`docs/adr/0015`). Leads with the
 /// focus board (what needs you, grouped by inquiry — `docs/attention.md`),
 /// then the channel cards: who is on each, how alive it is, the latest entry.
-pub fn index_html(summaries: &[ChannelSummary], attention: &[AttentionGroup]) -> String {
+pub fn index_html(
+    summaries: &[ChannelSummary],
+    attention: &[AttentionGroup],
+    substrates: &[std::path::PathBuf],
+) -> String {
     let mut cards = String::new();
     for summary in summaries {
         let display_name = summary.name.as_deref().unwrap_or("(unopened)");
@@ -783,9 +787,7 @@ pub fn index_html(summaries: &[ChannelSummary], attention: &[AttentionGroup]) ->
         );
     }
     let body = if summaries.is_empty() {
-        "<p class=\"empty\">no channels yet — open one with the open_channel tool or \
-         `junto open`</p>"
-            .to_string()
+        "<p class=\"empty\">no channels yet — open one below</p>".to_string()
     } else {
         format!("<div class=\"cards\">{cards}</div>")
     };
@@ -801,12 +803,46 @@ pub fn index_html(summaries: &[ChannelSummary], attention: &[AttentionGroup]) ->
     let content = format!(
         "<h1>channels</h1>\n\
          <p class=\"meta\">{count} channel{plural} across every registered substrate\
-         {gates_note}</p>\n{board}\n<h2 class=\"board-head\">all channels</h2>\n{body}",
+         {gates_note}</p>\n{board}\n<h2 class=\"board-head\">all channels</h2>\n{body}\n\
+         {open_form}",
         count = summaries.len(),
         plural = if summaries.len() == 1 { "" } else { "s" },
         board = focus_board(attention, "/"),
+        open_form = open_channel_form(substrates),
     );
     page_shell("junto — channels", summaries, None, &content)
+}
+
+/// The open-a-channel form: name plus, when the host serves several
+/// substrates, a home-substrate picker. The founder is the substrate's git
+/// user — no identity input, no member code (`docs/adr/0021`).
+fn open_channel_form(substrates: &[std::path::PathBuf]) -> String {
+    let picker = if substrates.len() > 1 {
+        let options: Vec<String> = substrates
+            .iter()
+            .map(|repo| {
+                let path = escape_html(&repo.display().to_string());
+                format!("<option value=\"{path}\">{path}</option>")
+            })
+            .collect();
+        format!(
+            "<select name=\"repo\" title=\"the home substrate — where this channel's \
+             durable record lives (docs/adr/0014)\">{}</select>",
+            options.join("")
+        )
+    } else {
+        // One (or zero) substrates: the host picks it; no field to fill.
+        String::new()
+    };
+    format!(
+        "<section class=\"board\"><h2 class=\"board-head\">open a channel</h2>\n\
+         <form class=\"act open-channel\" method=\"post\" action=\"/channels\">\
+         <input name=\"name\" placeholder=\"a name for one unit of inquiry, e.g. \
+         payments-refactor\" required>\
+         {picker}\
+         <button class=\"primary\">open</button>\
+         </form></section>"
+    )
 }
 
 /// Milliseconds-epoch → a human resumption cue ("12m ago"), falling back to
@@ -1652,6 +1688,8 @@ border-top:1px solid var(--border)}\
 form.act input{flex:1;min-width:10rem;background:var(--bg);color:var(--text);\
 border:1px solid var(--border);border-radius:.45rem;padding:.32rem .6rem;font-size:.84rem}\
 form.act input:focus{outline:1px solid var(--accent)}\
+form.act select{background:var(--bg);color:var(--text);border:1px solid var(--border);\
+border-radius:.45rem;padding:.32rem .6rem;font-size:.84rem}\
 form.act button{background:var(--panel);color:var(--soft);border:1px solid var(--border);\
 border-radius:.45rem;padding:.32rem .85rem;font-size:.84rem;cursor:pointer}\
 form.act button:hover{color:var(--text);border-color:var(--accent)}\
@@ -1816,6 +1854,27 @@ mod tests {
             html.contains("<details class=\"ledger\">"),
             "the transcript is collapsed: {html}"
         );
+    }
+
+    #[test]
+    fn index_offers_the_open_channel_form() {
+        // One substrate: the form posts with no picker (the host picks it).
+        let one = index_html(&[], &[], &[std::path::PathBuf::from("/repo/a")]);
+        assert!(one.contains("action=\"/channels\""), "{one}");
+        assert!(one.contains("name=\"name\""), "{one}");
+        assert!(!one.contains("name=\"repo\""), "{one}");
+
+        // Several substrates: a home-substrate picker appears.
+        let many = index_html(
+            &[],
+            &[],
+            &[
+                std::path::PathBuf::from("/repo/a"),
+                std::path::PathBuf::from("/repo/b"),
+            ],
+        );
+        assert!(many.contains("name=\"repo\""), "{many}");
+        assert!(many.contains("/repo/b"), "{many}");
     }
 
     #[test]

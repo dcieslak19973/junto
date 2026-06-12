@@ -40,6 +40,7 @@ use crate::render;
 pub fn router(host: Arc<Host>) -> Router {
     Router::new()
         .route("/", get(index_page))
+        .route("/channels", post(open_channel))
         .route("/channels/{channel}", get(channel_page))
         .route("/channels/{channel}/brief", get(channel_brief))
         .route("/channels/{channel}/entries/{entry}/{act}", post(verify))
@@ -93,9 +94,74 @@ async fn index_page(State(host): State<Arc<Host>>) -> Response {
         Ok((mut summaries, attention)) => {
             // Most recently active first — the resumption order.
             summaries.sort_by_key(|summary| std::cmp::Reverse(summary.last_activity));
-            Html(render::index_html(&summaries, &attention)).into_response()
+            // The substrates feed the open-channel form (a picker only when
+            // there are several to choose between).
+            let substrates = host.substrate_paths().unwrap_or_default();
+            Html(render::index_html(&summaries, &attention, &substrates)).into_response()
         }
         Err(err) => internal(format!("listing channels: {err}")),
+    }
+}
+
+/// The form body for opening a channel from the index page.
+#[derive(Debug, Deserialize)]
+struct OpenChannelForm {
+    /// The channel's name — a label, unique within its home substrate
+    /// (`docs/adr/0014`).
+    name: String,
+    /// The home substrate repo path; may be empty when the host serves
+    /// exactly one.
+    #[serde(default)]
+    repo: String,
+}
+
+/// Open a channel from the index page's form: the human-surface counterpart
+/// of the `open_channel` MCP tool. The founder is the substrate's git user —
+/// the host derives the author, same as verification acts (`docs/adr/0021`).
+async fn open_channel(
+    State(host): State<Arc<Host>>,
+    Form(form): Form<OpenChannelForm>,
+) -> Response {
+    let name = form.name.trim();
+    if name.is_empty() {
+        return (StatusCode::BAD_REQUEST, "a channel needs a name").into_response();
+    }
+    let substrates = match host.substrate_paths() {
+        Ok(substrates) => substrates,
+        Err(err) => return internal(format!("listing substrates: {err}")),
+    };
+    let repo = if form.repo.trim().is_empty() {
+        match substrates.as_slice() {
+            [only] => only.clone(),
+            [] => {
+                return internal(
+                    "no registered home substrates (run `junto init` in a repo first)".into(),
+                );
+            }
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "several substrates are registered — pick the home substrate in the form",
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        std::path::PathBuf::from(form.repo.trim())
+    };
+    let founder = match crate::host::git_user(&repo) {
+        Ok(founder) => founder,
+        Err(err) => {
+            return internal(format!(
+                "no founder identity: {err} (set git config user.name / user.email)"
+            ));
+        }
+    };
+    match host.open_channel(Some(&repo), name, founder, None).await {
+        // Id-addressed: ids are URL-safe, names may not be.
+        Ok(opened) => Redirect::to(&format!("/channels/{}", opened.id)).into_response(),
+        // Name taken, unregistered substrate, … — the message says which.
+        Err(err) => (StatusCode::CONFLICT, format!("{err:#}")).into_response(),
     }
 }
 
@@ -639,6 +705,58 @@ mod tests {
             .await
             .expect("body");
         String::from_utf8(bytes.to_vec()).expect("utf-8 body")
+    }
+
+    #[tokio::test]
+    async fn the_index_form_opens_a_channel() {
+        // The human-surface counterpart of the open_channel tool: post a
+        // name, the host picks its only substrate and the git user as
+        // founder, and the redirect lands on the new channel's page.
+        let fx = host_with_entry(assertion()).await;
+        let response = open_channel(
+            State(fx.host.clone()),
+            Form(OpenChannelForm {
+                name: "fresh-inquiry".into(),
+                repo: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .expect("redirect target")
+            .to_string();
+        assert!(location.starts_with("/channels/"), "{location}");
+
+        // The channel resolves by name, founded by the repo's git user.
+        let Resolution::Resolved { ledger, id, .. } =
+            fx.host.resolve("fresh-inquiry").await.unwrap()
+        else {
+            panic!("the opened channel resolves by name");
+        };
+        let view = ledger.lock().await.project(&id).await.unwrap();
+        assert_eq!(view.name.as_deref(), Some("fresh-inquiry"));
+        assert_eq!(view.party[0].email, "web@example.com");
+        // The redirect targeted exactly this channel.
+        assert_eq!(location, format!("/channels/{id}"));
+    }
+
+    #[tokio::test]
+    async fn a_taken_name_is_a_conflict() {
+        let fx = host_with_entry(assertion()).await;
+        let response = open_channel(
+            State(fx.host.clone()),
+            Form(OpenChannelForm {
+                name: "web-test".into(), // the fixture already opened this
+                repo: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let page = body_text(response).await;
+        assert!(page.contains("web-test"), "{page}");
     }
 
     #[tokio::test]
