@@ -113,35 +113,18 @@ async fn channel_page(State(host): State<Arc<Host>>, Path(channel): Path<String>
     }
 }
 
-/// The form body of a verification act: the rationale and the author's member
-/// code (`docs/adr/0017`) — the act and target come from the URL, the author
-/// from git config.
+/// The form body of a verification act: just the rationale — the act and
+/// target come from the URL, the author from git config, and no member code
+/// is asked of a human (the host derives the author itself and stores the
+/// codes; demanding one back is friction, not safety — see
+/// [`Host::authorize_human_write`]).
 #[derive(Debug, Deserialize)]
 struct ActForm {
     rationale: String,
-    /// The member code of the machine user (required once the channel has a
-    /// Party; blank falls back to the code remembered in the cookie).
-    #[serde(default)]
-    code: String,
     /// Where to return after acting (the focus board sets "/"); only local
     /// paths are honored.
     #[serde(default)]
     back: String,
-}
-
-/// The cookie that remembers the member code after a successful act, so a
-/// batch of verifications is N clicks, not N pastes (`docs/attention.md`).
-/// HttpOnly, SameSite=Strict, localhost-only host — the same machine-local
-/// accident-proofing posture as the code store itself (`docs/adr/0017`).
-const CODE_COOKIE: &str = "junto_member_code";
-
-/// The remembered member code from the request's cookies, if any.
-fn remembered_code(headers: &axum::http::HeaderMap) -> Option<String> {
-    let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
-    cookies.split(';').find_map(|pair| {
-        let (name, value) = pair.trim().split_once('=')?;
-        (name == CODE_COOKIE).then(|| value.to_string())
-    })
 }
 
 /// A safe local redirect target: an absolute path on this host, nothing that
@@ -154,7 +137,6 @@ fn safe_back(back: &str) -> Option<&str> {
 async fn verify(
     State(host): State<Arc<Host>>,
     Path((channel, entry, act)): Path<(String, String, String)>,
-    headers: axum::http::HeaderMap,
     Form(form): Form<ActForm>,
 ) -> Response {
     let rationale = form.rationale.trim().to_string();
@@ -202,8 +184,6 @@ async fn verify(
         Ok(view) => view,
         Err(err) => return internal(format!("projection failed: {err}")),
     };
-    // The rationale is cloned into the payload: the original is still needed
-    // for the retry page if the member-code check refuses the act below.
     let payload = match act.as_str() {
         "ratify" | "park" if view.standing(&target).is_some() => match act.as_str() {
             "ratify" => EntryPayload::Ratification {
@@ -255,57 +235,12 @@ async fn verify(
         }
     };
 
-    // The write-surface guardrail (docs/adr/0017): the author must be in the
-    // channel's Party and present their member code — typed, or remembered
-    // from the last successful act (docs/attention.md: batch verification is
-    // N clicks, not N pastes).
-    let typed = form.code.trim().to_string();
-    let remembered = remembered_code(&headers);
-    let code = if typed.is_empty() {
-        remembered.clone()
-    } else {
-        Some(typed.clone())
-    };
-    if let Err(err) = host.authorize_write(&view, &author, code.as_deref()) {
-        // A code mishap must not cost the human their work: keep the typed
-        // rationale, explain the refusal in place, and ask only for the code.
-        // If the failing code came from the remember-cookie, the human typed
-        // nothing wrong — forget the stale cookie so retyping takes.
-        drop(guard); // inventory() re-locks the ledgers below
-        let cookie_was_stale = typed.is_empty() && remembered.is_some();
-        let subject = view
-            .entries
-            .iter()
-            .find(|e| e.id == target)
-            .and_then(|entry| match &entry.payload {
-                EntryPayload::Assertion { statement, .. } => Some(statement.clone()),
-                EntryPayload::Proposal { action, .. } => Some(action.clone()),
-                _ => None,
-            });
-        let mut nav = host.inventory().await.unwrap_or_default();
-        nav.sort_by_key(|summary| std::cmp::Reverse(summary.last_activity));
-        let back = safe_back(&form.back)
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("/channels/{id}"));
-        let page = Html(render::act_retry_html(
-            &nav,
-            &render::ActRetry {
-                channel: &id,
-                name: view.name.as_deref().unwrap_or(&channel),
-                entry: target,
-                act: &act,
-                rationale: &rationale,
-                back: &back,
-                message: &format!("{err:#}"),
-                subject: subject.as_deref(),
-                cookie_forgotten: cookie_was_stale,
-            },
-        ));
-        if cookie_was_stale {
-            let clear = format!("{CODE_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
-            return (StatusCode::FORBIDDEN, [(header::SET_COOKIE, clear)], page).into_response();
-        }
-        return (StatusCode::FORBIDDEN, page).into_response();
+    // The human-surface guardrail: the (host-derived) author must be in the
+    // channel's Party. No member code — the host stores those itself; see
+    // Host::authorize_human_write. The refusal is rare (a git identity that
+    // was never granted membership), so a plain message suffices.
+    if let Err(err) = host.authorize_human_write(&view, &author) {
+        return (StatusCode::FORBIDDEN, format!("{err:#}")).into_response();
     }
 
     let entry = LedgerEntry {
@@ -342,12 +277,6 @@ async fn verify(
     let destination = safe_back(&form.back)
         .map(str::to_string)
         .unwrap_or_else(|| format!("/channels/{id}"));
-    // Remember a freshly typed, just-validated code for the next act.
-    if !typed.is_empty() && remembered.as_deref() != Some(typed.as_str()) {
-        let cookie =
-            format!("{CODE_COOKIE}={typed}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000");
-        return ([(header::SET_COOKIE, cookie)], Redirect::to(&destination)).into_response();
-    }
     Redirect::to(&destination).into_response()
 }
 
@@ -373,15 +302,14 @@ mod tests {
     use tempfile::TempDir;
 
     /// A test host: one fresh git repo, the member-code store in its own temp
-    /// dir, a channel founded by the repo's git user (the web-write author,
-    /// `docs/adr/0017`), and one entry by a granted "Bot" member.
+    /// dir, a channel founded by the repo's git user (the web-write author —
+    /// a member, so human-surface acts authorize without any code), and one
+    /// entry by a granted "Bot" member.
     struct WebFixture {
         _dirs: Vec<TempDir>,
         host: Arc<Host>,
         channel: ChannelId,
         target: EntryId,
-        /// The founder's (= git user's) member code, for the act forms.
-        code: String,
     }
 
     async fn host_with_entry(payload: EntryPayload) -> WebFixture {
@@ -416,7 +344,6 @@ mod tests {
             .await
             .expect("open channel");
         let channel = opened.id;
-        let code = opened.founder_code.code;
         // The bot is a granted member: its entry projects (Provisional /
         // Pending) so the page renders an act form for it.
         host.add_member(
@@ -445,7 +372,6 @@ mod tests {
             host,
             channel,
             target,
-            code,
         }
     }
 
@@ -474,36 +400,23 @@ mod tests {
         entry: String,
         act: &str,
         rationale: &str,
-        code: &str,
     ) -> Response {
-        post_act_with(host, channel, entry, act, rationale, code, "", None).await
+        post_act_with(host, channel, entry, act, rationale, "").await
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn post_act_with(
         host: Arc<Host>,
         channel: String,
         entry: String,
         act: &str,
         rationale: &str,
-        code: &str,
         back: &str,
-        cookie: Option<&str>,
     ) -> Response {
-        let mut headers = axum::http::HeaderMap::new();
-        if let Some(cookie) = cookie {
-            headers.insert(
-                header::COOKIE,
-                format!("{CODE_COOKIE}={cookie}").parse().unwrap(),
-            );
-        }
         verify(
             State(host),
             Path((channel, entry, act.to_string())),
-            headers,
             Form(ActForm {
                 rationale: rationale.into(),
-                code: code.into(),
                 back: back.into(),
             }),
         )
@@ -512,6 +425,8 @@ mod tests {
 
     #[tokio::test]
     async fn web_ratify_moves_standing_with_git_author() {
+        // No member code anywhere in the form: the host derives the author
+        // and authorizes membership itself (Host::authorize_human_write).
         let fx = host_with_entry(assertion()).await;
         let response = post_act(
             fx.host.clone(),
@@ -519,7 +434,6 @@ mod tests {
             fx.target.to_string(),
             "ratify",
             "checked it",
-            &fx.code,
         )
         .await;
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
@@ -551,7 +465,6 @@ mod tests {
             fx.target.to_string(),
             "approve",
             "lgtm",
-            &fx.code,
         )
         .await;
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
@@ -577,7 +490,6 @@ mod tests {
             fx.target.to_string(),
             "ratify",
             "  ",
-            &fx.code,
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -594,7 +506,6 @@ mod tests {
             fx.target.to_string(),
             "approve",
             "r",
-            &fx.code,
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -609,16 +520,15 @@ mod tests {
             fx.target.to_string(),
             "yolo",
             "r",
-            &fx.code,
         )
         .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
-    async fn remembered_code_and_back_path() {
-        // First act: typed code + back to the board — the response carries
-        // both the redirect to "/" and the remember-cookie.
+    async fn back_path_honored_and_hostile_back_ignored() {
+        // A board-originated act returns to "/"; no cookie of any kind is
+        // set (the member-code remember-cookie is gone with the code itself).
         let fx = host_with_entry(assertion()).await;
         let response = post_act_with(
             fx.host.clone(),
@@ -626,9 +536,7 @@ mod tests {
             fx.target.to_string(),
             "ratify",
             "checked",
-            &fx.code,
             "/",
-            None,
         )
         .await;
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
@@ -639,16 +547,12 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("/")
         );
-        let cookie = response
-            .headers()
-            .get(header::SET_COOKIE)
-            .and_then(|v| v.to_str().ok())
-            .expect("remember-cookie set");
-        assert!(cookie.contains(&format!("{CODE_COOKIE}={}", fx.code)));
-        assert!(cookie.contains("HttpOnly"));
+        assert!(
+            response.headers().get(header::SET_COOKIE).is_none(),
+            "no cookie machinery on the human surface"
+        );
 
-        // Second act: blank code, cookie supplies it; a hostile back path is
-        // ignored in favor of the channel page.
+        // A hostile back path is ignored in favor of the channel page.
         let fx2 = host_with_entry(proposal()).await;
         let response = post_act_with(
             fx2.host.clone(),
@@ -656,9 +560,7 @@ mod tests {
             fx2.target.to_string(),
             "approve",
             "lgtm",
-            "",
             "//evil.example.com",
-            Some(&fx2.code),
         )
         .await;
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
@@ -709,7 +611,6 @@ mod tests {
             fx.target.to_string(),
             "ratify",
             "checked",
-            &fx.code,
         )
         .await;
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
@@ -741,87 +642,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wrong_or_missing_member_codes_are_forbidden() {
-        // The guardrail of docs/adr/0017 on the web surface: the git-user
-        // author must present their member code. The refusal is a retry page
-        // that keeps the typed rationale — a wrong code costs one retyped
-        // code, never a retyped why.
-        let fx = host_with_entry(assertion()).await;
+    async fn non_member_git_identity_is_forbidden() {
+        // The human-surface guardrail that remains: the git-config author
+        // must be in the channel's Party. A repo whose git user was never
+        // granted membership gets a clear refusal and nothing is appended.
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(dir.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        for (key, value) in [("user.name", "Stranger"), ("user.email", "x@example.com")] {
+            assert!(
+                StdCommand::new("git")
+                    .args(["config", key, value])
+                    .current_dir(dir.path())
+                    .status()
+                    .expect("git config")
+                    .success()
+            );
+        }
+        let member_home = tempfile::tempdir().expect("member home");
+        let host = Host::fixed_with_member_home(
+            vec![dir.path().to_path_buf()],
+            Some(member_home.path().to_path_buf()),
+        );
+        // Founded by someone else: the git user is not in the Party.
+        let founder = Member::human("Founder", "founder@example.com");
+        let opened = host
+            .open_channel(None, "web-test", founder, None)
+            .await
+            .expect("open channel");
+        let target = EntryId::new();
+        let ledger = host.ledger_for(dir.path()).await.expect("ledger");
+        ledger
+            .lock()
+            .await
+            .append(LedgerEntry {
+                id: target,
+                channel: opened.id,
+                author: Member::human("Founder", "founder@example.com"),
+                timestamp: Timestamp::now(),
+                payload: assertion(),
+            })
+            .await
+            .expect("append");
+
         let response = post_act(
-            fx.host.clone(),
+            host.clone(),
             "web-test".into(),
-            fx.target.to_string(),
+            target.to_string(),
             "ratify",
-            "checked the diff carefully",
-            "WRONG0",
+            "drive-by",
         )
         .await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let page = body_text(response).await;
         assert!(
-            page.contains("checked the diff carefully"),
-            "the typed rationale survives the refusal"
+            page.contains("x@example.com"),
+            "the refusal names the non-member identity: {page}"
         );
-        assert!(
-            page.contains(&format!("/entries/{}/ratify", fx.target)),
-            "the page re-offers the same act"
-        );
-        assert!(
-            page.contains("web@example.com"),
-            "the refusal names whose code is expected"
-        );
-
-        let response = post_act(
-            fx.host.clone(),
-            "web-test".into(),
-            fx.target.to_string(),
-            "ratify",
-            "r",
-            "",
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
         // Nothing was appended: the assertion is still provisional.
-        let Resolution::Resolved { ledger, id, .. } =
-            fx.host.resolve(&fx.channel.to_string()).await.unwrap()
-        else {
-            panic!("channel resolves");
-        };
-        let view = ledger.lock().await.project(&id).await.unwrap();
+        let view = ledger.lock().await.project(&opened.id).await.unwrap();
         assert!(matches!(
-            view.standing(&fx.target),
+            view.standing(&target),
             Some(Standing::Provisional)
         ));
-    }
-
-    #[tokio::test]
-    async fn stale_remembered_code_is_forgotten() {
-        // A wrong code that came from the remember-cookie is the cookie's
-        // fault, not the human's: the refusal clears the cookie and says so,
-        // so the next typed code actually takes.
-        let fx = host_with_entry(assertion()).await;
-        let response = post_act_with(
-            fx.host.clone(),
-            "web-test".into(),
-            fx.target.to_string(),
-            "ratify",
-            "checked",
-            "", // nothing typed —
-            "/",
-            Some("STALE0"), // — the cookie supplied the (wrong) code
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        let clear = response
-            .headers()
-            .get(header::SET_COOKIE)
-            .and_then(|v| v.to_str().ok())
-            .expect("clearing cookie set")
-            .to_string();
-        assert!(clear.contains("Max-Age=0"), "cookie cleared: {clear}");
-        let page = body_text(response).await;
-        assert!(page.contains("forgotten"), "the page explains the clearing");
     }
 
     #[test]

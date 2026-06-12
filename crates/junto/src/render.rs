@@ -106,6 +106,62 @@ fn last_act<'a>(
         .find(|note| note.verb == verb)
 }
 
+/// The scaled brief's partition of a channel's live entries — what a
+/// returning member needs each entry *for*. Shared by the agent brief
+/// ([`brief_markdown`]) and the human channel page ([`channel_html`]): one
+/// information design, two renderings (`docs/adr/0013`).
+struct BriefShape<'a> {
+    /// Provisional assertions and pending proposals — the act targets.
+    open: Vec<&'a LedgerEntry>,
+    /// Ratified assertions plus corrections (the live text of settled
+    /// territory), in canonical order.
+    ratified: Vec<&'a LedgerEntry>,
+    /// Parked dead-ends — resolved, surfaced on demand, never decayed away.
+    parked: Vec<&'a LedgerEntry>,
+    /// Approved proposals — sanctioned actions, the fastest-decaying class.
+    approved: Vec<&'a LedgerEntry>,
+    /// Rejected proposals — resolved like parked.
+    rejected: Vec<&'a LedgerEntry>,
+    /// Superseded assertions, collapsed into their corrections.
+    superseded: usize,
+}
+
+/// Partition the live entries by what a newcomer needs them for. Genesis,
+/// membership, act, and session entries don't rent lines here: the party
+/// line, the folded notes, and the sessions board carry them.
+fn brief_shape(view: &ChannelView) -> BriefShape<'_> {
+    let mut shape = BriefShape {
+        open: Vec::new(),
+        ratified: Vec::new(),
+        parked: Vec::new(),
+        approved: Vec::new(),
+        rejected: Vec::new(),
+        superseded: 0,
+    };
+    for entry in &view.entries {
+        match &entry.payload {
+            EntryPayload::Assertion { .. } => match view.standing(&entry.id) {
+                Some(Standing::Provisional) => shape.open.push(entry),
+                Some(Standing::Ratified) => shape.ratified.push(entry),
+                Some(Standing::Parked) => shape.parked.push(entry),
+                // Collapsed: the correction carries the live text.
+                Some(Standing::Superseded) => shape.superseded += 1,
+                None => {}
+            },
+            // A correction is the live text of settled territory.
+            EntryPayload::Correction { .. } => shape.ratified.push(entry),
+            EntryPayload::Proposal { .. } => match view.gate_status(&entry.id) {
+                Some(GateStatus::Pending) => shape.open.push(entry),
+                Some(GateStatus::Approved) => shape.approved.push(entry),
+                Some(GateStatus::Rejected) => shape.rejected.push(entry),
+                None => {}
+            },
+            _ => {}
+        }
+    }
+    shape
+}
+
 /// The agent-facing **scaled brief**: state, not history. Acts fold into
 /// their targets, superseded bodies collapse, and old resolved material
 /// decays by tier (recent ratified in full → older clamped → oldest a count)
@@ -138,37 +194,14 @@ pub fn brief_markdown(name: &str, id: &ChannelId, view: &ChannelView) -> String 
     );
 
     let notes = act_notes(view);
-
-    // Partition the live entries by what a newcomer needs them for. Genesis,
-    // membership, and act entries don't rent lines: the party line and the
-    // folded notes carry them.
-    let mut open: Vec<&LedgerEntry> = Vec::new();
-    let mut ratified: Vec<&LedgerEntry> = Vec::new();
-    let mut parked: Vec<&LedgerEntry> = Vec::new();
-    let mut approved: Vec<&LedgerEntry> = Vec::new();
-    let mut rejected: Vec<&LedgerEntry> = Vec::new();
-    let mut superseded = 0usize;
-    for entry in &view.entries {
-        match &entry.payload {
-            EntryPayload::Assertion { .. } => match view.standing(&entry.id) {
-                Some(Standing::Provisional) => open.push(entry),
-                Some(Standing::Ratified) => ratified.push(entry),
-                Some(Standing::Parked) => parked.push(entry),
-                // Collapsed: the correction carries the live text.
-                Some(Standing::Superseded) => superseded += 1,
-                None => {}
-            },
-            // A correction is the live text of settled territory.
-            EntryPayload::Correction { .. } => ratified.push(entry),
-            EntryPayload::Proposal { .. } => match view.gate_status(&entry.id) {
-                Some(GateStatus::Pending) => open.push(entry),
-                Some(GateStatus::Approved) => approved.push(entry),
-                Some(GateStatus::Rejected) => rejected.push(entry),
-                None => {}
-            },
-            _ => {}
-        }
-    }
+    let BriefShape {
+        open,
+        ratified,
+        parked,
+        approved,
+        rejected,
+        superseded,
+    } = brief_shape(view);
 
     // Needs attention — full ids and full detail: these are the act targets.
     out.push_str("## needs attention — act by id (ratify/park · approve/reject)\n\n");
@@ -976,14 +1009,154 @@ pub fn channel_html(
         )
     };
     let sessions = sessions_section(view);
+    // The human brief: the same scaled shape the agent brief carries
+    // (state, not history), rendered as the page — with the full transcript
+    // collapsed below instead of *being* the page.
+    let shape = brief_shape(view);
+    let notes = act_notes(view);
+    let standing = standing_decisions_section(&shape, &notes);
+    let recently = recently_section(view);
+    let folded: usize = notes.values().map(Vec::len).sum();
+    let footer = format!(
+        "<p class=\"meta\">{folded} verification acts folded into the lines above · \
+         {superseded} superseded entries collapsed into their corrections · \
+         {parked} parked dead-ends and {rejected} rejected proposals in the full \
+         ledger below</p>\n",
+        superseded = shape.superseded,
+        parked = shape.parked.len(),
+        rejected = shape.rejected.len(),
+    );
     let content = format!(
         "<h1>{name}</h1>\n\
          <p class=\"meta\">channel {id} · {count} entries · read-only projection</p>\n\
-         {party}{strip}{sessions}<h2 class=\"board-head\">the ledger</h2>\n{body}",
+         {party}{strip}{sessions}{standing}{recently}{footer}\
+         <details class=\"ledger\"><summary class=\"board-head\">the full ledger \
+         ({count} entries)</summary>\n{body}</details>",
         name = escape_html(name),
         count = view.entries.len(),
     );
     page_shell(&format!("junto — {name}"), nav, Some(id), &content)
+}
+
+/// The human rendering of the brief's "standing decisions" tier: recent
+/// ratified decisions in full, older ones clamped to their first line, the
+/// oldest a count — each with who ratified it. Mirrors [`brief_markdown`]'s
+/// tiers exactly; the full bodies live in the collapsed ledger below.
+fn standing_decisions_section(
+    shape: &BriefShape<'_>,
+    notes: &std::collections::HashMap<EntryId, Vec<ActNote<'_>>>,
+) -> String {
+    if shape.ratified.is_empty() {
+        return String::new();
+    }
+    let mut items = String::new();
+    for (index, entry) in shape.ratified.iter().rev().enumerate() {
+        if index >= BRIEF_RECENT_FULL + BRIEF_OLDER_CLAMPED {
+            let _ = writeln!(
+                items,
+                "<li class=\"older\">…and {} older standing decisions (in the full \
+                 ledger below)</li>",
+                shape.ratified.len() - index
+            );
+            break;
+        }
+        let (text, corrects) = match &entry.payload {
+            EntryPayload::Assertion { statement, .. } => (statement.as_str(), String::new()),
+            EntryPayload::Correction {
+                target, statement, ..
+            } => (
+                statement.as_str(),
+                format!(
+                    " <span class=\"by\">(correction of <code>{}</code>)</span>",
+                    short(target)
+                ),
+            ),
+            _ => continue,
+        };
+        let body = if index < BRIEF_RECENT_FULL {
+            text.to_string()
+        } else {
+            clamp(text, BRIEF_CLAMP)
+        };
+        let by = last_act(notes, &entry.id, "ratified")
+            .map(|note| {
+                format!(
+                    " <span class=\"by\">— ratified by {}</span>",
+                    escape_html(&note.author.display_name)
+                )
+            })
+            .unwrap_or_default();
+        let _ = writeln!(
+            items,
+            "<li><code>{id}</code>{corrects} {body}{by}</li>",
+            id = short(&entry.id),
+            body = escape_html(&body),
+        );
+    }
+    format!(
+        "<section class=\"board\"><h2 class=\"board-head\">standing decisions \
+         (newest first)</h2>\n<ul class=\"standing\">{items}</ul></section>\n"
+    )
+}
+
+/// The human rendering of the brief's "recently" tail: the last few entries
+/// as one-liners, for resumption — what just happened here.
+fn recently_section(view: &ChannelView) -> String {
+    if view.entries.is_empty() {
+        return String::new();
+    }
+    let mut items = String::new();
+    let tail_start = view.entries.len().saturating_sub(BRIEF_RECENT_TAIL);
+    for entry in view.entries[tail_start..].iter().rev() {
+        let _ = writeln!(
+            items,
+            "<li><span class=\"when\">{when}</span> {who} {line}</li>",
+            when = escape_html(&iso_utc(entry.timestamp.as_millis())),
+            who = escape_html(&entry.author.display_name),
+            line = backticks_to_code(&recent_line(entry)),
+        );
+    }
+    format!(
+        "<section class=\"board\"><h2 class=\"board-head\">recently</h2>\n\
+         <ul class=\"standing\">{items}</ul></section>\n"
+    )
+}
+
+/// Escape text for HTML, rendering markdown-style `backtick` spans as
+/// `<code>` — the brief's one-liners are written for both surfaces.
+fn backticks_to_code(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (index, piece) in text.split('`').enumerate() {
+        if index % 2 == 1 && !piece.is_empty() {
+            out.push_str("<code>");
+            out.push_str(&escape_html(piece));
+            out.push_str("</code>");
+        } else {
+            out.push_str(&escape_html(piece));
+        }
+    }
+    out
+}
+
+/// The visual family of an entry kind, so the ledger scans by what an entry
+/// *is*: a decision to weigh (blue), agent work and its outputs (teal), or a
+/// verification/lifecycle act (quiet). Purely presentational — the families
+/// echo the kernel's subject/act split plus the session family of
+/// `docs/adr/0020`.
+fn entry_family(payload: &EntryPayload) -> &'static str {
+    match payload {
+        EntryPayload::Assertion { .. } | EntryPayload::Proposal { .. } => "fam-decision",
+        EntryPayload::SessionStarted { .. }
+        | EntryPayload::SessionUpdated { .. }
+        | EntryPayload::ArtifactAttached { .. } => "fam-work",
+        EntryPayload::ChannelOpened { .. }
+        | EntryPayload::MemberAdded { .. }
+        | EntryPayload::Ratification { .. }
+        | EntryPayload::Park { .. }
+        | EntryPayload::Correction { .. }
+        | EntryPayload::Approval { .. }
+        | EntryPayload::Rejection { .. } => "fam-act",
+    }
 }
 
 /// One ledger entry as a card: kind chip + state badge + author/when header,
@@ -1142,7 +1315,7 @@ fn entry_card(entry: &LedgerEntry, view: &ChannelView, channel: &ChannelId) -> S
         .unwrap_or_default();
 
     format!(
-        "<article class=\"card{flag}\">\
+        "<article class=\"card {family}{flag}\">\
          <header><span class=\"kind\">{kind}</span>{badge}{unrecognized_badge}\
          <span class=\"spacer\"></span>\
          <span class=\"who\" title=\"{email}\">{who}</span>\
@@ -1150,6 +1323,7 @@ fn entry_card(entry: &LedgerEntry, view: &ChannelView, channel: &ChannelId) -> S
          {statement}{target}{rationale}{provenance}\
          <footer class=\"id\">{id}</footer>\
          {form}</article>",
+        family = entry_family(&entry.payload),
         flag = if unrecognized { " flagged" } else { "" },
         email = escape_html(&entry.author.email),
         who = escape_html(&entry.author.display_name),
@@ -1207,7 +1381,7 @@ fn sessions_section(view: &ChannelView) -> String {
         };
         let _ = writeln!(
             cards,
-            "<article class=\"card\">\
+            "<article class=\"card fam-work\">\
              <header><span class=\"kind\">agent session</span>\
              <span class=\"badge {state}\">{state}</span>\
              <span class=\"spacer\"></span>\
@@ -1317,7 +1491,6 @@ fn act_forms_with_frame(
                  <button class=\"primary\">{label}</button>\
                  <input name=\"rationale\" value=\"{draft}\" required \
                  title=\"the drafted rationale — edit before choosing if it isn't quite yours\">\
-                 <input name=\"code\" class=\"code\" placeholder=\"member code\">\
                  </form>",
                 entry_id = entry.id,
                 back = escape_html(back),
@@ -1331,8 +1504,10 @@ fn act_forms_with_frame(
 }
 
 /// The act form itself: one rationale input feeding whichever button is
-/// pressed, the member code (blank uses the remembered one), and the
-/// return path the route redirects to afterwards.
+/// pressed, and the return path the route redirects to afterwards. No member
+/// code: the host derives the author from git config and authorizes
+/// membership itself (the codes guard the agent-facing MCP surface, where
+/// identity is claimed — not the human surface, where the host claims it).
 fn act_form(
     entry_id: junto_kernel::EntryId,
     channel: &ChannelId,
@@ -1345,87 +1520,10 @@ fn act_form(
          action=\"/channels/{channel}/entries/{entry_id}/{accept}\">\
          <input type=\"hidden\" name=\"back\" value=\"{back}\">\
          <input name=\"rationale\" placeholder=\"why — a rationale, not a checkbox\" required>\
-         <input name=\"code\" class=\"code\" placeholder=\"member code\" \
-         title=\"your machine-local member code (docs/adr/0017); blank reuses the one \
-         remembered from your last act\">\
          <button class=\"primary\">{accept}</button>\
          <button formaction=\"/channels/{channel}/entries/{entry_id}/{decline}\">{decline}</button>\
          </form>",
         back = escape_html(back),
-    )
-}
-
-/// Everything the act-retry page needs to re-offer a refused verification
-/// act without losing the human's work (`docs/adr/0017` guardrail meets
-/// `docs/attention.md`: the surface routes attention, it must not tax it).
-pub struct ActRetry<'a> {
-    pub channel: &'a ChannelId,
-    /// The channel's display name, for orientation.
-    pub name: &'a str,
-    pub entry: junto_kernel::EntryId,
-    /// The act being retried (already validated by the route: ratify / park /
-    /// approve / reject).
-    pub act: &'a str,
-    /// The rationale the human already typed — carried over verbatim.
-    pub rationale: &'a str,
-    /// The safe local path to return to after the act succeeds.
-    pub back: &'a str,
-    /// The guardrail's refusal, verbatim — it names the author identity whose
-    /// code is expected, which is the usual confusion.
-    pub message: &'a str,
-    /// An excerpt of the entry being acted on, for orientation.
-    pub subject: Option<&'a str>,
-    /// True when the failing code came from the remember-cookie (now being
-    /// cleared): the human typed nothing wrong, the stale memory did.
-    pub cookie_forgotten: bool,
-}
-
-/// The recovery page for a verification act refused at the member-code
-/// guardrail: a wrong code costs one retyped code, never a retyped rationale.
-pub fn act_retry_html(nav: &[ChannelSummary], retry: &ActRetry<'_>) -> String {
-    let subject = retry
-        .subject
-        .map(|text| format!("<p class=\"statement clamp\">{}</p>", escape_html(text)))
-        .unwrap_or_default();
-    let forgotten = if retry.cookie_forgotten {
-        "<p class=\"hint\">that code came from your last act, remembered — it no longer \
-         matches, so it has been forgotten. Type the current one below.</p>"
-    } else {
-        ""
-    };
-    let content = format!(
-        "<h1>not recorded — member code needed</h1>\
-         <p class=\"meta\">{name} · your {act} and its rationale are kept below; \
-         only the code is needed</p>\
-         <div class=\"card flagged\">{subject}\
-         <p class=\"refusal\">{message}</p>{forgotten}\
-         <form class=\"act\" method=\"post\" \
-         action=\"/channels/{channel}/entries/{entry}/{act}\">\
-         <input type=\"hidden\" name=\"back\" value=\"{back}\">\
-         <input name=\"rationale\" value=\"{rationale}\" required>\
-         <input name=\"code\" class=\"code\" placeholder=\"member code\" autofocus required>\
-         <button class=\"primary\">{act}</button>\
-         </form>\
-         <p class=\"hint\">member codes are machine-local accident-proofing \
-         (docs/adr/0017): yours was printed when you were minted and lives in \
-         <code>~/.junto/members.toml</code> — note the code belongs to the author \
-         identity named above, not to whoever is at the keyboard. Lost it? \
-         <code>junto add-member</code> re-mints a fresh one for the same member.</p>\
-         </div>\
-         <p><a class=\"back-link\" href=\"{back}\">go back without acting</a></p>",
-        name = escape_html(retry.name),
-        act = escape_html(retry.act),
-        channel = retry.channel,
-        entry = retry.entry,
-        back = escape_html(retry.back),
-        rationale = escape_html(retry.rationale),
-        message = escape_html(retry.message),
-    );
-    page_shell(
-        "member code needed — junto",
-        nav,
-        Some(retry.channel),
-        &content,
     )
 }
 
@@ -1449,7 +1547,7 @@ if(b){b.textContent='recording\\u2026'}},0)});</script>";
 const CSS: &str = "\
 :root{--bg:#11111b;--panel:#181825;--card:#1e1e2e;--border:#313244;--text:#cdd6f4;\
 --muted:#7f849c;--soft:#a6adc8;--accent:#89b4fa;--green:#a6e3a1;--yellow:#f9e2af;\
---red:#f38ba8;--gray:#9399b2}\
+--red:#f38ba8;--gray:#9399b2;--teal:#94e2d5}\
 *{box-sizing:border-box}\
 body{margin:0;background:var(--bg);color:var(--text);\
 font:15px/1.55 system-ui,'Segoe UI',sans-serif}\
@@ -1478,6 +1576,12 @@ h1{margin:0 0 .2rem;font-size:1.45rem}h2{margin:0;font-size:1.02rem}\
 .board-head{font-size:.78rem;text-transform:uppercase;letter-spacing:.08em;\
 color:var(--muted);margin:1.4rem 0 .6rem}\
 .all-clear{color:var(--green);font-size:.9rem}\
+ul.standing{list-style:none;margin:0;padding:0;font-size:.9rem;line-height:1.55}\
+ul.standing li{margin:.3rem 0;overflow-wrap:anywhere}\
+ul.standing .by,ul.standing li.older{color:var(--muted)}\
+details.ledger{margin-top:1.6rem}\
+details.ledger>summary{cursor:pointer;user-select:none}\
+details.ledger>summary:hover{color:var(--soft)}\
 .attn-group{margin:0 0 1rem}\
 .attn-chan{font-size:.95rem;margin:0 0 .45rem}\
 .attn-chan a{color:var(--text);text-decoration:none}\
@@ -1493,6 +1597,10 @@ border-radius:.7rem;padding:.12rem .6rem;background:var(--panel)}\
 .card{background:var(--card);border:1px solid var(--border);border-radius:.65rem;\
 padding:.8rem .95rem;margin-bottom:.7rem}\
 .card.flagged{border-color:var(--red)}\
+.card.fam-decision{border-left:2px solid rgba(137,180,250,.55)}\
+.card.fam-work{border-left:2px solid rgba(148,226,213,.55)}\
+.card.fam-work .kind{color:var(--teal)}\
+.card.fam-act .kind{color:var(--muted)}\
 .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(24rem,100%),1fr));\
 gap:.8rem}\
 .cards>*{min-width:0}\
@@ -1544,7 +1652,6 @@ border-top:1px solid var(--border)}\
 form.act input{flex:1;min-width:10rem;background:var(--bg);color:var(--text);\
 border:1px solid var(--border);border-radius:.45rem;padding:.32rem .6rem;font-size:.84rem}\
 form.act input:focus{outline:1px solid var(--accent)}\
-form.act input.code{flex:none;width:8.2rem}\
 form.act button{background:var(--panel);color:var(--soft);border:1px solid var(--border);\
 border-radius:.45rem;padding:.32rem .85rem;font-size:.84rem;cursor:pointer}\
 form.act button:hover{color:var(--text);border-color:var(--accent)}\
@@ -1555,9 +1662,6 @@ form.act.option button.primary{flex:none;min-width:7rem}\
 form.act.option input[name=rationale]{color:var(--soft);font-style:italic}\
 form.act.busy{opacity:.65}\
 form.act button:disabled{cursor:wait}\
-.refusal{color:var(--red);font-size:.9rem;margin:.55rem 0 0;white-space:pre-wrap;\
-overflow-wrap:anywhere}\
-.hint{color:var(--muted);font-size:.82rem;margin:.55rem 0 0}\
 a.back-link{color:var(--muted);font-size:.84rem}\
 a.back-link:hover{color:var(--soft)}";
 
@@ -1688,6 +1792,59 @@ mod tests {
         assert!(html.contains("fix the flaky sync test"), "{html}");
         assert!(html.contains("badge blocked"), "{html}");
         assert!(html.contains("the fix as a unified diff"), "{html}");
+    }
+
+    #[test]
+    fn channel_page_is_a_brief_with_the_ledger_collapsed() {
+        // The human brief mirrors the agent brief's shape: standing decisions
+        // tiered with their ratifier, a "recently" tail, and the full ledger
+        // demoted to a collapsed transcript instead of being the page.
+        let decision = assertion("the settled claim");
+        let ratify = act(EntryPayload::Ratification {
+            target: decision.id,
+            rationale: "verified".into(),
+        });
+        let mut view = view_with(vec![decision.clone(), ratify]);
+        view.standings.insert(decision.id, Standing::Ratified);
+
+        let html = channel_html(&[], "t", &ChannelId::new(), &view);
+        assert!(html.contains("standing decisions"), "{html}");
+        assert!(html.contains("the settled claim"), "{html}");
+        assert!(html.contains("ratified by Dan"), "{html}");
+        assert!(html.contains("recently"), "{html}");
+        assert!(
+            html.contains("<details class=\"ledger\">"),
+            "the transcript is collapsed: {html}"
+        );
+    }
+
+    #[test]
+    fn cards_carry_their_entry_family() {
+        // Decisions, work, and acts are visually distinct families: the card
+        // class drives the chip color and edge tint, so a ledger scans by
+        // what each entry *is*.
+        let decision = assertion("a claim to weigh");
+        let work = LedgerEntry {
+            id: EntryId::new(),
+            channel: ChannelId::new(),
+            author: Member::agent("Coder", "coder@junto.local"),
+            timestamp: Timestamp::from_millis(1_781_046_734_155),
+            payload: EntryPayload::ArtifactAttached {
+                target: decision.id, // dangling-by-kind is fine for rendering
+                kind: "diff".into(),
+                description: "an output to inspect".into(),
+                provenance: vec![],
+            },
+        };
+        let act = act(EntryPayload::Ratification {
+            target: decision.id,
+            rationale: "verified".into(),
+        });
+        let view = view_with(vec![decision, work, act]);
+        let html = channel_html(&[], "t", &ChannelId::new(), &view);
+        assert!(html.contains("card fam-decision"), "{html}");
+        assert!(html.contains("card fam-work"), "{html}");
+        assert!(html.contains("card fam-act"), "{html}");
     }
 
     #[test]

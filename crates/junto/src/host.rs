@@ -498,16 +498,9 @@ impl Host {
         author: &Member,
         code: Option<&str>,
     ) -> Result<()> {
+        self.authorize_human_write(view, author)?;
         if view.party.is_empty() {
             return Ok(());
-        }
-        if !view.party.iter().any(|member| member.email == author.email) {
-            bail!(
-                "{} <{}> is not a member of this channel — the founding member can grant \
-                 membership (junto add-member, or the add_member tool; docs/adr/0017)",
-                author.display_name,
-                author.email
-            );
         }
         let Some(code) = code else {
             bail!(
@@ -527,6 +520,28 @@ impl Host {
                 author.email
             ),
         }
+    }
+
+    /// The **human-surface** write guardrail: membership only, no member
+    /// code. The web pages derive the author from git config (never from the
+    /// form) and are served by this same process, which *stores* the codes —
+    /// demanding one back would prove possession of a file the server itself
+    /// can read: friction, not safety. Codes stay required where they earn
+    /// their keep — the MCP surface, where an agent *claims* an identity and
+    /// the code stops it accidentally authoring as someone else.
+    pub fn authorize_human_write(&self, view: &ChannelView, author: &Member) -> Result<()> {
+        if view.party.is_empty() {
+            return Ok(());
+        }
+        if !view.party.iter().any(|member| member.email == author.email) {
+            bail!(
+                "{} <{}> is not a member of this channel — the founding member can grant \
+                 membership (junto add-member, or the add_member tool; docs/adr/0017)",
+                author.display_name,
+                author.email
+            );
+        }
+        Ok(())
     }
 }
 
