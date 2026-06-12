@@ -773,7 +773,10 @@ fn page_shell(
          <nav class=\"side\">\n\
          <a class=\"brand\" href=\"/\"><span class=\"logo\">j</span>junto</a>\n\
          <div class=\"side-label\">channels</div>\n{links}\
-         <a class=\"chan open-link\" href=\"/#open-channel\">+ open a channel</a>\n\
+         <details class=\"side-menu\"><summary>+ new</summary>\
+         <a class=\"chan open-link\" href=\"/new#open-channel\">open a channel…</a>\
+         <a class=\"chan open-link\" href=\"/new#setup-repo\">set up a repo…</a>\
+         </details>\n\
          </nav>\n\
          <main>\n{content}</main>\n\
          </div>{ACT_FEEDBACK_SCRIPT}</body></html>\n",
@@ -785,11 +788,7 @@ fn page_shell(
 /// the landing page of the one surface (`docs/adr/0015`). Leads with the
 /// focus board (what needs you, grouped by inquiry — `docs/attention.md`),
 /// then the channel cards: who is on each, how alive it is, the latest entry.
-pub fn index_html(
-    summaries: &[ChannelSummary],
-    attention: &[AttentionGroup],
-    substrates: &[std::path::PathBuf],
-) -> String {
+pub fn index_html(summaries: &[ChannelSummary], attention: &[AttentionGroup]) -> String {
     let mut cards = String::new();
     let mut closed_cards = String::new();
     for summary in summaries {
@@ -875,21 +874,33 @@ pub fn index_html(
         "<h1>channels</h1>\n\
          <p class=\"meta\">{count} channel{plural} across every registered substrate\
          {gates_note}</p>\n{board}\n<h2 class=\"board-head\">all channels</h2>\n{body}\n\
-         {archive}{open_form}{repo_form}",
+         {archive}",
         count = summaries.len(),
         plural = if summaries.len() == 1 { "" } else { "s" },
         board = focus_board(attention, "/"),
+    );
+    page_shell("junto — channels", summaries, None, &content)
+}
+
+/// The "/new" page — where the sidebar's "+ new" menu lands: open a channel
+/// and set up a repo, each form with room to breathe instead of renting the
+/// bottom of the index.
+pub fn new_html(nav: &[ChannelSummary], substrates: &[std::path::PathBuf]) -> String {
+    let content = format!(
+        "<h1>new</h1>\n\
+         <p class=\"meta\">open a unit of inquiry, or bring another repo onto the one \
+         surface</p>\n{open_form}{repo_form}",
         open_form = open_channel_form(substrates),
         repo_form = setup_repo_form(),
     );
-    page_shell("junto — channels", summaries, None, &content)
+    page_shell("junto — new", nav, None, &content)
 }
 
 /// The set-up-a-repo form: the terminal-less `junto init`. Registers the
 /// repo as a home substrate, wires the agent harness, and opens its ambient
 /// channel (named after the directory unless overridden).
 fn setup_repo_form() -> String {
-    "<section class=\"board\"><h2 class=\"board-head\">set up a repo</h2>\n\
+    "<section class=\"board\" id=\"setup-repo\"><h2 class=\"board-head\">set up a repo</h2>\n\
      <form class=\"act open-channel\" method=\"post\" action=\"/repos\">\
      <input name=\"path\" placeholder=\"path to a git repo, e.g. D:\\git\\my-project\" required>\
      <input name=\"channel\" placeholder=\"ambient channel name (default: the directory name)\">\
@@ -1763,6 +1774,11 @@ a.chan:hover{background:var(--card);color:var(--text)}\
 a.chan.active{background:var(--card);color:var(--text);outline:1px solid var(--border)}\
 a.chan.open-link{color:var(--muted);font-size:.84rem;margin-top:.35rem}\
 a.chan.open-link:hover{color:var(--accent)}\
+.side-menu{margin-top:.5rem;font-size:.84rem}\
+.side-menu>summary{cursor:pointer;color:var(--muted);user-select:none;\
+padding:.3rem .55rem;border-radius:.45rem}\
+.side-menu>summary:hover{color:var(--accent);background:var(--card)}\
+.side-menu a.open-link{margin-top:0}\
 .side-sub{font-size:.68rem;text-transform:uppercase;letter-spacing:.07em;\
 color:var(--muted);margin:.7rem 0 .15rem;padding:0 .55rem}\
 .closed-banner{color:var(--yellow);background:rgba(249,226,175,.08);\
@@ -2032,16 +2048,17 @@ mod tests {
     }
 
     #[test]
-    fn index_offers_the_open_channel_form() {
-        // One substrate: the form posts with no picker (the host picks it).
-        let one = index_html(&[], &[], &[std::path::PathBuf::from("/repo/a")]);
+    fn the_new_page_carries_both_forms_and_the_sidebar_offers_the_menu() {
+        // One substrate: the open form posts with no picker (the host picks
+        // it); the setup-repo form is there too.
+        let one = new_html(&[], &[std::path::PathBuf::from("/repo/a")]);
         assert!(one.contains("action=\"/channels\""), "{one}");
         assert!(one.contains("name=\"name\""), "{one}");
         assert!(!one.contains("name=\"repo\""), "{one}");
+        assert!(one.contains("action=\"/repos\""), "{one}");
 
         // Several substrates: a home-substrate picker appears.
-        let many = index_html(
-            &[],
+        let many = new_html(
             &[],
             &[
                 std::path::PathBuf::from("/repo/a"),
@@ -2050,6 +2067,14 @@ mod tests {
         );
         assert!(many.contains("name=\"repo\""), "{many}");
         assert!(many.contains("/repo/b"), "{many}");
+
+        // The index dropped the inline forms; every page's sidebar carries
+        // the "+ new" menu instead.
+        let index = index_html(&[], &[]);
+        assert!(!index.contains("action=\"/repos\""), "{index}");
+        assert!(index.contains("+ new"), "{index}");
+        assert!(index.contains("href=\"/new#open-channel\""), "{index}");
+        assert!(index.contains("href=\"/new#setup-repo\""), "{index}");
     }
 
     #[test]

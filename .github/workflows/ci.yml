@@ -16,6 +16,12 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+# Cost shape (private-repo Actions minutes): linux bills 1×, windows 2×,
+# macOS 10× — a full five-job matrix on every PR push burned the monthly
+# quota in a day (2026-06-12). PRs therefore run the cheap linux canary
+# only; the full cross-platform matrix runs where it matters: on every
+# merge to main.
+
 jobs:
   # Formatting is platform-independent — check it once, fast.
   fmt:
@@ -28,17 +34,33 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all --check
 
-  # Lint + test on every supported platform.
-  #   windows / macos = the real targets (both case-INsensitive filesystems).
-  #   ubuntu          = canary: fast, and the only case-SENSITIVE runner, so it
-  #                     catches casing/path bugs Win+Mac would silently pass.
+  # Every push and PR: the 1×-billed canary. Ubuntu is also the only
+  # case-SENSITIVE runner, so it catches casing/path bugs Win+Mac would
+  # silently pass.
   check:
+    name: clippy + test (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace
+
+  # Merges to main only: the real target platforms (both case-INsensitive
+  # filesystems), at 2× / 10× billing.
+  check-platforms:
     name: clippy + test (${{ matrix.os }})
+    if: github.event_name == 'push'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false # see every platform's result, not just the first failure
       matrix:
-        os: [windows-latest, macos-latest, ubuntu-latest]
+        os: [windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -54,8 +76,10 @@ jobs:
   # the kernel one because Tauri's dependency tree is enormous — so it gets
   # its own job, on the app's target platforms only (Windows + macOS; Linux
   # would need webkit2gtk system packages and isn't an app target yet).
+  # Merges to main only: Tauri's tree is the most expensive thing CI builds.
   desktop:
     name: desktop shell (${{ matrix.os }})
+    if: github.event_name == 'push'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
