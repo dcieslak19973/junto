@@ -12,7 +12,9 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     EntryId, EntryPayload, GateStatus, LedgerEntry, Member, Result, SubstrateProvider,
-    gate::ApprovalRequirement, ids::ChannelId,
+    gate::ApprovalRequirement,
+    ids::ChannelId,
+    session::{SessionState, SessionView},
 };
 
 /// Whether a proposal's [`ApprovalRequirement`] is satisfied by the set of
@@ -76,6 +78,10 @@ pub struct ChannelView {
     pub standings: HashMap<EntryId, Standing>,
     /// Current gate status per proposal [`EntryId`].
     pub gate_status: HashMap<EntryId, GateStatus>,
+    /// Current view per Agent Session — keyed by the
+    /// [`EntryPayload::SessionStarted`] entry's id, holding the folded
+    /// [`SessionState`] and the session's attached artifacts.
+    pub sessions: HashMap<EntryId, SessionView>,
 }
 
 impl ChannelView {
@@ -89,6 +95,12 @@ impl ChannelView {
     #[must_use]
     pub fn gate_status(&self, id: &EntryId) -> Option<GateStatus> {
         self.gate_status.get(id).copied()
+    }
+
+    /// The view of a specific Agent Session, if present.
+    #[must_use]
+    pub fn session(&self, id: &EntryId) -> Option<&SessionView> {
+        self.sessions.get(id)
     }
 }
 
@@ -186,6 +198,7 @@ impl<S: SubstrateProvider> Ledger<S> {
 
         let standings = Self::project_standings(&recognized);
         let gate_status = Self::project_gates(&recognized);
+        let sessions = Self::project_sessions(&recognized);
         let name = recognized.iter().find_map(|entry| match &entry.payload {
             EntryPayload::ChannelOpened { name } => Some(name.clone()),
             _ => None,
@@ -198,6 +211,7 @@ impl<S: SubstrateProvider> Ledger<S> {
             unrecognized,
             standings,
             gate_status,
+            sessions,
         })
     }
 
@@ -254,7 +268,10 @@ impl<S: SubstrateProvider> Ledger<S> {
                 | EntryPayload::Assertion { .. }
                 | EntryPayload::Proposal { .. }
                 | EntryPayload::Approval { .. }
-                | EntryPayload::Rejection { .. } => continue,
+                | EntryPayload::Rejection { .. }
+                | EntryPayload::SessionStarted { .. }
+                | EntryPayload::SessionUpdated { .. }
+                | EntryPayload::ArtifactAttached { .. } => continue,
             };
             if let Some(target) = entry.payload.target()
                 && let Some(slot) = standings.get_mut(&target)
@@ -314,13 +331,54 @@ impl<S: SubstrateProvider> Ledger<S> {
             })
             .collect()
     }
+
+    /// Fold the Agent Session views out of an ordered list of *recognized*
+    /// entries. Each [`EntryPayload::SessionStarted`] begins a session in
+    /// [`SessionState::Working`]; [`EntryPayload::SessionUpdated`] moves its
+    /// state (last-applicable-wins, like standings); each
+    /// [`EntryPayload::ArtifactAttached`] appends its own entry id to the
+    /// session's artifact list, in canonical order. Acts targeting an unknown
+    /// session are skipped leniently, like every other dangling reference.
+    fn project_sessions(entries: &[&LedgerEntry]) -> HashMap<EntryId, SessionView> {
+        let mut sessions: HashMap<EntryId, SessionView> = HashMap::new();
+
+        for entry in entries {
+            if matches!(entry.payload, EntryPayload::SessionStarted { .. }) {
+                sessions.insert(
+                    entry.id,
+                    SessionView {
+                        state: SessionState::Working,
+                        artifacts: Vec::new(),
+                    },
+                );
+            }
+        }
+
+        for entry in entries {
+            match &entry.payload {
+                EntryPayload::SessionUpdated { target, state, .. } => {
+                    if let Some(session) = sessions.get_mut(target) {
+                        session.state = *state;
+                    }
+                }
+                EntryPayload::ArtifactAttached { target, .. } => {
+                    if let Some(session) = sessions.get_mut(target) {
+                        session.artifacts.push(entry.id);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        sessions
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::{
         ApprovalRequirement, EntryId, EntryPayload, GateStatus, InMemorySubstrate, Ledger,
-        LedgerEntry, Member, Standing, Timestamp, ids::ChannelId,
+        LedgerEntry, Member, SessionState, Standing, Timestamp, ids::ChannelId,
     };
 
     /// Build an entry with explicit id/timestamp/author for deterministic tests.
@@ -1328,6 +1386,199 @@ mod tests {
 
         let view = ledger.project(&channel).await.unwrap();
         assert_eq!(view.party, vec![dan, agent]);
+    }
+
+    // ---- Agent Sessions & Artifacts ----
+
+    fn session_started(intent: &str) -> EntryPayload {
+        EntryPayload::SessionStarted {
+            intent: intent.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_started_session_is_working_with_no_artifacts() {
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let agent = Member::agent("Coder", "coder@junto.local");
+        let session = EntryId::new();
+        ledger
+            .append(entry(
+                session,
+                channel,
+                agent,
+                1,
+                session_started("fix the flaky test"),
+            ))
+            .await
+            .unwrap();
+
+        let view = ledger.project(&channel).await.unwrap();
+        let session_view = view.session(&session).expect("session projected");
+        assert_eq!(session_view.state, SessionState::Working);
+        assert!(session_view.artifacts.is_empty());
+        // A session is not an assertion: it carries no standing.
+        assert_eq!(view.standing(&session), None);
+    }
+
+    #[tokio::test]
+    async fn session_updates_move_state_last_applicable_wins() {
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let agent = Member::agent("Coder", "coder@junto.local");
+        let session = EntryId::new();
+        ledger
+            .append(entry(
+                session,
+                channel,
+                agent.clone(),
+                1,
+                session_started("work"),
+            ))
+            .await
+            .unwrap();
+        for (millis, state) in [(2, SessionState::Blocked), (3, SessionState::Done)] {
+            ledger
+                .append(entry(
+                    EntryId::new(),
+                    channel,
+                    agent.clone(),
+                    millis,
+                    EntryPayload::SessionUpdated {
+                        target: session,
+                        state,
+                        note: "moving on".into(),
+                    },
+                ))
+                .await
+                .unwrap();
+        }
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert_eq!(view.session(&session).unwrap().state, SessionState::Done);
+    }
+
+    #[tokio::test]
+    async fn artifacts_attach_to_their_session_in_canonical_order() {
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let agent = Member::agent("Coder", "coder@junto.local");
+        let session = EntryId::new();
+        ledger
+            .append(entry(
+                session,
+                channel,
+                agent.clone(),
+                1,
+                session_started("work"),
+            ))
+            .await
+            .unwrap();
+        let diff = EntryId::new();
+        let log = EntryId::new();
+        // Append out of order; projection must list them canonically.
+        ledger
+            .append(entry(
+                log,
+                channel,
+                agent.clone(),
+                3,
+                EntryPayload::ArtifactAttached {
+                    target: session,
+                    kind: "log".into(),
+                    description: "test run".into(),
+                    provenance: Vec::new(),
+                },
+            ))
+            .await
+            .unwrap();
+        ledger
+            .append(entry(
+                diff,
+                channel,
+                agent,
+                2,
+                EntryPayload::ArtifactAttached {
+                    target: session,
+                    kind: "diff".into(),
+                    description: "the fix".into(),
+                    provenance: Vec::new(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert_eq!(view.session(&session).unwrap().artifacts, vec![diff, log]);
+    }
+
+    #[tokio::test]
+    async fn dangling_session_acts_are_ignored() {
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let agent = Member::agent("Coder", "coder@junto.local");
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                agent.clone(),
+                1,
+                EntryPayload::SessionUpdated {
+                    target: EntryId::new(),
+                    state: SessionState::Done,
+                    note: "no such session".into(),
+                },
+            ))
+            .await
+            .unwrap();
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                agent,
+                2,
+                EntryPayload::ArtifactAttached {
+                    target: EntryId::new(),
+                    kind: "diff".into(),
+                    description: "orphan".into(),
+                    provenance: Vec::new(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert!(view.sessions.is_empty());
+        assert_eq!(view.entries.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn non_member_session_update_does_not_move_state() {
+        let dan = Member::human("Dan", "dan@example.com");
+        let stranger = Member::agent("Stranger", "stranger@example.com");
+        let (mut ledger, channel) = opened_channel(&dan).await;
+        let session = EntryId::new();
+        ledger
+            .append(entry(session, channel, dan, 1, session_started("work")))
+            .await
+            .unwrap();
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                stranger,
+                2,
+                EntryPayload::SessionUpdated {
+                    target: session,
+                    state: SessionState::Error,
+                    note: "drive-by".into(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert_eq!(view.session(&session).unwrap().state, SessionState::Working);
     }
 
     #[tokio::test]

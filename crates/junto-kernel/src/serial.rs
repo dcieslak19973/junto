@@ -162,6 +162,30 @@ mod tests {
             target,
             rationale: "needs work".into(),
         }));
+        // The Agent Session family: start, every state an update can carry,
+        // and an artifact with digest-bearing provenance.
+        assert_round_trips(&entry(EntryPayload::SessionStarted {
+            intent: "fix the flaky test".into(),
+        }));
+        for state in [
+            crate::SessionState::Working,
+            crate::SessionState::Blocked,
+            crate::SessionState::AwaitingApproval,
+            crate::SessionState::Done,
+            crate::SessionState::Error,
+        ] {
+            assert_round_trips(&entry(EntryPayload::SessionUpdated {
+                target,
+                state,
+                note: "progress".into(),
+            }));
+        }
+        assert_round_trips(&entry(EntryPayload::ArtifactAttached {
+            target,
+            kind: "diff".into(),
+            description: "the fix as a unified diff".into(),
+            provenance: vec![provenance_with_digest()],
+        }));
     }
 
     #[test]

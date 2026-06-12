@@ -16,7 +16,10 @@ use std::cmp::Ordering;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{EntryId, Member, ProvenanceRef, Timestamp, gate::ApprovalRequirement, ids::ChannelId};
+use crate::{
+    EntryId, Member, ProvenanceRef, Timestamp, gate::ApprovalRequirement, ids::ChannelId,
+    session::SessionState,
+};
 
 /// One immutable record in a Channel's Ledger.
 ///
@@ -187,6 +190,43 @@ pub enum EntryPayload {
         /// Why it was rejected.
         rationale: String,
     },
+    /// An agent began work in this channel — the genesis of one **Agent
+    /// Session** (see [`crate::session`]). A *subject* entry: its id is the
+    /// session's identity, the envelope's author is the agent, and the
+    /// session starts [`SessionState::Working`] implicitly. The record holds
+    /// intent + provenance, never the agent's transcript (hard constraint #3).
+    SessionStarted {
+        /// What the session set out to do, as the surface shows it.
+        intent: String,
+    },
+    /// Moves an Agent Session's live state. An act targeting a
+    /// [`SessionStarted`](EntryPayload::SessionStarted) entry; the current
+    /// state is derived by folding these, last-applicable-wins.
+    SessionUpdated {
+        /// The session being updated (a `SessionStarted` entry id).
+        target: EntryId,
+        /// The state the session moved to.
+        state: SessionState,
+        /// What changed, or why — e.g. what the agent is blocked on.
+        note: String,
+    },
+    /// Binds a verifiable **Artifact** (a diff, log, test result, memo…) to
+    /// the Agent Session that produced it. The artifact's *content* lives
+    /// wherever `provenance` points — URI + digest, never blobs in the ledger
+    /// (`docs/adr/0005`'s pattern). This entry's id is the artifact's id.
+    ArtifactAttached {
+        /// The session that produced it (a `SessionStarted` entry id).
+        target: EntryId,
+        /// The artifact's kind — a **playbook-supplied** label (e.g. "diff",
+        /// "test-result", "memo"), deliberately a string: artifact kinds and
+        /// their renderers belong to Playbooks, not the kernel (constraint #5).
+        kind: String,
+        /// What the artifact is, as the surface shows it.
+        description: String,
+        /// Where the content lives and its digest, so later drift is
+        /// detectable and the artifact is re-fetchable.
+        provenance: Vec<ProvenanceRef>,
+    },
 }
 
 impl LedgerEntry {
@@ -211,23 +251,27 @@ impl EntryPayload {
     /// The entry this payload acts upon, if it acts on a prior entry.
     ///
     /// Returns `None` for the kinds that target nothing — the *subject* kinds
-    /// [`Assertion`](EntryPayload::Assertion) and [`Proposal`](EntryPayload::Proposal),
-    /// and the lifecycle acts [`ChannelOpened`](EntryPayload::ChannelOpened) /
+    /// [`Assertion`](EntryPayload::Assertion), [`Proposal`](EntryPayload::Proposal),
+    /// and [`SessionStarted`](EntryPayload::SessionStarted), and the lifecycle
+    /// acts [`ChannelOpened`](EntryPayload::ChannelOpened) /
     /// [`MemberAdded`](EntryPayload::MemberAdded) — and `Some(target)` for the
     /// acts that reference a prior entry (ratify / park / correct / approve /
-    /// reject).
+    /// reject / session-update / artifact-attach).
     #[must_use]
     pub fn target(&self) -> Option<EntryId> {
         match self {
             EntryPayload::ChannelOpened { .. }
             | EntryPayload::MemberAdded { .. }
             | EntryPayload::Assertion { .. }
-            | EntryPayload::Proposal { .. } => None,
+            | EntryPayload::Proposal { .. }
+            | EntryPayload::SessionStarted { .. } => None,
             EntryPayload::Ratification { target, .. }
             | EntryPayload::Park { target, .. }
             | EntryPayload::Correction { target, .. }
             | EntryPayload::Approval { target, .. }
-            | EntryPayload::Rejection { target, .. } => Some(*target),
+            | EntryPayload::Rejection { target, .. }
+            | EntryPayload::SessionUpdated { target, .. }
+            | EntryPayload::ArtifactAttached { target, .. } => Some(*target),
         }
     }
 }

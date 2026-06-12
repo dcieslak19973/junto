@@ -608,6 +608,9 @@ fn preview(entry: &LedgerEntry) -> String {
         EntryPayload::Proposal { action, .. } => ("proposal", action.clone()),
         EntryPayload::Approval { rationale, .. } => ("approval", rationale.clone()),
         EntryPayload::Rejection { rationale, .. } => ("rejection", rationale.clone()),
+        EntryPayload::SessionStarted { intent } => ("session started", intent.clone()),
+        EntryPayload::SessionUpdated { note, .. } => ("session updated", note.clone()),
+        EntryPayload::ArtifactAttached { description, .. } => ("artifact", description.clone()),
     };
     const LIMIT: usize = 160;
     let snippet: String = text.chars().take(LIMIT).collect();

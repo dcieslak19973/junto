@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use junto_kernel::{
     ApprovalRequirement, ChannelId, ChannelView, ContentDigest, EntryId, EntryPayload, LedgerEntry,
-    Member, ProvenanceRef, Timestamp, Uri,
+    Member, ProvenanceRef, SessionState, Timestamp, Uri,
 };
 use rmcp::{
     ErrorData as McpError, ServerHandler,
@@ -126,6 +126,11 @@ fn parse_frame(
                         "frame act '{other}' is not coherent for a proposal \
                          (approve or reject)"
                     )));
+                }
+                // Sessions carry no decision frame; no tool parses one for
+                // them, so this arm is unreachable in practice.
+                (TargetKind::Session, _) => {
+                    return Err(invalid("an agent session does not carry a decision frame"));
                 }
             };
             Ok(junto_kernel::FrameOption {
@@ -269,6 +274,57 @@ pub struct DeadEndsRequest {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct StartSessionRequest {
+    /// Channel name or id.
+    pub channel: String,
+    pub author: AuthorParam,
+    /// The author's member code (docs/adr/0017) — required once the channel
+    /// has a Party.
+    pub code: Option<String>,
+    /// What this Agent Session sets out to do, e.g. "fix the flaky
+    /// sync test". The session starts in the `working` state.
+    pub intent: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UpdateSessionRequest {
+    /// Channel name or id.
+    pub channel: String,
+    pub author: AuthorParam,
+    /// The author's member code (docs/adr/0017) — required once the channel
+    /// has a Party.
+    pub code: Option<String>,
+    /// The session being updated — the id `start_session` returned (a
+    /// prefix of 6+ chars is accepted).
+    pub session: String,
+    /// "working" | "blocked" | "awaiting-approval" | "done" | "error".
+    pub state: String,
+    /// What changed, or why — e.g. what you are blocked on, or what the
+    /// session accomplished.
+    pub note: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AttachArtifactRequest {
+    /// Channel name or id.
+    pub channel: String,
+    pub author: AuthorParam,
+    /// The author's member code (docs/adr/0017) — required once the channel
+    /// has a Party.
+    pub code: Option<String>,
+    /// The session that produced the artifact — the id `start_session`
+    /// returned (a prefix of 6+ chars is accepted).
+    pub session: String,
+    /// The artifact's kind, e.g. "diff", "log", "test-result", "memo".
+    pub kind: String,
+    /// What the artifact is, as a reader should see it.
+    pub description: String,
+    /// Where the content lives (URI, ideally with a digest) — the content
+    /// itself never enters the ledger.
+    pub provenance: Option<Vec<ProvenanceParam>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SyncRequest {
     /// Channel name or id.
     pub channel: String,
@@ -301,6 +357,8 @@ enum TargetKind {
     Assertion,
     /// approve / reject act on proposals (gate-bearing).
     Proposal,
+    /// update_session / attach_artifact act on Agent Sessions.
+    Session,
 }
 
 /// Resolve an act's target against the channel projection: a full id must
@@ -313,10 +371,12 @@ fn resolve_target(view: &ChannelView, raw: &str, kind: TargetKind) -> Result<Ent
     let described = match kind {
         TargetKind::Assertion => "an assertion (ratify/park/correct targets)",
         TargetKind::Proposal => "a proposal (approve/reject targets)",
+        TargetKind::Session => "an agent session (update_session/attach_artifact targets)",
     };
     let bears_kind = |id: &EntryId| match kind {
         TargetKind::Assertion => view.standing(id).is_some(),
         TargetKind::Proposal => view.gate_status(id).is_some(),
+        TargetKind::Session => view.session(id).is_some(),
     };
 
     if let Ok(id) = raw.parse::<EntryId>() {
@@ -367,6 +427,22 @@ fn parse_provenance(params: Option<Vec<ProvenanceParam>>) -> Result<Vec<Provenan
             })
         })
         .collect()
+}
+
+/// Parse a session-state string from the wire, mirroring the lowercase
+/// labels the surfaces render.
+fn parse_session_state(raw: &str) -> Result<SessionState, McpError> {
+    match raw {
+        "working" => Ok(SessionState::Working),
+        "blocked" => Ok(SessionState::Blocked),
+        "awaiting-approval" => Ok(SessionState::AwaitingApproval),
+        "done" => Ok(SessionState::Done),
+        "error" => Ok(SessionState::Error),
+        other => Err(invalid(format!(
+            "'{other}' is not a session state (working | blocked | \
+             awaiting-approval | done | error)"
+        ))),
+    }
 }
 
 /// A successful tool result carrying one text block.
@@ -724,6 +800,84 @@ impl JuntoMcp {
     }
 
     #[tool(
+        description = "Start an Agent Session: the recorded beginning of one agent execution in a channel. Returns the session id — keep it; update_session and attach_artifact target it. The session starts in the `working` state. Author as yourself (the agent), never as your operator."
+    )]
+    async fn start_session(
+        &self,
+        Parameters(req): Parameters<StartSessionRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let author: Member = req.author.into();
+        let (ledger, channel) = self.resolve(&req.channel).await?;
+        self.authorize(&ledger, &channel, &author, req.code.as_deref())
+            .await?;
+        let entry = Self::entry(
+            channel,
+            author,
+            EntryPayload::SessionStarted { intent: req.intent },
+        );
+        let id = entry.id;
+        ledger.lock().await.append(entry).await.map_err(internal)?;
+        Ok(text(format!(
+            "started session {id} in channel '{}' (state: working) — target it from \
+             update_session and attach_artifact",
+            req.channel
+        )))
+    }
+
+    #[tool(
+        description = "Move an Agent Session's state: working | blocked | awaiting-approval | done | error. Say what changed in `note` (what you are blocked on, what the session accomplished). Mark sessions done or error when they end — a session left `working` reads as live."
+    )]
+    async fn update_session(
+        &self,
+        Parameters(req): Parameters<UpdateSessionRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let author: Member = req.author.into();
+        let state = parse_session_state(&req.state)?;
+        let (ledger, channel) = self.resolve(&req.channel).await?;
+        let view = self
+            .authorize(&ledger, &channel, &author, req.code.as_deref())
+            .await?;
+        let target = resolve_target(&view, &req.session, TargetKind::Session)?;
+        let entry = Self::entry(
+            channel,
+            author,
+            EntryPayload::SessionUpdated {
+                target,
+                state,
+                note: req.note,
+            },
+        );
+        self.append(&req.channel, ledger, entry).await
+    }
+
+    #[tool(
+        description = "Attach a verifiable Artifact (diff, log, test result, memo…) to the Agent Session that produced it. The ledger records kind + description + provenance (URI, ideally with a digest); the content itself lives wherever provenance points, never in the ledger. Attach artifacts as you produce them — they are what humans review instead of scrollback."
+    )]
+    async fn attach_artifact(
+        &self,
+        Parameters(req): Parameters<AttachArtifactRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let author: Member = req.author.into();
+        let (ledger, channel) = self.resolve(&req.channel).await?;
+        let view = self
+            .authorize(&ledger, &channel, &author, req.code.as_deref())
+            .await?;
+        let target = resolve_target(&view, &req.session, TargetKind::Session)?;
+        let provenance = parse_provenance(req.provenance)?;
+        let entry = Self::entry(
+            channel,
+            author,
+            EntryPayload::ArtifactAttached {
+                target,
+                kind: req.kind,
+                description: req.description,
+                provenance,
+            },
+        );
+        self.append(&req.channel, ledger, entry).await
+    }
+
+    #[tool(
         description = "Project a channel's ledger as markdown. Default: the scaled brief — state, not history (open items with full ids, standing decisions tiered newest-first, verification acts folded into their targets). Pass full=true for the complete transcript: every entry in canonical order, including parked dead-ends and superseded bodies — consult it before re-trying old territory or overturning a settled decision. Entry ids are the targets for ratify/park/correct/approve/reject."
     )]
     async fn view_channel(
@@ -802,8 +956,10 @@ impl ServerHandler for JuntoMcp {
         info.instructions = Some(
             "junto's ledger: open channels (open_channel) and discover them (list_channels), \
              record decisions/findings (assertions), verify them (ratify/park/correct), gate \
-             consequential actions (propose/approve/reject), grant membership (add_member, \
-             founder only), inspect a channel (view_channel), and sync the durable record \
+             consequential actions (propose/approve/reject), track agent work as sessions \
+             (start_session/update_session) with verifiable outputs (attach_artifact), grant \
+             membership (add_member, founder only), inspect a channel (view_channel), and \
+             sync the durable record \
              through a git remote (sync_channel). Channels are addressed by name (bound when \
              opened) or id; a channel must be opened before recording into it. Always pass \
              your own identity as `author` — agents author as themselves, never as their \
@@ -962,6 +1118,124 @@ mod tests {
         assert!(rendered.contains(&id), "view lists the entry id");
         assert!(rendered.contains("the sky is blue"));
         assert!(rendered.contains("[provisional]"));
+    }
+
+    #[tokio::test]
+    async fn session_lifecycle_start_update_attach() {
+        let (dirs, mcp) = init_repo();
+        open(&mcp, &dirs, "junto-dev").await;
+        let started = mcp
+            .start_session(Parameters(StartSessionRequest {
+                channel: "junto-dev".into(),
+                author: claude(),
+                code: code_of(&dirs, claude()),
+                intent: "fix the flaky sync test".into(),
+            }))
+            .await
+            .unwrap();
+        // "started session <id> in channel ..." → the id.
+        let session = text_of(&started)
+            .split_whitespace()
+            .nth(2)
+            .expect("session id in confirmation")
+            .to_string();
+
+        mcp.attach_artifact(Parameters(AttachArtifactRequest {
+            channel: "junto-dev".into(),
+            author: claude(),
+            code: code_of(&dirs, claude()),
+            session: session.clone(),
+            kind: "diff".into(),
+            description: "the fix as a unified diff".into(),
+            provenance: Some(vec![ProvenanceParam {
+                uri: "git:abc123".into(),
+                digest: Some("sha256:deadbeef".into()),
+            }]),
+        }))
+        .await
+        .unwrap();
+        mcp.update_session(Parameters(UpdateSessionRequest {
+            channel: "junto-dev".into(),
+            author: claude(),
+            code: code_of(&dirs, claude()),
+            session: session[..8].to_string(), // prefix targeting works too
+            state: "done".into(),
+            note: "tests green".into(),
+        }))
+        .await
+        .unwrap();
+
+        let view = mcp
+            .view_channel(Parameters(ViewRequest {
+                channel: "junto-dev".into(),
+                full: true,
+            }))
+            .await
+            .unwrap();
+        let rendered = text_of(&view);
+        assert!(rendered.contains("fix the flaky sync test"), "{rendered}");
+        assert!(rendered.contains("[done]"), "{rendered}");
+        assert!(rendered.contains("the fix as a unified diff"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn session_acts_reject_bad_targets_and_states() {
+        let (dirs, mcp) = init_repo();
+        open(&mcp, &dirs, "junto-dev").await;
+        // An assertion id is not a session target.
+        let recorded = mcp
+            .record(Parameters(RecordRequest {
+                channel: "junto-dev".into(),
+                author: claude(),
+                code: code_of(&dirs, claude()),
+                statement: "not a session".into(),
+                rationale: "r".into(),
+                frame: None,
+                provenance: None,
+            }))
+            .await
+            .unwrap();
+        let assertion_id = recorded_id(&recorded);
+        let err = mcp
+            .update_session(Parameters(UpdateSessionRequest {
+                channel: "junto-dev".into(),
+                author: claude(),
+                code: code_of(&dirs, claude()),
+                session: assertion_id,
+                state: "done".into(),
+                note: "n".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("not an agent session"), "{err}");
+
+        // A made-up state is refused before anything is appended.
+        let started = mcp
+            .start_session(Parameters(StartSessionRequest {
+                channel: "junto-dev".into(),
+                author: claude(),
+                code: code_of(&dirs, claude()),
+                intent: "work".into(),
+            }))
+            .await
+            .unwrap();
+        let session = text_of(&started)
+            .split_whitespace()
+            .nth(2)
+            .expect("session id")
+            .to_string();
+        let err = mcp
+            .update_session(Parameters(UpdateSessionRequest {
+                channel: "junto-dev".into(),
+                author: claude(),
+                code: code_of(&dirs, claude()),
+                session,
+                state: "napping".into(),
+                note: "n".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("not a session state"), "{err}");
     }
 
     #[tokio::test]
