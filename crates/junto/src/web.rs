@@ -41,6 +41,7 @@ use crate::render;
 pub fn router(host: Arc<Host>) -> Router {
     Router::new()
         .route("/", get(index_page))
+        .route("/new", get(new_page))
         .route("/channels", post(open_channel))
         .route("/repos", post(setup_repo))
         .route("/channels/{channel}", get(channel_page))
@@ -107,13 +108,20 @@ async fn index_page(State(host): State<Arc<Host>>) -> Response {
         Ok((mut summaries, attention)) => {
             // Most recently active first — the resumption order.
             summaries.sort_by_key(|summary| std::cmp::Reverse(summary.last_activity));
-            // The substrates feed the open-channel form (a picker only when
-            // there are several to choose between).
-            let substrates = host.substrate_paths().unwrap_or_default();
-            Html(render::index_html(&summaries, &attention, &substrates)).into_response()
+            Html(render::index_html(&summaries, &attention)).into_response()
         }
         Err(err) => internal(format!("listing channels: {err}")),
     }
+}
+
+/// The "/new" page behind the sidebar's "+ new" menu: open a channel, set up
+/// a repo. The substrates feed the open form's picker (shown only when
+/// several are registered).
+async fn new_page(State(host): State<Arc<Host>>) -> Response {
+    let mut nav = host.inventory().await.unwrap_or_default();
+    nav.sort_by_key(|summary| std::cmp::Reverse(summary.last_activity));
+    let substrates = host.substrate_paths().unwrap_or_default();
+    Html(render::new_html(&nav, &substrates)).into_response()
 }
 
 /// The form body for opening a channel from the index page.
