@@ -986,6 +986,27 @@ pub fn channel_html(
     page_shell(&format!("junto — {name}"), nav, Some(id), &content)
 }
 
+/// The visual family of an entry kind, so the ledger scans by what an entry
+/// *is*: a decision to weigh (blue), agent work and its outputs (teal), or a
+/// verification/lifecycle act (quiet). Purely presentational — the families
+/// echo the kernel's subject/act split plus the session family of
+/// `docs/adr/0020`.
+fn entry_family(payload: &EntryPayload) -> &'static str {
+    match payload {
+        EntryPayload::Assertion { .. } | EntryPayload::Proposal { .. } => "fam-decision",
+        EntryPayload::SessionStarted { .. }
+        | EntryPayload::SessionUpdated { .. }
+        | EntryPayload::ArtifactAttached { .. } => "fam-work",
+        EntryPayload::ChannelOpened { .. }
+        | EntryPayload::MemberAdded { .. }
+        | EntryPayload::Ratification { .. }
+        | EntryPayload::Park { .. }
+        | EntryPayload::Correction { .. }
+        | EntryPayload::Approval { .. }
+        | EntryPayload::Rejection { .. } => "fam-act",
+    }
+}
+
 /// One ledger entry as a card: kind chip + state badge + author/when header,
 /// the content itself, and the rationale/provenance the page used to hide.
 fn entry_card(entry: &LedgerEntry, view: &ChannelView, channel: &ChannelId) -> String {
@@ -1142,7 +1163,7 @@ fn entry_card(entry: &LedgerEntry, view: &ChannelView, channel: &ChannelId) -> S
         .unwrap_or_default();
 
     format!(
-        "<article class=\"card{flag}\">\
+        "<article class=\"card {family}{flag}\">\
          <header><span class=\"kind\">{kind}</span>{badge}{unrecognized_badge}\
          <span class=\"spacer\"></span>\
          <span class=\"who\" title=\"{email}\">{who}</span>\
@@ -1150,6 +1171,7 @@ fn entry_card(entry: &LedgerEntry, view: &ChannelView, channel: &ChannelId) -> S
          {statement}{target}{rationale}{provenance}\
          <footer class=\"id\">{id}</footer>\
          {form}</article>",
+        family = entry_family(&entry.payload),
         flag = if unrecognized { " flagged" } else { "" },
         email = escape_html(&entry.author.email),
         who = escape_html(&entry.author.display_name),
@@ -1207,7 +1229,7 @@ fn sessions_section(view: &ChannelView) -> String {
         };
         let _ = writeln!(
             cards,
-            "<article class=\"card\">\
+            "<article class=\"card fam-work\">\
              <header><span class=\"kind\">agent session</span>\
              <span class=\"badge {state}\">{state}</span>\
              <span class=\"spacer\"></span>\
@@ -1373,7 +1395,7 @@ if(b){b.textContent='recording\\u2026'}},0)});</script>";
 const CSS: &str = "\
 :root{--bg:#11111b;--panel:#181825;--card:#1e1e2e;--border:#313244;--text:#cdd6f4;\
 --muted:#7f849c;--soft:#a6adc8;--accent:#89b4fa;--green:#a6e3a1;--yellow:#f9e2af;\
---red:#f38ba8;--gray:#9399b2}\
+--red:#f38ba8;--gray:#9399b2;--teal:#94e2d5}\
 *{box-sizing:border-box}\
 body{margin:0;background:var(--bg);color:var(--text);\
 font:15px/1.55 system-ui,'Segoe UI',sans-serif}\
@@ -1417,6 +1439,10 @@ border-radius:.7rem;padding:.12rem .6rem;background:var(--panel)}\
 .card{background:var(--card);border:1px solid var(--border);border-radius:.65rem;\
 padding:.8rem .95rem;margin-bottom:.7rem}\
 .card.flagged{border-color:var(--red)}\
+.card.fam-decision{border-left:2px solid rgba(137,180,250,.55)}\
+.card.fam-work{border-left:2px solid rgba(148,226,213,.55)}\
+.card.fam-work .kind{color:var(--teal)}\
+.card.fam-act .kind{color:var(--muted)}\
 .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(24rem,100%),1fr));\
 gap:.8rem}\
 .cards>*{min-width:0}\
@@ -1608,6 +1634,35 @@ mod tests {
         assert!(html.contains("fix the flaky sync test"), "{html}");
         assert!(html.contains("badge blocked"), "{html}");
         assert!(html.contains("the fix as a unified diff"), "{html}");
+    }
+
+    #[test]
+    fn cards_carry_their_entry_family() {
+        // Decisions, work, and acts are visually distinct families: the card
+        // class drives the chip color and edge tint, so a ledger scans by
+        // what each entry *is*.
+        let decision = assertion("a claim to weigh");
+        let work = LedgerEntry {
+            id: EntryId::new(),
+            channel: ChannelId::new(),
+            author: Member::agent("Coder", "coder@junto.local"),
+            timestamp: Timestamp::from_millis(1_781_046_734_155),
+            payload: EntryPayload::ArtifactAttached {
+                target: decision.id, // dangling-by-kind is fine for rendering
+                kind: "diff".into(),
+                description: "an output to inspect".into(),
+                provenance: vec![],
+            },
+        };
+        let act = act(EntryPayload::Ratification {
+            target: decision.id,
+            rationale: "verified".into(),
+        });
+        let view = view_with(vec![decision, work, act]);
+        let html = channel_html(&[], "t", &ChannelId::new(), &view);
+        assert!(html.contains("card fam-decision"), "{html}");
+        assert!(html.contains("card fam-work"), "{html}");
+        assert!(html.contains("card fam-act"), "{html}");
     }
 
     #[test]
