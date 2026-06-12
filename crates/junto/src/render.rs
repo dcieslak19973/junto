@@ -721,6 +721,7 @@ fn page_shell(
          <nav class=\"side\">\n\
          <a class=\"brand\" href=\"/\"><span class=\"logo\">j</span>junto</a>\n\
          <div class=\"side-label\">channels</div>\n{links}\
+         <a class=\"chan open-link\" href=\"/#open-channel\">+ open a channel</a>\n\
          </nav>\n\
          <main>\n{content}</main>\n\
          </div>{ACT_FEEDBACK_SCRIPT}</body></html>\n",
@@ -835,7 +836,8 @@ fn open_channel_form(substrates: &[std::path::PathBuf]) -> String {
         String::new()
     };
     format!(
-        "<section class=\"board\"><h2 class=\"board-head\">open a channel</h2>\n\
+        "<section class=\"board\" id=\"open-channel\">\
+         <h2 class=\"board-head\">open a channel</h2>\n\
          <form class=\"act open-channel\" method=\"post\" action=\"/channels\">\
          <input name=\"name\" placeholder=\"a name for one unit of inquiry, e.g. \
          payments-refactor\" required>\
@@ -1600,6 +1602,8 @@ a.chan{display:flex;align-items:center;gap:.5rem;padding:.4rem .55rem;border-rad
 color:var(--soft);text-decoration:none;font-size:.9rem;margin-bottom:2px}\
 a.chan:hover{background:var(--card);color:var(--text)}\
 a.chan.active{background:var(--card);color:var(--text);outline:1px solid var(--border)}\
+a.chan.open-link{color:var(--muted);font-size:.84rem;margin-top:.35rem}\
+a.chan.open-link:hover{color:var(--accent)}\
 .chan-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\
 .gatecount{flex:none;font-size:.7rem;font-weight:650;color:var(--bg);background:var(--yellow);\
 border-radius:.6rem;padding:0 .45rem}\
