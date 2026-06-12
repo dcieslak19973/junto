@@ -136,6 +136,9 @@ pub struct ChannelSummary {
     /// A one-line preview of the most recent entry — the resumption cue on
     /// the index ("where was I?").
     pub latest: Option<String>,
+    /// Whether the channel is closed (`docs/adr/0022`) — out of the working
+    /// set; the surfaces demote it.
+    pub closed: bool,
 }
 
 /// What kind of act an [`AttentionItem`] awaits (`docs/attention.md`:
@@ -281,11 +284,15 @@ impl Host {
             let guard = ledger.lock().await;
             for id in guard.substrate().channels().await? {
                 let view = guard.project(&id).await?;
-                summaries.push(summarize(&id, &view, &repo));
-                let group = attention_for_view(&id, &view);
-                if !group.items.is_empty() {
-                    groups.push(group);
+                // A closed channel demands no attention (docs/adr/0022) —
+                // its summary still lists, demoted, for the archive view.
+                if !view.closed {
+                    let group = attention_for_view(&id, &view);
+                    if !group.items.is_empty() {
+                        groups.push(group);
+                    }
                 }
+                summaries.push(summarize(&id, &view, &repo));
             }
         }
         // Urgency tiers: gate-bearing inquiries first; recency within a tier
@@ -607,6 +614,7 @@ fn summarize(id: &ChannelId, view: &ChannelView, substrate: &Path) -> ChannelSum
             .count(),
         members: view.party.len(),
         latest: view.entries.last().map(preview),
+        closed: view.closed,
     }
 }
 
@@ -616,6 +624,8 @@ fn preview(entry: &LedgerEntry) -> String {
     let (kind, text) = match &entry.payload {
         EntryPayload::ChannelOpened { name } => ("genesis", format!("channel '{name}' opened")),
         EntryPayload::MemberAdded { member } => ("member added", member.display_name.clone()),
+        EntryPayload::ChannelClosed { rationale } => ("closed", rationale.clone()),
+        EntryPayload::ChannelReopened { rationale } => ("reopened", rationale.clone()),
         EntryPayload::Assertion { statement, .. } => ("assertion", statement.clone()),
         EntryPayload::Ratification { rationale, .. } => ("ratification", rationale.clone()),
         EntryPayload::Park { rationale, .. } => ("park", rationale.clone()),
@@ -635,4 +645,41 @@ fn preview(entry: &LedgerEntry) -> String {
         ""
     };
     format!("{kind} — {snippet}{ellipsis}")
+}
+
+/// Test support for anything that touches `JUNTO_HOME`: the env var is
+/// process-global and cargo runs tests in parallel threads, so every test
+/// that sets it must hold the **one** lock — a per-module lock would still
+/// race against other modules' tests.
+#[cfg(test)]
+pub(crate) mod test_home {
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Points `JUNTO_HOME` at a fresh temp dir for the guard's lifetime,
+    /// serialized across the whole test process.
+    pub(crate) struct HomeGuard {
+        dir: tempfile::TempDir,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl HomeGuard {
+        pub(crate) fn new() -> Self {
+            let lock = HOME_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let dir = tempfile::tempdir().expect("temp junto home");
+            unsafe { std::env::set_var("JUNTO_HOME", dir.path()) };
+            Self { dir, _lock: lock }
+        }
+
+        pub(crate) fn path(&self) -> &std::path::Path {
+            self.dir.path()
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("JUNTO_HOME") };
+        }
+    }
 }

@@ -10,16 +10,17 @@
 //!   recall hook curls this into agent context, and anything else that wants
 //!   the projection without an MCP handshake can too.
 //!
-//! And one POST — the **human write surface**: verification acts (ratify /
-//! park / approve / reject) submitted from the channel page's forms, so the
-//! human's slow loop happens on the one surface instead of through an agent
-//! relaying it. Authored as the machine user's git identity
-//! ([`crate::host::git_user`]) — identity stays claimed (`docs/adr/0012`),
-//! this is a default, not an identity system. Verification acts only:
-//! recording assertions and proposing actions remain agent (MCP) territory.
-//! Each web write triggers a **best-effort background sync** with `origin` —
-//! the page is a terminal-less human's only affordance, so the durable record
-//! must not wait for an agent to run `sync_channel`.
+//! And the POSTs — the **human write surface**: verification acts (ratify /
+//! park / approve / reject) from the channel page's forms, opening a channel
+//! (`/channels`, from the index form or a channel page's contextual
+//! open-an-inquiry-here form), and setting a repo up as a home substrate
+//! (`/repos` — the terminal-less `junto init`). All authored as the machine
+//! user's git identity ([`crate::host::git_user`]) — identity stays claimed
+//! (`docs/adr/0012`), this is a default, not an identity system. Recording
+//! assertions and proposing actions remain agent (MCP) territory.
+//! Each verification act triggers a **best-effort background sync** with
+//! `origin` — the page is a terminal-less human's only affordance, so the
+//! durable record must not wait for an agent to run `sync_channel`.
 
 use std::sync::Arc;
 
@@ -40,21 +41,34 @@ use crate::render;
 pub fn router(host: Arc<Host>) -> Router {
     Router::new()
         .route("/", get(index_page))
+        .route("/channels", post(open_channel))
+        .route("/repos", post(setup_repo))
         .route("/channels/{channel}", get(channel_page))
+        .route("/channels/{channel}/rename", post(rename_channel))
+        .route("/channels/{channel}/close", post(close_channel))
+        .route("/channels/{channel}/reopen", post(reopen_channel))
         .route("/channels/{channel}/brief", get(channel_brief))
         .route("/channels/{channel}/entries/{entry}/{act}", post(verify))
         .with_state(host)
 }
 
 /// Resolve and project a channel reference, or surface the failure as an
-/// appropriate HTTP status.
-async fn project(host: &Host, channel: &str) -> Result<(ChannelId, ChannelView), Response> {
+/// appropriate HTTP status. Also yields the home substrate path — the
+/// channel page's contextual open-an-inquiry form prefills it.
+async fn project(
+    host: &Host,
+    channel: &str,
+) -> Result<(ChannelId, ChannelView, std::path::PathBuf), Response> {
     let resolution = host
         .resolve(channel)
         .await
         .map_err(|err| internal(format!("resolving '{channel}': {err}")))?;
-    let (ledger, id) = match resolution {
-        Resolution::Resolved { ledger, id, .. } => (ledger, id),
+    let (ledger, id, substrate) = match resolution {
+        Resolution::Resolved {
+            ledger,
+            id,
+            substrate,
+        } => (ledger, id, substrate),
         Resolution::NotFound => {
             return Err((
                 StatusCode::NOT_FOUND,
@@ -79,7 +93,7 @@ async fn project(host: &Host, channel: &str) -> Result<(ChannelId, ChannelView),
         .project(&id)
         .await
         .map_err(|err| internal(format!("projection failed: {err}")))?;
-    Ok((id, view))
+    Ok((id, view, substrate))
 }
 
 fn internal(message: String) -> Response {
@@ -93,24 +107,340 @@ async fn index_page(State(host): State<Arc<Host>>) -> Response {
         Ok((mut summaries, attention)) => {
             // Most recently active first — the resumption order.
             summaries.sort_by_key(|summary| std::cmp::Reverse(summary.last_activity));
-            Html(render::index_html(&summaries, &attention)).into_response()
+            // The substrates feed the open-channel form (a picker only when
+            // there are several to choose between).
+            let substrates = host.substrate_paths().unwrap_or_default();
+            Html(render::index_html(&summaries, &attention, &substrates)).into_response()
         }
         Err(err) => internal(format!("listing channels: {err}")),
     }
 }
 
+/// The form body for opening a channel from the index page.
+#[derive(Debug, Deserialize)]
+struct OpenChannelForm {
+    /// The channel's name — a label, unique within its home substrate
+    /// (`docs/adr/0014`).
+    name: String,
+    /// The home substrate repo path; may be empty when the host serves
+    /// exactly one.
+    #[serde(default)]
+    repo: String,
+}
+
+/// Open a channel from the index page's form: the human-surface counterpart
+/// of the `open_channel` MCP tool. The founder is the substrate's git user —
+/// the host derives the author, same as verification acts (`docs/adr/0021`).
+async fn open_channel(
+    State(host): State<Arc<Host>>,
+    Form(form): Form<OpenChannelForm>,
+) -> Response {
+    let name = form.name.trim();
+    if name.is_empty() {
+        return (StatusCode::BAD_REQUEST, "a channel needs a name").into_response();
+    }
+    let substrates = match host.substrate_paths() {
+        Ok(substrates) => substrates,
+        Err(err) => return internal(format!("listing substrates: {err}")),
+    };
+    let repo = if form.repo.trim().is_empty() {
+        match substrates.as_slice() {
+            [only] => only.clone(),
+            [] => {
+                return internal(
+                    "no registered home substrates (run `junto init` in a repo first)".into(),
+                );
+            }
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "several substrates are registered — pick the home substrate in the form",
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        std::path::PathBuf::from(form.repo.trim())
+    };
+    let founder = match crate::host::git_user(&repo) {
+        Ok(founder) => founder,
+        Err(err) => {
+            return internal(format!(
+                "no founder identity: {err} (set git config user.name / user.email)"
+            ));
+        }
+    };
+    match host.open_channel(Some(&repo), name, founder, None).await {
+        // Id-addressed: ids are URL-safe, names may not be.
+        Ok(opened) => Redirect::to(&format!("/channels/{}", opened.id)).into_response(),
+        // Name taken, unregistered substrate, … — the message says which.
+        Err(err) => (StatusCode::CONFLICT, format!("{err:#}")).into_response(),
+    }
+}
+
+/// The form body for setting a repo up as a home substrate.
+#[derive(Debug, Deserialize)]
+struct SetupRepoForm {
+    /// Filesystem path to a git repository on this machine.
+    path: String,
+    /// The ambient channel's name; empty defaults to the repo's directory
+    /// name (mirroring `junto init`).
+    #[serde(default)]
+    channel: String,
+}
+
+/// Set a repo up from the index page — the terminal-less `junto init`
+/// (constraint #2: the host runs as the machine user, so it can do
+/// everything the CLI did): register the substrate, wire the agent harness,
+/// bind and **open** the ambient channel, then land on its page. The
+/// agent-membership grant stays on `junto add-member` for now.
+async fn setup_repo(State(host): State<Arc<Host>>, Form(form): Form<SetupRepoForm>) -> Response {
+    let path = std::path::PathBuf::from(form.path.trim());
+    if form.path.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "a repo path is required").into_response();
+    }
+    let channel = match form.channel.trim() {
+        "" => None,
+        name => Some(name.to_string()),
+    };
+    if let Err(err) = crate::init::run(&path, channel.clone(), true, None).await {
+        return (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response();
+    }
+    // Land on the ambient channel's page (init derived its name from the
+    // directory when none was given — re-derive the same way).
+    let ambient = match channel {
+        Some(name) => name,
+        None => match path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+        {
+            Some(name) => name,
+            None => return Redirect::to("/").into_response(),
+        },
+    };
+    match host.resolve(&ambient).await {
+        Ok(Resolution::Resolved { id, .. }) => {
+            Redirect::to(&format!("/channels/{id}")).into_response()
+        }
+        // Ambiguous (the name exists elsewhere too) or anything unexpected:
+        // the index shows the new substrate either way.
+        _ => Redirect::to("/").into_response(),
+    }
+}
+
 async fn channel_page(State(host): State<Arc<Host>>, Path(channel): Path<String>) -> Response {
     match project(&host, &channel).await {
-        Ok((id, view)) => {
+        Ok((id, view, substrate)) => {
             let name = view.name.clone().unwrap_or_else(|| channel.clone());
             // The sidebar: every channel, most recently active first —
             // best-effort, an empty nav never blocks the page itself.
             let mut nav = host.inventory().await.unwrap_or_default();
             nav.sort_by_key(|summary| std::cmp::Reverse(summary.last_activity));
-            Html(render::channel_html(&nav, &name, &id, &view)).into_response()
+            Html(render::channel_html(&nav, &name, &id, &view, &substrate)).into_response()
         }
         Err(response) => response,
     }
+}
+
+/// The form body for renaming a channel.
+#[derive(Debug, Deserialize)]
+struct RenameForm {
+    /// The new name — a label, unique within the home substrate
+    /// (`docs/adr/0014`).
+    name: String,
+    /// Why the rename. A rationale, not a checkbox.
+    rationale: String,
+}
+
+/// Rename a channel: append a [`EntryPayload::Correction`] targeting the
+/// `ChannelOpened` genesis — the corrective-entry rename ADR 0016 anticipated,
+/// not mutable metadata. The projection resolves the current name as
+/// "genesis unless corrected, last applicable wins"; links stay id-addressed,
+/// so nothing breaks.
+async fn rename_channel(
+    State(host): State<Arc<Host>>,
+    Path(channel): Path<String>,
+    Form(form): Form<RenameForm>,
+) -> Response {
+    let new_name = form.name.trim().to_string();
+    if new_name.is_empty() {
+        return (StatusCode::BAD_REQUEST, "a channel needs a name").into_response();
+    }
+    if new_name.parse::<ChannelId>().is_ok() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "a channel name must not look like a channel id",
+        )
+            .into_response();
+    }
+    let rationale = form.rationale.trim().to_string();
+    if rationale.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "a rationale is required — it's a rationale, not a checkbox",
+        )
+            .into_response();
+    }
+
+    let (id, view, substrate) = match project(&host, &channel).await {
+        Ok(projected) => projected,
+        Err(response) => return response,
+    };
+    // Name uniqueness within the home substrate, same rule open_channel
+    // enforces (docs/adr/0014: names are substrate-scoped labels).
+    let taken = host.inventory().await.unwrap_or_default().iter().any(|s| {
+        s.substrate == substrate && s.id != id && s.name.as_deref() == Some(new_name.as_str())
+    });
+    if taken {
+        return (
+            StatusCode::CONFLICT,
+            format!("a channel named '{new_name}' already exists in this substrate"),
+        )
+            .into_response();
+    }
+    let author = match crate::host::git_user(&substrate) {
+        Ok(author) => author,
+        Err(err) => {
+            return internal(format!(
+                "no author identity: {err} (set git config user.name / user.email)"
+            ));
+        }
+    };
+    if let Err(err) = host.authorize_human_write(&view, &author) {
+        return (StatusCode::FORBIDDEN, format!("{err:#}")).into_response();
+    }
+    let Some(genesis) = view
+        .entries
+        .iter()
+        .find(|entry| matches!(entry.payload, EntryPayload::ChannelOpened { .. }))
+        .map(|entry| entry.id)
+    else {
+        return (
+            StatusCode::CONFLICT,
+            "this channel has no genesis entry (pre-0014 record) — it cannot be renamed",
+        )
+            .into_response();
+    };
+
+    let ledger = match host.ledger_for(&substrate).await {
+        Ok(ledger) => ledger,
+        Err(err) => return internal(format!("opening the ledger: {err}")),
+    };
+    let entry = LedgerEntry {
+        id: EntryId::new(),
+        channel: id,
+        author,
+        timestamp: Timestamp::now(),
+        payload: EntryPayload::Correction {
+            target: genesis,
+            statement: new_name,
+            rationale,
+        },
+    };
+    if let Err(err) = ledger.lock().await.append(entry).await {
+        return internal(format!("append failed: {err}"));
+    }
+    // Best-effort background sync, same as verification acts.
+    let repo = substrate.clone();
+    tokio::spawn(async move {
+        let mut fresh = junto_substrate_git::GitRefsSubstrate::open(repo);
+        if let Err(err) = fresh.sync("origin", &id).await {
+            tracing::warn!("auto-sync of channel {id} after a rename failed: {err:#}");
+        }
+    });
+    Redirect::to(&format!("/channels/{id}")).into_response()
+}
+
+/// The form body for closing or reopening a channel: just the rationale.
+#[derive(Debug, Deserialize)]
+struct LifecycleForm {
+    /// Why the channel closes/reopens. A rationale, not a checkbox.
+    rationale: String,
+}
+
+/// Close a channel (`docs/adr/0022`): append a `ChannelClosed` lifecycle
+/// entry. The record stays; the channel leaves the working set.
+async fn close_channel(
+    State(host): State<Arc<Host>>,
+    Path(channel): Path<String>,
+    Form(form): Form<LifecycleForm>,
+) -> Response {
+    lifecycle_act(&host, &channel, form, true).await
+}
+
+/// Reopen a closed channel (`docs/adr/0022`): append a `ChannelReopened`
+/// lifecycle entry — last applicable wins.
+async fn reopen_channel(
+    State(host): State<Arc<Host>>,
+    Path(channel): Path<String>,
+    Form(form): Form<LifecycleForm>,
+) -> Response {
+    lifecycle_act(&host, &channel, form, false).await
+}
+
+/// The shared close/reopen path: author from git config, membership checked,
+/// the act appended, background sync, back to the channel page.
+async fn lifecycle_act(host: &Host, channel: &str, form: LifecycleForm, close: bool) -> Response {
+    let rationale = form.rationale.trim().to_string();
+    if rationale.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "a rationale is required — it's a rationale, not a checkbox",
+        )
+            .into_response();
+    }
+    let (id, view, substrate) = match project(host, channel).await {
+        Ok(projected) => projected,
+        Err(response) => return response,
+    };
+    if view.closed == close {
+        return (
+            StatusCode::CONFLICT,
+            format!(
+                "this channel is already {}",
+                if close { "closed" } else { "open" }
+            ),
+        )
+            .into_response();
+    }
+    let author = match crate::host::git_user(&substrate) {
+        Ok(author) => author,
+        Err(err) => {
+            return internal(format!(
+                "no author identity: {err} (set git config user.name / user.email)"
+            ));
+        }
+    };
+    if let Err(err) = host.authorize_human_write(&view, &author) {
+        return (StatusCode::FORBIDDEN, format!("{err:#}")).into_response();
+    }
+    let payload = if close {
+        EntryPayload::ChannelClosed { rationale }
+    } else {
+        EntryPayload::ChannelReopened { rationale }
+    };
+    let ledger = match host.ledger_for(&substrate).await {
+        Ok(ledger) => ledger,
+        Err(err) => return internal(format!("opening the ledger: {err}")),
+    };
+    let entry = LedgerEntry {
+        id: EntryId::new(),
+        channel: id,
+        author,
+        timestamp: Timestamp::now(),
+        payload,
+    };
+    if let Err(err) = ledger.lock().await.append(entry).await {
+        return internal(format!("append failed: {err}"));
+    }
+    let repo = substrate.clone();
+    tokio::spawn(async move {
+        let mut fresh = junto_substrate_git::GitRefsSubstrate::open(repo);
+        if let Err(err) = fresh.sync("origin", &id).await {
+            tracing::warn!("auto-sync of channel {id} after a lifecycle act failed: {err:#}");
+        }
+    });
+    Redirect::to(&format!("/channels/{id}")).into_response()
 }
 
 /// The form body of a verification act: just the rationale — the act and
@@ -282,7 +612,7 @@ async fn verify(
 
 async fn channel_brief(State(host): State<Arc<Host>>, Path(channel): Path<String>) -> Response {
     match project(&host, &channel).await {
-        Ok((id, view)) => {
+        Ok((id, view, _substrate)) => {
             let name = view.name.clone().unwrap_or_else(|| channel.clone());
             (
                 [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
@@ -642,6 +972,232 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn setup_repo_runs_init_and_lands_on_the_ambient_channel() {
+        // The terminal-less `junto init`: registering from the form leaves
+        // the repo wired (harness config, binding) with its ambient channel
+        // open, and the redirect lands on that channel's page.
+        let home = crate::host::test_home::HomeGuard::new();
+        let repo = tempfile::tempdir().expect("repo dir");
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(repo.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        for (key, value) in [("user.name", "Web User"), ("user.email", "web@example.com")] {
+            assert!(
+                StdCommand::new("git")
+                    .args(["config", key, value])
+                    .current_dir(repo.path())
+                    .status()
+                    .expect("git config")
+                    .success()
+            );
+        }
+        let host = Host::from_registry(home.path().to_path_buf());
+
+        let response = setup_repo(
+            State(host.clone()),
+            Form(SetupRepoForm {
+                path: repo.path().display().to_string(),
+                channel: "ambient-test".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .expect("redirect")
+            .to_string();
+        assert!(location.starts_with("/channels/"), "{location}");
+
+        // The substrate is registered and the ambient channel is open with
+        // the git user as founder; the harness wiring exists in the repo.
+        let Resolution::Resolved { id, ledger, .. } = host.resolve("ambient-test").await.unwrap()
+        else {
+            panic!("ambient channel resolves");
+        };
+        assert_eq!(location, format!("/channels/{id}"));
+        let view = ledger.lock().await.project(&id).await.unwrap();
+        assert_eq!(view.party[0].email, "web@example.com");
+        assert!(repo.path().join(".mcp.json").exists());
+
+        // A non-repo path is refused with the reason.
+        let not_a_repo = tempfile::tempdir().expect("dir");
+        let response = setup_repo(
+            State(host),
+            Form(SetupRepoForm {
+                path: not_a_repo.path().display().to_string(),
+                channel: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let page = body_text(response).await;
+        assert!(page.contains("not a git repository"), "{page}");
+    }
+
+    #[tokio::test]
+    async fn close_then_reopen_round_trips() {
+        let fx = host_with_entry(assertion()).await;
+
+        // Close: the channel projects closed and demotes in summaries.
+        let response = close_channel(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LifecycleForm {
+                rationale: "inquiry finished".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let Resolution::Resolved { ledger, id, .. } = fx.host.resolve("web-test").await.unwrap()
+        else {
+            panic!("closed channel still resolves by name");
+        };
+        let view = ledger.lock().await.project(&id).await.unwrap();
+        assert!(view.closed);
+        let summary = fx
+            .host
+            .inventory()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == id)
+            .unwrap();
+        assert!(summary.closed);
+
+        // Closing again is a conflict.
+        let response = close_channel(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LifecycleForm {
+                rationale: "again".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        // Reopen: back in the working set.
+        let response = reopen_channel(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LifecycleForm {
+                rationale: "it resumed".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let view = ledger.lock().await.project(&id).await.unwrap();
+        assert!(!view.closed);
+    }
+
+    #[tokio::test]
+    async fn rename_supersedes_the_genesis_binding() {
+        let fx = host_with_entry(assertion()).await;
+        let response = rename_channel(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(RenameForm {
+                name: "better-name".into(),
+                rationale: "the inquiry sharpened".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        // The new name resolves; the old one no longer does.
+        let Resolution::Resolved { ledger, id, .. } = fx.host.resolve("better-name").await.unwrap()
+        else {
+            panic!("renamed channel resolves by its new name");
+        };
+        assert_eq!(id, fx.channel);
+        let view = ledger.lock().await.project(&id).await.unwrap();
+        assert_eq!(view.name.as_deref(), Some("better-name"));
+        assert!(matches!(
+            fx.host.resolve("web-test").await.unwrap(),
+            Resolution::NotFound
+        ));
+
+        // Renaming onto a taken name is a conflict.
+        let response = open_channel(
+            State(fx.host.clone()),
+            Form(OpenChannelForm {
+                name: "other".into(),
+                repo: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let response = rename_channel(
+            State(fx.host.clone()),
+            Path("better-name".into()),
+            Form(RenameForm {
+                name: "other".into(),
+                rationale: "collide".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn the_index_form_opens_a_channel() {
+        // The human-surface counterpart of the open_channel tool: post a
+        // name, the host picks its only substrate and the git user as
+        // founder, and the redirect lands on the new channel's page.
+        let fx = host_with_entry(assertion()).await;
+        let response = open_channel(
+            State(fx.host.clone()),
+            Form(OpenChannelForm {
+                name: "fresh-inquiry".into(),
+                repo: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .expect("redirect target")
+            .to_string();
+        assert!(location.starts_with("/channels/"), "{location}");
+
+        // The channel resolves by name, founded by the repo's git user.
+        let Resolution::Resolved { ledger, id, .. } =
+            fx.host.resolve("fresh-inquiry").await.unwrap()
+        else {
+            panic!("the opened channel resolves by name");
+        };
+        let view = ledger.lock().await.project(&id).await.unwrap();
+        assert_eq!(view.name.as_deref(), Some("fresh-inquiry"));
+        assert_eq!(view.party[0].email, "web@example.com");
+        // The redirect targeted exactly this channel.
+        assert_eq!(location, format!("/channels/{id}"));
+    }
+
+    #[tokio::test]
+    async fn a_taken_name_is_a_conflict() {
+        let fx = host_with_entry(assertion()).await;
+        let response = open_channel(
+            State(fx.host.clone()),
+            Form(OpenChannelForm {
+                name: "web-test".into(), // the fixture already opened this
+                repo: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let page = body_text(response).await;
+        assert!(page.contains("web-test"), "{page}");
+    }
+
+    #[tokio::test]
     async fn non_member_git_identity_is_forbidden() {
         // The human-surface guardrail that remains: the git-config author
         // must be in the channel's Party. A repo whose git user was never
@@ -734,8 +1290,15 @@ mod tests {
             party: Vec::new(),
             unrecognized: Default::default(),
             sessions: Default::default(),
+            closed: false,
         };
-        let html = crate::render::channel_html(&[], "web-test", &channel, &view);
+        let html = crate::render::channel_html(
+            &[],
+            "web-test",
+            &channel,
+            &view,
+            std::path::Path::new("/repo"),
+        );
         assert!(html.contains(&format!("/channels/{channel}/entries/{}/ratify", entry.id)));
         assert!(html.contains("name=\"rationale\""));
         // The act-feedback enhancement ships with every page: a submitted act

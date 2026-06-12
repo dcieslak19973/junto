@@ -148,8 +148,13 @@ fn brief_shape(view: &ChannelView) -> BriefShape<'_> {
                 Some(Standing::Superseded) => shape.superseded += 1,
                 None => {}
             },
-            // A correction is the live text of settled territory.
-            EntryPayload::Correction { .. } => shape.ratified.push(entry),
+            // A correction of an assertion is the live text of settled
+            // territory. A correction of anything else (the genesis — a
+            // rename, docs/adr/0016) is not a decision and rents no line.
+            EntryPayload::Correction { target, .. } if view.standings.contains_key(target) => {
+                shape.ratified.push(entry);
+            }
+            EntryPayload::Correction { .. } => {}
             EntryPayload::Proposal { .. } => match view.gate_status(&entry.id) {
                 Some(GateStatus::Pending) => shape.open.push(entry),
                 Some(GateStatus::Approved) => shape.approved.push(entry),
@@ -186,6 +191,12 @@ pub fn brief_markdown(name: &str, id: &ChannelId, view: &ChannelView) -> String 
     if view.entries.is_empty() {
         out.push_str("(no entries)\n");
         return out;
+    }
+    if view.closed {
+        out.push_str(
+            "**This channel is closed** (`docs/adr/0022`) — the inquiry left the working \
+             set; do not record new work here without reopening.\n\n",
+        );
     }
     out.push_str(
         "State, not history: verification acts are folded into their targets and old \
@@ -351,6 +362,12 @@ fn recent_line(entry: &LedgerEntry) -> String {
         }
         EntryPayload::ArtifactAttached { description, .. } => {
             format!("attached artifact: {}", clamp(description, TAIL_CLAMP))
+        }
+        EntryPayload::ChannelClosed { rationale } => {
+            format!("closed the channel: {}", clamp(rationale, TAIL_CLAMP))
+        }
+        EntryPayload::ChannelReopened { rationale } => {
+            format!("reopened the channel: {}", clamp(rationale, TAIL_CLAMP))
         }
     }
 }
@@ -614,6 +631,12 @@ fn describe_markdown(entry: &LedgerEntry, view: &ChannelView) -> String {
         } => {
             format!("**artifact** ({kind}) on session `{target}` — {description}")
         }
+        EntryPayload::ChannelClosed { rationale } => {
+            format!("**channel closed** — {rationale}")
+        }
+        EntryPayload::ChannelReopened { rationale } => {
+            format!("**channel reopened** — {rationale}")
+        }
     }
 }
 
@@ -689,29 +712,58 @@ fn page_shell(
     active: Option<&ChannelId>,
     content: &str,
 ) -> String {
+    // Channels group under their home substrate (labelled by directory
+    // name), groups ordered by first appearance in `nav` — which arrives
+    // most-recently-active first, so the busiest repo tops the sidebar. A
+    // storage fact used as a reading aid, not scope (docs/domain-model.md).
+    // Closed channels leave the sidebar entirely (docs/adr/0022) — they
+    // remain reachable from the index's archive section.
+    let open_nav: Vec<&ChannelSummary> = nav.iter().filter(|s| !s.closed).collect();
+    let mut group_order: Vec<&std::path::PathBuf> = Vec::new();
+    for summary in &open_nav {
+        if !group_order.contains(&&summary.substrate) {
+            group_order.push(&summary.substrate);
+        }
+    }
     let mut links = String::new();
-    for summary in nav {
-        let display_name = summary.name.as_deref().unwrap_or("(unopened)");
-        let href = summary
-            .name
-            .clone()
-            .unwrap_or_else(|| summary.id.to_string());
-        let class = if active == Some(&summary.id) {
-            "chan active"
-        } else {
-            "chan"
-        };
-        let gates = if summary.open_gates > 0 {
-            format!("<span class=\"gatecount\">{}</span>", summary.open_gates)
-        } else {
-            String::new()
-        };
-        let _ = writeln!(
-            links,
-            "<a class=\"{class}\" href=\"/channels/{href}\"><span class=\"chan-name\">{name}</span>{gates}</a>",
-            href = escape_html(&href),
-            name = escape_html(display_name),
-        );
+    for substrate in group_order {
+        if open_nav.iter().any(|s| &s.substrate != substrate) {
+            // Only label groups when there is more than one substrate —
+            // a single-repo host needs no heading.
+            let label = substrate
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| substrate.display().to_string());
+            let _ = writeln!(
+                links,
+                "<div class=\"side-sub\" title=\"{path}\">{label}</div>",
+                path = escape_html(&substrate.display().to_string()),
+                label = escape_html(&label),
+            );
+        }
+        for summary in open_nav.iter().filter(|s| &s.substrate == substrate) {
+            let display_name = summary.name.as_deref().unwrap_or("(unopened)");
+            let href = summary
+                .name
+                .clone()
+                .unwrap_or_else(|| summary.id.to_string());
+            let class = if active == Some(&summary.id) {
+                "chan active"
+            } else {
+                "chan"
+            };
+            let gates = if summary.open_gates > 0 {
+                format!("<span class=\"gatecount\">{}</span>", summary.open_gates)
+            } else {
+                String::new()
+            };
+            let _ = writeln!(
+                links,
+                "<a class=\"{class}\" href=\"/channels/{href}\"><span class=\"chan-name\">{name}</span>{gates}</a>",
+                href = escape_html(&href),
+                name = escape_html(display_name),
+            );
+        }
     }
     format!(
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
@@ -721,6 +773,7 @@ fn page_shell(
          <nav class=\"side\">\n\
          <a class=\"brand\" href=\"/\"><span class=\"logo\">j</span>junto</a>\n\
          <div class=\"side-label\">channels</div>\n{links}\
+         <a class=\"chan open-link\" href=\"/#open-channel\">+ open a channel</a>\n\
          </nav>\n\
          <main>\n{content}</main>\n\
          </div>{ACT_FEEDBACK_SCRIPT}</body></html>\n",
@@ -732,15 +785,22 @@ fn page_shell(
 /// the landing page of the one surface (`docs/adr/0015`). Leads with the
 /// focus board (what needs you, grouped by inquiry — `docs/attention.md`),
 /// then the channel cards: who is on each, how alive it is, the latest entry.
-pub fn index_html(summaries: &[ChannelSummary], attention: &[AttentionGroup]) -> String {
+pub fn index_html(
+    summaries: &[ChannelSummary],
+    attention: &[AttentionGroup],
+    substrates: &[std::path::PathBuf],
+) -> String {
     let mut cards = String::new();
+    let mut closed_cards = String::new();
     for summary in summaries {
         let display_name = summary.name.as_deref().unwrap_or("(unopened)");
         let href = summary
             .name
             .clone()
             .unwrap_or_else(|| summary.id.to_string());
-        let gates = if summary.open_gates > 0 {
+        let gates = if summary.closed {
+            "<span class=\"badge quiet\">closed</span>".to_string()
+        } else if summary.open_gates > 0 {
             format!(
                 "<span class=\"badge pending\">{} open gate{}</span>",
                 summary.open_gates,
@@ -767,27 +827,40 @@ pub fn index_html(summaries: &[ChannelSummary], attention: &[AttentionGroup]) ->
         } else {
             String::new()
         };
-        let _ = writeln!(
-            cards,
+        let card = format!(
             "<a class=\"card-link\" href=\"/channels/{href}\"><article class=\"card chan-card\">\
              <header><h2>{name}</h2><span class=\"spacer\"></span>{gates}</header>\
              {preview}\
              <div class=\"meta-line\">{count} entries{members}{when}</div>\
              <footer class=\"id\">{id} · {substrate}</footer>\
-             </article></a>",
+             </article></a>\n",
             href = escape_html(&href),
             name = escape_html(display_name),
             count = summary.entry_count,
             id = summary.id,
             substrate = escape_html(&summary.substrate.display().to_string()),
         );
+        // Closed channels archive below (docs/adr/0022): present, demoted.
+        if summary.closed {
+            closed_cards.push_str(&card);
+        } else {
+            cards.push_str(&card);
+        }
     }
-    let body = if summaries.is_empty() {
-        "<p class=\"empty\">no channels yet — open one with the open_channel tool or \
-         `junto open`</p>"
-            .to_string()
+    let open_count = summaries.iter().filter(|s| !s.closed).count();
+    let body = if open_count == 0 {
+        "<p class=\"empty\">no open channels — open one below</p>".to_string()
     } else {
         format!("<div class=\"cards\">{cards}</div>")
+    };
+    let archive = if closed_cards.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<details class=\"ledger\"><summary class=\"board-head\">closed channels \
+             ({})</summary>\n<div class=\"cards\">{closed_cards}</div></details>\n",
+            summaries.len() - open_count
+        )
     };
     let open_gates: usize = summaries.iter().map(|summary| summary.open_gates).sum();
     let gates_note = if open_gates > 0 {
@@ -801,12 +874,64 @@ pub fn index_html(summaries: &[ChannelSummary], attention: &[AttentionGroup]) ->
     let content = format!(
         "<h1>channels</h1>\n\
          <p class=\"meta\">{count} channel{plural} across every registered substrate\
-         {gates_note}</p>\n{board}\n<h2 class=\"board-head\">all channels</h2>\n{body}",
+         {gates_note}</p>\n{board}\n<h2 class=\"board-head\">all channels</h2>\n{body}\n\
+         {archive}{open_form}{repo_form}",
         count = summaries.len(),
         plural = if summaries.len() == 1 { "" } else { "s" },
         board = focus_board(attention, "/"),
+        open_form = open_channel_form(substrates),
+        repo_form = setup_repo_form(),
     );
     page_shell("junto — channels", summaries, None, &content)
+}
+
+/// The set-up-a-repo form: the terminal-less `junto init`. Registers the
+/// repo as a home substrate, wires the agent harness, and opens its ambient
+/// channel (named after the directory unless overridden).
+fn setup_repo_form() -> String {
+    "<section class=\"board\"><h2 class=\"board-head\">set up a repo</h2>\n\
+     <form class=\"act open-channel\" method=\"post\" action=\"/repos\">\
+     <input name=\"path\" placeholder=\"path to a git repo, e.g. D:\\git\\my-project\" required>\
+     <input name=\"channel\" placeholder=\"ambient channel name (default: the directory name)\">\
+     <button class=\"primary\">set up</button>\
+     </form>\
+     <p class=\"meta\">registers the repo as a home substrate, wires the agent harness \
+     (.mcp.json + recall hook), and opens its ambient channel — everything `junto init` \
+     does except granting an agent membership</p></section>"
+        .to_string()
+}
+
+/// The open-a-channel form: name plus, when the host serves several
+/// substrates, a home-substrate picker. The founder is the substrate's git
+/// user — no identity input, no member code (`docs/adr/0021`).
+fn open_channel_form(substrates: &[std::path::PathBuf]) -> String {
+    let picker = if substrates.len() > 1 {
+        let options: Vec<String> = substrates
+            .iter()
+            .map(|repo| {
+                let path = escape_html(&repo.display().to_string());
+                format!("<option value=\"{path}\">{path}</option>")
+            })
+            .collect();
+        format!(
+            "<select name=\"repo\" title=\"the home substrate — where this channel's \
+             durable record lives (docs/adr/0014)\">{}</select>",
+            options.join("")
+        )
+    } else {
+        // One (or zero) substrates: the host picks it; no field to fill.
+        String::new()
+    };
+    format!(
+        "<section class=\"board\" id=\"open-channel\">\
+         <h2 class=\"board-head\">open a channel</h2>\n\
+         <form class=\"act open-channel\" method=\"post\" action=\"/channels\">\
+         <input name=\"name\" placeholder=\"a name for one unit of inquiry, e.g. \
+         payments-refactor\" required>\
+         {picker}\
+         <button class=\"primary\">open</button>\
+         </form></section>"
+    )
 }
 
 /// Milliseconds-epoch → a human resumption cue ("12m ago"), falling back to
@@ -958,11 +1083,14 @@ fn attention_item(item: &crate::host::AttentionItem, channel: &ChannelId, back: 
 /// are URL-safe; names may not be) and require a rationale.
 ///
 /// `nav` feeds the sidebar; pass `&[]` where navigation is irrelevant.
+/// `substrate` is this channel's home substrate, prefilled (hidden) into the
+/// contextual open-an-inquiry form.
 pub fn channel_html(
     nav: &[ChannelSummary],
     name: &str,
     id: &ChannelId,
     view: &ChannelView,
+    substrate: &std::path::Path,
 ) -> String {
     let mut cards = String::new();
     for entry in &view.entries {
@@ -1026,12 +1154,63 @@ pub fn channel_html(
         parked = shape.parked.len(),
         rejected = shape.rejected.len(),
     );
+    // No picker, no decision: a sibling inquiry opens in this channel's own
+    // home substrate (a storage fact the form carries, not a choice).
+    let open_here = format!(
+        "<section class=\"board\"><h2 class=\"board-head\">open an inquiry here</h2>\n\
+         <form class=\"act open-channel\" method=\"post\" action=\"/channels\">\
+         <input type=\"hidden\" name=\"repo\" value=\"{repo}\">\
+         <input name=\"name\" placeholder=\"a name for a new unit of inquiry in \
+         {repo_label}\" required>\
+         <button class=\"primary\">open</button>\
+         </form></section>",
+        repo = escape_html(&substrate.display().to_string()),
+        repo_label = escape_html(
+            &substrate
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| substrate.display().to_string())
+        ),
+    );
+    // Rename and close: lifecycle acts (docs/adr/0016/0022) — collapsed
+    // behind the title so they never compete with the brief. A closed
+    // channel leads with the banner and offers reopen instead.
+    let rename = format!(
+        "<details class=\"rename\"><summary>rename this channel</summary>\
+         <form class=\"act\" method=\"post\" action=\"/channels/{id}/rename\">\
+         <input name=\"name\" value=\"{name}\" required>\
+         <input name=\"rationale\" placeholder=\"why — a rationale, not a checkbox\" required>\
+         <button class=\"primary\">rename</button>\
+         </form></details>\n",
+        name = escape_html(name),
+    );
+    let lifecycle = if view.closed {
+        format!(
+            "<div class=\"closed-banner\">this channel is <strong>closed</strong> — the \
+             record remains, the inquiry left the working set (docs/adr/0022)</div>\n\
+             <details class=\"rename\"><summary>reopen this channel</summary>\
+             <form class=\"act\" method=\"post\" action=\"/channels/{id}/reopen\">\
+             <input name=\"rationale\" placeholder=\"why it resumes — a rationale, not a \
+             checkbox\" required>\
+             <button class=\"primary\">reopen</button>\
+             </form></details>\n"
+        )
+    } else {
+        format!(
+            "<details class=\"rename\"><summary>close this channel</summary>\
+             <form class=\"act\" method=\"post\" action=\"/channels/{id}/close\">\
+             <input name=\"rationale\" placeholder=\"why it closes — outcome reached, \
+             superseded, abandoned…\" required>\
+             <button class=\"primary\">close</button>\
+             </form></details>\n"
+        )
+    };
     let content = format!(
         "<h1>{name}</h1>\n\
          <p class=\"meta\">channel {id} · {count} entries · read-only projection</p>\n\
-         {party}{strip}{sessions}{standing}{recently}{footer}\
+         {rename}{lifecycle}{party}{strip}{sessions}{standing}{recently}{footer}\
          <details class=\"ledger\"><summary class=\"board-head\">the full ledger \
-         ({count} entries)</summary>\n{body}</details>",
+         ({count} entries)</summary>\n{body}</details>\n{open_here}",
         name = escape_html(name),
         count = view.entries.len(),
     );
@@ -1151,6 +1330,8 @@ fn entry_family(payload: &EntryPayload) -> &'static str {
         | EntryPayload::ArtifactAttached { .. } => "fam-work",
         EntryPayload::ChannelOpened { .. }
         | EntryPayload::MemberAdded { .. }
+        | EntryPayload::ChannelClosed { .. }
+        | EntryPayload::ChannelReopened { .. }
         | EntryPayload::Ratification { .. }
         | EntryPayload::Park { .. }
         | EntryPayload::Correction { .. }
@@ -1177,6 +1358,22 @@ fn entry_card(entry: &LedgerEntry, view: &ChannelView, channel: &ChannelId) -> S
             None,
             Some(member_label(member)),
             None,
+            None,
+            None,
+        ),
+        EntryPayload::ChannelClosed { rationale } => (
+            "channel closed",
+            None,
+            None,
+            Some(rationale.as_str()),
+            None,
+            None,
+        ),
+        EntryPayload::ChannelReopened { rationale } => (
+            "channel reopened",
+            None,
+            None,
+            Some(rationale.as_str()),
             None,
             None,
         ),
@@ -1564,6 +1761,13 @@ a.chan{display:flex;align-items:center;gap:.5rem;padding:.4rem .55rem;border-rad
 color:var(--soft);text-decoration:none;font-size:.9rem;margin-bottom:2px}\
 a.chan:hover{background:var(--card);color:var(--text)}\
 a.chan.active{background:var(--card);color:var(--text);outline:1px solid var(--border)}\
+a.chan.open-link{color:var(--muted);font-size:.84rem;margin-top:.35rem}\
+a.chan.open-link:hover{color:var(--accent)}\
+.side-sub{font-size:.68rem;text-transform:uppercase;letter-spacing:.07em;\
+color:var(--muted);margin:.7rem 0 .15rem;padding:0 .55rem}\
+.closed-banner{color:var(--yellow);background:rgba(249,226,175,.08);\
+border:1px solid rgba(249,226,175,.25);border-radius:.55rem;\
+padding:.55rem .8rem;font-size:.88rem;margin:0 0 1rem}\
 .chan-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\
 .gatecount{flex:none;font-size:.7rem;font-weight:650;color:var(--bg);background:var(--yellow);\
 border-radius:.6rem;padding:0 .45rem}\
@@ -1652,6 +1856,8 @@ border-top:1px solid var(--border)}\
 form.act input{flex:1;min-width:10rem;background:var(--bg);color:var(--text);\
 border:1px solid var(--border);border-radius:.45rem;padding:.32rem .6rem;font-size:.84rem}\
 form.act input:focus{outline:1px solid var(--accent)}\
+form.act select{background:var(--bg);color:var(--text);border:1px solid var(--border);\
+border-radius:.45rem;padding:.32rem .6rem;font-size:.84rem}\
 form.act button{background:var(--panel);color:var(--soft);border:1px solid var(--border);\
 border-radius:.45rem;padding:.32rem .85rem;font-size:.84rem;cursor:pointer}\
 form.act button:hover{color:var(--text);border-color:var(--accent)}\
@@ -1724,6 +1930,7 @@ mod tests {
             standings,
             gate_status,
             sessions: HashMap::new(),
+            closed: false,
         }
     }
 
@@ -1787,7 +1994,7 @@ mod tests {
         );
 
         let channel = ChannelId::new();
-        let html = channel_html(&[], "t", &channel, &view);
+        let html = channel_html(&[], "t", &channel, &view, std::path::Path::new("/repo"));
         assert!(html.contains("agent sessions"), "{html}");
         assert!(html.contains("fix the flaky sync test"), "{html}");
         assert!(html.contains("badge blocked"), "{html}");
@@ -1807,7 +2014,13 @@ mod tests {
         let mut view = view_with(vec![decision.clone(), ratify]);
         view.standings.insert(decision.id, Standing::Ratified);
 
-        let html = channel_html(&[], "t", &ChannelId::new(), &view);
+        let html = channel_html(
+            &[],
+            "t",
+            &ChannelId::new(),
+            &view,
+            std::path::Path::new("/repo"),
+        );
         assert!(html.contains("standing decisions"), "{html}");
         assert!(html.contains("the settled claim"), "{html}");
         assert!(html.contains("ratified by Dan"), "{html}");
@@ -1815,6 +2028,103 @@ mod tests {
         assert!(
             html.contains("<details class=\"ledger\">"),
             "the transcript is collapsed: {html}"
+        );
+    }
+
+    #[test]
+    fn index_offers_the_open_channel_form() {
+        // One substrate: the form posts with no picker (the host picks it).
+        let one = index_html(&[], &[], &[std::path::PathBuf::from("/repo/a")]);
+        assert!(one.contains("action=\"/channels\""), "{one}");
+        assert!(one.contains("name=\"name\""), "{one}");
+        assert!(!one.contains("name=\"repo\""), "{one}");
+
+        // Several substrates: a home-substrate picker appears.
+        let many = index_html(
+            &[],
+            &[],
+            &[
+                std::path::PathBuf::from("/repo/a"),
+                std::path::PathBuf::from("/repo/b"),
+            ],
+        );
+        assert!(many.contains("name=\"repo\""), "{many}");
+        assert!(many.contains("/repo/b"), "{many}");
+    }
+
+    #[test]
+    fn channel_page_offers_rename() {
+        let view = view_with(vec![]);
+        let channel = ChannelId::new();
+        let html = channel_html(&[], "old-name", &channel, &view, std::path::Path::new("/r"));
+        assert!(html.contains("rename this channel"), "{html}");
+        assert!(
+            html.contains(&format!("/channels/{channel}/rename")),
+            "{html}"
+        );
+        assert!(html.contains("value=\"old-name\""), "{html}");
+    }
+
+    #[test]
+    fn sidebar_groups_channels_by_substrate() {
+        let nav = vec![
+            ChannelSummary {
+                id: ChannelId::new(),
+                name: Some("alpha".into()),
+                substrate: std::path::PathBuf::from("/repo/one"),
+                entry_count: 1,
+                last_activity: None,
+                open_gates: 0,
+                members: 1,
+                latest: None,
+                closed: false,
+            },
+            ChannelSummary {
+                id: ChannelId::new(),
+                name: Some("beta".into()),
+                substrate: std::path::PathBuf::from("/repo/two"),
+                entry_count: 1,
+                last_activity: None,
+                open_gates: 0,
+                members: 1,
+                latest: None,
+                closed: false,
+            },
+        ];
+        let view = view_with(vec![]);
+        let html = channel_html(&nav, "alpha", &nav[0].id, &view, std::path::Path::new("/r"));
+        assert!(html.contains("<div class=\"side-sub\""), "{html}");
+        assert!(html.contains(">one</div>"), "{html}");
+        assert!(html.contains(">two</div>"), "{html}");
+
+        // A single-substrate host gets no group headings.
+        let solo = vec![nav[0].clone()];
+        let html = channel_html(
+            &solo,
+            "alpha",
+            &solo[0].id,
+            &view,
+            std::path::Path::new("/r"),
+        );
+        assert!(!html.contains("<div class=\"side-sub\""), "{html}");
+    }
+
+    #[test]
+    fn channel_page_offers_open_an_inquiry_here() {
+        // The contextual form carries the channel's home substrate hidden —
+        // a sibling inquiry opens in the same repo, no picker.
+        let view = view_with(vec![]);
+        let html = channel_html(
+            &[],
+            "t",
+            &ChannelId::new(),
+            &view,
+            std::path::Path::new("/repo/wmux"),
+        );
+        assert!(html.contains("open an inquiry here"), "{html}");
+        assert!(
+            html.contains("type=\"hidden\" name=\"repo\" value=\"/repo/wmux\""),
+            "{html}"
         );
     }
 
@@ -1841,7 +2151,13 @@ mod tests {
             rationale: "verified".into(),
         });
         let view = view_with(vec![decision, work, act]);
-        let html = channel_html(&[], "t", &ChannelId::new(), &view);
+        let html = channel_html(
+            &[],
+            "t",
+            &ChannelId::new(),
+            &view,
+            std::path::Path::new("/repo"),
+        );
         assert!(html.contains("card fam-decision"), "{html}");
         assert!(html.contains("card fam-work"), "{html}");
         assert!(html.contains("card fam-act"), "{html}");
@@ -1907,6 +2223,7 @@ mod tests {
             standings,
             gate_status,
             sessions: Default::default(),
+            closed: false,
         };
         let brief = brief_markdown("t", &ChannelId::new(), &view);
 
@@ -1941,6 +2258,7 @@ mod tests {
             standings,
             gate_status: Default::default(),
             sessions: Default::default(),
+            closed: false,
         };
         let brief = brief_markdown("t", &ChannelId::new(), &view);
 
@@ -1967,7 +2285,13 @@ mod tests {
     #[test]
     fn html_escapes_user_content() {
         let view = view_with(vec![assertion("<script>alert('x')</script> & co")]);
-        let html = channel_html(&[], "test", &ChannelId::new(), &view);
+        let html = channel_html(
+            &[],
+            "test",
+            &ChannelId::new(),
+            &view,
+            std::path::Path::new("/repo"),
+        );
         assert!(
             !html.contains("<script>alert"),
             "raw script must not appear"
@@ -1979,7 +2303,13 @@ mod tests {
     #[test]
     fn html_shows_standing_badge_and_timestamp() {
         let view = view_with(vec![assertion("claim")]);
-        let html = channel_html(&[], "test", &ChannelId::new(), &view);
+        let html = channel_html(
+            &[],
+            "test",
+            &ChannelId::new(),
+            &view,
+            std::path::Path::new("/repo"),
+        );
         assert!(html.contains("badge provisional"));
         assert!(html.contains("2026-06-09"), "human-readable date: {html}");
     }
@@ -2002,7 +2332,13 @@ mod tests {
             },
         };
         let view = view_with(vec![entry]);
-        let html = channel_html(&[], "test", &ChannelId::new(), &view);
+        let html = channel_html(
+            &[],
+            "test",
+            &ChannelId::new(),
+            &view,
+            std::path::Path::new("/repo"),
+        );
         assert!(html.contains("because the tests prove it"));
         assert!(html.contains("provenance (1)"));
         assert!(html.contains("https://example.com/pr/1"));
@@ -2023,7 +2359,10 @@ mod tests {
         let view = view_with(vec![]);
         let id = ChannelId::new();
         assert!(brief_markdown("empty", &id, &view).contains("(no entries)"));
-        assert!(channel_html(&[], "empty", &id, &view).contains("(no entries)"));
+        assert!(
+            channel_html(&[], "empty", &id, &view, std::path::Path::new("/repo"))
+                .contains("(no entries)")
+        );
     }
 
     #[test]
@@ -2058,7 +2397,7 @@ mod tests {
         let id = entry.id;
         let channel = entry.channel;
         let view = view_with(vec![entry]);
-        let html = channel_html(&[], "test", &channel, &view);
+        let html = channel_html(&[], "test", &channel, &view, std::path::Path::new("/repo"));
         assert!(html.contains(">verified</button>"), "{html}");
         assert!(html.contains("value=\"CI green and reviewed\""));
         assert!(html.contains(&format!("/channels/{channel}/entries/{id}/park")));
@@ -2082,6 +2421,7 @@ mod tests {
                 open_gates: 2,
                 members: 2,
                 latest: Some("assertion — the latest finding".into()),
+                closed: false,
             },
             ChannelSummary {
                 id: other,
@@ -2092,10 +2432,11 @@ mod tests {
                 open_gates: 0,
                 members: 1,
                 latest: None,
+                closed: false,
             },
         ];
         let view = view_with(vec![]);
-        let html = channel_html(&nav, "alpha", &active, &view);
+        let html = channel_html(&nav, "alpha", &active, &view, std::path::Path::new("/repo"));
         assert!(html.contains("chan active"));
         assert!(html.contains("alpha"));
         assert!(html.contains("beta"));

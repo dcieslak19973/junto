@@ -106,6 +106,19 @@ pub enum EntryPayload {
         /// The member being granted membership — human or agent.
         member: Member,
     },
+    /// Closes the channel — the inquiry is finished (or abandoned); the
+    /// record stays forever, the channel just leaves the working set
+    /// (`docs/adr/0022`). The derived closed state folds last-applicable-wins
+    /// against [`ChannelReopened`](EntryPayload::ChannelReopened).
+    ChannelClosed {
+        /// Why it closed — outcome reached, superseded, abandoned…
+        rationale: String,
+    },
+    /// Reopens a closed channel — the inquiry resumed (`docs/adr/0022`).
+    ChannelReopened {
+        /// Why it reopened.
+        rationale: String,
+    },
     /// An original claim, decision, or finding. Alternatives considered live in
     /// `rationale` — or, structurally, in the optional `frame` (`docs/adr/0019`).
     Assertion {
@@ -262,6 +275,8 @@ impl EntryPayload {
         match self {
             EntryPayload::ChannelOpened { .. }
             | EntryPayload::MemberAdded { .. }
+            | EntryPayload::ChannelClosed { .. }
+            | EntryPayload::ChannelReopened { .. }
             | EntryPayload::Assertion { .. }
             | EntryPayload::Proposal { .. }
             | EntryPayload::SessionStarted { .. } => None,

@@ -82,6 +82,11 @@ pub struct ChannelView {
     /// [`EntryPayload::SessionStarted`] entry's id, holding the folded
     /// [`SessionState`] and the session's attached artifacts.
     pub sessions: HashMap<EntryId, SessionView>,
+    /// Whether the channel is closed (`docs/adr/0022`): the last applicable
+    /// [`EntryPayload::ChannelClosed`] / [`EntryPayload::ChannelReopened`]
+    /// wins, in canonical order, members only. The record outlives the
+    /// inquiry — closed only means "out of the working set".
+    pub closed: bool,
 }
 
 impl ChannelView {
@@ -199,10 +204,35 @@ impl<S: SubstrateProvider> Ledger<S> {
         let standings = Self::project_standings(&recognized);
         let gate_status = Self::project_gates(&recognized);
         let sessions = Self::project_sessions(&recognized);
-        let name = recognized.iter().find_map(|entry| match &entry.payload {
-            EntryPayload::ChannelOpened { name } => Some(name.clone()),
+        // The current name: the (canonically first) genesis binding, unless a
+        // later Correction targeting the genesis superseded it — rename is a
+        // corrective entry, not mutable metadata (docs/adr/0014/0016).
+        let genesis = recognized.iter().find_map(|entry| match &entry.payload {
+            EntryPayload::ChannelOpened { name } => Some((entry.id, name.clone())),
             _ => None,
         });
+        let name = genesis.map(|(genesis_id, mut name)| {
+            for entry in &recognized {
+                if let EntryPayload::Correction {
+                    target, statement, ..
+                } = &entry.payload
+                    && *target == genesis_id
+                {
+                    name = statement.clone();
+                }
+            }
+            name
+        });
+        // Closed: the last applicable lifecycle act wins (docs/adr/0022).
+        let closed = recognized
+            .iter()
+            .rev()
+            .find_map(|entry| match &entry.payload {
+                EntryPayload::ChannelClosed { .. } => Some(true),
+                EntryPayload::ChannelReopened { .. } => Some(false),
+                _ => None,
+            })
+            .unwrap_or(false);
 
         Ok(ChannelView {
             name,
@@ -212,6 +242,7 @@ impl<S: SubstrateProvider> Ledger<S> {
             standings,
             gate_status,
             sessions,
+            closed,
         })
     }
 
@@ -265,6 +296,8 @@ impl<S: SubstrateProvider> Ledger<S> {
                 // Not standing-bearing acts.
                 EntryPayload::ChannelOpened { .. }
                 | EntryPayload::MemberAdded { .. }
+                | EntryPayload::ChannelClosed { .. }
+                | EntryPayload::ChannelReopened { .. }
                 | EntryPayload::Assertion { .. }
                 | EntryPayload::Proposal { .. }
                 | EntryPayload::Approval { .. }
@@ -821,6 +854,121 @@ mod tests {
 
         let view = ledger.project(&channel).await.unwrap();
         assert_eq!(view.name, None);
+    }
+
+    #[tokio::test]
+    async fn close_and_reopen_fold_last_applicable_wins() {
+        let dan = Member::human("Dan", "dan@example.com");
+        let stranger = Member::agent("Stranger", "stranger@example.com");
+        let (mut ledger, channel) = opened_channel(&dan).await;
+
+        // Open by default.
+        let view = ledger.project(&channel).await.unwrap();
+        assert!(!view.closed);
+
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                dan.clone(),
+                1,
+                EntryPayload::ChannelClosed {
+                    rationale: "done".into(),
+                },
+            ))
+            .await
+            .unwrap();
+        let view = ledger.project(&channel).await.unwrap();
+        assert!(view.closed);
+
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                dan.clone(),
+                2,
+                EntryPayload::ChannelReopened {
+                    rationale: "it resumed".into(),
+                },
+            ))
+            .await
+            .unwrap();
+        let view = ledger.project(&channel).await.unwrap();
+        assert!(!view.closed);
+
+        // A stranger's close has no effect (docs/adr/0017).
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                stranger,
+                3,
+                EntryPayload::ChannelClosed {
+                    rationale: "drive-by".into(),
+                },
+            ))
+            .await
+            .unwrap();
+        let view = ledger.project(&channel).await.unwrap();
+        assert!(!view.closed);
+    }
+
+    #[tokio::test]
+    async fn correcting_the_genesis_renames_the_channel() {
+        // Rename is a corrective entry superseding the genesis binding
+        // (docs/adr/0016) — last applicable wins, and a non-member's attempt
+        // has no effect.
+        let dan = Member::human("Dan", "dan@example.com");
+        let stranger = Member::agent("Stranger", "stranger@example.com");
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let genesis = EntryId::new();
+        ledger
+            .append(entry(
+                genesis,
+                channel,
+                dan.clone(),
+                0,
+                EntryPayload::ChannelOpened {
+                    name: "first-name".into(),
+                },
+            ))
+            .await
+            .unwrap();
+        for (millis, new_name) in [(1, "second-name"), (2, "third-name")] {
+            ledger
+                .append(entry(
+                    EntryId::new(),
+                    channel,
+                    dan.clone(),
+                    millis,
+                    EntryPayload::Correction {
+                        target: genesis,
+                        statement: new_name.into(),
+                        rationale: "renamed".into(),
+                    },
+                ))
+                .await
+                .unwrap();
+        }
+        // A stranger's rename does not count (docs/adr/0017).
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                stranger,
+                3,
+                EntryPayload::Correction {
+                    target: genesis,
+                    statement: "hijacked".into(),
+                    rationale: "drive-by".into(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert_eq!(view.name.as_deref(), Some("third-name"));
     }
 
     #[tokio::test]

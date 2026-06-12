@@ -87,6 +87,12 @@ mod tests {
         assert_round_trips(&entry(EntryPayload::MemberAdded {
             member: Member::agent("Claude Code", "claude-code@anthropic.com"),
         }));
+        assert_round_trips(&entry(EntryPayload::ChannelClosed {
+            rationale: "inquiry finished".into(),
+        }));
+        assert_round_trips(&entry(EntryPayload::ChannelReopened {
+            rationale: "it resumed".into(),
+        }));
         // Assertion with a digest-bearing provenance ref.
         assert_round_trips(&entry(EntryPayload::Assertion {
             statement: "the sky is blue".into(),

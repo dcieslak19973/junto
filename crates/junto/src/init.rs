@@ -328,33 +328,7 @@ mod tests {
         dir
     }
 
-    /// Serializes JUNTO_HOME tests: the env var is process-global, and cargo
-    /// runs tests in parallel threads.
-    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Point JUNTO_HOME at a temp dir for the duration of a test.
-    struct HomeGuard {
-        _dir: tempfile::TempDir,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-    impl HomeGuard {
-        fn new() -> Self {
-            let lock = HOME_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let dir = tempfile::tempdir().unwrap();
-            unsafe { std::env::set_var("JUNTO_HOME", dir.path()) };
-            Self {
-                _dir: dir,
-                _lock: lock,
-            }
-        }
-    }
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            unsafe { std::env::remove_var("JUNTO_HOME") };
-        }
-    }
+    use crate::host::test_home::HomeGuard;
 
     #[tokio::test]
     async fn init_is_idempotent_and_wires_everything() {
