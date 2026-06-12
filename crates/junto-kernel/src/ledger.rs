@@ -82,6 +82,11 @@ pub struct ChannelView {
     /// [`EntryPayload::SessionStarted`] entry's id, holding the folded
     /// [`SessionState`] and the session's attached artifacts.
     pub sessions: HashMap<EntryId, SessionView>,
+    /// Whether the channel is closed (`docs/adr/0022`): the last applicable
+    /// [`EntryPayload::ChannelClosed`] / [`EntryPayload::ChannelReopened`]
+    /// wins, in canonical order, members only. The record outlives the
+    /// inquiry — closed only means "out of the working set".
+    pub closed: bool,
 }
 
 impl ChannelView {
@@ -218,6 +223,16 @@ impl<S: SubstrateProvider> Ledger<S> {
             }
             name
         });
+        // Closed: the last applicable lifecycle act wins (docs/adr/0022).
+        let closed = recognized
+            .iter()
+            .rev()
+            .find_map(|entry| match &entry.payload {
+                EntryPayload::ChannelClosed { .. } => Some(true),
+                EntryPayload::ChannelReopened { .. } => Some(false),
+                _ => None,
+            })
+            .unwrap_or(false);
 
         Ok(ChannelView {
             name,
@@ -227,6 +242,7 @@ impl<S: SubstrateProvider> Ledger<S> {
             standings,
             gate_status,
             sessions,
+            closed,
         })
     }
 
@@ -280,6 +296,8 @@ impl<S: SubstrateProvider> Ledger<S> {
                 // Not standing-bearing acts.
                 EntryPayload::ChannelOpened { .. }
                 | EntryPayload::MemberAdded { .. }
+                | EntryPayload::ChannelClosed { .. }
+                | EntryPayload::ChannelReopened { .. }
                 | EntryPayload::Assertion { .. }
                 | EntryPayload::Proposal { .. }
                 | EntryPayload::Approval { .. }
@@ -836,6 +854,63 @@ mod tests {
 
         let view = ledger.project(&channel).await.unwrap();
         assert_eq!(view.name, None);
+    }
+
+    #[tokio::test]
+    async fn close_and_reopen_fold_last_applicable_wins() {
+        let dan = Member::human("Dan", "dan@example.com");
+        let stranger = Member::agent("Stranger", "stranger@example.com");
+        let (mut ledger, channel) = opened_channel(&dan).await;
+
+        // Open by default.
+        let view = ledger.project(&channel).await.unwrap();
+        assert!(!view.closed);
+
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                dan.clone(),
+                1,
+                EntryPayload::ChannelClosed {
+                    rationale: "done".into(),
+                },
+            ))
+            .await
+            .unwrap();
+        let view = ledger.project(&channel).await.unwrap();
+        assert!(view.closed);
+
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                dan.clone(),
+                2,
+                EntryPayload::ChannelReopened {
+                    rationale: "it resumed".into(),
+                },
+            ))
+            .await
+            .unwrap();
+        let view = ledger.project(&channel).await.unwrap();
+        assert!(!view.closed);
+
+        // A stranger's close has no effect (docs/adr/0017).
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                stranger,
+                3,
+                EntryPayload::ChannelClosed {
+                    rationale: "drive-by".into(),
+                },
+            ))
+            .await
+            .unwrap();
+        let view = ledger.project(&channel).await.unwrap();
+        assert!(!view.closed);
     }
 
     #[tokio::test]

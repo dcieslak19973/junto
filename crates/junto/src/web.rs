@@ -45,6 +45,8 @@ pub fn router(host: Arc<Host>) -> Router {
         .route("/repos", post(setup_repo))
         .route("/channels/{channel}", get(channel_page))
         .route("/channels/{channel}/rename", post(rename_channel))
+        .route("/channels/{channel}/close", post(close_channel))
+        .route("/channels/{channel}/reopen", post(reopen_channel))
         .route("/channels/{channel}/brief", get(channel_brief))
         .route("/channels/{channel}/entries/{entry}/{act}", post(verify))
         .with_state(host)
@@ -344,6 +346,98 @@ async fn rename_channel(
         let mut fresh = junto_substrate_git::GitRefsSubstrate::open(repo);
         if let Err(err) = fresh.sync("origin", &id).await {
             tracing::warn!("auto-sync of channel {id} after a rename failed: {err:#}");
+        }
+    });
+    Redirect::to(&format!("/channels/{id}")).into_response()
+}
+
+/// The form body for closing or reopening a channel: just the rationale.
+#[derive(Debug, Deserialize)]
+struct LifecycleForm {
+    /// Why the channel closes/reopens. A rationale, not a checkbox.
+    rationale: String,
+}
+
+/// Close a channel (`docs/adr/0022`): append a `ChannelClosed` lifecycle
+/// entry. The record stays; the channel leaves the working set.
+async fn close_channel(
+    State(host): State<Arc<Host>>,
+    Path(channel): Path<String>,
+    Form(form): Form<LifecycleForm>,
+) -> Response {
+    lifecycle_act(&host, &channel, form, true).await
+}
+
+/// Reopen a closed channel (`docs/adr/0022`): append a `ChannelReopened`
+/// lifecycle entry — last applicable wins.
+async fn reopen_channel(
+    State(host): State<Arc<Host>>,
+    Path(channel): Path<String>,
+    Form(form): Form<LifecycleForm>,
+) -> Response {
+    lifecycle_act(&host, &channel, form, false).await
+}
+
+/// The shared close/reopen path: author from git config, membership checked,
+/// the act appended, background sync, back to the channel page.
+async fn lifecycle_act(host: &Host, channel: &str, form: LifecycleForm, close: bool) -> Response {
+    let rationale = form.rationale.trim().to_string();
+    if rationale.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "a rationale is required — it's a rationale, not a checkbox",
+        )
+            .into_response();
+    }
+    let (id, view, substrate) = match project(host, channel).await {
+        Ok(projected) => projected,
+        Err(response) => return response,
+    };
+    if view.closed == close {
+        return (
+            StatusCode::CONFLICT,
+            format!(
+                "this channel is already {}",
+                if close { "closed" } else { "open" }
+            ),
+        )
+            .into_response();
+    }
+    let author = match crate::host::git_user(&substrate) {
+        Ok(author) => author,
+        Err(err) => {
+            return internal(format!(
+                "no author identity: {err} (set git config user.name / user.email)"
+            ));
+        }
+    };
+    if let Err(err) = host.authorize_human_write(&view, &author) {
+        return (StatusCode::FORBIDDEN, format!("{err:#}")).into_response();
+    }
+    let payload = if close {
+        EntryPayload::ChannelClosed { rationale }
+    } else {
+        EntryPayload::ChannelReopened { rationale }
+    };
+    let ledger = match host.ledger_for(&substrate).await {
+        Ok(ledger) => ledger,
+        Err(err) => return internal(format!("opening the ledger: {err}")),
+    };
+    let entry = LedgerEntry {
+        id: EntryId::new(),
+        channel: id,
+        author,
+        timestamp: Timestamp::now(),
+        payload,
+    };
+    if let Err(err) = ledger.lock().await.append(entry).await {
+        return internal(format!("append failed: {err}"));
+    }
+    let repo = substrate.clone();
+    tokio::spawn(async move {
+        let mut fresh = junto_substrate_git::GitRefsSubstrate::open(repo);
+        if let Err(err) = fresh.sync("origin", &id).await {
+            tracing::warn!("auto-sync of channel {id} after a lifecycle act failed: {err:#}");
         }
     });
     Redirect::to(&format!("/channels/{id}")).into_response()
@@ -948,6 +1042,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn close_then_reopen_round_trips() {
+        let fx = host_with_entry(assertion()).await;
+
+        // Close: the channel projects closed and demotes in summaries.
+        let response = close_channel(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LifecycleForm {
+                rationale: "inquiry finished".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let Resolution::Resolved { ledger, id, .. } = fx.host.resolve("web-test").await.unwrap()
+        else {
+            panic!("closed channel still resolves by name");
+        };
+        let view = ledger.lock().await.project(&id).await.unwrap();
+        assert!(view.closed);
+        let summary = fx
+            .host
+            .inventory()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == id)
+            .unwrap();
+        assert!(summary.closed);
+
+        // Closing again is a conflict.
+        let response = close_channel(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LifecycleForm {
+                rationale: "again".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        // Reopen: back in the working set.
+        let response = reopen_channel(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LifecycleForm {
+                rationale: "it resumed".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let view = ledger.lock().await.project(&id).await.unwrap();
+        assert!(!view.closed);
+    }
+
+    #[tokio::test]
     async fn rename_supersedes_the_genesis_binding() {
         let fx = host_with_entry(assertion()).await;
         let response = rename_channel(
@@ -1141,6 +1290,7 @@ mod tests {
             party: Vec::new(),
             unrecognized: Default::default(),
             sessions: Default::default(),
+            closed: false,
         };
         let html = crate::render::channel_html(
             &[],

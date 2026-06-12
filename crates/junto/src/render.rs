@@ -192,6 +192,12 @@ pub fn brief_markdown(name: &str, id: &ChannelId, view: &ChannelView) -> String 
         out.push_str("(no entries)\n");
         return out;
     }
+    if view.closed {
+        out.push_str(
+            "**This channel is closed** (`docs/adr/0022`) — the inquiry left the working \
+             set; do not record new work here without reopening.\n\n",
+        );
+    }
     out.push_str(
         "State, not history: verification acts are folded into their targets and old \
          resolved material decays out. The full transcript is one call away \
@@ -356,6 +362,12 @@ fn recent_line(entry: &LedgerEntry) -> String {
         }
         EntryPayload::ArtifactAttached { description, .. } => {
             format!("attached artifact: {}", clamp(description, TAIL_CLAMP))
+        }
+        EntryPayload::ChannelClosed { rationale } => {
+            format!("closed the channel: {}", clamp(rationale, TAIL_CLAMP))
+        }
+        EntryPayload::ChannelReopened { rationale } => {
+            format!("reopened the channel: {}", clamp(rationale, TAIL_CLAMP))
         }
     }
 }
@@ -619,6 +631,12 @@ fn describe_markdown(entry: &LedgerEntry, view: &ChannelView) -> String {
         } => {
             format!("**artifact** ({kind}) on session `{target}` — {description}")
         }
+        EntryPayload::ChannelClosed { rationale } => {
+            format!("**channel closed** — {rationale}")
+        }
+        EntryPayload::ChannelReopened { rationale } => {
+            format!("**channel reopened** — {rationale}")
+        }
     }
 }
 
@@ -698,15 +716,18 @@ fn page_shell(
     // name), groups ordered by first appearance in `nav` — which arrives
     // most-recently-active first, so the busiest repo tops the sidebar. A
     // storage fact used as a reading aid, not scope (docs/domain-model.md).
+    // Closed channels leave the sidebar entirely (docs/adr/0022) — they
+    // remain reachable from the index's archive section.
+    let open_nav: Vec<&ChannelSummary> = nav.iter().filter(|s| !s.closed).collect();
     let mut group_order: Vec<&std::path::PathBuf> = Vec::new();
-    for summary in nav {
+    for summary in &open_nav {
         if !group_order.contains(&&summary.substrate) {
             group_order.push(&summary.substrate);
         }
     }
     let mut links = String::new();
     for substrate in group_order {
-        if nav.iter().any(|s| &s.substrate != substrate) {
+        if open_nav.iter().any(|s| &s.substrate != substrate) {
             // Only label groups when there is more than one substrate —
             // a single-repo host needs no heading.
             let label = substrate
@@ -720,7 +741,7 @@ fn page_shell(
                 label = escape_html(&label),
             );
         }
-        for summary in nav.iter().filter(|s| &s.substrate == substrate) {
+        for summary in open_nav.iter().filter(|s| &s.substrate == substrate) {
             let display_name = summary.name.as_deref().unwrap_or("(unopened)");
             let href = summary
                 .name
@@ -770,13 +791,16 @@ pub fn index_html(
     substrates: &[std::path::PathBuf],
 ) -> String {
     let mut cards = String::new();
+    let mut closed_cards = String::new();
     for summary in summaries {
         let display_name = summary.name.as_deref().unwrap_or("(unopened)");
         let href = summary
             .name
             .clone()
             .unwrap_or_else(|| summary.id.to_string());
-        let gates = if summary.open_gates > 0 {
+        let gates = if summary.closed {
+            "<span class=\"badge quiet\">closed</span>".to_string()
+        } else if summary.open_gates > 0 {
             format!(
                 "<span class=\"badge pending\">{} open gate{}</span>",
                 summary.open_gates,
@@ -803,25 +827,40 @@ pub fn index_html(
         } else {
             String::new()
         };
-        let _ = writeln!(
-            cards,
+        let card = format!(
             "<a class=\"card-link\" href=\"/channels/{href}\"><article class=\"card chan-card\">\
              <header><h2>{name}</h2><span class=\"spacer\"></span>{gates}</header>\
              {preview}\
              <div class=\"meta-line\">{count} entries{members}{when}</div>\
              <footer class=\"id\">{id} · {substrate}</footer>\
-             </article></a>",
+             </article></a>\n",
             href = escape_html(&href),
             name = escape_html(display_name),
             count = summary.entry_count,
             id = summary.id,
             substrate = escape_html(&summary.substrate.display().to_string()),
         );
+        // Closed channels archive below (docs/adr/0022): present, demoted.
+        if summary.closed {
+            closed_cards.push_str(&card);
+        } else {
+            cards.push_str(&card);
+        }
     }
-    let body = if summaries.is_empty() {
-        "<p class=\"empty\">no channels yet — open one below</p>".to_string()
+    let open_count = summaries.iter().filter(|s| !s.closed).count();
+    let body = if open_count == 0 {
+        "<p class=\"empty\">no open channels — open one below</p>".to_string()
     } else {
         format!("<div class=\"cards\">{cards}</div>")
+    };
+    let archive = if closed_cards.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<details class=\"ledger\"><summary class=\"board-head\">closed channels \
+             ({})</summary>\n<div class=\"cards\">{closed_cards}</div></details>\n",
+            summaries.len() - open_count
+        )
     };
     let open_gates: usize = summaries.iter().map(|summary| summary.open_gates).sum();
     let gates_note = if open_gates > 0 {
@@ -836,7 +875,7 @@ pub fn index_html(
         "<h1>channels</h1>\n\
          <p class=\"meta\">{count} channel{plural} across every registered substrate\
          {gates_note}</p>\n{board}\n<h2 class=\"board-head\">all channels</h2>\n{body}\n\
-         {open_form}{repo_form}",
+         {archive}{open_form}{repo_form}",
         count = summaries.len(),
         plural = if summaries.len() == 1 { "" } else { "s" },
         board = focus_board(attention, "/"),
@@ -1133,9 +1172,9 @@ pub fn channel_html(
                 .unwrap_or_else(|| substrate.display().to_string())
         ),
     );
-    // Rename: a corrective entry superseding the genesis binding
-    // (docs/adr/0016) — collapsed behind the title so it never competes with
-    // the brief.
+    // Rename and close: lifecycle acts (docs/adr/0016/0022) — collapsed
+    // behind the title so they never compete with the brief. A closed
+    // channel leads with the banner and offers reopen instead.
     let rename = format!(
         "<details class=\"rename\"><summary>rename this channel</summary>\
          <form class=\"act\" method=\"post\" action=\"/channels/{id}/rename\">\
@@ -1145,10 +1184,31 @@ pub fn channel_html(
          </form></details>\n",
         name = escape_html(name),
     );
+    let lifecycle = if view.closed {
+        format!(
+            "<div class=\"closed-banner\">this channel is <strong>closed</strong> — the \
+             record remains, the inquiry left the working set (docs/adr/0022)</div>\n\
+             <details class=\"rename\"><summary>reopen this channel</summary>\
+             <form class=\"act\" method=\"post\" action=\"/channels/{id}/reopen\">\
+             <input name=\"rationale\" placeholder=\"why it resumes — a rationale, not a \
+             checkbox\" required>\
+             <button class=\"primary\">reopen</button>\
+             </form></details>\n"
+        )
+    } else {
+        format!(
+            "<details class=\"rename\"><summary>close this channel</summary>\
+             <form class=\"act\" method=\"post\" action=\"/channels/{id}/close\">\
+             <input name=\"rationale\" placeholder=\"why it closes — outcome reached, \
+             superseded, abandoned…\" required>\
+             <button class=\"primary\">close</button>\
+             </form></details>\n"
+        )
+    };
     let content = format!(
         "<h1>{name}</h1>\n\
          <p class=\"meta\">channel {id} · {count} entries · read-only projection</p>\n\
-         {rename}{party}{strip}{sessions}{standing}{recently}{footer}\
+         {rename}{lifecycle}{party}{strip}{sessions}{standing}{recently}{footer}\
          <details class=\"ledger\"><summary class=\"board-head\">the full ledger \
          ({count} entries)</summary>\n{body}</details>\n{open_here}",
         name = escape_html(name),
@@ -1270,6 +1330,8 @@ fn entry_family(payload: &EntryPayload) -> &'static str {
         | EntryPayload::ArtifactAttached { .. } => "fam-work",
         EntryPayload::ChannelOpened { .. }
         | EntryPayload::MemberAdded { .. }
+        | EntryPayload::ChannelClosed { .. }
+        | EntryPayload::ChannelReopened { .. }
         | EntryPayload::Ratification { .. }
         | EntryPayload::Park { .. }
         | EntryPayload::Correction { .. }
@@ -1296,6 +1358,22 @@ fn entry_card(entry: &LedgerEntry, view: &ChannelView, channel: &ChannelId) -> S
             None,
             Some(member_label(member)),
             None,
+            None,
+            None,
+        ),
+        EntryPayload::ChannelClosed { rationale } => (
+            "channel closed",
+            None,
+            None,
+            Some(rationale.as_str()),
+            None,
+            None,
+        ),
+        EntryPayload::ChannelReopened { rationale } => (
+            "channel reopened",
+            None,
+            None,
+            Some(rationale.as_str()),
             None,
             None,
         ),
@@ -1687,6 +1765,9 @@ a.chan.open-link{color:var(--muted);font-size:.84rem;margin-top:.35rem}\
 a.chan.open-link:hover{color:var(--accent)}\
 .side-sub{font-size:.68rem;text-transform:uppercase;letter-spacing:.07em;\
 color:var(--muted);margin:.7rem 0 .15rem;padding:0 .55rem}\
+.closed-banner{color:var(--yellow);background:rgba(249,226,175,.08);\
+border:1px solid rgba(249,226,175,.25);border-radius:.55rem;\
+padding:.55rem .8rem;font-size:.88rem;margin:0 0 1rem}\
 .chan-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\
 .gatecount{flex:none;font-size:.7rem;font-weight:650;color:var(--bg);background:var(--yellow);\
 border-radius:.6rem;padding:0 .45rem}\
@@ -1849,6 +1930,7 @@ mod tests {
             standings,
             gate_status,
             sessions: HashMap::new(),
+            closed: false,
         }
     }
 
@@ -1995,6 +2077,7 @@ mod tests {
                 open_gates: 0,
                 members: 1,
                 latest: None,
+                closed: false,
             },
             ChannelSummary {
                 id: ChannelId::new(),
@@ -2005,6 +2088,7 @@ mod tests {
                 open_gates: 0,
                 members: 1,
                 latest: None,
+                closed: false,
             },
         ];
         let view = view_with(vec![]);
@@ -2139,6 +2223,7 @@ mod tests {
             standings,
             gate_status,
             sessions: Default::default(),
+            closed: false,
         };
         let brief = brief_markdown("t", &ChannelId::new(), &view);
 
@@ -2173,6 +2258,7 @@ mod tests {
             standings,
             gate_status: Default::default(),
             sessions: Default::default(),
+            closed: false,
         };
         let brief = brief_markdown("t", &ChannelId::new(), &view);
 
@@ -2335,6 +2421,7 @@ mod tests {
                 open_gates: 2,
                 members: 2,
                 latest: Some("assertion — the latest finding".into()),
+                closed: false,
             },
             ChannelSummary {
                 id: other,
@@ -2345,6 +2432,7 @@ mod tests {
                 open_gates: 0,
                 members: 1,
                 latest: None,
+                closed: false,
             },
         ];
         let view = view_with(vec![]);
