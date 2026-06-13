@@ -509,17 +509,14 @@ async fn view_artifact(
     let Ok(artifact_id) = artifact.parse::<EntryId>() else {
         return (StatusCode::BAD_REQUEST, "not an artifact id").into_response();
     };
-    let (id, view, _substrate) = match project(&host, &channel).await {
+    let (_id, view, _substrate) = match project(&host, &channel).await {
         Ok(projected) => projected,
         Err(response) => return response,
     };
     let Some(entry) = view.entries.iter().find(|e| e.id == artifact_id) else {
         return (StatusCode::NOT_FOUND, "no such artifact in this channel").into_response();
     };
-    let EntryPayload::ArtifactAttached {
-        kind, provenance, ..
-    } = &entry.payload
-    else {
+    let EntryPayload::ArtifactAttached { provenance, .. } = &entry.payload else {
         return (StatusCode::BAD_REQUEST, "that entry is not an artifact").into_response();
     };
     let Some(file) = provenance.first() else {
@@ -555,11 +552,13 @@ async fn view_artifact(
             return (StatusCode::NOT_FOUND, format!("reading artifact: {err}")).into_response();
         }
     };
-    let name = canon_path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| kind.clone());
-    Html(render::artifact_html(&id, &name, &content)).into_response()
+    // Raw text so the session card can fetch and expand it inline (the card's
+    // `<details>` lazy-loads this), not a standalone page.
+    (
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        content,
+    )
+        .into_response()
 }
 
 /// Turn a `file://` URI (as `store_artifact` writes it) back into a path.

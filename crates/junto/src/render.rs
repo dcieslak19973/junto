@@ -1580,12 +1580,17 @@ fn entry_card(entry: &LedgerEntry, view: &ChannelView, channel: &ChannelId) -> S
 /// reviews instead of scrollback), and a steer box once the turn has landed
 /// (`docs/adr/0023`: steering is between turns). Empty when the channel has
 /// none.
-/// Client wiring for live session feeds (`docs/adr/0023`): each running card's
-/// `.live` box opens an `EventSource`, appends a structured progress line per
-/// `live` event, and reloads to the persisted outcome on `end`. Read-only —
-/// steering stays a separate recorded POST. Text is set via `textContent`, so
-/// agent output can never inject markup (it's a feed, not scrollback).
-const LIVE_FEED_SCRIPT: &str = r#"<script>
+/// Client wiring for agent sessions (`docs/adr/0023`), two parts:
+/// - **Live feeds:** each running `.live` box opens an `EventSource`, appends a
+///   structured progress line per `live` event, and reloads to the persisted
+///   outcome on `end`. Read-only — steering stays a separate recorded POST.
+/// - **Inline output:** each `details.artifact` lazy-loads its full body (the
+///   memo/diff) from the artifact endpoint the first time it's open, so the
+///   agent's output reads inline as a stream instead of a snippet + link.
+///
+/// All text is set via `textContent`, so agent output can never inject markup
+/// (a feed/stream, not scrollback).
+const SESSIONS_SCRIPT: &str = r#"<script>
 (function(){
   document.querySelectorAll('.live').forEach(function(box){
     if(box.dataset.wired) return; box.dataset.wired='1';
@@ -1602,6 +1607,17 @@ const LIVE_FEED_SCRIPT: &str = r#"<script>
       feed.scrollTop=feed.scrollHeight;
     });
     es.addEventListener('end',function(){ es.close(); location.reload(); });
+  });
+  function loadBody(d){
+    var pre=d.querySelector('.artifact-body');
+    if(!pre||pre.dataset.loaded) return; pre.dataset.loaded='1';
+    fetch(pre.dataset.src).then(function(r){return r.text();})
+      .then(function(t){ pre.textContent=t; })
+      .catch(function(){ pre.textContent='(could not load artifact)'; });
+  }
+  document.querySelectorAll('details.artifact').forEach(function(d){
+    if(d.open) loadBody(d);
+    d.addEventListener('toggle',function(){ if(d.open) loadBody(d); });
   });
 })();
 </script>"#;
@@ -1652,34 +1668,37 @@ fn sessions_section(view: &ChannelView, channel: &ChannelId) -> String {
             else {
                 continue;
             };
-            // Link to the full content when there's a stored file — the card
-            // only shows a snippet, and the file:// URI won't open in the
-            // webview (docs/adr/0023).
-            let view_full = if provenance.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "<a class=\"view\" href=\"/channels/{channel}/artifacts/{artifact_id}\">\
-                     view full</a>",
-                    artifact_id = artifact.id,
-                )
-            };
+            // The agent's output reads inline as a stream: the memo expands
+            // open by default; bulkier artifacts (the diff) start collapsed.
+            // The full body lazy-loads from the artifact endpoint — content
+            // lives machine-local, never the ledger (docs/adr/0020/0023).
+            if provenance.is_empty() {
+                let _ = writeln!(
+                    artifacts,
+                    "<div class=\"artifact-note\"><span class=\"kind\">{kind}</span> \
+                     {description}</div>",
+                    kind = escape_html(kind),
+                    description = escape_html(description),
+                );
+                continue;
+            }
+            let open = if kind == "memo" { " open" } else { "" };
             let _ = writeln!(
                 artifacts,
-                "<li><span class=\"kind\">{kind}</span> {description}{view_full}{prov}</li>",
+                "<details class=\"artifact\"{open}>\
+                 <summary><span class=\"kind\">{kind}</span> {description}</summary>\
+                 <pre class=\"artifact-body\" \
+                 data-src=\"/channels/{channel}/artifacts/{artifact_id}\">loading…</pre>\
+                 </details>",
                 kind = escape_html(kind),
                 description = escape_html(description),
-                prov = if provenance.is_empty() {
-                    String::new()
-                } else {
-                    provenance_details(provenance)
-                },
+                artifact_id = artifact.id,
             );
         }
         let artifacts = if artifacts.is_empty() {
             String::new()
         } else {
-            format!("<ul class=\"artifacts\">{artifacts}</ul>")
+            format!("<div class=\"artifacts\">{artifacts}</div>")
         };
         let _ = writeln!(
             cards,
@@ -1706,34 +1725,10 @@ fn sessions_section(view: &ChannelView, channel: &ChannelId) -> String {
         "<section class=\"board\"><h2 class=\"board-head\">agent sessions</h2>\n\
          {cards}</section>\n"
     );
-    // Only wire the live feeds when a session is actually running.
-    if view
-        .sessions
-        .iter()
-        .any(|(_, session)| session.state == SessionState::Working)
-    {
-        out.push_str(LIVE_FEED_SCRIPT);
-    }
+    // Wire live feeds (running sessions) and inline artifact loading (done
+    // sessions) — the script no-ops for whichever isn't present.
+    out.push_str(SESSIONS_SCRIPT);
     out
-}
-
-/// A standalone page showing one artifact's full content (`docs/adr/0023`):
-/// the memo or diff a session card only snippets inline. Plain and dark, with
-/// a link back — the `file://` provenance URI can't open in the webview, so
-/// this is how a human reads the whole thing.
-pub fn artifact_html(channel: &ChannelId, name: &str, content: &str) -> String {
-    format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
-         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
-         <title>{name}</title><style>{CSS}</style></head>\
-         <body class=\"app\"><main>\
-         <p><a class=\"back-link\" href=\"/channels/{channel}\">← back to channel</a></p>\
-         <h1>{name}</h1>\
-         <pre class=\"artifact-body\">{content}</pre>\
-         </main></body></html>",
-        name = escape_html(name),
-        content = escape_html(content),
-    )
 }
 
 /// The provenance list, collapsed by default; http(s) URIs become links.
@@ -1972,8 +1967,13 @@ border-color:rgba(137,180,250,.3)}\
 .who{color:var(--soft);font-size:.82rem}\
 .when{color:var(--muted);font-size:.76rem}\
 .statement{margin:.55rem 0 0;white-space:pre-wrap}\
-.artifacts{margin:.55rem 0 0;padding-left:1.1rem;font-size:.86rem}\
-.artifacts li{margin:.2rem 0}\
+.artifacts{margin:.6rem 0 0;font-size:.86rem}\
+.artifact-note{color:var(--soft);margin:.3rem 0}\
+details.artifact{margin:.45rem 0;border:1px solid var(--border);border-radius:.5rem;\
+background:var(--panel);overflow:hidden}\
+details.artifact>summary{cursor:pointer;user-select:none;padding:.45rem .7rem;color:var(--soft)}\
+details.artifact>summary:hover{color:var(--text)}\
+details.artifact[open]>summary{border-bottom:1px solid var(--border)}\
 .live{margin:.55rem 0 0}\
 .live-status{display:flex;align-items:center;gap:.45rem;color:var(--accent);font-size:.82rem;margin:0}\
 .live-status::before{content:'';width:.5rem;height:.5rem;border-radius:50%;background:var(--accent);\
@@ -1990,11 +1990,9 @@ max-height:18rem;overflow-y:auto;border-left:2px solid var(--border);padding-lef
 .meta-line{color:var(--muted);font-size:.8rem;margin-top:.45rem}\
 .hint{color:var(--yellow);background:rgba(249,226,175,.07);border:1px solid rgba(249,226,175,.22);\
 border-radius:.5rem;padding:.5rem .7rem;margin-top:.6rem}\
-a.view{color:var(--accent);text-decoration:none;font-size:.8rem;margin-left:.4rem}\
-a.view:hover{text-decoration:underline}\
-.artifact-body{background:var(--panel);border:1px solid var(--border);border-radius:.55rem;\
-padding:1rem 1.1rem;white-space:pre-wrap;overflow-wrap:anywhere;font:.84rem/1.55 ui-monospace,\
-'Cascadia Mono',Consolas,monospace;color:var(--soft)}\
+.artifact-body{margin:0;padding:.7rem .85rem;max-height:32rem;overflow:auto;white-space:pre-wrap;\
+overflow-wrap:anywhere;font:.82rem/1.5 ui-monospace,'Cascadia Mono',Consolas,monospace;\
+color:var(--soft)}\
 .target{color:var(--muted);font-size:.82rem;margin-top:.5rem}\
 code{font:.82em ui-monospace,'Cascadia Mono',Consolas,monospace;color:var(--soft);\
 background:var(--panel);padding:.06rem .3rem;border-radius:.3rem}\
