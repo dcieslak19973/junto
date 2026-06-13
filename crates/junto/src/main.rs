@@ -10,6 +10,7 @@
 mod binding;
 mod host;
 mod init;
+mod launch;
 mod mcp;
 mod members;
 mod render;
