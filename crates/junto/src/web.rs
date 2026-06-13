@@ -291,7 +291,7 @@ async fn launch_session(
     if intent.is_empty() {
         return (StatusCode::BAD_REQUEST, "an intent is required").into_response();
     }
-    let (id, view, _substrate) = match project(&host, &channel).await {
+    let (id, view, substrate) = match project(&host, &channel).await {
         Ok(projected) => projected,
         Err(response) => return response,
     };
@@ -302,20 +302,27 @@ async fn launch_session(
         )
             .into_response();
     }
-    // The session's author is the harness member (docs/adr/0020); its
-    // entries only project if it is in the Party (docs/adr/0017) — refuse
-    // up front with the fix rather than recording unrecognized work.
+    // The session's author is the harness member (docs/adr/0020); its entries
+    // only project once it is in the Party (docs/adr/0017). Rather than reject
+    // a launch in a fresh channel, bring the harness in: if the human at the
+    // keyboard founded this channel, auto-grant membership (a founder-authored
+    // MemberAdded) so the agent joins and starts work in one motion — the
+    // grant is recorded, not hidden. A non-founder can't grant: they get
+    // add_member's error naming who can (docs/adr/0017).
     let harness = crate::launch::harness_member();
-    if !view.party.is_empty() && !view.party.iter().any(|m| m.email == harness.email) {
-        return (
-            StatusCode::FORBIDDEN,
-            format!(
-                "{} <{}> is not a member of this channel — grant it membership first \
-                 (junto add-member, or the add_member tool)",
-                harness.display_name, harness.email
-            ),
-        )
-            .into_response();
+    let harness_is_member = view.party.iter().any(|m| m.email == harness.email);
+    if !view.party.is_empty() && !harness_is_member {
+        let granter = match crate::host::git_user(&substrate) {
+            Ok(granter) => granter,
+            Err(err) => {
+                return internal(format!(
+                    "no author identity: {err} (set git config user.name / user.email)"
+                ));
+            }
+        };
+        if let Err(err) = host.add_member(&channel, &granter, harness).await {
+            return (StatusCode::FORBIDDEN, format!("{err:#}")).into_response();
+        }
     }
     let junto_home = match crate::host::junto_home() {
         Ok(home) => home,
@@ -1352,6 +1359,86 @@ mod tests {
                 .as_deref(),
             Some("h-stub-1")
         );
+
+        unsafe { std::env::remove_var("JUNTO_HARNESS_CMD") };
+    }
+
+    #[tokio::test]
+    async fn launch_auto_grants_the_harness_when_the_founder_starts_work() {
+        // A fresh channel has only its founder in the Party; the founder
+        // starting work should bring the harness in (a founder-authored
+        // MemberAdded) rather than reject the launch — the new-channel
+        // papercut (docs/adr/0017).
+        let _home = crate::host::test_home::HomeGuard::new();
+        let stub_dir = tempfile::tempdir().expect("stub dir");
+        let stub = if cfg!(windows) {
+            let path = stub_dir.path().join("stub.cmd");
+            std::fs::write(
+                &path,
+                "@echo {\"result\":\"ok\",\"session_id\":\"h-grant-1\"}\r\n",
+            )
+            .expect("write stub");
+            path
+        } else {
+            let path = stub_dir.path().join("stub.sh");
+            std::fs::write(
+                &path,
+                "#!/bin/sh\necho '{\"result\":\"ok\",\"session_id\":\"h-grant-1\"}'\n",
+            )
+            .expect("write stub");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod stub");
+            }
+            path
+        };
+        unsafe { std::env::set_var("JUNTO_HARNESS_CMD", &stub) };
+
+        // host_with_entry founds "web-test" by the git user (web@example.com)
+        // and grants only a "Bot" — the harness is deliberately not a member.
+        let fx = host_with_entry(assertion()).await;
+        let harness = crate::launch::harness_member();
+        let workspace = tempfile::tempdir().expect("workspace");
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+
+        let response = launch_session(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LaunchForm {
+                intent: "start in a fresh channel".into(),
+                workspace: workspace.path().display().to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        // The harness is now a member, and the grant was authored by the
+        // founder (the git user), not by the agent itself.
+        let Resolution::Resolved { ledger, id, .. } = fx.host.resolve("web-test").await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+        let view = ledger.lock().await.project(&id).await.unwrap();
+        assert!(
+            view.party.iter().any(|m| m.email == harness.email),
+            "the harness was auto-granted membership"
+        );
+        let granted_by = view.entries.iter().find_map(|entry| match &entry.payload {
+            junto_kernel::EntryPayload::MemberAdded { member } if member.email == harness.email => {
+                Some(entry.author.email.clone())
+            }
+            _ => None,
+        });
+        assert_eq!(granted_by.as_deref(), Some("web@example.com"));
 
         unsafe { std::env::remove_var("JUNTO_HARNESS_CMD") };
     }
