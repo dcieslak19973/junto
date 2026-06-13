@@ -1574,6 +1574,32 @@ fn entry_card(entry: &LedgerEntry, view: &ChannelView, channel: &ChannelId) -> S
 /// reviews instead of scrollback), and a steer box once the turn has landed
 /// (`docs/adr/0023`: steering is between turns). Empty when the channel has
 /// none.
+/// Client wiring for live session feeds (`docs/adr/0023`): each running card's
+/// `.live` box opens an `EventSource`, appends a structured progress line per
+/// `live` event, and reloads to the persisted outcome on `end`. Read-only —
+/// steering stays a separate recorded POST. Text is set via `textContent`, so
+/// agent output can never inject markup (it's a feed, not scrollback).
+const LIVE_FEED_SCRIPT: &str = r#"<script>
+(function(){
+  document.querySelectorAll('.live').forEach(function(box){
+    if(box.dataset.wired) return; box.dataset.wired='1';
+    var feed=box.querySelector('.live-feed');
+    var url='/channels/'+box.dataset.channel+'/sessions/'+box.dataset.session+'/stream';
+    var es=new EventSource(url);
+    var marks={tool:'⚙ ',status:'· ',result:'✓ ',error:'✗ '};
+    es.addEventListener('live',function(e){
+      var ev; try{ev=JSON.parse(e.data);}catch(_){return;}
+      var li=document.createElement('li');
+      li.className='le le-'+(ev.kind||'status');
+      li.textContent=(marks[ev.kind]||'')+(ev.text||'');
+      feed.appendChild(li);
+      feed.scrollTop=feed.scrollHeight;
+    });
+    es.addEventListener('end',function(){ es.close(); location.reload(); });
+  });
+})();
+</script>"#;
+
 fn sessions_section(view: &ChannelView, channel: &ChannelId) -> String {
     // Sessions render newest-first; entries are already canonical, so walk
     // them in reverse and pick the session subjects.
@@ -1598,9 +1624,12 @@ fn sessions_section(view: &ChannelView, channel: &ChannelId) -> String {
                  </form>",
                 session_id = entry.id,
             ),
-            SessionState::Working => {
-                "<p class=\"meta\">running — artifacts land here when the turn ends</p>".to_string()
-            }
+            SessionState::Working => format!(
+                "<div class=\"live\" data-channel=\"{channel}\" data-session=\"{session_id}\">\
+                 <p class=\"live-status\">running — live progress</p>\
+                 <ul class=\"live-feed\"></ul></div>",
+                session_id = entry.id,
+            ),
             _ => String::new(),
         };
         let mut artifacts = String::new();
@@ -1653,13 +1682,21 @@ fn sessions_section(view: &ChannelView, channel: &ChannelId) -> String {
         );
     }
     if cards.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "<section class=\"board\"><h2 class=\"board-head\">agent sessions</h2>\n\
-             {cards}</section>\n"
-        )
+        return String::new();
     }
+    let mut out = format!(
+        "<section class=\"board\"><h2 class=\"board-head\">agent sessions</h2>\n\
+         {cards}</section>\n"
+    );
+    // Only wire the live feeds when a session is actually running.
+    if view
+        .sessions
+        .iter()
+        .any(|(_, session)| session.state == SessionState::Working)
+    {
+        out.push_str(LIVE_FEED_SCRIPT);
+    }
+    out
 }
 
 /// The provenance list, collapsed by default; http(s) URIs become links.
@@ -1900,6 +1937,19 @@ border-color:rgba(137,180,250,.3)}\
 .statement{margin:.55rem 0 0;white-space:pre-wrap}\
 .artifacts{margin:.55rem 0 0;padding-left:1.1rem;font-size:.86rem}\
 .artifacts li{margin:.2rem 0}\
+.live{margin:.55rem 0 0}\
+.live-status{display:flex;align-items:center;gap:.45rem;color:var(--accent);font-size:.82rem;margin:0}\
+.live-status::before{content:'';width:.5rem;height:.5rem;border-radius:50%;background:var(--accent);\
+animation:livepulse 1.1s ease-in-out infinite}\
+@keyframes livepulse{0%,100%{opacity:.3}50%{opacity:1}}\
+.live-feed{list-style:none;margin:.5rem 0 0;padding:0;font-size:.84rem;line-height:1.5;\
+max-height:18rem;overflow-y:auto;border-left:2px solid var(--border);padding-left:.7rem}\
+.live-feed li{margin:.25rem 0;overflow-wrap:anywhere;white-space:pre-wrap}\
+.le-assistant{color:var(--text)}\
+.le-tool{color:var(--teal);font-family:ui-monospace,'Cascadia Mono',Consolas,monospace;font-size:.8rem}\
+.le-status{color:var(--muted);font-size:.8rem}\
+.le-result{color:var(--green)}\
+.le-error{color:var(--red)}\
 .meta-line{color:var(--muted);font-size:.8rem;margin-top:.45rem}\
 .target{color:var(--muted);font-size:.82rem;margin-top:.5rem}\
 code{font:.82em ui-monospace,'Cascadia Mono',Consolas,monospace;color:var(--soft);\

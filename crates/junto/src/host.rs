@@ -204,6 +204,9 @@ pub struct Host {
     /// Ledgers opened so far, keyed by substrate repo path — cached so each
     /// repo has one append-serializing mutex for the host's lifetime.
     ledgers: Mutex<HashMap<PathBuf, SharedLedger>>,
+    /// In-memory live-progress feeds for running Agent Sessions
+    /// (`docs/adr/0023`) — ephemeral, never part of the record.
+    live: crate::launch::LiveSessions,
 }
 
 impl Host {
@@ -213,6 +216,7 @@ impl Host {
             substrates: Substrates::Registry(junto_home),
             member_home_override: None,
             ledgers: Mutex::new(HashMap::new()),
+            live: crate::launch::LiveSessions::default(),
         })
     }
 
@@ -236,7 +240,15 @@ impl Host {
             substrates: Substrates::Fixed(repos),
             member_home_override: member_home,
             ledgers: Mutex::new(HashMap::new()),
+            live: crate::launch::LiveSessions::default(),
         })
+    }
+
+    /// The in-memory live-progress feeds for running Agent Sessions
+    /// (`docs/adr/0023`). The web SSE endpoint subscribes; a launched turn
+    /// publishes. Ephemeral — never the durable record.
+    pub fn live(&self) -> &crate::launch::LiveSessions {
+        &self.live
     }
 
     /// Where this host's member-code store lives (`docs/adr/0017`): the

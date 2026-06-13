@@ -50,6 +50,10 @@ pub fn router(host: Arc<Host>) -> Router {
             "/channels/{channel}/sessions/{session}/steer",
             post(steer_session),
         )
+        .route(
+            "/channels/{channel}/sessions/{session}/stream",
+            get(stream_session),
+        )
         .route("/channels/{channel}/rename", post(rename_channel))
         .route("/channels/{channel}/close", post(close_channel))
         .route("/channels/{channel}/reopen", post(reopen_channel))
@@ -435,6 +439,55 @@ async fn steer_session(
         Ok(()) => Redirect::to(&format!("/channels/{id}")).into_response(),
         Err(err) => (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
     }
+}
+
+/// Stream a running session's live progress as Server-Sent Events
+/// (`docs/adr/0023`). The card's `EventSource` subscribes; the turn publishes
+/// to the in-memory feed. Read-only — steering is a separate recorded POST, so
+/// SSE (server→browser) fits, no WebSocket needed.
+///
+/// Each progress line is an SSE `live` event carrying the JSON `LiveEvent`.
+/// When the turn ends (the feed's sender drops) — or if no feed is running —
+/// an `end` event tells the client to stop (no auto-reconnect) and reload to
+/// the now-persisted memo + diff. The feed itself is never the record.
+async fn stream_session(
+    State(host): State<Arc<Host>>,
+    Path((_channel, session)): Path<(String, String)>,
+) -> Response {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+
+    let Ok(session) = session.parse::<EntryId>() else {
+        return (StatusCode::BAD_REQUEST, "not a session id").into_response();
+    };
+    let subscription = host.live().subscribe(session);
+    let stream = async_stream::stream! {
+        if let Some((buffer, mut receiver)) = subscription {
+            for event in buffer {
+                if let Ok(sse) = Event::default().event("live").json_data(&event) {
+                    yield Ok::<_, std::convert::Infallible>(sse);
+                }
+            }
+            loop {
+                match receiver.recv().await {
+                    Ok(event) => {
+                        if let Ok(sse) = Event::default().event("live").json_data(&event) {
+                            yield Ok(sse);
+                        }
+                    }
+                    // A slow watcher that fell behind: keep going from the tail.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    // The turn ended (sender dropped): stop.
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+        // Whether or not a feed was live, end the stream so the client closes
+        // (no reconnect) and reloads to the persisted outcome.
+        yield Ok(Event::default().event("end").data("done"));
+    };
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 /// The form body for renaming a channel.
@@ -1248,7 +1301,8 @@ mod tests {
             let path = stub_dir.path().join("stub.cmd");
             std::fs::write(
                 &path,
-                "@echo {\"result\":\"stub work complete\",\"session_id\":\"h-stub-1\"}\r\n",
+                "@echo {\"type\":\"result\",\"subtype\":\"success\",\"result\":\"stub work \
+                 complete\",\"session_id\":\"h-stub-1\",\"is_error\":false}\r\n",
             )
             .expect("write stub");
             path
@@ -1256,7 +1310,8 @@ mod tests {
             let path = stub_dir.path().join("stub.sh");
             std::fs::write(
                 &path,
-                "#!/bin/sh\necho '{\"result\":\"stub work complete\",\"session_id\":\"h-stub-1\"}'\n",
+                "#!/bin/sh\necho '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"stub \
+                 work complete\",\"session_id\":\"h-stub-1\",\"is_error\":false}'\n",
             )
             .expect("write stub");
             #[cfg(unix)]
@@ -1375,7 +1430,8 @@ mod tests {
             let path = stub_dir.path().join("stub.cmd");
             std::fs::write(
                 &path,
-                "@echo {\"result\":\"ok\",\"session_id\":\"h-grant-1\"}\r\n",
+                "@echo {\"type\":\"result\",\"subtype\":\"success\",\"result\":\"ok\",\
+                 \"session_id\":\"h-grant-1\",\"is_error\":false}\r\n",
             )
             .expect("write stub");
             path
@@ -1383,7 +1439,8 @@ mod tests {
             let path = stub_dir.path().join("stub.sh");
             std::fs::write(
                 &path,
-                "#!/bin/sh\necho '{\"result\":\"ok\",\"session_id\":\"h-grant-1\"}'\n",
+                "#!/bin/sh\necho '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"ok\",\
+                 \"session_id\":\"h-grant-1\",\"is_error\":false}'\n",
             )
             .expect("write stub");
             #[cfg(unix)]

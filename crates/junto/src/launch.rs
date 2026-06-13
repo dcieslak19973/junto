@@ -16,12 +16,15 @@
 //! `AgentHarnessAdapter` trait yet** — rule of three; this is the first
 //! concrete harness, extracted when OpenCode lands.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
+use tokio::sync::broadcast;
 
 use junto_kernel::{
     ChannelId, ContentDigest, EntryId, EntryPayload, LedgerEntry, Member, ProvenanceRef,
@@ -201,6 +204,200 @@ fn record_turn(junto_home: &Path, junto: &EntryId, harness: Option<String>) -> R
     Ok(turn)
 }
 
+// ---- live progress: an ephemeral feed of the running turn (docs/adr/0023) ----
+//
+// A running turn streams structured progress (assistant text, named tool
+// actions) so the human can watch it work instead of staring at "working".
+// This is **not the record**: it lives in memory, never the ledger — the
+// durable capture stays the memo + diff artifacts (CLAUDE.md terminal-less:
+// the verifiable Artifact is the record; this feed is a transient window that
+// vanishes when the turn lands). It is also the normalized event shape a
+// future `AgentHarnessAdapter` will converge on.
+
+/// One line in a session's live progress feed.
+#[derive(Clone, Debug, Serialize)]
+pub struct LiveEvent {
+    /// `status` (lifecycle), `assistant` (model text), `tool` (a named
+    /// action), `result` (final summary), or `error`.
+    pub kind: String,
+    /// A human-readable line — assistant text, or a tool action like
+    /// `Bash: cargo test`.
+    pub text: String,
+}
+
+impl LiveEvent {
+    fn new(kind: &str, text: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            text: text.into(),
+        }
+    }
+}
+
+/// Per-session live feed: a bounded replay buffer (for a page that loads
+/// mid-turn) plus a broadcast sender for the live tail.
+struct LiveFeed {
+    buffer: Vec<LiveEvent>,
+    sender: broadcast::Sender<LiveEvent>,
+}
+
+/// The host's in-memory registry of running sessions' live feeds. Ephemeral —
+/// nothing here is part of the durable record.
+#[derive(Default)]
+pub struct LiveSessions {
+    inner: Mutex<HashMap<EntryId, LiveFeed>>,
+}
+
+impl LiveSessions {
+    /// Open a fresh feed for a session about to run (replaces any stale one).
+    fn begin(&self, session: EntryId) {
+        let (sender, _rx) = broadcast::channel(256);
+        let mut map = self.inner.lock().expect("live sessions registry lock");
+        map.insert(
+            session,
+            LiveFeed {
+                buffer: Vec::new(),
+                sender,
+            },
+        );
+    }
+
+    /// Append an event: into the replay buffer (bounded) and to live tails.
+    fn publish(&self, session: EntryId, event: LiveEvent) {
+        let mut map = self.inner.lock().expect("live sessions registry lock");
+        if let Some(feed) = map.get_mut(&session) {
+            // Bound the replay buffer; live subscribers still get every event.
+            if feed.buffer.len() < 1000 {
+                feed.buffer.push(event.clone());
+            }
+            // Err just means no one is watching right now — fine.
+            let _ = feed.sender.send(event);
+        }
+    }
+
+    /// Subscribe to a running session: its replay buffer plus a live receiver,
+    /// or `None` if no turn is currently streaming for it.
+    pub fn subscribe(
+        &self,
+        session: EntryId,
+    ) -> Option<(Vec<LiveEvent>, broadcast::Receiver<LiveEvent>)> {
+        let map = self.inner.lock().expect("live sessions registry lock");
+        let feed = map.get(&session)?;
+        Some((feed.buffer.clone(), feed.sender.subscribe()))
+    }
+
+    /// Close a session's feed — dropping the sender, so any live subscriber
+    /// sees the stream end and reloads to the now-persisted outcome.
+    fn finish(&self, session: EntryId) {
+        let mut map = self.inner.lock().expect("live sessions registry lock");
+        map.remove(&session);
+    }
+}
+
+/// What interpreting one `stream-json` line yielded: progress events to show,
+/// plus any harness-session id and final result it carried.
+#[derive(Default)]
+struct LineEffects {
+    events: Vec<LiveEvent>,
+    session: Option<String>,
+    result: Option<String>,
+    is_error: bool,
+    saw_result: bool,
+}
+
+/// A short label for a tool action, e.g. `Bash: cargo test` — the first
+/// salient input field, never the whole payload (terminal-less: a glanceable
+/// action, not scrollback).
+fn tool_summary(name: &str, input: Option<&serde_json::Value>) -> String {
+    let detail = input.and_then(|i| {
+        [
+            "command",
+            "file_path",
+            "path",
+            "pattern",
+            "url",
+            "description",
+        ]
+        .iter()
+        .find_map(|key| i.get(*key).and_then(|v| v.as_str()))
+    });
+    match detail {
+        Some(d) => {
+            let first = d.lines().next().unwrap_or(d);
+            format!("{name}: {}", snippet(first, 80))
+        }
+        None => name.to_string(),
+    }
+}
+
+/// Interpret one line of `claude -p --output-format stream-json` (JSONL).
+/// Lenient: an unrecognized line yields nothing rather than failing the turn.
+fn interpret_stream_line(line: &str) -> LineEffects {
+    let mut effects = LineEffects::default();
+    let line = line.trim();
+    if line.is_empty() {
+        return effects;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return effects;
+    };
+    if let Some(session) = value.get("session_id").and_then(|v| v.as_str()) {
+        effects.session = Some(session.to_string());
+    }
+    match value.get("type").and_then(|t| t.as_str()) {
+        Some("system") => {
+            effects
+                .events
+                .push(LiveEvent::new("status", "session started"));
+        }
+        Some("assistant") => {
+            if let Some(blocks) = value.pointer("/message/content").and_then(|c| c.as_array()) {
+                for block in blocks {
+                    match block.get("type").and_then(|t| t.as_str()) {
+                        Some("text") => {
+                            if let Some(text) = block.get("text").and_then(|v| v.as_str())
+                                && !text.trim().is_empty()
+                            {
+                                effects
+                                    .events
+                                    .push(LiveEvent::new("assistant", text.trim()));
+                            }
+                        }
+                        Some("tool_use") => {
+                            let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
+                            effects.events.push(LiveEvent::new(
+                                "tool",
+                                tool_summary(name, block.get("input")),
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Some("result") => {
+            effects.saw_result = true;
+            effects.is_error = value
+                .get("is_error")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let text = value
+                .get("result")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            effects.events.push(LiveEvent::new(
+                if effects.is_error { "error" } else { "result" },
+                snippet(&text, 240),
+            ));
+            effects.result = Some(text);
+        }
+        // "user" carries tool results — skipped to keep the feed glanceable.
+        _ => {}
+    }
+    effects
+}
+
 // ---- the turn itself: spawn → capture → record ----
 
 /// What one finished harness turn yielded.
@@ -214,13 +411,22 @@ struct TurnOutcome {
 }
 
 /// Run one harness turn in `workspace`: the launch turn when `resume` is
-/// `None`, a steer turn otherwise. Blocking on the spawned process — callers
-/// run this inside a spawned task.
+/// `None`, a steer turn otherwise. Streams `stream-json` line by line,
+/// publishing progress to the session's live feed as it arrives; returns the
+/// final outcome. Callers run this inside a spawned task.
 ///
 /// The prompt travels over **stdin**, never argv: prompts are multi-line,
 /// and Windows refuses newline-bearing arguments to `.cmd` shims (which is
 /// what an npm-installed `claude` is).
-async fn run_turn(workspace: &Path, prompt: &str, resume: Option<&str>) -> TurnOutcome {
+async fn run_turn(
+    workspace: &Path,
+    prompt: &str,
+    resume: Option<&str>,
+    live: &LiveSessions,
+    session: EntryId,
+) -> TurnOutcome {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
     let mut command = tokio::process::Command::new(harness_program());
     if let Some(harness_session) = resume {
         command.arg("--resume").arg(harness_session);
@@ -228,7 +434,10 @@ async fn run_turn(workspace: &Path, prompt: &str, resume: Option<&str>) -> TurnO
     command
         .arg("-p")
         .arg("--output-format")
-        .arg("json")
+        .arg("stream-json")
+        // stream-json under --print requires --verbose; it only affects
+        // stderr logging, so stdout stays clean JSONL.
+        .arg("--verbose")
         // docs/adr/0023: a headless turn stalled on an invisible permission
         // prompt is worthless; junto's gates are the outcome layer.
         .arg("--dangerously-skip-permissions")
@@ -253,65 +462,82 @@ async fn run_turn(workspace: &Path, prompt: &str, resume: Option<&str>) -> TurnO
         }
     };
     if let Some(mut stdin) = spawned.stdin.take() {
-        use tokio::io::AsyncWriteExt as _;
         // A stub that never reads stdin is fine — the pipe buffer holds a
         // prompt-sized write; errors here just mean the child exited early.
         let _ = stdin.write_all(prompt.as_bytes()).await;
         let _ = stdin.shutdown().await;
     }
-    let output = match tokio::time::timeout(TURN_TIMEOUT, spawned.wait_with_output()).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(err)) => {
-            return TurnOutcome {
-                result: format!("harness I/O failed: {err}"),
-                harness_session: None,
-                failed: true,
-            };
+    let Some(stdout) = spawned.stdout.take() else {
+        return TurnOutcome {
+            result: "harness produced no stdout pipe".into(),
+            harness_session: None,
+            failed: true,
+        };
+    };
+    // Drain stderr concurrently so a chatty harness can't fill the pipe and
+    // block; it's the fallback message when no result line arrives.
+    let stderr_task = spawned.stderr.take().map(|mut stderr| {
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt as _;
+            let mut buf = String::new();
+            let _ = stderr.read_to_string(&mut buf).await;
+            buf
+        })
+    });
+
+    let mut harness_session: Option<String> = None;
+    let mut result_text: Option<String> = None;
+    let mut is_error = false;
+
+    // Read stdout to EOF, publishing each interpreted line, then reap the
+    // child for its exit status. The whole drive is under the turn timeout;
+    // on timeout the future drops and kill_on_drop reaps the child.
+    let drive = async {
+        let mut lines = tokio::io::BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let effects = interpret_stream_line(&line);
+            for event in effects.events {
+                live.publish(session, event);
+            }
+            if let Some(found) = effects.session {
+                harness_session = Some(found);
+            }
+            if effects.saw_result {
+                result_text = effects.result;
+                is_error = effects.is_error;
+            }
         }
-        // Timeout: kill_on_drop reaps the child as the future is dropped.
+        spawned.wait().await
+    };
+
+    let status = match tokio::time::timeout(TURN_TIMEOUT, drive).await {
+        Ok(status) => status,
         Err(_) => {
             return TurnOutcome {
                 result: format!(
                     "turn exceeded the {}-minute timeout and was killed (docs/adr/0023)",
                     TURN_TIMEOUT.as_secs() / 60
                 ),
-                harness_session: None,
+                harness_session,
                 failed: true,
             };
         }
     };
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // `claude -p --output-format json` prints one JSON object with `result`
-    // and `session_id`; parse leniently so a harness change degrades to raw
-    // text instead of a hard failure.
-    let parsed: Option<serde_json::Value> = serde_json::from_str(stdout.trim()).ok();
-    let harness_session = parsed
-        .as_ref()
-        .and_then(|v| v.get("session_id"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let result = parsed
-        .as_ref()
-        .and_then(|v| v.get("result"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            if stdout.trim().is_empty() {
-                String::from_utf8_lossy(&output.stderr).trim().to_string()
-            } else {
-                stdout.trim().to_string()
-            }
-        });
-    let is_error = parsed
-        .as_ref()
-        .and_then(|v| v.get("is_error"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let exit_ok = matches!(status, Ok(s) if s.success());
+    let stderr = match stderr_task {
+        Some(handle) => handle.await.unwrap_or_default(),
+        None => String::new(),
+    };
+    let result = match result_text {
+        Some(text) if !text.trim().is_empty() => text,
+        _ if !stderr.trim().is_empty() => stderr.trim().to_string(),
+        _ => "(the harness produced no result)".to_string(),
+    };
     TurnOutcome {
         result,
         harness_session,
-        failed: !output.status.success() || is_error,
+        failed: is_error || !exit_ok,
     }
 }
 
@@ -486,12 +712,16 @@ fn spawn_turn(
     resume: Option<String>,
 ) {
     tokio::spawn(async move {
-        let outcome = run_turn(&workspace, &prompt, resume.as_deref()).await;
+        host.live().begin(session);
+        let outcome = run_turn(&workspace, &prompt, resume.as_deref(), host.live(), session).await;
         if let Err(err) =
             record_outcome(&host, &channel_ref, channel, session, &workspace, &outcome).await
         {
             tracing::warn!("recording session {session} outcome failed: {err:#}");
         }
+        // Close the live feed only after the outcome is recorded, so a watcher
+        // reloading on stream-end sees the landed memo + diff, not "working".
+        host.live().finish(session);
         // Best-effort sync so the session's record leaves this machine.
         if let Ok(resolution) = host.resolve(&channel_ref).await
             && let crate::host::Resolution::Resolved { ledger, id, .. } = resolution
@@ -658,6 +888,86 @@ mod tests {
         let plain = tempfile::tempdir().unwrap();
         let err = remember_workspace(home.path(), &channel, plain.path()).unwrap_err();
         assert!(err.to_string().contains("not a git repository"), "{err}");
+    }
+
+    #[test]
+    fn stream_line_system_carries_session_and_status() {
+        let effects = interpret_stream_line(
+            r#"{"type":"system","subtype":"init","session_id":"h-abc","tools":[]}"#,
+        );
+        assert_eq!(effects.session.as_deref(), Some("h-abc"));
+        assert_eq!(effects.events.len(), 1);
+        assert_eq!(effects.events[0].kind, "status");
+        assert!(!effects.saw_result);
+    }
+
+    #[test]
+    fn stream_line_assistant_yields_text_and_tool_events() {
+        let line = r#"{"type":"assistant","session_id":"h-abc","message":{"content":[
+            {"type":"text","text":"Running the tests."},
+            {"type":"tool_use","name":"Bash","input":{"command":"cargo test\n--workspace"}}
+        ]}}"#;
+        let effects = interpret_stream_line(line);
+        assert_eq!(effects.events.len(), 2);
+        assert_eq!(effects.events[0].kind, "assistant");
+        assert_eq!(effects.events[0].text, "Running the tests.");
+        assert_eq!(effects.events[1].kind, "tool");
+        // The summary takes the first line of the salient input field.
+        assert_eq!(effects.events[1].text, "Bash: cargo test");
+    }
+
+    #[test]
+    fn stream_line_result_captures_outcome() {
+        let ok = interpret_stream_line(
+            r#"{"type":"result","subtype":"success","result":"all green","session_id":"h-abc","is_error":false}"#,
+        );
+        assert!(ok.saw_result);
+        assert!(!ok.is_error);
+        assert_eq!(ok.result.as_deref(), Some("all green"));
+        assert_eq!(ok.events[0].kind, "result");
+
+        let bad = interpret_stream_line(
+            r#"{"type":"result","subtype":"error","result":"boom","is_error":true}"#,
+        );
+        assert!(bad.is_error);
+        assert_eq!(bad.events[0].kind, "error");
+    }
+
+    #[test]
+    fn stream_line_garbage_is_ignored() {
+        assert!(interpret_stream_line("not json at all").events.is_empty());
+        assert!(interpret_stream_line("").events.is_empty());
+        // An unknown event type carries its session id but shows nothing.
+        let unknown = interpret_stream_line(r#"{"type":"user","session_id":"h-z"}"#);
+        assert!(unknown.events.is_empty());
+        assert_eq!(unknown.session.as_deref(), Some("h-z"));
+    }
+
+    #[test]
+    fn live_registry_replays_buffer_and_tails() {
+        let live = LiveSessions::default();
+        let session = EntryId::new();
+        // No feed yet → no subscription.
+        assert!(live.subscribe(session).is_none());
+
+        live.begin(session);
+        live.publish(session, LiveEvent::new("assistant", "first"));
+        let (buffer, mut receiver) = live.subscribe(session).expect("feed is live");
+        assert_eq!(buffer.len(), 1, "late joiner replays what already happened");
+        assert_eq!(buffer[0].text, "first");
+
+        // A subsequent publish reaches the live tail.
+        live.publish(session, LiveEvent::new("tool", "Bash: ls"));
+        let tailed = receiver.try_recv().expect("live event delivered");
+        assert_eq!(tailed.text, "Bash: ls");
+
+        // Finishing drops the feed: the receiver closes, new subscribes miss.
+        live.finish(session);
+        assert!(live.subscribe(session).is_none());
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed)
+        ));
     }
 
     #[test]

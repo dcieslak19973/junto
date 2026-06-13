@@ -50,3 +50,5 @@ toml = "0.9"
 dunce = "1"
 # content digests for artifact provenance (docs/adr/0005, 0023; MIT/Apache)
 sha2 = "0.10"
+# ergonomic async streams for the live-progress SSE endpoint (docs/adr/0023; MIT)
+async-stream = "0.3"
