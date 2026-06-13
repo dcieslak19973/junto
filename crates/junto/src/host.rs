@@ -94,10 +94,11 @@ pub fn register_substrate(junto_home: &Path, repo: &Path) -> Result<()> {
 /// (`docs/adr/0012`); git config is just the sensible machine-user default.
 pub fn git_user(repo: &Path) -> Result<Member> {
     let get = |key: &str| -> Result<String> {
-        let out = std::process::Command::new("git")
-            .args(["-C", &repo.display().to_string(), "config", key])
-            .output()
-            .context("running git config")?;
+        let mut command = std::process::Command::new("git");
+        command.args(["-C", &repo.display().to_string(), "config", key]);
+        // Terminal-less: no flashed console window (runs on every human act).
+        crate::launch::no_console_window(&mut command);
+        let out = command.output().context("running git config")?;
         if !out.status.success() {
             bail!("git config {key} is unset");
         }

@@ -568,7 +568,7 @@ fn store_artifact(
 /// spawns a console child. CLAUDE.md (terminal-less): agent and tool output
 /// is captured as Artifacts, never rendered as scrollback — and never as a
 /// flashed window. A no-op off Windows.
-fn no_console_window(command: &mut std::process::Command) {
+pub(crate) fn no_console_window(command: &mut std::process::Command) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
