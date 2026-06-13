@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -43,9 +43,187 @@ pub fn harness_member() -> Member {
 
 /// The harness command line, overridable for tests (`JUNTO_HARNESS_CMD`
 /// names a program that accepts the same trailing arguments and prints a
-/// `claude -p --output-format json`-shaped result).
+/// `claude -p --output-format stream-json`-shaped result).
 fn harness_program() -> String {
     std::env::var("JUNTO_HARNESS_CMD").unwrap_or_else(|_| "claude".to_string())
+}
+
+// ---- the ExecutionBackend: where the harness runs (docs/adr/0023) ----
+//
+// On Windows a native `claude.exe` flashes a console window for every Bash
+// tool call — an upstream Claude Code bug (anthropics/claude-code#15572 and
+// friends), and one a pseudo-terminal does *not* fix (the bug reproduces in
+// interactive/PTY mode). Running the harness inside WSL makes those Linux
+// processes, so no Windows console windows exist to flash. We prefer WSL when
+// a distro actually has `claude`, and fall back to native otherwise — with a
+// suggestion to set WSL up. This is the first concrete ExecutionBackend; the
+// trait waits for a second one (rule of three).
+
+/// Where the harness runs on this machine.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HarnessBackend {
+    /// The harness binary directly (`claude` on PATH, or `JUNTO_HARNESS_CMD`).
+    Native,
+    /// `claude` inside the default WSL distro — Linux processes, no flashing.
+    Wsl,
+}
+
+/// The resolved backend plus a one-line suggestion shown on the start-work
+/// surface when we fell back to native on Windows (else `None`).
+struct HarnessChoice {
+    backend: HarnessBackend,
+    hint: Option<&'static str>,
+}
+
+/// The machine's resolved harness backend, detected once and cached (machine
+/// facts don't change mid-run).
+static HARNESS_CHOICE: OnceLock<HarnessChoice> = OnceLock::new();
+
+/// The machine's harness backend, detecting it if needed. Detection probes are
+/// quiet (no flashed window) and bounded (a wedged WSL can't hang a launch),
+/// but can still take a second or two — callers off the render path (a launch)
+/// may block on it.
+fn harness_choice() -> &'static HarnessChoice {
+    HARNESS_CHOICE.get_or_init(detect_harness_choice)
+}
+
+/// The harness suggestion for the human surface, if any. **Non-blocking**:
+/// detection shells out to WSL, so the render path must never wait on it — if
+/// it hasn't run yet, warm it off-thread and show nothing this time (the next
+/// page load has it).
+pub(crate) fn harness_hint() -> Option<&'static str> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    if let Some(choice) = HARNESS_CHOICE.get() {
+        return choice.hint;
+    }
+    static WARMING: AtomicBool = AtomicBool::new(false);
+    if !WARMING.swap(true, Ordering::SeqCst) {
+        std::thread::spawn(|| {
+            let _ = harness_choice();
+        });
+    }
+    None
+}
+
+fn detect_harness_choice() -> HarnessChoice {
+    // A test/override stub always runs natively (and never probes WSL).
+    if std::env::var_os("JUNTO_HARNESS_CMD").is_some() {
+        return HarnessChoice {
+            backend: HarnessBackend::Native,
+            hint: None,
+        };
+    }
+    match std::env::var("JUNTO_HARNESS_BACKEND").ok().as_deref() {
+        Some("native") => {
+            return HarnessChoice {
+                backend: HarnessBackend::Native,
+                hint: None,
+            };
+        }
+        Some("wsl") => {
+            return HarnessChoice {
+                backend: HarnessBackend::Wsl,
+                hint: None,
+            };
+        }
+        _ => {}
+    }
+    // Auto-detect only in real builds — tests must never shell out to WSL
+    // (slow, machine-dependent). A forced backend via env still works above.
+    #[cfg(all(windows, not(test)))]
+    {
+        if !wsl_has_distro() {
+            HarnessChoice {
+                backend: HarnessBackend::Native,
+                hint: Some(
+                    "Console windows flash during agent turns — an upstream Claude Code bug \
+                     on Windows. Install WSL (run `wsl --install`) and Claude Code inside it; \
+                     junto will run the harness there and the flashing stops.",
+                ),
+            }
+        } else if wsl_has_claude() {
+            HarnessChoice {
+                backend: HarnessBackend::Wsl,
+                hint: None,
+            }
+        } else {
+            HarnessChoice {
+                backend: HarnessBackend::Native,
+                hint: Some(
+                    "Console windows flash during agent turns — an upstream Claude Code bug on \
+                     Windows. WSL is installed but Claude Code isn't inside it; install \
+                     `claude` in your WSL distro (and sign in there) and junto will run the \
+                     harness there.",
+                ),
+            }
+        }
+    }
+    #[cfg(not(all(windows, not(test))))]
+    {
+        HarnessChoice {
+            backend: HarnessBackend::Native,
+            hint: None,
+        }
+    }
+}
+
+/// Does WSL have at least one installed distro? `wsl -l -q` exits non-zero
+/// when WSL is absent or empty, and is fast (no distro boot).
+#[cfg(all(windows, not(test)))]
+fn wsl_has_distro() -> bool {
+    let mut command = std::process::Command::new("wsl");
+    command.args(["-l", "-q"]);
+    no_console_window(&mut command);
+    command
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// Is `claude` runnable inside the default WSL distro? Booting the distro can
+/// take a moment, so the probe is bounded — a wedged WSL reads as "absent".
+#[cfg(all(windows, not(test)))]
+fn wsl_has_claude() -> bool {
+    run_bounded(|| {
+        let mut command = std::process::Command::new("wsl");
+        command.args(["--", "claude", "--version"]);
+        no_console_window(&mut command);
+        command
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    })
+    .unwrap_or(false)
+}
+
+/// Run a blocking probe on a worker thread, giving up after a few seconds so
+/// a broken WSL can never wedge backend detection.
+#[cfg(all(windows, not(test)))]
+fn run_bounded(probe: impl FnOnce() -> bool + Send + 'static) -> Option<bool> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(probe());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(15)).ok()
+}
+
+/// The base harness command for `workspace`, per the detected backend. The
+/// caller appends the shared `claude` arguments (`-p`, `--output-format …`).
+fn harness_command(workspace: &Path) -> tokio::process::Command {
+    match harness_choice().backend {
+        HarnessBackend::Native => {
+            let mut command = tokio::process::Command::new(harness_program());
+            command.current_dir(workspace);
+            command
+        }
+        HarnessBackend::Wsl => {
+            // `--cd` takes the Windows workspace path and translates it; the
+            // harness then runs as a Linux process (no flashing console).
+            let mut command = tokio::process::Command::new("wsl");
+            command.arg("--cd").arg(workspace).arg("--").arg("claude");
+            command
+        }
+    }
 }
 
 /// How long a turn may run before the host kills it (docs/adr/0023).
@@ -427,7 +605,9 @@ async fn run_turn(
 ) -> TurnOutcome {
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
-    let mut command = tokio::process::Command::new(harness_program());
+    // The backend decides native-vs-WSL and the working directory; we add the
+    // shared claude arguments on top.
+    let mut command = harness_command(workspace);
     if let Some(harness_session) = resume {
         command.arg("--resume").arg(harness_session);
     }
@@ -441,7 +621,6 @@ async fn run_turn(
         // docs/adr/0023: a headless turn stalled on an invisible permission
         // prompt is worthless; junto's gates are the outcome layer.
         .arg("--dangerously-skip-permissions")
-        .current_dir(workspace)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -455,7 +634,7 @@ async fn run_turn(
         Ok(child) => child,
         Err(err) => {
             return TurnOutcome {
-                result: format!("failed to spawn harness '{}': {err}", harness_program()),
+                result: format!("failed to spawn the harness: {err}"),
                 harness_session: None,
                 failed: true,
             };
@@ -888,6 +1067,32 @@ mod tests {
         let plain = tempfile::tempdir().unwrap();
         let err = remember_workspace(home.path(), &channel, plain.path()).unwrap_err();
         assert!(err.to_string().contains("not a git repository"), "{err}");
+    }
+
+    #[test]
+    fn harness_backend_honors_the_test_stub_override() {
+        // The HomeGuard's process-wide lock serializes env mutation here.
+        let _home = HomeGuard::new();
+        // SAFETY: env mutation is serialized by the HomeGuard lock.
+        unsafe { std::env::set_var("JUNTO_HARNESS_CMD", "stub") };
+        let choice = detect_harness_choice();
+        assert_eq!(choice.backend, HarnessBackend::Native);
+        assert!(
+            choice.hint.is_none(),
+            "the stub override never suggests WSL"
+        );
+        unsafe { std::env::remove_var("JUNTO_HARNESS_CMD") };
+    }
+
+    #[test]
+    fn forced_backend_env_selects_wsl_without_probing() {
+        let _home = HomeGuard::new();
+        unsafe { std::env::set_var("JUNTO_HARNESS_BACKEND", "wsl") };
+        // JUNTO_HARNESS_CMD must be unset for the backend env to win.
+        unsafe { std::env::remove_var("JUNTO_HARNESS_CMD") };
+        let choice = detect_harness_choice();
+        assert_eq!(choice.backend, HarnessBackend::Wsl);
+        unsafe { std::env::remove_var("JUNTO_HARNESS_BACKEND") };
     }
 
     #[test]

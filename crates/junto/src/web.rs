@@ -54,6 +54,10 @@ pub fn router(host: Arc<Host>) -> Router {
             "/channels/{channel}/sessions/{session}/stream",
             get(stream_session),
         )
+        .route(
+            "/channels/{channel}/artifacts/{artifact}",
+            get(view_artifact),
+        )
         .route("/channels/{channel}/rename", post(rename_channel))
         .route("/channels/{channel}/close", post(close_channel))
         .route("/channels/{channel}/reopen", post(reopen_channel))
@@ -488,6 +492,84 @@ async fn stream_session(
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
         .into_response()
+}
+
+/// Serve an artifact's full content (`docs/adr/0020`/`0023`): the memo or diff
+/// the card only snippets inline. Artifact content lives machine-local under
+/// `~/.junto/artifacts/` (never the ledger), referenced by a `file://` URI —
+/// which the desktop webview can't open, so the human surface serves it here.
+///
+/// The URI is taken from the artifact entry, but **not trusted**: an entry can
+/// arrive by sync carrying any path, so the resolved file must sit under this
+/// machine's artifacts root before we read it.
+async fn view_artifact(
+    State(host): State<Arc<Host>>,
+    Path((channel, artifact)): Path<(String, String)>,
+) -> Response {
+    let Ok(artifact_id) = artifact.parse::<EntryId>() else {
+        return (StatusCode::BAD_REQUEST, "not an artifact id").into_response();
+    };
+    let (id, view, _substrate) = match project(&host, &channel).await {
+        Ok(projected) => projected,
+        Err(response) => return response,
+    };
+    let Some(entry) = view.entries.iter().find(|e| e.id == artifact_id) else {
+        return (StatusCode::NOT_FOUND, "no such artifact in this channel").into_response();
+    };
+    let EntryPayload::ArtifactAttached {
+        kind, provenance, ..
+    } = &entry.payload
+    else {
+        return (StatusCode::BAD_REQUEST, "that entry is not an artifact").into_response();
+    };
+    let Some(file) = provenance.first() else {
+        return (StatusCode::NOT_FOUND, "artifact has no stored content").into_response();
+    };
+    let Some(path) = file_uri_to_path(file.uri.as_str()) else {
+        return (StatusCode::BAD_REQUEST, "artifact is not a local file").into_response();
+    };
+    // Defense in depth: only ever read under this machine's artifacts root.
+    let artifacts_root = match crate::host::junto_home() {
+        Ok(home) => home.join("artifacts"),
+        Err(err) => return internal(format!("no junto home: {err}")),
+    };
+    let (canon_path, canon_root) = match (
+        dunce::canonicalize(&path),
+        dunce::canonicalize(&artifacts_root),
+    ) {
+        (Ok(p), Ok(root)) => (p, root),
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                "artifact content is not on this machine",
+            )
+                .into_response();
+        }
+    };
+    if !canon_path.starts_with(&canon_root) {
+        return (StatusCode::FORBIDDEN, "artifact path is outside the store").into_response();
+    }
+    let content = match std::fs::read_to_string(&canon_path) {
+        Ok(content) => content,
+        Err(err) => {
+            return (StatusCode::NOT_FOUND, format!("reading artifact: {err}")).into_response();
+        }
+    };
+    let name = canon_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| kind.clone());
+    Html(render::artifact_html(&id, &name, &content)).into_response()
+}
+
+/// Turn a `file://` URI (as `store_artifact` writes it) back into a path.
+/// Lenient about the Windows `file:///C:/…` vs POSIX `file:////home/…` forms.
+fn file_uri_to_path(uri: &str) -> Option<std::path::PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    // Windows: "/C:/Users/…" → drop the leading slash before the drive.
+    // POSIX:   "//home/…"     → drop one slash, leaving "/home/…".
+    let rest = rest.strip_prefix('/').unwrap_or(rest);
+    Some(std::path::PathBuf::from(rest))
 }
 
 /// The form body for renaming a channel.
@@ -1498,6 +1580,87 @@ mod tests {
         assert_eq!(granted_by.as_deref(), Some("web@example.com"));
 
         unsafe { std::env::remove_var("JUNTO_HARNESS_CMD") };
+    }
+
+    #[tokio::test]
+    async fn view_artifact_serves_content_and_refuses_paths_outside_the_store() {
+        let home = crate::host::test_home::HomeGuard::new();
+        let fx = host_with_entry(assertion()).await;
+        let Resolution::Resolved { ledger, .. } = fx.host.resolve("web-test").await.unwrap() else {
+            panic!("channel resolves");
+        };
+        let session = EntryId::new();
+
+        // An ArtifactAttached entry (authored by a member so it projects)
+        // whose provenance points at `uri`.
+        let attach = |id: EntryId, uri: String| LedgerEntry {
+            id,
+            channel: fx.channel,
+            author: Member::agent("Bot", "bot@example.com"),
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::ArtifactAttached {
+                target: session,
+                kind: "memo".into(),
+                description: "snippet…".into(),
+                provenance: vec![junto_kernel::ProvenanceRef::new(
+                    junto_kernel::Uri::new(uri).expect("uri"),
+                )],
+            },
+        };
+
+        // A real artifact file under this machine's artifacts root.
+        let dir = home.path().join("artifacts").join(session.to_string());
+        std::fs::create_dir_all(&dir).expect("artifact dir");
+        let file = dir.join("turn-1-result.md");
+        std::fs::write(&file, "the FULL agent output\nsecond line").expect("write artifact");
+        let good = EntryId::new();
+        let good_uri = format!("file:///{}", file.display().to_string().replace('\\', "/"));
+        ledger
+            .lock()
+            .await
+            .append(attach(good, good_uri))
+            .await
+            .unwrap();
+
+        // Happy path: the whole content comes back, not just a snippet.
+        let response = view_artifact(
+            State(fx.host.clone()),
+            Path(("web-test".into(), good.to_string())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("the FULL agent output"), "{text}");
+        assert!(text.contains("second line"), "the full body, not a snippet");
+
+        // Guard: a file outside the artifacts root is refused even with a
+        // valid entry (entries can arrive by sync carrying any path).
+        let secret = home.path().join("secret.txt");
+        std::fs::write(&secret, "top secret").unwrap();
+        let evil = EntryId::new();
+        let evil_uri = format!(
+            "file:///{}",
+            secret.display().to_string().replace('\\', "/")
+        );
+        ledger
+            .lock()
+            .await
+            .append(attach(evil, evil_uri))
+            .await
+            .unwrap();
+        let response = view_artifact(
+            State(fx.host.clone()),
+            Path(("web-test".into(), evil.to_string())),
+        )
+        .await;
+        assert_ne!(
+            response.status(),
+            StatusCode::OK,
+            "must not serve a path outside the artifacts root"
+        );
     }
 
     #[tokio::test]

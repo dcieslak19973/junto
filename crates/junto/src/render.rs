@@ -1154,6 +1154,12 @@ pub fn channel_html(
     let start_work = if view.closed {
         String::new()
     } else {
+        // A backend suggestion (e.g. install WSL to stop console windows
+        // flashing) when the harness fell back to native (docs/adr/0023).
+        let hint = match crate::launch::harness_hint() {
+            Some(text) => format!("<p class=\"meta hint\">⚠ {}</p>", escape_html(text)),
+            None => String::new(),
+        };
         format!(
             "<section class=\"board\" id=\"start-work\">\
              <h2 class=\"board-head\">start work</h2>\n\
@@ -1166,7 +1172,7 @@ pub fn channel_html(
              </form>\
              <p class=\"meta\">spawns Claude Code headless in the workspace \
              (docs/adr/0023); progress lands below as the session's state and artifacts</p>\
-             </section>\n",
+             {hint}</section>\n",
             workspace = escape_html(
                 &workspace
                     .map(|p| p.display().to_string())
@@ -1646,9 +1652,21 @@ fn sessions_section(view: &ChannelView, channel: &ChannelId) -> String {
             else {
                 continue;
             };
+            // Link to the full content when there's a stored file — the card
+            // only shows a snippet, and the file:// URI won't open in the
+            // webview (docs/adr/0023).
+            let view_full = if provenance.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "<a class=\"view\" href=\"/channels/{channel}/artifacts/{artifact_id}\">\
+                     view full</a>",
+                    artifact_id = artifact.id,
+                )
+            };
             let _ = writeln!(
                 artifacts,
-                "<li><span class=\"kind\">{kind}</span> {description}{prov}</li>",
+                "<li><span class=\"kind\">{kind}</span> {description}{view_full}{prov}</li>",
                 kind = escape_html(kind),
                 description = escape_html(description),
                 prov = if provenance.is_empty() {
@@ -1697,6 +1715,25 @@ fn sessions_section(view: &ChannelView, channel: &ChannelId) -> String {
         out.push_str(LIVE_FEED_SCRIPT);
     }
     out
+}
+
+/// A standalone page showing one artifact's full content (`docs/adr/0023`):
+/// the memo or diff a session card only snippets inline. Plain and dark, with
+/// a link back — the `file://` provenance URI can't open in the webview, so
+/// this is how a human reads the whole thing.
+pub fn artifact_html(channel: &ChannelId, name: &str, content: &str) -> String {
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+         <title>{name}</title><style>{CSS}</style></head>\
+         <body class=\"app\"><main>\
+         <p><a class=\"back-link\" href=\"/channels/{channel}\">← back to channel</a></p>\
+         <h1>{name}</h1>\
+         <pre class=\"artifact-body\">{content}</pre>\
+         </main></body></html>",
+        name = escape_html(name),
+        content = escape_html(content),
+    )
 }
 
 /// The provenance list, collapsed by default; http(s) URIs become links.
@@ -1951,6 +1988,13 @@ max-height:18rem;overflow-y:auto;border-left:2px solid var(--border);padding-lef
 .le-result{color:var(--green)}\
 .le-error{color:var(--red)}\
 .meta-line{color:var(--muted);font-size:.8rem;margin-top:.45rem}\
+.hint{color:var(--yellow);background:rgba(249,226,175,.07);border:1px solid rgba(249,226,175,.22);\
+border-radius:.5rem;padding:.5rem .7rem;margin-top:.6rem}\
+a.view{color:var(--accent);text-decoration:none;font-size:.8rem;margin-left:.4rem}\
+a.view:hover{text-decoration:underline}\
+.artifact-body{background:var(--panel);border:1px solid var(--border);border-radius:.55rem;\
+padding:1rem 1.1rem;white-space:pre-wrap;overflow-wrap:anywhere;font:.84rem/1.55 ui-monospace,\
+'Cascadia Mono',Consolas,monospace;color:var(--soft)}\
 .target{color:var(--muted);font-size:.82rem;margin-top:.5rem}\
 code{font:.82em ui-monospace,'Cascadia Mono',Consolas,monospace;color:var(--soft);\
 background:var(--panel);padding:.06rem .3rem;border-radius:.3rem}\
