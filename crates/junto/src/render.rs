@@ -1609,11 +1609,16 @@ const SESSIONS_SCRIPT: &str = r#"<script>
     es.addEventListener('end',function(){ es.close(); location.reload(); });
   });
   function loadBody(d){
-    var pre=d.querySelector('.artifact-body');
-    if(!pre||pre.dataset.loaded) return; pre.dataset.loaded='1';
-    fetch(pre.dataset.src).then(function(r){return r.text();})
-      .then(function(t){ pre.textContent=t; })
-      .catch(function(){ pre.textContent='(could not load artifact)'; });
+    var body=d.querySelector('.artifact-body');
+    if(!body||body.dataset.loaded) return; body.dataset.loaded='1';
+    fetch(body.dataset.src).then(function(r){return r.text();})
+      .then(function(t){
+        // Memos arrive as server-rendered (sanitized) HTML; everything else
+        // is raw text set safely via textContent.
+        if(body.dataset.format==='md'){ body.innerHTML=t; }
+        else { body.textContent=t; }
+      })
+      .catch(function(){ body.textContent='(could not load artifact)'; });
   }
   document.querySelectorAll('details.artifact').forEach(function(d){
     if(d.open) loadBody(d);
@@ -1682,17 +1687,30 @@ fn sessions_section(view: &ChannelView, channel: &ChannelId) -> String {
                 );
                 continue;
             }
-            let open = if kind == "memo" { " open" } else { "" };
+            // Markdown memos render to HTML in a flowing block (open by
+            // default — the agent's output as a stream); raw artifacts (a
+            // diff) stay verbatim in a <pre>, collapsed. Both lazy-load.
+            let markdown = is_markdown_artifact(kind);
+            let open = if markdown { " open" } else { "" };
+            let src = format!("/channels/{channel}/artifacts/{}", artifact.id);
+            let body = if markdown {
+                format!(
+                    "<div class=\"artifact-body md\" data-format=\"md\" \
+                     data-src=\"{src}\">loading…</div>"
+                )
+            } else {
+                format!(
+                    "<pre class=\"artifact-body\" data-format=\"text\" \
+                     data-src=\"{src}\">loading…</pre>"
+                )
+            };
             let _ = writeln!(
                 artifacts,
                 "<details class=\"artifact\"{open}>\
                  <summary><span class=\"kind\">{kind}</span> {description}</summary>\
-                 <pre class=\"artifact-body\" \
-                 data-src=\"/channels/{channel}/artifacts/{artifact_id}\">loading…</pre>\
-                 </details>",
+                 {body}</details>",
                 kind = escape_html(kind),
                 description = escape_html(description),
-                artifact_id = artifact.id,
             );
         }
         let artifacts = if artifacts.is_empty() {
@@ -1729,6 +1747,35 @@ fn sessions_section(view: &ChannelView, channel: &ChannelId) -> String {
     // sessions) — the script no-ops for whichever isn't present.
     out.push_str(SESSIONS_SCRIPT);
     out
+}
+
+/// Which artifact kinds are CommonMark (the agent's prose memo) versus raw
+/// text (a diff/patch, a log). Markdown kinds render to HTML; the rest stay
+/// verbatim in a `<pre>`. One concrete markdown kind today (`memo`).
+pub fn is_markdown_artifact(kind: &str) -> bool {
+    kind == "memo"
+}
+
+/// Render an agent memo (CommonMark) to HTML for inline display. Agent output
+/// is **untrusted**: raw HTML embedded in the markdown is neutralized to text
+/// (never injected as markup), so a memo can format itself but never inject
+/// script. The kernel never sees this — it's a render of machine-local
+/// artifact content (`docs/adr/0020`/`0023`).
+pub fn render_markdown(markdown: &str) -> String {
+    use pulldown_cmark::{Event, Options, Parser, html};
+
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+    let events = Parser::new_ext(markdown, options).map(|event| match event {
+        // Escape any raw HTML the agent emitted instead of passing it through.
+        Event::Html(raw) | Event::InlineHtml(raw) => Event::Text(raw),
+        other => other,
+    });
+    let mut html_out = String::new();
+    html::push_html(&mut html_out, events);
+    html_out
 }
 
 /// The provenance list, collapsed by default; http(s) URIs become links.
@@ -1990,9 +2037,28 @@ max-height:18rem;overflow-y:auto;border-left:2px solid var(--border);padding-lef
 .meta-line{color:var(--muted);font-size:.8rem;margin-top:.45rem}\
 .hint{color:var(--yellow);background:rgba(249,226,175,.07);border:1px solid rgba(249,226,175,.22);\
 border-radius:.5rem;padding:.5rem .7rem;margin-top:.6rem}\
-.artifact-body{margin:0;padding:.7rem .85rem;max-height:32rem;overflow:auto;white-space:pre-wrap;\
-overflow-wrap:anywhere;font:.82rem/1.5 ui-monospace,'Cascadia Mono',Consolas,monospace;\
+.artifact-body{margin:0;padding:.7rem .9rem;max-height:34rem;overflow:auto;\
+overflow-wrap:anywhere;color:var(--soft)}\
+pre.artifact-body{white-space:pre-wrap;font:.82rem/1.5 ui-monospace,'Cascadia Mono',Consolas,monospace}\
+.artifact-body.md{font-size:.9rem;line-height:1.6;color:var(--text)}\
+.artifact-body.md>:first-child{margin-top:0}\
+.artifact-body.md>:last-child{margin-bottom:0}\
+.artifact-body.md h1,.artifact-body.md h2,.artifact-body.md h3{line-height:1.3;margin:1.1rem 0 .5rem}\
+.artifact-body.md h1{font-size:1.2rem}.artifact-body.md h2{font-size:1.08rem}\
+.artifact-body.md h3{font-size:.98rem}\
+.artifact-body.md p{margin:.55rem 0}\
+.artifact-body.md ul,.artifact-body.md ol{margin:.5rem 0;padding-left:1.3rem}\
+.artifact-body.md li{margin:.2rem 0}\
+.artifact-body.md code{font:.85em ui-monospace,'Cascadia Mono',Consolas,monospace;\
+background:var(--bg);padding:.06rem .3rem;border-radius:.3rem}\
+.artifact-body.md pre{background:var(--bg);border:1px solid var(--border);border-radius:.45rem;\
+padding:.7rem .85rem;overflow:auto}\
+.artifact-body.md pre code{background:none;padding:0}\
+.artifact-body.md a{color:var(--accent)}\
+.artifact-body.md blockquote{margin:.5rem 0;padding-left:.8rem;border-left:2px solid var(--border);\
 color:var(--soft)}\
+.artifact-body.md table{border-collapse:collapse;margin:.5rem 0}\
+.artifact-body.md th,.artifact-body.md td{border:1px solid var(--border);padding:.3rem .55rem}\
 .target{color:var(--muted);font-size:.82rem;margin-top:.5rem}\
 code{font:.82em ui-monospace,'Cascadia Mono',Consolas,monospace;color:var(--soft);\
 background:var(--panel);padding:.06rem .3rem;border-radius:.3rem}\
@@ -2113,6 +2179,28 @@ mod tests {
             timestamp: Timestamp::from_millis(1_781_046_734_155),
             payload,
         }
+    }
+
+    #[test]
+    fn only_memos_render_as_markdown() {
+        assert!(is_markdown_artifact("memo"));
+        assert!(!is_markdown_artifact("diff"));
+        assert!(!is_markdown_artifact("log"));
+    }
+
+    #[test]
+    fn markdown_renders_and_neutralizes_raw_html() {
+        let html = render_markdown(
+            "# Heading\n\nsome **bold** and `code`.\n\n- one\n- two\n\n\
+             <script>alert('x')</script>",
+        );
+        assert!(html.contains("<h1>Heading</h1>"), "{html}");
+        assert!(html.contains("<strong>bold</strong>"), "{html}");
+        assert!(html.contains("<code>code</code>"), "{html}");
+        assert!(html.contains("<li>one</li>"), "{html}");
+        // Agent output is untrusted: raw HTML is escaped, never injected.
+        assert!(!html.contains("<script>"), "{html}");
+        assert!(html.contains("&lt;script&gt;"), "{html}");
     }
 
     #[test]

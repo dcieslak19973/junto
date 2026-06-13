@@ -516,7 +516,10 @@ async fn view_artifact(
     let Some(entry) = view.entries.iter().find(|e| e.id == artifact_id) else {
         return (StatusCode::NOT_FOUND, "no such artifact in this channel").into_response();
     };
-    let EntryPayload::ArtifactAttached { provenance, .. } = &entry.payload else {
+    let EntryPayload::ArtifactAttached {
+        kind, provenance, ..
+    } = &entry.payload
+    else {
         return (StatusCode::BAD_REQUEST, "that entry is not an artifact").into_response();
     };
     let Some(file) = provenance.first() else {
@@ -552,13 +555,22 @@ async fn view_artifact(
             return (StatusCode::NOT_FOUND, format!("reading artifact: {err}")).into_response();
         }
     };
-    // Raw text so the session card can fetch and expand it inline (the card's
-    // `<details>` lazy-loads this), not a standalone page.
-    (
-        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        content,
-    )
-        .into_response()
+    // The card's `<details>` lazy-loads this inline. A memo is the agent's
+    // prose — render it as (sanitized) CommonMark HTML; a diff and other raw
+    // artifacts stay verbatim as text.
+    if render::is_markdown_artifact(kind) {
+        (
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            render::render_markdown(&content),
+        )
+            .into_response()
+    } else {
+        (
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            content,
+        )
+            .into_response()
+    }
 }
 
 /// Turn a `file://` URI (as `store_artifact` writes it) back into a path.
