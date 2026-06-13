@@ -237,6 +237,10 @@ async fn run_turn(workspace: &Path, prompt: &str, resume: Option<&str>) -> TurnO
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // CLAUDE.md (terminal-less): never flash a console window for the harness;
+    // its output is captured as a memo/diff Artifact, not shown as scrollback.
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
 
     let mut spawned = match command.spawn() {
         Ok(child) => child,
@@ -334,16 +338,28 @@ fn store_artifact(
     Ok(ProvenanceRef::with_digest(uri, digest))
 }
 
+/// Suppress the console window Windows flashes when a GUI-hosted process
+/// spawns a console child. CLAUDE.md (terminal-less): agent and tool output
+/// is captured as Artifacts, never rendered as scrollback — and never as a
+/// flashed window. A no-op off Windows.
+fn no_console_window(command: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    #[cfg(not(windows))]
+    let _ = command;
+}
+
 /// The workspace's uncommitted changes (`git diff HEAD` + untracked names),
 /// or `None` when clean.
 fn workspace_diff(workspace: &Path) -> Option<String> {
     let run = |args: &[&str]| -> Option<String> {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(workspace)
-            .args(args)
-            .output()
-            .ok()?;
+        let mut command = std::process::Command::new("git");
+        command.arg("-C").arg(workspace).args(args);
+        no_console_window(&mut command);
+        let out = command.output().ok()?;
         Some(String::from_utf8_lossy(&out.stdout).to_string())
     };
     let status = run(&["status", "--porcelain"])?;
