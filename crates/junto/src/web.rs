@@ -556,20 +556,18 @@ async fn view_artifact(
         }
     };
     // The card's `<details>` lazy-loads this inline. A memo is the agent's
-    // prose — render it as (sanitized) CommonMark HTML; a diff and other raw
-    // artifacts stay verbatim as text.
-    if render::is_markdown_artifact(kind) {
-        (
-            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-            render::render_markdown(&content),
-        )
-            .into_response()
-    } else {
-        (
+    // prose (rendered as sanitized CommonMark); a diff gets per-line colour;
+    // everything else stays verbatim as text.
+    let html =
+        |body: String| ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], body).into_response();
+    match render::artifact_format(kind) {
+        render::ArtifactFormat::Markdown => html(render::render_markdown(&content)),
+        render::ArtifactFormat::Diff => html(render::render_diff(&content)),
+        render::ArtifactFormat::Raw => (
             [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
             content,
         )
-            .into_response()
+            .into_response(),
     }
 }
 

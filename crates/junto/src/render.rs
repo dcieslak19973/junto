@@ -1613,9 +1613,9 @@ const SESSIONS_SCRIPT: &str = r#"<script>
     if(!body||body.dataset.loaded) return; body.dataset.loaded='1';
     fetch(body.dataset.src).then(function(r){return r.text();})
       .then(function(t){
-        // Memos arrive as server-rendered (sanitized) HTML; everything else
-        // is raw text set safely via textContent.
-        if(body.dataset.format==='md'){ body.innerHTML=t; }
+        // Memos and diffs arrive as server-rendered (sanitized) HTML;
+        // everything else is raw text set safely via textContent.
+        if(body.dataset.format==='html'){ body.innerHTML=t; }
         else { body.textContent=t; }
       })
       .catch(function(){ body.textContent='(could not load artifact)'; });
@@ -1687,22 +1687,30 @@ fn sessions_section(view: &ChannelView, channel: &ChannelId) -> String {
                 );
                 continue;
             }
-            // Markdown memos render to HTML in a flowing block (open by
-            // default — the agent's output as a stream); raw artifacts (a
-            // diff) stay verbatim in a <pre>, collapsed. Both lazy-load.
-            let markdown = is_markdown_artifact(kind);
-            let open = if markdown { " open" } else { "" };
-            let src = format!("/channels/{channel}/artifacts/{}", artifact.id);
-            let body = if markdown {
-                format!(
-                    "<div class=\"artifact-body md\" data-format=\"md\" \
-                     data-src=\"{src}\">loading…</div>"
-                )
+            // The memo renders as markdown and opens by default (the agent's
+            // output as a stream); a diff renders with coloured lines and
+            // starts collapsed (bulky); anything else is verbatim text. All
+            // lazy-load their body from the artifact endpoint.
+            let format = artifact_format(kind);
+            let open = if format == ArtifactFormat::Markdown {
+                " open"
             } else {
-                format!(
+                ""
+            };
+            let src = format!("/channels/{channel}/artifacts/{}", artifact.id);
+            let body = match format {
+                ArtifactFormat::Markdown => format!(
+                    "<div class=\"artifact-body md\" data-format=\"html\" \
+                     data-src=\"{src}\">loading…</div>"
+                ),
+                ArtifactFormat::Diff => format!(
+                    "<div class=\"artifact-body diff\" data-format=\"html\" \
+                     data-src=\"{src}\">loading…</div>"
+                ),
+                ArtifactFormat::Raw => format!(
                     "<pre class=\"artifact-body\" data-format=\"text\" \
                      data-src=\"{src}\">loading…</pre>"
-                )
+                ),
             };
             let _ = writeln!(
                 artifacts,
@@ -1749,11 +1757,58 @@ fn sessions_section(view: &ChannelView, channel: &ChannelId) -> String {
     out
 }
 
-/// Which artifact kinds are CommonMark (the agent's prose memo) versus raw
-/// text (a diff/patch, a log). Markdown kinds render to HTML; the rest stay
-/// verbatim in a `<pre>`. One concrete markdown kind today (`memo`).
-pub fn is_markdown_artifact(kind: &str) -> bool {
-    kind == "memo"
+/// How an artifact's content is presented on the human surface.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ArtifactFormat {
+    /// The agent's prose memo — rendered as CommonMark.
+    Markdown,
+    /// A unified diff — rendered with per-line add/remove/hunk colouring.
+    Diff,
+    /// Anything else (a log, a chart dump) — shown verbatim in a `<pre>`.
+    Raw,
+}
+
+/// The presentation for an artifact kind. Markdown and diff render to HTML;
+/// the rest stay verbatim. Two concrete formatted kinds today (`memo`,
+/// `diff`) — a playbook's own kinds fall through to raw.
+pub fn artifact_format(kind: &str) -> ArtifactFormat {
+    match kind {
+        "memo" => ArtifactFormat::Markdown,
+        "diff" => ArtifactFormat::Diff,
+        _ => ArtifactFormat::Raw,
+    }
+}
+
+/// Render a unified diff to HTML, one coloured line per row: additions green,
+/// removals red, hunk headers and file/metadata lines tinted. Pure text → no
+/// markup can leak (every line is escaped); the kernel never sees this.
+pub fn render_diff(diff: &str) -> String {
+    let mut out = String::new();
+    for line in diff.lines() {
+        let class = if line.starts_with("@@") {
+            "d-hunk"
+        } else if line.starts_with("+++")
+            || line.starts_with("---")
+            || line.starts_with("diff ")
+            || line.starts_with("index ")
+            || line.starts_with("new file")
+            || line.starts_with("deleted file")
+            || line.starts_with("rename ")
+            || line.starts_with("similarity ")
+            || line.starts_with("old mode")
+            || line.starts_with("new mode")
+        {
+            "d-meta"
+        } else if line.starts_with('+') {
+            "d-add"
+        } else if line.starts_with('-') {
+            "d-del"
+        } else {
+            "d-ctx"
+        };
+        let _ = writeln!(out, "<div class=\"dl {class}\">{}</div>", escape_html(line));
+    }
+    out
 }
 
 /// Render an agent memo (CommonMark) to HTML for inline display. Agent output
@@ -2059,6 +2114,13 @@ padding:.7rem .85rem;overflow:auto}\
 color:var(--soft)}\
 .artifact-body.md table{border-collapse:collapse;margin:.5rem 0}\
 .artifact-body.md th,.artifact-body.md td{border:1px solid var(--border);padding:.3rem .55rem}\
+.artifact-body.diff{padding:.5rem 0;font:.82rem/1.45 ui-monospace,'Cascadia Mono',Consolas,monospace}\
+.artifact-body.diff .dl{white-space:pre;padding:0 .9rem;min-height:1.25em}\
+.d-add{background:rgba(166,227,161,.10);color:var(--green)}\
+.d-del{background:rgba(243,139,168,.10);color:var(--red)}\
+.d-hunk{color:var(--teal)}\
+.d-meta{color:var(--muted)}\
+.d-ctx{color:var(--soft)}\
 .target{color:var(--muted);font-size:.82rem;margin-top:.5rem}\
 code{font:.82em ui-monospace,'Cascadia Mono',Consolas,monospace;color:var(--soft);\
 background:var(--panel);padding:.06rem .3rem;border-radius:.3rem}\
@@ -2182,10 +2244,25 @@ mod tests {
     }
 
     #[test]
-    fn only_memos_render_as_markdown() {
-        assert!(is_markdown_artifact("memo"));
-        assert!(!is_markdown_artifact("diff"));
-        assert!(!is_markdown_artifact("log"));
+    fn artifact_formats_map_by_kind() {
+        assert_eq!(artifact_format("memo"), ArtifactFormat::Markdown);
+        assert_eq!(artifact_format("diff"), ArtifactFormat::Diff);
+        assert_eq!(artifact_format("log"), ArtifactFormat::Raw);
+    }
+
+    #[test]
+    fn diff_colouring_classifies_lines() {
+        let html = render_diff("diff --git a/x b/x\n@@ -1,2 +1,2 @@\n context\n-removed\n+added\n");
+        assert!(html.contains("d-meta"), "{html}");
+        assert!(html.contains("d-hunk"), "{html}");
+        assert!(
+            html.contains("<div class=\"dl d-del\">-removed</div>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<div class=\"dl d-add\">+added</div>"),
+            "{html}"
+        );
     }
 
     #[test]
