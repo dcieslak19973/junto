@@ -116,6 +116,9 @@ pub(crate) struct HarnessStatus {
     pub(crate) detail: String,
     /// `native`, `WSL`, or `detecting…`.
     pub(crate) backend: &'static str,
+    /// How the harness authenticates — read-only status, never a stored key
+    /// (auth stays with the harness, `docs/adr/0024`).
+    pub(crate) auth: &'static str,
     /// The flashing/setup suggestion, if any.
     pub(crate) hint: Option<&'static str>,
 }
@@ -141,10 +144,17 @@ pub(crate) fn harness_status() -> HarnessStatus {
         },
         None => "detecting…",
     };
+    // Auth status only — junto never stores a key; the harness owns its auth.
+    let auth = if std::env::var_os("ANTHROPIC_API_KEY").is_some() {
+        "Claude: API key (ANTHROPIC_API_KEY set)"
+    } else {
+        "Claude: subscription login (no API key)"
+    };
     HarnessStatus {
         protocol,
         detail,
         backend,
+        auth,
         hint: harness_hint(),
     }
 }

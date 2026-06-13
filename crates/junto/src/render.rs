@@ -931,6 +931,7 @@ pub fn settings_html(
          <dl class=\"settings\">\
          <dt>harness protocol</dt><dd>{protocol} <span class=\"when\">{detail}</span></dd>\
          <dt>execution backend</dt><dd>{backend}</dd>\
+         <dt>auth</dt><dd>{auth}</dd>\
          </dl>{hint}</section>\n\
          <section class=\"board\"><h2 class=\"board-head\">substrates</h2>\
          <ul class=\"settings-list\">{substrate_items}</ul>\
@@ -945,6 +946,7 @@ pub fn settings_html(
         protocol = escape_html(status.protocol),
         detail = escape_html(&status.detail),
         backend = escape_html(status.backend),
+        auth = escape_html(status.auth),
         version = escape_html(version),
         host = escape_html(host_url),
     );
@@ -2477,6 +2479,7 @@ mod tests {
             protocol: "ACP",
             detail: "adapter: npx.cmd -y @agentclientprotocol/claude-agent-acp".to_string(),
             backend: "native",
+            auth: "Claude: subscription login (no API key)",
             hint: None,
         };
         let substrates = vec![std::path::PathBuf::from("/repo/ledger")];
