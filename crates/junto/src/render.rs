@@ -777,6 +777,7 @@ fn page_shell(
          <a class=\"chan open-link\" href=\"/new#open-channel\">open a channel…</a>\
          <a class=\"chan open-link\" href=\"/new#setup-repo\">set up a repo…</a>\
          </details>\n\
+         <a class=\"chan open-link side-settings\" href=\"/settings\">⚙ settings</a>\n\
          </nav>\n\
          <main>\n{content}</main>\n\
          </div>{ACT_FEEDBACK_SCRIPT}</body></html>\n",
@@ -894,6 +895,60 @@ pub fn new_html(nav: &[ChannelSummary], substrates: &[std::path::PathBuf]) -> St
         repo_form = setup_repo_form(),
     );
     page_shell("junto — new", nav, None, &content)
+}
+
+/// The "/settings" page — machine-local preferences & status behind the
+/// sidebar's ⚙. Read-only for now: how the harness runs (protocol + backend,
+/// `docs/adr/0023`/`0024`), the registered substrates, and identity/about.
+pub fn settings_html(
+    nav: &[ChannelSummary],
+    substrates: &[std::path::PathBuf],
+    status: &crate::launch::HarnessStatus,
+    identity: Option<(&str, &str)>,
+    version: &str,
+    host_url: &str,
+) -> String {
+    let hint = match status.hint {
+        Some(text) => format!("<p class=\"meta hint\">⚠ {}</p>", escape_html(text)),
+        None => String::new(),
+    };
+    let substrate_items: String = if substrates.is_empty() {
+        "<li class=\"empty\">none registered — set up a repo to add one</li>".to_string()
+    } else {
+        substrates
+            .iter()
+            .map(|repo| format!("<li>{}</li>", escape_html(&repo.display().to_string())))
+            .collect()
+    };
+    let who = match identity {
+        Some((name, email)) => format!("{} &lt;{}&gt;", escape_html(name), escape_html(email)),
+        None => "(no git user configured)".to_string(),
+    };
+    let content = format!(
+        "<h1>settings</h1>\n\
+         <p class=\"meta\">how this machine runs junto — read-only for now</p>\n\
+         <section class=\"board\"><h2 class=\"board-head\">execution</h2>\
+         <dl class=\"settings\">\
+         <dt>harness protocol</dt><dd>{protocol} <span class=\"when\">{detail}</span></dd>\
+         <dt>execution backend</dt><dd>{backend}</dd>\
+         </dl>{hint}</section>\n\
+         <section class=\"board\"><h2 class=\"board-head\">substrates</h2>\
+         <ul class=\"settings-list\">{substrate_items}</ul>\
+         <p class=\"meta\"><a class=\"view\" href=\"/new#setup-repo\">+ set up another repo</a></p>\
+         </section>\n\
+         <section class=\"board\"><h2 class=\"board-head\">identity &amp; about</h2>\
+         <dl class=\"settings\">\
+         <dt>you act as</dt><dd>{who}</dd>\
+         <dt>junto version</dt><dd>{version}</dd>\
+         <dt>host</dt><dd><a class=\"view\" href=\"{host}\">{host}</a></dd>\
+         </dl></section>\n",
+        protocol = escape_html(status.protocol),
+        detail = escape_html(&status.detail),
+        backend = escape_html(status.backend),
+        version = escape_html(version),
+        host = escape_html(host_url),
+    );
+    page_shell("junto — settings", nav, None, &content)
 }
 
 /// The set-up-a-repo form: the terminal-less `junto init`. Registers the
@@ -2092,6 +2147,13 @@ max-height:18rem;overflow-y:auto;border-left:2px solid var(--border);padding-lef
 .meta-line{color:var(--muted);font-size:.8rem;margin-top:.45rem}\
 .hint{color:var(--yellow);background:rgba(249,226,175,.07);border:1px solid rgba(249,226,175,.22);\
 border-radius:.5rem;padding:.5rem .7rem;margin-top:.6rem}\
+.side-settings{margin-top:.35rem}\
+dl.settings{display:grid;grid-template-columns:auto 1fr;gap:.4rem 1.2rem;margin:.6rem 0 0;font-size:.9rem}\
+dl.settings dt{color:var(--muted)}\
+dl.settings dd{margin:0;color:var(--text);overflow-wrap:anywhere}\
+ul.settings-list{list-style:none;margin:.5rem 0 0;padding:0;font:.85rem ui-monospace,\
+'Cascadia Mono',Consolas,monospace}\
+ul.settings-list li{padding:.25rem 0;color:var(--soft);overflow-wrap:anywhere}\
 .artifact-body{margin:0;padding:.7rem .9rem;max-height:34rem;overflow:auto;\
 overflow-wrap:anywhere;color:var(--soft)}\
 pre.artifact-body{white-space:pre-wrap;font:.82rem/1.5 ui-monospace,'Cascadia Mono',Consolas,monospace}\
@@ -2407,6 +2469,33 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("value=\"old-name\""), "{html}");
+    }
+
+    #[test]
+    fn settings_page_shows_execution_substrates_and_identity() {
+        let status = crate::launch::HarnessStatus {
+            protocol: "ACP",
+            detail: "adapter: npx.cmd -y @agentclientprotocol/claude-agent-acp".to_string(),
+            backend: "native",
+            hint: None,
+        };
+        let substrates = vec![std::path::PathBuf::from("/repo/ledger")];
+        let html = settings_html(
+            &[],
+            &substrates,
+            &status,
+            Some(("Dan Cieslak", "dan@example.com")),
+            "9.9.9",
+            "http://127.0.0.1:1727",
+        );
+        assert!(html.contains("settings"), "{html}");
+        assert!(html.contains("execution"), "has the execution section");
+        assert!(html.contains("ACP"), "shows the harness protocol");
+        assert!(html.contains("/repo/ledger"), "lists the substrate");
+        assert!(html.contains("Dan Cieslak"), "shows the identity");
+        assert!(html.contains("9.9.9"), "shows the version");
+        // The gear lives in every page's sidebar.
+        assert!(html.contains("/settings"), "the sidebar links to settings");
     }
 
     #[test]

@@ -42,6 +42,7 @@ pub fn router(host: Arc<Host>) -> Router {
     Router::new()
         .route("/", get(index_page))
         .route("/new", get(new_page))
+        .route("/settings", get(settings_page))
         .route("/channels", post(open_channel))
         .route("/repos", post(setup_repo))
         .route("/channels/{channel}", get(channel_page))
@@ -135,6 +136,32 @@ async fn new_page(State(host): State<Arc<Host>>) -> Response {
     nav.sort_by_key(|summary| std::cmp::Reverse(summary.last_activity));
     let substrates = host.substrate_paths().unwrap_or_default();
     Html(render::new_html(&nav, &substrates)).into_response()
+}
+
+/// The "/settings" page behind the sidebar's ⚙: machine-local preferences and
+/// status — how the harness runs (`docs/adr/0023`/`0024`), the registered
+/// substrates, and the identity human-surface acts author as. Read-only.
+async fn settings_page(State(host): State<Arc<Host>>) -> Response {
+    let mut nav = host.inventory().await.unwrap_or_default();
+    nav.sort_by_key(|summary| std::cmp::Reverse(summary.last_activity));
+    let substrates = host.substrate_paths().unwrap_or_default();
+    let status = crate::launch::harness_status();
+    // Who human-surface acts author as: the git user of the first substrate.
+    let identity = substrates
+        .first()
+        .and_then(|repo| crate::host::git_user(repo).ok());
+    let identity_pair = identity
+        .as_ref()
+        .map(|member| (member.display_name.as_str(), member.email.as_str()));
+    Html(render::settings_html(
+        &nav,
+        &substrates,
+        &status,
+        identity_pair,
+        env!("CARGO_PKG_VERSION"),
+        "http://127.0.0.1:1727",
+    ))
+    .into_response()
 }
 
 /// The form body for opening a channel from the index page.
