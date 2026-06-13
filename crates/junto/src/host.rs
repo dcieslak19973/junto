@@ -94,10 +94,11 @@ pub fn register_substrate(junto_home: &Path, repo: &Path) -> Result<()> {
 /// (`docs/adr/0012`); git config is just the sensible machine-user default.
 pub fn git_user(repo: &Path) -> Result<Member> {
     let get = |key: &str| -> Result<String> {
-        let out = std::process::Command::new("git")
-            .args(["-C", &repo.display().to_string(), "config", key])
-            .output()
-            .context("running git config")?;
+        let mut command = std::process::Command::new("git");
+        command.args(["-C", &repo.display().to_string(), "config", key]);
+        // Terminal-less: no flashed console window (runs on every human act).
+        crate::launch::no_console_window(&mut command);
+        let out = command.output().context("running git config")?;
         if !out.status.success() {
             bail!("git config {key} is unset");
         }
@@ -204,6 +205,9 @@ pub struct Host {
     /// Ledgers opened so far, keyed by substrate repo path — cached so each
     /// repo has one append-serializing mutex for the host's lifetime.
     ledgers: Mutex<HashMap<PathBuf, SharedLedger>>,
+    /// In-memory live-progress feeds for running Agent Sessions
+    /// (`docs/adr/0023`) — ephemeral, never part of the record.
+    live: crate::launch::LiveSessions,
 }
 
 impl Host {
@@ -213,6 +217,7 @@ impl Host {
             substrates: Substrates::Registry(junto_home),
             member_home_override: None,
             ledgers: Mutex::new(HashMap::new()),
+            live: crate::launch::LiveSessions::default(),
         })
     }
 
@@ -236,7 +241,15 @@ impl Host {
             substrates: Substrates::Fixed(repos),
             member_home_override: member_home,
             ledgers: Mutex::new(HashMap::new()),
+            live: crate::launch::LiveSessions::default(),
         })
+    }
+
+    /// The in-memory live-progress feeds for running Agent Sessions
+    /// (`docs/adr/0023`). The web SSE endpoint subscribes; a launched turn
+    /// publishes. Ephemeral — never the durable record.
+    pub fn live(&self) -> &crate::launch::LiveSessions {
+        &self.live
     }
 
     /// Where this host's member-code store lives (`docs/adr/0017`): the

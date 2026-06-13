@@ -105,6 +105,12 @@ impl GitRefsSubstrate {
             Stdio::null()
         });
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        // Terminal-less (CLAUDE.md): the host shells out to git constantly
+        // (every read, append, push, fetch, sync). On Windows each spawn would
+        // flash a console window; suppress it. This is the single chokepoint
+        // for all production git, so the whole substrate goes quiet.
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
 
         let mut child = cmd
             .spawn()

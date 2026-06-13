@@ -1154,6 +1154,12 @@ pub fn channel_html(
     let start_work = if view.closed {
         String::new()
     } else {
+        // A backend suggestion (e.g. install WSL to stop console windows
+        // flashing) when the harness fell back to native (docs/adr/0023).
+        let hint = match crate::launch::harness_hint() {
+            Some(text) => format!("<p class=\"meta hint\">⚠ {}</p>", escape_html(text)),
+            None => String::new(),
+        };
         format!(
             "<section class=\"board\" id=\"start-work\">\
              <h2 class=\"board-head\">start work</h2>\n\
@@ -1166,7 +1172,7 @@ pub fn channel_html(
              </form>\
              <p class=\"meta\">spawns Claude Code headless in the workspace \
              (docs/adr/0023); progress lands below as the session's state and artifacts</p>\
-             </section>\n",
+             {hint}</section>\n",
             workspace = escape_html(
                 &workspace
                     .map(|p| p.display().to_string())
@@ -1574,6 +1580,53 @@ fn entry_card(entry: &LedgerEntry, view: &ChannelView, channel: &ChannelId) -> S
 /// reviews instead of scrollback), and a steer box once the turn has landed
 /// (`docs/adr/0023`: steering is between turns). Empty when the channel has
 /// none.
+/// Client wiring for agent sessions (`docs/adr/0023`), two parts:
+/// - **Live feeds:** each running `.live` box opens an `EventSource`, appends a
+///   structured progress line per `live` event, and reloads to the persisted
+///   outcome on `end`. Read-only — steering stays a separate recorded POST.
+/// - **Inline output:** each `details.artifact` lazy-loads its full body (the
+///   memo/diff) from the artifact endpoint the first time it's open, so the
+///   agent's output reads inline as a stream instead of a snippet + link.
+///
+/// All text is set via `textContent`, so agent output can never inject markup
+/// (a feed/stream, not scrollback).
+const SESSIONS_SCRIPT: &str = r#"<script>
+(function(){
+  document.querySelectorAll('.live').forEach(function(box){
+    if(box.dataset.wired) return; box.dataset.wired='1';
+    var feed=box.querySelector('.live-feed');
+    var url='/channels/'+box.dataset.channel+'/sessions/'+box.dataset.session+'/stream';
+    var es=new EventSource(url);
+    var marks={tool:'⚙ ',status:'· ',result:'✓ ',error:'✗ '};
+    es.addEventListener('live',function(e){
+      var ev; try{ev=JSON.parse(e.data);}catch(_){return;}
+      var li=document.createElement('li');
+      li.className='le le-'+(ev.kind||'status');
+      li.textContent=(marks[ev.kind]||'')+(ev.text||'');
+      feed.appendChild(li);
+      feed.scrollTop=feed.scrollHeight;
+    });
+    es.addEventListener('end',function(){ es.close(); location.reload(); });
+  });
+  function loadBody(d){
+    var body=d.querySelector('.artifact-body');
+    if(!body||body.dataset.loaded) return; body.dataset.loaded='1';
+    fetch(body.dataset.src).then(function(r){return r.text();})
+      .then(function(t){
+        // Memos and diffs arrive as server-rendered (sanitized) HTML;
+        // everything else is raw text set safely via textContent.
+        if(body.dataset.format==='html'){ body.innerHTML=t; }
+        else { body.textContent=t; }
+      })
+      .catch(function(){ body.textContent='(could not load artifact)'; });
+  }
+  document.querySelectorAll('details.artifact').forEach(function(d){
+    if(d.open) loadBody(d);
+    d.addEventListener('toggle',function(){ if(d.open) loadBody(d); });
+  });
+})();
+</script>"#;
+
 fn sessions_section(view: &ChannelView, channel: &ChannelId) -> String {
     // Sessions render newest-first; entries are already canonical, so walk
     // them in reverse and pick the session subjects.
@@ -1598,9 +1651,12 @@ fn sessions_section(view: &ChannelView, channel: &ChannelId) -> String {
                  </form>",
                 session_id = entry.id,
             ),
-            SessionState::Working => {
-                "<p class=\"meta\">running — artifacts land here when the turn ends</p>".to_string()
-            }
+            SessionState::Working => format!(
+                "<div class=\"live\" data-channel=\"{channel}\" data-session=\"{session_id}\">\
+                 <p class=\"live-status\">running — live progress</p>\
+                 <ul class=\"live-feed\"></ul></div>",
+                session_id = entry.id,
+            ),
             _ => String::new(),
         };
         let mut artifacts = String::new();
@@ -1617,22 +1673,58 @@ fn sessions_section(view: &ChannelView, channel: &ChannelId) -> String {
             else {
                 continue;
             };
+            // The agent's output reads inline as a stream: the memo expands
+            // open by default; bulkier artifacts (the diff) start collapsed.
+            // The full body lazy-loads from the artifact endpoint — content
+            // lives machine-local, never the ledger (docs/adr/0020/0023).
+            if provenance.is_empty() {
+                let _ = writeln!(
+                    artifacts,
+                    "<div class=\"artifact-note\"><span class=\"kind\">{kind}</span> \
+                     {description}</div>",
+                    kind = escape_html(kind),
+                    description = escape_html(description),
+                );
+                continue;
+            }
+            // The memo renders as markdown and opens by default (the agent's
+            // output as a stream); a diff renders with coloured lines and
+            // starts collapsed (bulky); anything else is verbatim text. All
+            // lazy-load their body from the artifact endpoint.
+            let format = artifact_format(kind);
+            let open = if format == ArtifactFormat::Markdown {
+                " open"
+            } else {
+                ""
+            };
+            let src = format!("/channels/{channel}/artifacts/{}", artifact.id);
+            let body = match format {
+                ArtifactFormat::Markdown => format!(
+                    "<div class=\"artifact-body md\" data-format=\"html\" \
+                     data-src=\"{src}\">loading…</div>"
+                ),
+                ArtifactFormat::Diff => format!(
+                    "<div class=\"artifact-body diff\" data-format=\"html\" \
+                     data-src=\"{src}\">loading…</div>"
+                ),
+                ArtifactFormat::Raw => format!(
+                    "<pre class=\"artifact-body\" data-format=\"text\" \
+                     data-src=\"{src}\">loading…</pre>"
+                ),
+            };
             let _ = writeln!(
                 artifacts,
-                "<li><span class=\"kind\">{kind}</span> {description}{prov}</li>",
+                "<details class=\"artifact\"{open}>\
+                 <summary><span class=\"kind\">{kind}</span> {description}</summary>\
+                 {body}</details>",
                 kind = escape_html(kind),
                 description = escape_html(description),
-                prov = if provenance.is_empty() {
-                    String::new()
-                } else {
-                    provenance_details(provenance)
-                },
             );
         }
         let artifacts = if artifacts.is_empty() {
             String::new()
         } else {
-            format!("<ul class=\"artifacts\">{artifacts}</ul>")
+            format!("<div class=\"artifacts\">{artifacts}</div>")
         };
         let _ = writeln!(
             cards,
@@ -1653,13 +1745,92 @@ fn sessions_section(view: &ChannelView, channel: &ChannelId) -> String {
         );
     }
     if cards.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "<section class=\"board\"><h2 class=\"board-head\">agent sessions</h2>\n\
-             {cards}</section>\n"
-        )
+        return String::new();
     }
+    let mut out = format!(
+        "<section class=\"board\"><h2 class=\"board-head\">agent sessions</h2>\n\
+         {cards}</section>\n"
+    );
+    // Wire live feeds (running sessions) and inline artifact loading (done
+    // sessions) — the script no-ops for whichever isn't present.
+    out.push_str(SESSIONS_SCRIPT);
+    out
+}
+
+/// How an artifact's content is presented on the human surface.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ArtifactFormat {
+    /// The agent's prose memo — rendered as CommonMark.
+    Markdown,
+    /// A unified diff — rendered with per-line add/remove/hunk colouring.
+    Diff,
+    /// Anything else (a log, a chart dump) — shown verbatim in a `<pre>`.
+    Raw,
+}
+
+/// The presentation for an artifact kind. Markdown and diff render to HTML;
+/// the rest stay verbatim. Two concrete formatted kinds today (`memo`,
+/// `diff`) — a playbook's own kinds fall through to raw.
+pub fn artifact_format(kind: &str) -> ArtifactFormat {
+    match kind {
+        "memo" => ArtifactFormat::Markdown,
+        "diff" => ArtifactFormat::Diff,
+        _ => ArtifactFormat::Raw,
+    }
+}
+
+/// Render a unified diff to HTML, one coloured line per row: additions green,
+/// removals red, hunk headers and file/metadata lines tinted. Pure text → no
+/// markup can leak (every line is escaped); the kernel never sees this.
+pub fn render_diff(diff: &str) -> String {
+    let mut out = String::new();
+    for line in diff.lines() {
+        let class = if line.starts_with("@@") {
+            "d-hunk"
+        } else if line.starts_with("+++")
+            || line.starts_with("---")
+            || line.starts_with("diff ")
+            || line.starts_with("index ")
+            || line.starts_with("new file")
+            || line.starts_with("deleted file")
+            || line.starts_with("rename ")
+            || line.starts_with("similarity ")
+            || line.starts_with("old mode")
+            || line.starts_with("new mode")
+        {
+            "d-meta"
+        } else if line.starts_with('+') {
+            "d-add"
+        } else if line.starts_with('-') {
+            "d-del"
+        } else {
+            "d-ctx"
+        };
+        let _ = writeln!(out, "<div class=\"dl {class}\">{}</div>", escape_html(line));
+    }
+    out
+}
+
+/// Render an agent memo (CommonMark) to HTML for inline display. Agent output
+/// is **untrusted**: raw HTML embedded in the markdown is neutralized to text
+/// (never injected as markup), so a memo can format itself but never inject
+/// script. The kernel never sees this — it's a render of machine-local
+/// artifact content (`docs/adr/0020`/`0023`).
+pub fn render_markdown(markdown: &str) -> String {
+    use pulldown_cmark::{Event, Options, Parser, html};
+
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+    let events = Parser::new_ext(markdown, options).map(|event| match event {
+        // Escape any raw HTML the agent emitted instead of passing it through.
+        Event::Html(raw) | Event::InlineHtml(raw) => Event::Text(raw),
+        other => other,
+    });
+    let mut html_out = String::new();
+    html::push_html(&mut html_out, events);
+    html_out
 }
 
 /// The provenance list, collapsed by default; http(s) URIs become links.
@@ -1898,9 +2069,58 @@ border-color:rgba(137,180,250,.3)}\
 .who{color:var(--soft);font-size:.82rem}\
 .when{color:var(--muted);font-size:.76rem}\
 .statement{margin:.55rem 0 0;white-space:pre-wrap}\
-.artifacts{margin:.55rem 0 0;padding-left:1.1rem;font-size:.86rem}\
-.artifacts li{margin:.2rem 0}\
+.artifacts{margin:.6rem 0 0;font-size:.86rem}\
+.artifact-note{color:var(--soft);margin:.3rem 0}\
+details.artifact{margin:.45rem 0;border:1px solid var(--border);border-radius:.5rem;\
+background:var(--panel);overflow:hidden}\
+details.artifact>summary{cursor:pointer;user-select:none;padding:.45rem .7rem;color:var(--soft)}\
+details.artifact>summary:hover{color:var(--text)}\
+details.artifact[open]>summary{border-bottom:1px solid var(--border)}\
+.live{margin:.55rem 0 0}\
+.live-status{display:flex;align-items:center;gap:.45rem;color:var(--accent);font-size:.82rem;margin:0}\
+.live-status::before{content:'';width:.5rem;height:.5rem;border-radius:50%;background:var(--accent);\
+animation:livepulse 1.1s ease-in-out infinite}\
+@keyframes livepulse{0%,100%{opacity:.3}50%{opacity:1}}\
+.live-feed{list-style:none;margin:.5rem 0 0;padding:0;font-size:.84rem;line-height:1.5;\
+max-height:18rem;overflow-y:auto;border-left:2px solid var(--border);padding-left:.7rem}\
+.live-feed li{margin:.25rem 0;overflow-wrap:anywhere;white-space:pre-wrap}\
+.le-assistant{color:var(--text)}\
+.le-tool{color:var(--teal);font-family:ui-monospace,'Cascadia Mono',Consolas,monospace;font-size:.8rem}\
+.le-status{color:var(--muted);font-size:.8rem}\
+.le-result{color:var(--green)}\
+.le-error{color:var(--red)}\
 .meta-line{color:var(--muted);font-size:.8rem;margin-top:.45rem}\
+.hint{color:var(--yellow);background:rgba(249,226,175,.07);border:1px solid rgba(249,226,175,.22);\
+border-radius:.5rem;padding:.5rem .7rem;margin-top:.6rem}\
+.artifact-body{margin:0;padding:.7rem .9rem;max-height:34rem;overflow:auto;\
+overflow-wrap:anywhere;color:var(--soft)}\
+pre.artifact-body{white-space:pre-wrap;font:.82rem/1.5 ui-monospace,'Cascadia Mono',Consolas,monospace}\
+.artifact-body.md{font-size:.9rem;line-height:1.6;color:var(--text)}\
+.artifact-body.md>:first-child{margin-top:0}\
+.artifact-body.md>:last-child{margin-bottom:0}\
+.artifact-body.md h1,.artifact-body.md h2,.artifact-body.md h3{line-height:1.3;margin:1.1rem 0 .5rem}\
+.artifact-body.md h1{font-size:1.2rem}.artifact-body.md h2{font-size:1.08rem}\
+.artifact-body.md h3{font-size:.98rem}\
+.artifact-body.md p{margin:.55rem 0}\
+.artifact-body.md ul,.artifact-body.md ol{margin:.5rem 0;padding-left:1.3rem}\
+.artifact-body.md li{margin:.2rem 0}\
+.artifact-body.md code{font:.85em ui-monospace,'Cascadia Mono',Consolas,monospace;\
+background:var(--bg);padding:.06rem .3rem;border-radius:.3rem}\
+.artifact-body.md pre{background:var(--bg);border:1px solid var(--border);border-radius:.45rem;\
+padding:.7rem .85rem;overflow:auto}\
+.artifact-body.md pre code{background:none;padding:0}\
+.artifact-body.md a{color:var(--accent)}\
+.artifact-body.md blockquote{margin:.5rem 0;padding-left:.8rem;border-left:2px solid var(--border);\
+color:var(--soft)}\
+.artifact-body.md table{border-collapse:collapse;margin:.5rem 0}\
+.artifact-body.md th,.artifact-body.md td{border:1px solid var(--border);padding:.3rem .55rem}\
+.artifact-body.diff{padding:.5rem 0;font:.82rem/1.45 ui-monospace,'Cascadia Mono',Consolas,monospace}\
+.artifact-body.diff .dl{white-space:pre;padding:0 .9rem;min-height:1.25em}\
+.d-add{background:rgba(166,227,161,.10);color:var(--green)}\
+.d-del{background:rgba(243,139,168,.10);color:var(--red)}\
+.d-hunk{color:var(--teal)}\
+.d-meta{color:var(--muted)}\
+.d-ctx{color:var(--soft)}\
 .target{color:var(--muted);font-size:.82rem;margin-top:.5rem}\
 code{font:.82em ui-monospace,'Cascadia Mono',Consolas,monospace;color:var(--soft);\
 background:var(--panel);padding:.06rem .3rem;border-radius:.3rem}\
@@ -2021,6 +2241,43 @@ mod tests {
             timestamp: Timestamp::from_millis(1_781_046_734_155),
             payload,
         }
+    }
+
+    #[test]
+    fn artifact_formats_map_by_kind() {
+        assert_eq!(artifact_format("memo"), ArtifactFormat::Markdown);
+        assert_eq!(artifact_format("diff"), ArtifactFormat::Diff);
+        assert_eq!(artifact_format("log"), ArtifactFormat::Raw);
+    }
+
+    #[test]
+    fn diff_colouring_classifies_lines() {
+        let html = render_diff("diff --git a/x b/x\n@@ -1,2 +1,2 @@\n context\n-removed\n+added\n");
+        assert!(html.contains("d-meta"), "{html}");
+        assert!(html.contains("d-hunk"), "{html}");
+        assert!(
+            html.contains("<div class=\"dl d-del\">-removed</div>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<div class=\"dl d-add\">+added</div>"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn markdown_renders_and_neutralizes_raw_html() {
+        let html = render_markdown(
+            "# Heading\n\nsome **bold** and `code`.\n\n- one\n- two\n\n\
+             <script>alert('x')</script>",
+        );
+        assert!(html.contains("<h1>Heading</h1>"), "{html}");
+        assert!(html.contains("<strong>bold</strong>"), "{html}");
+        assert!(html.contains("<code>code</code>"), "{html}");
+        assert!(html.contains("<li>one</li>"), "{html}");
+        // Agent output is untrusted: raw HTML is escaped, never injected.
+        assert!(!html.contains("<script>"), "{html}");
+        assert!(html.contains("&lt;script&gt;"), "{html}");
     }
 
     #[test]

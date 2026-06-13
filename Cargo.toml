@@ -50,3 +50,7 @@ toml = "0.9"
 dunce = "1"
 # content digests for artifact provenance (docs/adr/0005, 0023; MIT/Apache)
 sha2 = "0.10"
+# ergonomic async streams for the live-progress SSE endpoint (docs/adr/0023; MIT)
+async-stream = "0.3"
+# CommonMark rendering for agent memos on the human surface (docs/adr/0023; MIT)
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }

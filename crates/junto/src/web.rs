@@ -50,6 +50,14 @@ pub fn router(host: Arc<Host>) -> Router {
             "/channels/{channel}/sessions/{session}/steer",
             post(steer_session),
         )
+        .route(
+            "/channels/{channel}/sessions/{session}/stream",
+            get(stream_session),
+        )
+        .route(
+            "/channels/{channel}/artifacts/{artifact}",
+            get(view_artifact),
+        )
         .route("/channels/{channel}/rename", post(rename_channel))
         .route("/channels/{channel}/close", post(close_channel))
         .route("/channels/{channel}/reopen", post(reopen_channel))
@@ -291,7 +299,7 @@ async fn launch_session(
     if intent.is_empty() {
         return (StatusCode::BAD_REQUEST, "an intent is required").into_response();
     }
-    let (id, view, _substrate) = match project(&host, &channel).await {
+    let (id, view, substrate) = match project(&host, &channel).await {
         Ok(projected) => projected,
         Err(response) => return response,
     };
@@ -302,20 +310,27 @@ async fn launch_session(
         )
             .into_response();
     }
-    // The session's author is the harness member (docs/adr/0020); its
-    // entries only project if it is in the Party (docs/adr/0017) — refuse
-    // up front with the fix rather than recording unrecognized work.
+    // The session's author is the harness member (docs/adr/0020); its entries
+    // only project once it is in the Party (docs/adr/0017). Rather than reject
+    // a launch in a fresh channel, bring the harness in: if the human at the
+    // keyboard founded this channel, auto-grant membership (a founder-authored
+    // MemberAdded) so the agent joins and starts work in one motion — the
+    // grant is recorded, not hidden. A non-founder can't grant: they get
+    // add_member's error naming who can (docs/adr/0017).
     let harness = crate::launch::harness_member();
-    if !view.party.is_empty() && !view.party.iter().any(|m| m.email == harness.email) {
-        return (
-            StatusCode::FORBIDDEN,
-            format!(
-                "{} <{}> is not a member of this channel — grant it membership first \
-                 (junto add-member, or the add_member tool)",
-                harness.display_name, harness.email
-            ),
-        )
-            .into_response();
+    let harness_is_member = view.party.iter().any(|m| m.email == harness.email);
+    if !view.party.is_empty() && !harness_is_member {
+        let granter = match crate::host::git_user(&substrate) {
+            Ok(granter) => granter,
+            Err(err) => {
+                return internal(format!(
+                    "no author identity: {err} (set git config user.name / user.email)"
+                ));
+            }
+        };
+        if let Err(err) = host.add_member(&channel, &granter, harness).await {
+            return (StatusCode::FORBIDDEN, format!("{err:#}")).into_response();
+        }
     }
     let junto_home = match crate::host::junto_home() {
         Ok(home) => home,
@@ -428,6 +443,142 @@ async fn steer_session(
         Ok(()) => Redirect::to(&format!("/channels/{id}")).into_response(),
         Err(err) => (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
     }
+}
+
+/// Stream a running session's live progress as Server-Sent Events
+/// (`docs/adr/0023`). The card's `EventSource` subscribes; the turn publishes
+/// to the in-memory feed. Read-only — steering is a separate recorded POST, so
+/// SSE (server→browser) fits, no WebSocket needed.
+///
+/// Each progress line is an SSE `live` event carrying the JSON `LiveEvent`.
+/// When the turn ends (the feed's sender drops) — or if no feed is running —
+/// an `end` event tells the client to stop (no auto-reconnect) and reload to
+/// the now-persisted memo + diff. The feed itself is never the record.
+async fn stream_session(
+    State(host): State<Arc<Host>>,
+    Path((_channel, session)): Path<(String, String)>,
+) -> Response {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+
+    let Ok(session) = session.parse::<EntryId>() else {
+        return (StatusCode::BAD_REQUEST, "not a session id").into_response();
+    };
+    let subscription = host.live().subscribe(session);
+    let stream = async_stream::stream! {
+        if let Some((buffer, mut receiver)) = subscription {
+            for event in buffer {
+                if let Ok(sse) = Event::default().event("live").json_data(&event) {
+                    yield Ok::<_, std::convert::Infallible>(sse);
+                }
+            }
+            loop {
+                match receiver.recv().await {
+                    Ok(event) => {
+                        if let Ok(sse) = Event::default().event("live").json_data(&event) {
+                            yield Ok(sse);
+                        }
+                    }
+                    // A slow watcher that fell behind: keep going from the tail.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    // The turn ended (sender dropped): stop.
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+        // Whether or not a feed was live, end the stream so the client closes
+        // (no reconnect) and reloads to the persisted outcome.
+        yield Ok(Event::default().event("end").data("done"));
+    };
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+/// Serve an artifact's full content (`docs/adr/0020`/`0023`): the memo or diff
+/// the card only snippets inline. Artifact content lives machine-local under
+/// `~/.junto/artifacts/` (never the ledger), referenced by a `file://` URI —
+/// which the desktop webview can't open, so the human surface serves it here.
+///
+/// The URI is taken from the artifact entry, but **not trusted**: an entry can
+/// arrive by sync carrying any path, so the resolved file must sit under this
+/// machine's artifacts root before we read it.
+async fn view_artifact(
+    State(host): State<Arc<Host>>,
+    Path((channel, artifact)): Path<(String, String)>,
+) -> Response {
+    let Ok(artifact_id) = artifact.parse::<EntryId>() else {
+        return (StatusCode::BAD_REQUEST, "not an artifact id").into_response();
+    };
+    let (_id, view, _substrate) = match project(&host, &channel).await {
+        Ok(projected) => projected,
+        Err(response) => return response,
+    };
+    let Some(entry) = view.entries.iter().find(|e| e.id == artifact_id) else {
+        return (StatusCode::NOT_FOUND, "no such artifact in this channel").into_response();
+    };
+    let EntryPayload::ArtifactAttached {
+        kind, provenance, ..
+    } = &entry.payload
+    else {
+        return (StatusCode::BAD_REQUEST, "that entry is not an artifact").into_response();
+    };
+    let Some(file) = provenance.first() else {
+        return (StatusCode::NOT_FOUND, "artifact has no stored content").into_response();
+    };
+    let Some(path) = file_uri_to_path(file.uri.as_str()) else {
+        return (StatusCode::BAD_REQUEST, "artifact is not a local file").into_response();
+    };
+    // Defense in depth: only ever read under this machine's artifacts root.
+    let artifacts_root = match crate::host::junto_home() {
+        Ok(home) => home.join("artifacts"),
+        Err(err) => return internal(format!("no junto home: {err}")),
+    };
+    let (canon_path, canon_root) = match (
+        dunce::canonicalize(&path),
+        dunce::canonicalize(&artifacts_root),
+    ) {
+        (Ok(p), Ok(root)) => (p, root),
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                "artifact content is not on this machine",
+            )
+                .into_response();
+        }
+    };
+    if !canon_path.starts_with(&canon_root) {
+        return (StatusCode::FORBIDDEN, "artifact path is outside the store").into_response();
+    }
+    let content = match std::fs::read_to_string(&canon_path) {
+        Ok(content) => content,
+        Err(err) => {
+            return (StatusCode::NOT_FOUND, format!("reading artifact: {err}")).into_response();
+        }
+    };
+    // The card's `<details>` lazy-loads this inline. A memo is the agent's
+    // prose (rendered as sanitized CommonMark); a diff gets per-line colour;
+    // everything else stays verbatim as text.
+    let html =
+        |body: String| ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], body).into_response();
+    match render::artifact_format(kind) {
+        render::ArtifactFormat::Markdown => html(render::render_markdown(&content)),
+        render::ArtifactFormat::Diff => html(render::render_diff(&content)),
+        render::ArtifactFormat::Raw => (
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            content,
+        )
+            .into_response(),
+    }
+}
+
+/// Turn a `file://` URI (as `store_artifact` writes it) back into a path.
+/// Lenient about the Windows `file:///C:/…` vs POSIX `file:////home/…` forms.
+fn file_uri_to_path(uri: &str) -> Option<std::path::PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    // Windows: "/C:/Users/…" → drop the leading slash before the drive.
+    // POSIX:   "//home/…"     → drop one slash, leaving "/home/…".
+    let rest = rest.strip_prefix('/').unwrap_or(rest);
+    Some(std::path::PathBuf::from(rest))
 }
 
 /// The form body for renaming a channel.
@@ -1241,7 +1392,8 @@ mod tests {
             let path = stub_dir.path().join("stub.cmd");
             std::fs::write(
                 &path,
-                "@echo {\"result\":\"stub work complete\",\"session_id\":\"h-stub-1\"}\r\n",
+                "@echo {\"type\":\"result\",\"subtype\":\"success\",\"result\":\"stub work \
+                 complete\",\"session_id\":\"h-stub-1\",\"is_error\":false}\r\n",
             )
             .expect("write stub");
             path
@@ -1249,7 +1401,8 @@ mod tests {
             let path = stub_dir.path().join("stub.sh");
             std::fs::write(
                 &path,
-                "#!/bin/sh\necho '{\"result\":\"stub work complete\",\"session_id\":\"h-stub-1\"}'\n",
+                "#!/bin/sh\necho '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"stub \
+                 work complete\",\"session_id\":\"h-stub-1\",\"is_error\":false}'\n",
             )
             .expect("write stub");
             #[cfg(unix)]
@@ -1354,6 +1507,169 @@ mod tests {
         );
 
         unsafe { std::env::remove_var("JUNTO_HARNESS_CMD") };
+    }
+
+    #[tokio::test]
+    async fn launch_auto_grants_the_harness_when_the_founder_starts_work() {
+        // A fresh channel has only its founder in the Party; the founder
+        // starting work should bring the harness in (a founder-authored
+        // MemberAdded) rather than reject the launch — the new-channel
+        // papercut (docs/adr/0017).
+        let _home = crate::host::test_home::HomeGuard::new();
+        let stub_dir = tempfile::tempdir().expect("stub dir");
+        let stub = if cfg!(windows) {
+            let path = stub_dir.path().join("stub.cmd");
+            std::fs::write(
+                &path,
+                "@echo {\"type\":\"result\",\"subtype\":\"success\",\"result\":\"ok\",\
+                 \"session_id\":\"h-grant-1\",\"is_error\":false}\r\n",
+            )
+            .expect("write stub");
+            path
+        } else {
+            let path = stub_dir.path().join("stub.sh");
+            std::fs::write(
+                &path,
+                "#!/bin/sh\necho '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"ok\",\
+                 \"session_id\":\"h-grant-1\",\"is_error\":false}'\n",
+            )
+            .expect("write stub");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod stub");
+            }
+            path
+        };
+        unsafe { std::env::set_var("JUNTO_HARNESS_CMD", &stub) };
+
+        // host_with_entry founds "web-test" by the git user (web@example.com)
+        // and grants only a "Bot" — the harness is deliberately not a member.
+        let fx = host_with_entry(assertion()).await;
+        let harness = crate::launch::harness_member();
+        let workspace = tempfile::tempdir().expect("workspace");
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+
+        let response = launch_session(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LaunchForm {
+                intent: "start in a fresh channel".into(),
+                workspace: workspace.path().display().to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        // The harness is now a member, and the grant was authored by the
+        // founder (the git user), not by the agent itself.
+        let Resolution::Resolved { ledger, id, .. } = fx.host.resolve("web-test").await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+        let view = ledger.lock().await.project(&id).await.unwrap();
+        assert!(
+            view.party.iter().any(|m| m.email == harness.email),
+            "the harness was auto-granted membership"
+        );
+        let granted_by = view.entries.iter().find_map(|entry| match &entry.payload {
+            junto_kernel::EntryPayload::MemberAdded { member } if member.email == harness.email => {
+                Some(entry.author.email.clone())
+            }
+            _ => None,
+        });
+        assert_eq!(granted_by.as_deref(), Some("web@example.com"));
+
+        unsafe { std::env::remove_var("JUNTO_HARNESS_CMD") };
+    }
+
+    #[tokio::test]
+    async fn view_artifact_serves_content_and_refuses_paths_outside_the_store() {
+        let home = crate::host::test_home::HomeGuard::new();
+        let fx = host_with_entry(assertion()).await;
+        let Resolution::Resolved { ledger, .. } = fx.host.resolve("web-test").await.unwrap() else {
+            panic!("channel resolves");
+        };
+        let session = EntryId::new();
+
+        // An ArtifactAttached entry (authored by a member so it projects)
+        // whose provenance points at `uri`.
+        let attach = |id: EntryId, uri: String| LedgerEntry {
+            id,
+            channel: fx.channel,
+            author: Member::agent("Bot", "bot@example.com"),
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::ArtifactAttached {
+                target: session,
+                kind: "memo".into(),
+                description: "snippet…".into(),
+                provenance: vec![junto_kernel::ProvenanceRef::new(
+                    junto_kernel::Uri::new(uri).expect("uri"),
+                )],
+            },
+        };
+
+        // A real artifact file under this machine's artifacts root.
+        let dir = home.path().join("artifacts").join(session.to_string());
+        std::fs::create_dir_all(&dir).expect("artifact dir");
+        let file = dir.join("turn-1-result.md");
+        std::fs::write(&file, "the FULL agent output\nsecond line").expect("write artifact");
+        let good = EntryId::new();
+        let good_uri = format!("file:///{}", file.display().to_string().replace('\\', "/"));
+        ledger
+            .lock()
+            .await
+            .append(attach(good, good_uri))
+            .await
+            .unwrap();
+
+        // Happy path: the whole content comes back, not just a snippet.
+        let response = view_artifact(
+            State(fx.host.clone()),
+            Path(("web-test".into(), good.to_string())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("the FULL agent output"), "{text}");
+        assert!(text.contains("second line"), "the full body, not a snippet");
+
+        // Guard: a file outside the artifacts root is refused even with a
+        // valid entry (entries can arrive by sync carrying any path).
+        let secret = home.path().join("secret.txt");
+        std::fs::write(&secret, "top secret").unwrap();
+        let evil = EntryId::new();
+        let evil_uri = format!(
+            "file:///{}",
+            secret.display().to_string().replace('\\', "/")
+        );
+        ledger
+            .lock()
+            .await
+            .append(attach(evil, evil_uri))
+            .await
+            .unwrap();
+        let response = view_artifact(
+            State(fx.host.clone()),
+            Path(("web-test".into(), evil.to_string())),
+        )
+        .await;
+        assert_ne!(
+            response.status(),
+            StatusCode::OK,
+            "must not serve a path outside the artifacts root"
+        );
     }
 
     #[tokio::test]
