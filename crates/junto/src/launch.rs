@@ -6,15 +6,16 @@
 //! session-id mapping (`~/.junto/harness-sessions.toml`) is machine-local for
 //! the same reason.
 //!
-//! v1 invocation is **`oneshot-exec`**: spawn `claude -p` in the workspace
-//! with `--dangerously-skip-permissions`, parse the JSON result, attach the
-//! result memo + workspace `git diff` as artifacts (content written under
-//! `~/.junto/artifacts/`, referenced by `file://` URI + sha256 digest —
-//! never blobs in the ledger), and mark the session done/error. Steering is
-//! a later `--resume <harness-session-id>` turn; state lives in the
-//! harness's own session storage, so host restarts are harmless. **No
-//! `AgentHarnessAdapter` trait yet** — rule of three; this is the first
-//! concrete harness, extracted when OpenCode lands.
+//! A turn runs the harness over **ACP** (`docs/adr/0024`, see [`crate::acp`])
+//! when available, falling back to the **`claude -p` oneshot-exec** CLI here.
+//! Either way the host parses the result, attaches the result memo + workspace
+//! `git diff` as artifacts (content written under `~/.junto/artifacts/`,
+//! referenced by `file://` URI + sha256 digest — never blobs in the ledger),
+//! and marks the session done/error. Steering is a later resume turn
+//! (ACP `session/load` or `claude -p --resume <harness-session-id>`); state
+//! lives in the harness's own session storage, so host restarts are harmless.
+//! ACP's capability flags stand in for an `AgentHarnessAdapter` trait — one
+//! client, many harnesses (`docs/adr/0024`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -227,7 +228,7 @@ fn harness_command(workspace: &Path) -> tokio::process::Command {
 }
 
 /// How long a turn may run before the host kills it (docs/adr/0023).
-const TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+pub(crate) const TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 // ---- the Workspace store (channel → repos; machine config) ----
 
@@ -404,7 +405,7 @@ pub struct LiveEvent {
 }
 
 impl LiveEvent {
-    fn new(kind: &str, text: impl Into<String>) -> Self {
+    pub(crate) fn new(kind: &str, text: impl Into<String>) -> Self {
         Self {
             kind: kind.into(),
             text: text.into(),
@@ -441,7 +442,7 @@ impl LiveSessions {
     }
 
     /// Append an event: into the replay buffer (bounded) and to live tails.
-    fn publish(&self, session: EntryId, event: LiveEvent) {
+    pub(crate) fn publish(&self, session: EntryId, event: LiveEvent) {
         let mut map = self.inner.lock().expect("live sessions registry lock");
         if let Some(feed) = map.get_mut(&session) {
             // Bound the replay buffer; live subscribers still get every event.
@@ -579,24 +580,93 @@ fn interpret_stream_line(line: &str) -> LineEffects {
 // ---- the turn itself: spawn → capture → record ----
 
 /// What one finished harness turn yielded.
-struct TurnOutcome {
+pub(crate) struct TurnOutcome {
     /// The result text (the harness's final message, or the failure tail).
-    result: String,
+    pub(crate) result: String,
     /// The harness's session id, when the output carried one.
-    harness_session: Option<String>,
+    pub(crate) harness_session: Option<String>,
     /// Whether the turn failed (non-zero exit, timeout, unparseable output).
-    failed: bool,
+    pub(crate) failed: bool,
 }
 
 /// Run one harness turn in `workspace`: the launch turn when `resume` is
-/// `None`, a steer turn otherwise. Streams `stream-json` line by line,
-/// publishing progress to the session's live feed as it arrives; returns the
-/// final outcome. Callers run this inside a spawned task.
+/// `None`, a steer turn otherwise; publishing progress to the live feed.
+/// Callers run this inside a spawned task.
+///
+/// Prefers **ACP** (`docs/adr/0024`) when an adapter is available, falling
+/// back to the `claude -p` CLI when ACP is disabled/unavailable or its setup
+/// fails.
+async fn run_turn(
+    workspace: &Path,
+    prompt: &str,
+    resume: Option<&str>,
+    live: &LiveSessions,
+    session: EntryId,
+) -> TurnOutcome {
+    if let Some(adapter) = acp_adapter_command() {
+        match crate::acp::run_turn_acp(&adapter, workspace, prompt, resume, live, session).await {
+            Ok(outcome) => return outcome,
+            Err(err) => {
+                tracing::warn!("ACP turn setup failed ({err:#}); falling back to claude -p");
+                live.publish(
+                    session,
+                    LiveEvent::new("status", "ACP unavailable — falling back to claude -p"),
+                );
+            }
+        }
+    }
+    run_turn_cli(workspace, prompt, resume, live, session).await
+}
+
+/// The ACP adapter command for the harness, or `None` to use the `claude -p`
+/// CLI. ACP is preferred; fall back when a test stub is set, when forced to
+/// `cli`, or when Node (which the adapter needs) is absent.
+fn acp_adapter_command() -> Option<Vec<String>> {
+    if std::env::var_os("JUNTO_HARNESS_CMD").is_some() {
+        return None; // tests drive the stub over the CLI path
+    }
+    if std::env::var("JUNTO_HARNESS_PROTOCOL").ok().as_deref() == Some("cli") {
+        return None;
+    }
+    if !node_available() {
+        return None;
+    }
+    // The published Claude Code ACP adapter (overridable). It runs Claude
+    // Code's SDK — same subscription auth as `claude -p`, no API token. On
+    // Windows the launcher is `npx.cmd` (Rust's spawn won't auto-append the
+    // `.cmd` extension the way a shell does).
+    let default = if cfg!(windows) {
+        "npx.cmd -y @agentclientprotocol/claude-agent-acp"
+    } else {
+        "npx -y @agentclientprotocol/claude-agent-acp"
+    };
+    let cmd = std::env::var("JUNTO_ACP_CLAUDE_CMD").unwrap_or_else(|_| default.to_string());
+    let parts: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
+    if parts.is_empty() { None } else { Some(parts) }
+}
+
+/// Is Node on PATH? The ACP adapter is a Node package; probed once and cached.
+fn node_available() -> bool {
+    static NODE: OnceLock<bool> = OnceLock::new();
+    *NODE.get_or_init(|| {
+        let mut command = std::process::Command::new("node");
+        command
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        no_console_window(&mut command);
+        command.status().map(|s| s.success()).unwrap_or(false)
+    })
+}
+
+/// Run one harness turn over the `claude -p` stream-json CLI — the fallback
+/// path. Streams `stream-json` line by line, publishing progress to the live
+/// feed as it arrives; returns the final outcome.
 ///
 /// The prompt travels over **stdin**, never argv: prompts are multi-line,
 /// and Windows refuses newline-bearing arguments to `.cmd` shims (which is
 /// what an npm-installed `claude` is).
-async fn run_turn(
+async fn run_turn_cli(
     workspace: &Path,
     prompt: &str,
     resume: Option<&str>,

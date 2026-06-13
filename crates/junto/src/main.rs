@@ -7,6 +7,7 @@
 //! surfaces) connect to. Binary/`main` code may use `anyhow` and may
 //! `?`-propagate — unlike the library crates.
 
+mod acp;
 mod binding;
 mod host;
 mod init;
