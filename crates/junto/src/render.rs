@@ -1102,6 +1102,7 @@ pub fn channel_html(
     id: &ChannelId,
     view: &ChannelView,
     substrate: &std::path::Path,
+    workspace: Option<&std::path::Path>,
 ) -> String {
     let mut cards = String::new();
     for entry in &view.entries {
@@ -1147,7 +1148,34 @@ pub fn channel_html(
             attention_group(&strip_group, &format!("/channels/{id}"), false)
         )
     };
-    let sessions = sessions_section(view);
+    // Start work (docs/adr/0023): intent + workspace (prefilled once
+    // remembered), spawning a real harness session. Hidden on closed
+    // channels — reopen first.
+    let start_work = if view.closed {
+        String::new()
+    } else {
+        format!(
+            "<section class=\"board\" id=\"start-work\">\
+             <h2 class=\"board-head\">start work</h2>\n\
+             <form class=\"act open-channel\" method=\"post\" action=\"/channels/{id}/sessions\">\
+             <input name=\"intent\" placeholder=\"what should the agent do? e.g. fix the flaky \
+             sync test\" required>\
+             <input name=\"workspace\" value=\"{workspace}\" placeholder=\"workspace repo path \
+             (remembered after first launch)\"{ws_required}>\
+             <button class=\"primary\">launch</button>\
+             </form>\
+             <p class=\"meta\">spawns Claude Code headless in the workspace \
+             (docs/adr/0023); progress lands below as the session's state and artifacts</p>\
+             </section>\n",
+            workspace = escape_html(
+                &workspace
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
+            ),
+            ws_required = if workspace.is_some() { "" } else { " required" },
+        )
+    };
+    let sessions = sessions_section(view, id);
     // The human brief: the same scaled shape the agent brief carries
     // (state, not history), rendered as the page — with the full transcript
     // collapsed below instead of *being* the page.
@@ -1219,7 +1247,7 @@ pub fn channel_html(
     let content = format!(
         "<h1>{name}</h1>\n\
          <p class=\"meta\">channel {id} · {count} entries · read-only projection</p>\n\
-         {rename}{lifecycle}{party}{strip}{sessions}{standing}{recently}{footer}\
+         {rename}{lifecycle}{party}{strip}{start_work}{sessions}{standing}{recently}{footer}\
          <details class=\"ledger\"><summary class=\"board-head\">the full ledger \
          ({count} entries)</summary>\n{body}</details>\n{open_here}",
         name = escape_html(name),
@@ -1542,9 +1570,11 @@ fn entry_card(entry: &LedgerEntry, view: &ChannelView, channel: &ChannelId) -> S
 }
 
 /// The "agent sessions" board: one card per session, newest first — state
-/// badge, intent, and the artifacts it produced (the verifiable outputs a
-/// human reviews instead of scrollback). Empty when the channel has none.
-fn sessions_section(view: &ChannelView) -> String {
+/// badge, intent, the artifacts it produced (the verifiable outputs a human
+/// reviews instead of scrollback), and a steer box once the turn has landed
+/// (`docs/adr/0023`: steering is between turns). Empty when the channel has
+/// none.
+fn sessions_section(view: &ChannelView, channel: &ChannelId) -> String {
     // Sessions render newest-first; entries are already canonical, so walk
     // them in reverse and pick the session subjects.
     let mut cards = String::new();
@@ -1556,6 +1586,23 @@ fn sessions_section(view: &ChannelView) -> String {
             continue; // unrecognized author: the card stays in the ledger list
         };
         let state = session_state_label(session.state);
+        // Steering targets a finished turn (--resume runs a new one); a
+        // mid-turn session shows its liveness instead.
+        let steer = match session.state {
+            SessionState::Done | SessionState::Error => format!(
+                "<form class=\"act\" method=\"post\" \
+                 action=\"/channels/{channel}/sessions/{session_id}/steer\">\
+                 <input name=\"message\" placeholder=\"steer — what should it do next?\" \
+                 required>\
+                 <button class=\"primary\">send</button>\
+                 </form>",
+                session_id = entry.id,
+            ),
+            SessionState::Working => {
+                "<p class=\"meta\">running — artifacts land here when the turn ends</p>".to_string()
+            }
+            _ => String::new(),
+        };
         let mut artifacts = String::new();
         for artifact_id in &session.artifacts {
             let Some(artifact) = view.entries.iter().find(|e| e.id == *artifact_id) else {
@@ -1596,7 +1643,7 @@ fn sessions_section(view: &ChannelView) -> String {
              <span class=\"who\" title=\"{email}\">{who}</span>\
              <span class=\"when\">{when}</span></header>\
              <div class=\"statement\">{intent}</div>\
-             {artifacts}\
+             {artifacts}{steer}\
              <footer class=\"id\">{id}</footer></article>",
             email = escape_html(&entry.author.email),
             who = escape_html(&entry.author.display_name),
@@ -2010,7 +2057,14 @@ mod tests {
         );
 
         let channel = ChannelId::new();
-        let html = channel_html(&[], "t", &channel, &view, std::path::Path::new("/repo"));
+        let html = channel_html(
+            &[],
+            "t",
+            &channel,
+            &view,
+            std::path::Path::new("/repo"),
+            None,
+        );
         assert!(html.contains("agent sessions"), "{html}");
         assert!(html.contains("fix the flaky sync test"), "{html}");
         assert!(html.contains("badge blocked"), "{html}");
@@ -2036,6 +2090,7 @@ mod tests {
             &ChannelId::new(),
             &view,
             std::path::Path::new("/repo"),
+            None,
         );
         assert!(html.contains("standing decisions"), "{html}");
         assert!(html.contains("the settled claim"), "{html}");
@@ -2081,7 +2136,14 @@ mod tests {
     fn channel_page_offers_rename() {
         let view = view_with(vec![]);
         let channel = ChannelId::new();
-        let html = channel_html(&[], "old-name", &channel, &view, std::path::Path::new("/r"));
+        let html = channel_html(
+            &[],
+            "old-name",
+            &channel,
+            &view,
+            std::path::Path::new("/r"),
+            None,
+        );
         assert!(html.contains("rename this channel"), "{html}");
         assert!(
             html.contains(&format!("/channels/{channel}/rename")),
@@ -2117,7 +2179,14 @@ mod tests {
             },
         ];
         let view = view_with(vec![]);
-        let html = channel_html(&nav, "alpha", &nav[0].id, &view, std::path::Path::new("/r"));
+        let html = channel_html(
+            &nav,
+            "alpha",
+            &nav[0].id,
+            &view,
+            std::path::Path::new("/r"),
+            None,
+        );
         assert!(html.contains("<div class=\"side-sub\""), "{html}");
         assert!(html.contains(">one</div>"), "{html}");
         assert!(html.contains(">two</div>"), "{html}");
@@ -2130,6 +2199,7 @@ mod tests {
             &solo[0].id,
             &view,
             std::path::Path::new("/r"),
+            None,
         );
         assert!(!html.contains("<div class=\"side-sub\""), "{html}");
     }
@@ -2145,6 +2215,7 @@ mod tests {
             &ChannelId::new(),
             &view,
             std::path::Path::new("/repo/wmux"),
+            None,
         );
         assert!(html.contains("open an inquiry here"), "{html}");
         assert!(
@@ -2182,6 +2253,7 @@ mod tests {
             &ChannelId::new(),
             &view,
             std::path::Path::new("/repo"),
+            None,
         );
         assert!(html.contains("card fam-decision"), "{html}");
         assert!(html.contains("card fam-work"), "{html}");
@@ -2316,6 +2388,7 @@ mod tests {
             &ChannelId::new(),
             &view,
             std::path::Path::new("/repo"),
+            None,
         );
         assert!(
             !html.contains("<script>alert"),
@@ -2334,6 +2407,7 @@ mod tests {
             &ChannelId::new(),
             &view,
             std::path::Path::new("/repo"),
+            None,
         );
         assert!(html.contains("badge provisional"));
         assert!(html.contains("2026-06-09"), "human-readable date: {html}");
@@ -2363,6 +2437,7 @@ mod tests {
             &ChannelId::new(),
             &view,
             std::path::Path::new("/repo"),
+            None,
         );
         assert!(html.contains("because the tests prove it"));
         assert!(html.contains("provenance (1)"));
@@ -2385,8 +2460,15 @@ mod tests {
         let id = ChannelId::new();
         assert!(brief_markdown("empty", &id, &view).contains("(no entries)"));
         assert!(
-            channel_html(&[], "empty", &id, &view, std::path::Path::new("/repo"))
-                .contains("(no entries)")
+            channel_html(
+                &[],
+                "empty",
+                &id,
+                &view,
+                std::path::Path::new("/repo"),
+                None
+            )
+            .contains("(no entries)")
         );
     }
 
@@ -2422,7 +2504,14 @@ mod tests {
         let id = entry.id;
         let channel = entry.channel;
         let view = view_with(vec![entry]);
-        let html = channel_html(&[], "test", &channel, &view, std::path::Path::new("/repo"));
+        let html = channel_html(
+            &[],
+            "test",
+            &channel,
+            &view,
+            std::path::Path::new("/repo"),
+            None,
+        );
         assert!(html.contains(">verified</button>"), "{html}");
         assert!(html.contains("value=\"CI green and reviewed\""));
         assert!(html.contains(&format!("/channels/{channel}/entries/{id}/park")));
@@ -2461,7 +2550,14 @@ mod tests {
             },
         ];
         let view = view_with(vec![]);
-        let html = channel_html(&nav, "alpha", &active, &view, std::path::Path::new("/repo"));
+        let html = channel_html(
+            &nav,
+            "alpha",
+            &active,
+            &view,
+            std::path::Path::new("/repo"),
+            None,
+        );
         assert!(html.contains("chan active"));
         assert!(html.contains("alpha"));
         assert!(html.contains("beta"));

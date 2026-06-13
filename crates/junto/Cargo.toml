@@ -29,7 +29,9 @@ toml.workspace = true
 dunce.workspace = true
 # member-code minting (docs/adr/0017) reuses the workspace's entropy source
 uuid.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal"] }
+# artifact content digests (docs/adr/0023 capture)
+sha2.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal", "time"] }
 
 [dev-dependencies]
 tempfile.workspace = true

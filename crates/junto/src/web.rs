@@ -45,6 +45,11 @@ pub fn router(host: Arc<Host>) -> Router {
         .route("/channels", post(open_channel))
         .route("/repos", post(setup_repo))
         .route("/channels/{channel}", get(channel_page))
+        .route("/channels/{channel}/sessions", post(launch_session))
+        .route(
+            "/channels/{channel}/sessions/{session}/steer",
+            post(steer_session),
+        )
         .route("/channels/{channel}/rename", post(rename_channel))
         .route("/channels/{channel}/close", post(close_channel))
         .route("/channels/{channel}/reopen", post(reopen_channel))
@@ -244,9 +249,184 @@ async fn channel_page(State(host): State<Arc<Host>>, Path(channel): Path<String>
             // best-effort, an empty nav never blocks the page itself.
             let mut nav = host.inventory().await.unwrap_or_default();
             nav.sort_by_key(|summary| std::cmp::Reverse(summary.last_activity));
-            Html(render::channel_html(&nav, &name, &id, &view, &substrate)).into_response()
+            // The remembered workspace prefills the start-work form
+            // (docs/adr/0023); best-effort, like the nav.
+            let workspace = crate::host::junto_home()
+                .ok()
+                .and_then(|home| crate::launch::workspace_for(&home, &id).ok().flatten());
+            Html(render::channel_html(
+                &nav,
+                &name,
+                &id,
+                &view,
+                &substrate,
+                workspace.as_deref(),
+            ))
+            .into_response()
         }
         Err(response) => response,
+    }
+}
+
+/// The form body for launching an Agent Session (`docs/adr/0023`).
+#[derive(Debug, Deserialize)]
+struct LaunchForm {
+    /// What the agent should do — becomes the session's intent and the
+    /// harness prompt.
+    intent: String,
+    /// The workspace repo; empty falls back to the remembered mapping.
+    #[serde(default)]
+    workspace: String,
+}
+
+/// Launch an Agent Session from the channel page: resolve the workspace
+/// (remembering a newly typed one), check the harness member is in the
+/// Party, and spawn the first turn in the background.
+async fn launch_session(
+    State(host): State<Arc<Host>>,
+    Path(channel): Path<String>,
+    Form(form): Form<LaunchForm>,
+) -> Response {
+    let intent = form.intent.trim().to_string();
+    if intent.is_empty() {
+        return (StatusCode::BAD_REQUEST, "an intent is required").into_response();
+    }
+    let (id, view, _substrate) = match project(&host, &channel).await {
+        Ok(projected) => projected,
+        Err(response) => return response,
+    };
+    if view.closed {
+        return (
+            StatusCode::CONFLICT,
+            "this channel is closed — reopen it before starting work",
+        )
+            .into_response();
+    }
+    // The session's author is the harness member (docs/adr/0020); its
+    // entries only project if it is in the Party (docs/adr/0017) — refuse
+    // up front with the fix rather than recording unrecognized work.
+    let harness = crate::launch::harness_member();
+    if !view.party.is_empty() && !view.party.iter().any(|m| m.email == harness.email) {
+        return (
+            StatusCode::FORBIDDEN,
+            format!(
+                "{} <{}> is not a member of this channel — grant it membership first \
+                 (junto add-member, or the add_member tool)",
+                harness.display_name, harness.email
+            ),
+        )
+            .into_response();
+    }
+    let junto_home = match crate::host::junto_home() {
+        Ok(home) => home,
+        Err(err) => return internal(format!("no junto home: {err}")),
+    };
+    let workspace = if form.workspace.trim().is_empty() {
+        match crate::launch::workspace_for(&junto_home, &id) {
+            Ok(Some(workspace)) => workspace,
+            Ok(None) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "no workspace is remembered for this channel — fill in the workspace \
+                     repo path (it will be remembered)",
+                )
+                    .into_response();
+            }
+            Err(err) => return internal(format!("reading workspaces: {err}")),
+        }
+    } else {
+        let typed = std::path::PathBuf::from(form.workspace.trim());
+        if let Err(err) = crate::launch::remember_workspace(&junto_home, &id, &typed) {
+            return (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response();
+        }
+        match crate::launch::workspace_for(&junto_home, &id) {
+            Ok(Some(workspace)) => workspace,
+            _ => return internal("workspace vanished after remembering".into()),
+        }
+    };
+    match crate::launch::launch(host.clone(), id, channel.clone(), workspace, intent).await {
+        Ok(_session) => Redirect::to(&format!("/channels/{id}")).into_response(),
+        Err(err) => internal(format!("launch failed: {err:#}")),
+    }
+}
+
+/// The form body for steering a session.
+#[derive(Debug, Deserialize)]
+struct SteerForm {
+    /// The follow-up instruction — recorded as a `SessionUpdated` note, then
+    /// transported via `--resume` (docs/adr/0023).
+    message: String,
+}
+
+/// Steer an existing session from its card.
+async fn steer_session(
+    State(host): State<Arc<Host>>,
+    Path((channel, session)): Path<(String, String)>,
+    Form(form): Form<SteerForm>,
+) -> Response {
+    let message = form.message.trim().to_string();
+    if message.is_empty() {
+        return (StatusCode::BAD_REQUEST, "a steer message is required").into_response();
+    }
+    let Ok(session) = session.parse::<EntryId>() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("'{session}' is not a session id"),
+        )
+            .into_response();
+    };
+    let (id, view, substrate) = match project(&host, &channel).await {
+        Ok(projected) => projected,
+        Err(response) => return response,
+    };
+    if view.session(&session).is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("{session} is not an agent session in this channel"),
+        )
+            .into_response();
+    }
+    // The steer note is authored by the human at the keyboard (the record
+    // keeps who steered); membership checked like every human-surface act.
+    let author = match crate::host::git_user(&substrate) {
+        Ok(author) => author,
+        Err(err) => {
+            return internal(format!(
+                "no author identity: {err} (set git config user.name / user.email)"
+            ));
+        }
+    };
+    if let Err(err) = host.authorize_human_write(&view, &author) {
+        return (StatusCode::FORBIDDEN, format!("{err:#}")).into_response();
+    }
+    let junto_home = match crate::host::junto_home() {
+        Ok(home) => home,
+        Err(err) => return internal(format!("no junto home: {err}")),
+    };
+    let workspace = match crate::launch::workspace_for(&junto_home, &id) {
+        Ok(Some(workspace)) => workspace,
+        Ok(None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "no workspace is remembered for this channel on this machine",
+            )
+                .into_response();
+        }
+        Err(err) => return internal(format!("reading workspaces: {err}")),
+    };
+    match crate::launch::steer(
+        host.clone(),
+        id,
+        channel.clone(),
+        workspace,
+        session,
+        author,
+        message,
+    )
+    .await
+    {
+        Ok(()) => Redirect::to(&format!("/channels/{id}")).into_response(),
+        Err(err) => (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
     }
 }
 
@@ -1050,6 +1230,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn launch_runs_a_turn_and_records_the_session() {
+        // End to end with a stubbed harness (docs/adr/0023): launch from the
+        // form → SessionStarted appears → the background turn finishes → a
+        // memo artifact + done state land, and the harness session id is
+        // remembered for --resume.
+        let home = crate::host::test_home::HomeGuard::new();
+        let stub_dir = tempfile::tempdir().expect("stub dir");
+        let stub = if cfg!(windows) {
+            let path = stub_dir.path().join("stub.cmd");
+            std::fs::write(
+                &path,
+                "@echo {\"result\":\"stub work complete\",\"session_id\":\"h-stub-1\"}\r\n",
+            )
+            .expect("write stub");
+            path
+        } else {
+            let path = stub_dir.path().join("stub.sh");
+            std::fs::write(
+                &path,
+                "#!/bin/sh\necho '{\"result\":\"stub work complete\",\"session_id\":\"h-stub-1\"}'\n",
+            )
+            .expect("write stub");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod stub");
+            }
+            path
+        };
+        // Safe-enough: env mutation is serialized by the HomeGuard's lock.
+        unsafe { std::env::set_var("JUNTO_HARNESS_CMD", &stub) };
+
+        let fx = host_with_entry(assertion()).await;
+        // The harness member must be in the Party for its entries to project.
+        let founder = Member::human("Web User", "web@example.com");
+        fx.host
+            .add_member("web-test", &founder, crate::launch::harness_member())
+            .await
+            .expect("grant the harness membership");
+        // A workspace repo for the session to run in.
+        let workspace = tempfile::tempdir().expect("workspace");
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+
+        let response = launch_session(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LaunchForm {
+                intent: "do the stub thing".into(),
+                workspace: workspace.path().display().to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        // Poll the projection until the background turn lands.
+        let Resolution::Resolved { ledger, id, .. } = fx.host.resolve("web-test").await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+        let mut done_session = None;
+        for _ in 0..100 {
+            let view = ledger.lock().await.project(&id).await.unwrap();
+            if let Some((session_id, session)) = view
+                .sessions
+                .iter()
+                .find(|(_, s)| s.state == junto_kernel::SessionState::Done)
+            {
+                assert!(
+                    !session.artifacts.is_empty(),
+                    "the turn attached at least the result memo"
+                );
+                done_session = Some(*session_id);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        if done_session.is_none() {
+            let view = ledger.lock().await.project(&id).await.unwrap();
+            for entry in &view.entries {
+                eprintln!("entry: {:?}", entry.payload);
+            }
+            for (sid, s) in &view.sessions {
+                eprintln!("session {sid}: {:?}", s.state);
+            }
+        }
+        let session = done_session.expect("session reached done");
+
+        // The memo artifact carries the stub's result and a file:// + sha256
+        // provenance; the harness session id is remembered for --resume.
+        let view = ledger.lock().await.project(&id).await.unwrap();
+        let memo = view
+            .entries
+            .iter()
+            .find_map(|entry| match &entry.payload {
+                junto_kernel::EntryPayload::ArtifactAttached {
+                    target,
+                    kind,
+                    description,
+                    provenance,
+                } if *target == session && kind == "memo" => {
+                    Some((description.clone(), provenance.clone()))
+                }
+                _ => None,
+            })
+            .expect("memo artifact recorded");
+        assert!(memo.0.contains("stub work complete"), "{}", memo.0);
+        assert!(memo.1[0].uri.as_str().starts_with("file:///"));
+        assert!(memo.1[0].digest.is_some());
+        assert_eq!(
+            crate::launch::harness_session_for(home.path(), &session)
+                .unwrap()
+                .as_deref(),
+            Some("h-stub-1")
+        );
+
+        unsafe { std::env::remove_var("JUNTO_HARNESS_CMD") };
+    }
+
+    #[tokio::test]
     async fn close_then_reopen_round_trips() {
         let fx = host_with_entry(assertion()).await;
 
@@ -1306,6 +1613,7 @@ mod tests {
             &channel,
             &view,
             std::path::Path::new("/repo"),
+            None,
         );
         assert!(html.contains(&format!("/channels/{channel}/entries/{}/ratify", entry.id)));
         assert!(html.contains("name=\"rationale\""));
