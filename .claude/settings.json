@@ -1,6 +1,10 @@
 {
   "//": "Shared project hooks. Cross-platform: bare `cargo`/`curl` invocations (on PATH everywhere), no shell operators or scripts. Runs from the session's project-root cwd. Personal/machine settings live in the gitignored settings.local.json.",
   "//recall": "SessionStart injects the junto-dev channel brief into agent context — the recall bridge until membership-time injection exists (docs/adr/0013). -sf fails silently when `junto serve` isn't running; -m 2 keeps a hung host from stalling session start.",
+  "//mcp": "Pre-approve the .mcp.json junto server (the dogfooding write surface) so every checkout — fresh clones AND new worktrees — gets the record/view tools without a per-project approval prompt. Connects to the singleton host on 127.0.0.1:1727 (one host per machine serves all checkouts); degrades to a silent no-op when `junto serve` isn't running, exactly like the recall hook above. A per-checkout disable still wins via the gitignored settings.local.json.",
+  "enabledMcpjsonServers": [
+    "junto"
+  ],
   "hooks": {
     "SessionStart": [
       {
