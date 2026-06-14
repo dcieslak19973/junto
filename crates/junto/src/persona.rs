@@ -3,7 +3,7 @@
 //!
 //! A **Persona** is the thing a human picks when starting work: it references a
 //! [`Harness`](crate::launch::Harness) (the engine) and carries a role, an
-//! optional model, MCP servers, and (Claude-only) skills + plugin marketplaces.
+//! optional model, MCP servers, and (Claude-only) skills + local plugins.
 //! One harness → many personas. The config is a **machine fact**
 //! (`~/.junto/personas.toml`) and never enters the ledger; only the persona's
 //! identity (its agent [`Member`]) lands there when it authors work.
@@ -50,12 +50,16 @@ pub(crate) struct Persona {
     /// MCP servers the persona offers.
     #[serde(default)]
     pub(crate) mcp_servers: Vec<McpServer>,
-    /// Claude-only: skills to enable.
+    /// Claude-only: skills to enable, by name (matching the `SKILL.md` `name`
+    /// or `plugin:skill`). Delivered as the SDK `skills` option; only enables
+    /// skills already discovered on the machine.
     #[serde(default)]
     pub(crate) skills: Vec<String>,
-    /// Claude-only: plugin marketplaces to register.
+    /// Claude-only: local plugin directories to load (absolute paths).
+    /// Delivered as SDK `plugins: [{type:"local", path}]`. (Remote plugin
+    /// marketplaces aren't supported by the SDK option yet — out of scope.)
     #[serde(default)]
-    pub(crate) marketplaces: Vec<String>,
+    pub(crate) plugins: Vec<String>,
 }
 
 impl Persona {
@@ -92,9 +96,97 @@ fn stock_personas() -> Vec<Persona> {
             model: None,
             mcp_servers: Vec::new(),
             skills: Vec::new(),
-            marketplaces: Vec::new(),
+            plugins: Vec::new(),
         })
         .collect()
+}
+
+/// A skill discovered on this machine, for the persona form's picker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DiscoveredSkill {
+    /// The skill's name (matches the SDK `skills` option and `SKILL.md` `name`).
+    pub(crate) name: String,
+    /// The one-line description from `SKILL.md` frontmatter, for the picker.
+    pub(crate) description: String,
+}
+
+/// The Claude config dir skills are discovered from — `CLAUDE_CONFIG_DIR` if
+/// set (matching the ACP adapter), else `~/.claude`. The persona's `skills`
+/// option enables among the skills in this dir's `skills/` subtree.
+fn claude_config_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+    dirs_home().map(|home| home.join(".claude"))
+}
+
+fn dirs_home() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+}
+
+/// Skills installed under the Claude config dir's `skills/`, each parsed for
+/// its `name` + `description` from `SKILL.md` frontmatter. Empty when the dir
+/// is absent — discovery is best-effort (the picker just shows nothing).
+pub(crate) fn discover_skills() -> Vec<DiscoveredSkill> {
+    let Some(skills_dir) = claude_config_dir().map(|dir| dir.join("skills")) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&skills_dir) else {
+        return Vec::new();
+    };
+    let mut skills: Vec<DiscoveredSkill> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let text = std::fs::read_to_string(entry.path().join("SKILL.md")).ok()?;
+            let dir_name = entry.file_name().to_string_lossy().into_owned();
+            Some(parse_skill_frontmatter(&text, &dir_name))
+        })
+        .collect();
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    skills
+}
+
+/// Pull `name` and `description` from a `SKILL.md` YAML frontmatter block,
+/// falling back to the directory name. Handles inline values and folded/literal
+/// block scalars (`description: >` / `|`) by gathering the indented lines that
+/// follow. Deliberately tiny — a full YAML parse isn't warranted for two keys.
+fn parse_skill_frontmatter(text: &str, dir_name: &str) -> DiscoveredSkill {
+    let mut name = dir_name.to_string();
+    let mut description = String::new();
+    let mut lines = text.lines();
+    // The frontmatter is the block between the first two `---` fences.
+    if lines.next().map(str::trim) != Some("---") {
+        return DiscoveredSkill { name, description };
+    }
+    let mut pending: Vec<String> = Vec::new();
+    while let Some(line) = lines.next() {
+        if line.trim() == "---" {
+            break;
+        }
+        if let Some(rest) = line.strip_prefix("name:") {
+            name = rest.trim().to_string();
+        } else if let Some(rest) = line.strip_prefix("description:") {
+            let rest = rest.trim();
+            if rest.is_empty() || rest == ">" || rest == "|" || rest == ">-" || rest == "|-" {
+                // A block scalar: gather the indented lines that follow, until
+                // a non-indented line (the next key, or the closing `---`).
+                pending = lines
+                    .by_ref()
+                    .take_while(|l| l.starts_with(char::is_whitespace))
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                break;
+            }
+            description = rest.to_string();
+        }
+    }
+    if description.is_empty() {
+        description = pending.join(" ");
+    }
+    DiscoveredSkill { name, description }
 }
 
 /// Every persona — the stored set, or the stock seed when none are stored yet.
@@ -187,8 +279,26 @@ mod tests {
                 url: "http://127.0.0.1:1727/mcp".to_string(),
             }],
             skills: vec!["security-review".to_string()],
-            marketplaces: vec![],
+            plugins: vec![],
         }
+    }
+
+    #[test]
+    fn parse_skill_frontmatter_reads_inline_and_folded_descriptions() {
+        let folded = "---\nname: caveman\ndescription: >\n  Ultra-compressed mode.\n  Cuts tokens.\n---\nbody";
+        let skill = parse_skill_frontmatter(folded, "caveman");
+        assert_eq!(skill.name, "caveman");
+        assert_eq!(skill.description, "Ultra-compressed mode. Cuts tokens.");
+
+        let inline = "---\nname: diagnose\ndescription: A debugging loop.\n---\n";
+        let skill = parse_skill_frontmatter(inline, "diagnose");
+        assert_eq!(skill.name, "diagnose");
+        assert_eq!(skill.description, "A debugging loop.");
+
+        // No frontmatter → fall back to the directory name, empty description.
+        let none = parse_skill_frontmatter("# just a heading\n", "my-skill");
+        assert_eq!(none.name, "my-skill");
+        assert_eq!(none.description, "");
     }
 
     #[test]

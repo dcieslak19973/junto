@@ -38,6 +38,11 @@ pub(crate) struct AcpPersona {
     pub(crate) system_prompt: Option<String>,
     /// A model override (Claude only) → `_meta.claudeCode.options.model`.
     pub(crate) model: Option<String>,
+    /// Skills to enable (Claude only) → `_meta.claudeCode.options.skills`.
+    pub(crate) skills: Vec<String>,
+    /// Local plugin paths (Claude only) →
+    /// `_meta.claudeCode.options.plugins: [{type:"local", path}]`.
+    pub(crate) plugins: Vec<String>,
 }
 
 impl AcpPersona {
@@ -53,23 +58,37 @@ impl AcpPersona {
     }
 
     /// The `_meta` object for `session/new`, or `None` when the persona carries
-    /// no Claude-adapter extras. Builds `systemPrompt` and
-    /// `claudeCode.options.model` only as each is present.
+    /// no Claude-adapter extras. `systemPrompt` rides the top level; `model`,
+    /// `skills`, and `plugins` go under `claudeCode.options` (which the adapter
+    /// spreads into the Claude Agent SDK's options), each only when present.
     fn meta_json(&self) -> Option<Value> {
-        if self.system_prompt.is_none() && self.model.is_none() {
-            return None;
+        let mut options = serde_json::Map::new();
+        if let Some(model) = &self.model {
+            options.insert("model".to_string(), json!(model));
+        }
+        if !self.skills.is_empty() {
+            options.insert("skills".to_string(), json!(self.skills));
+        }
+        if !self.plugins.is_empty() {
+            let plugins: Vec<Value> = self
+                .plugins
+                .iter()
+                .map(|path| json!({ "type": "local", "path": path }))
+                .collect();
+            options.insert("plugins".to_string(), Value::Array(plugins));
         }
         let mut meta = serde_json::Map::new();
         if let Some(prompt) = &self.system_prompt {
             meta.insert("systemPrompt".to_string(), json!(prompt));
         }
-        if let Some(model) = &self.model {
-            meta.insert(
-                "claudeCode".to_string(),
-                json!({ "options": { "model": model } }),
-            );
+        if !options.is_empty() {
+            meta.insert("claudeCode".to_string(), json!({ "options": options }));
         }
-        Some(Value::Object(meta))
+        if meta.is_empty() {
+            None
+        } else {
+            Some(Value::Object(meta))
+        }
     }
 }
 
@@ -394,17 +413,24 @@ mod tests {
     fn meta_json_builds_only_the_present_claude_extras() {
         // No extras → no _meta at all.
         assert!(AcpPersona::default().meta_json().is_none());
-        // systemPrompt and model land under the adapter's recognized keys.
+        // systemPrompt rides the top level; model/skills/plugins nest under
+        // claudeCode.options (the SDK options the adapter spreads).
         let persona = AcpPersona {
             system_prompt: Some("be careful".into()),
             model: Some("claude-opus-4-8".into()),
+            skills: vec!["diagnose".into(), "caveman".into()],
+            plugins: vec!["/abs/plugin".into()],
             ..Default::default()
         };
         assert_eq!(
             persona.meta_json(),
             Some(json!({
                 "systemPrompt": "be careful",
-                "claudeCode": { "options": { "model": "claude-opus-4-8" } }
+                "claudeCode": { "options": {
+                    "model": "claude-opus-4-8",
+                    "skills": ["diagnose", "caveman"],
+                    "plugins": [{ "type": "local", "path": "/abs/plugin" }]
+                } }
             }))
         );
     }

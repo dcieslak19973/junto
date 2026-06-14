@@ -1039,8 +1039,8 @@ fn persona_summary(persona: &crate::persona::Persona) -> String {
     if !persona.skills.is_empty() {
         parts.push(format!("{} skill(s)", persona.skills.len()));
     }
-    if !persona.marketplaces.is_empty() {
-        parts.push(format!("{} marketplace(s)", persona.marketplaces.len()));
+    if !persona.plugins.is_empty() {
+        parts.push(format!("{} plugin(s)", persona.plugins.len()));
     }
     if persona.role.is_some() {
         parts.push("custom role".to_string());
@@ -1066,41 +1066,81 @@ fn mcp_row(name: &str, url: &str) -> String {
     )
 }
 
+/// One local-plugin path row (a single `plugin_path` field). Blank rows are
+/// dropped by the handler.
+fn plugin_row(path: &str) -> String {
+    format!(
+        "<div class=\"row\">\
+         <input name=\"plugin_path\" value=\"{path}\" placeholder=\"absolute path to a local plugin directory\" aria-label=\"local plugin path\">\
+         </div>",
+        path = escape_html(path),
+    )
+}
+
+/// The skills picker: a checkbox per skill discovered under the Claude config
+/// dir's `skills/` (name + its `SKILL.md` description), checked when the persona
+/// enables it. Any skill the persona stored that isn't discovered on this
+/// machine is still shown (checked, flagged) so editing never silently drops it.
+fn skills_checklist(selected: &[String]) -> String {
+    let discovered = crate::persona::discover_skills();
+    let mut html = String::new();
+    for skill in &discovered {
+        let checked = if selected.iter().any(|s| s == &skill.name) {
+            " checked"
+        } else {
+            ""
+        };
+        let _ = write!(
+            html,
+            "<label class=\"check\"><input type=\"checkbox\" name=\"skill\" value=\"{name}\"{checked}>\
+             <span class=\"skill-name\">{name}</span> <span class=\"when\">{desc}</span></label>",
+            name = escape_html(&skill.name),
+            desc = escape_html(&skill.description),
+        );
+    }
+    for stored in selected {
+        if !discovered.iter().any(|d| &d.name == stored) {
+            let _ = write!(
+                html,
+                "<label class=\"check\"><input type=\"checkbox\" name=\"skill\" value=\"{name}\" checked>\
+                 <span class=\"skill-name\">{name}</span> <span class=\"when\">(not found on this machine)</span></label>",
+                name = escape_html(stored),
+            );
+        }
+    }
+    if html.is_empty() {
+        "<span class=\"when\">no skills found under ~/.claude/skills</span>".to_string()
+    } else {
+        html
+    }
+}
+
 /// The create/edit form for a persona. `Some` prefills for an edit (slug is a
 /// hidden, immutable field); `None` renders a blank create form (the server
-/// derives the slug from the name). MCP servers are structured `name`+`url`
-/// rows (one blank trailing row to add another; `+ add server` clones a row
-/// when JS is on). Skills and marketplaces are **not editable yet** — they are
-/// shown read-only because delivery isn't wired (a per-persona Claude config
-/// dir; see the design's §6 open item). The handler carries any stored values
-/// through unchanged, so saving the form never silently drops them.
+/// derives the slug from the name). MCP servers and local plugins are
+/// structured rows (one blank trailing row to add another; `+ add` clones a row
+/// when JS is on). Skills are a checklist of what's installed under the Claude
+/// config dir. All of these are delivered to Claude personas over ACP `_meta`.
 fn persona_form(persona: Option<&crate::persona::Persona>) -> String {
     let slug = persona.map(|p| p.slug.as_str()).unwrap_or("");
     let name = persona.map(|p| p.name.as_str()).unwrap_or("");
     let role = persona.and_then(|p| p.role.as_deref()).unwrap_or("");
     let model = persona.and_then(|p| p.model.as_deref()).unwrap_or("");
     let selected_harness = persona.map(|p| p.harness.as_str()).unwrap_or("");
-    // Existing servers as filled rows, plus one blank row to add another.
+    // Existing servers / plugins as filled rows, plus one blank row to add more.
     let mut mcp_rows = String::new();
+    let mut plugin_rows = String::new();
     if let Some(persona) = persona {
         for server in &persona.mcp_servers {
             mcp_rows.push_str(&mcp_row(&server.name, &server.url));
         }
+        for path in &persona.plugins {
+            plugin_rows.push_str(&plugin_row(path));
+        }
     }
     mcp_rows.push_str(&mcp_row("", ""));
-    // Skills / marketplaces: stored values shown read-only until delivery lands.
-    let read_only_list = |items: &[String]| {
-        if items.is_empty() {
-            "<span class=\"when\">none</span>".to_string()
-        } else {
-            items
-                .iter()
-                .map(|item| format!("<span class=\"chip\">{}</span>", escape_html(item)))
-                .collect::<String>()
-        }
-    };
-    let skills = read_only_list(persona.map(|p| p.skills.as_slice()).unwrap_or(&[]));
-    let marketplaces = read_only_list(persona.map(|p| p.marketplaces.as_slice()).unwrap_or(&[]));
+    plugin_rows.push_str(&plugin_row(""));
+    let skills = skills_checklist(persona.map(|p| p.skills.as_slice()).unwrap_or(&[]));
     let harness_options: String = crate::launch::all_harnesses()
         .iter()
         .map(|harness| {
@@ -1127,12 +1167,13 @@ fn persona_form(persona: Option<&crate::persona::Persona>) -> String {
          <label>role / system-prompt<textarea name=\"role\" rows=\"3\" placeholder=\"how this agent should behave (optional)\">{role}</textarea></label>\
          <label>model<input name=\"model\" value=\"{model}\" placeholder=\"optional model override\"></label>\
          <div class=\"field\"><span class=\"field-label\">MCP servers</span>\
-         <div class=\"mcp-rows\">{mcp_rows}</div>\
-         <button type=\"button\" class=\"add-mcp\">+ add server</button></div>\
-         <div class=\"field\"><span class=\"field-label\">skills <span class=\"when\">(Claude only · not yet applied)</span></span>\
-         <div class=\"chips\">{skills}</div></div>\
-         <div class=\"field\"><span class=\"field-label\">marketplaces <span class=\"when\">(Claude only · not yet applied)</span></span>\
-         <div class=\"chips\">{marketplaces}</div></div>\
+         <div class=\"rows\">{mcp_rows}</div>\
+         <button type=\"button\" class=\"add-row\">+ add server</button></div>\
+         <div class=\"field\"><span class=\"field-label\">skills <span class=\"when\">(Claude only · installed under ~/.claude/skills)</span></span>\
+         <div class=\"checks\">{skills}</div></div>\
+         <div class=\"field\"><span class=\"field-label\">local plugins <span class=\"when\">(Claude only · a plugin's skills become available)</span></span>\
+         <div class=\"rows\">{plugin_rows}</div>\
+         <button type=\"button\" class=\"add-row\">+ add plugin</button></div>\
          <button class=\"primary\">save</button>\
          </form>",
         slug = escape_html(slug),
@@ -2251,11 +2292,11 @@ var b=e.submitter;setTimeout(function(){f.classList.add('busy');\
 f.querySelectorAll('button').forEach(function(x){x.disabled=true});\
 if(b){b.textContent='recording\\u2026'}},0)});</script>";
 
-/// Progressive enhancement for the personas form: clone a blank MCP-server row
-/// when `+ add server` is clicked. Without JS the form still works — each save
-/// adds the one trailing blank row the server rendered.
+/// Progressive enhancement for the personas form: clone a blank row (MCP server
+/// or plugin path) when a `+ add` button is clicked. Without JS the form still
+/// works — each save adds the one trailing blank row the server rendered.
 const ADD_MCP_SCRIPT: &str = "<script>document.addEventListener('click',function(e)\
-{var b=e.target;if(!b.classList||!b.classList.contains('add-mcp'))return;\
+{var b=e.target;if(!b.classList||!b.classList.contains('add-row'))return;\
 var rows=b.previousElementSibling;var last=rows.lastElementChild;\
 var clone=last.cloneNode(true);\
 clone.querySelectorAll('input').forEach(function(i){i.value=''});\
@@ -2466,12 +2507,19 @@ form.persona-form textarea:focus{outline:1px solid var(--accent)}\
 form.persona-form button.primary{align-self:flex-start}\
 form.persona-form .field{display:flex;flex-direction:column;gap:.3rem}\
 form.persona-form .field-label{font-size:.8rem;color:var(--muted)}\
-.mcp-rows{display:flex;flex-direction:column;gap:.35rem}\
+.rows{display:flex;flex-direction:column;gap:.35rem}\
 .mcp-row{display:flex;gap:.4rem}\
 .mcp-row input[name=mcp_name]{flex:0 0 9rem}\
 .mcp-row input[name=mcp_url]{flex:1}\
-form.persona-form button.add-mcp{align-self:flex-start;font-size:.8rem;padding:.2rem .6rem}\
+.row input{width:100%}\
+form.persona-form button.add-row{align-self:flex-start;font-size:.8rem;padding:.2rem .6rem}\
 .chips{display:flex;flex-wrap:wrap;gap:.3rem}\
+.checks{display:flex;flex-direction:column;gap:.2rem;max-height:14rem;overflow:auto;\
+border:1px solid var(--border);border-radius:.45rem;padding:.4rem}\
+label.check{display:flex;align-items:baseline;gap:.4rem;font-size:.82rem;color:var(--text)}\
+label.check input{flex:0 0 auto}\
+label.check .skill-name{font-weight:500}\
+label.check .when{flex:1;min-width:0}\
 a.back-link{color:var(--muted);font-size:.84rem}\
 a.back-link:hover{color:var(--soft)}";
 

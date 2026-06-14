@@ -226,11 +226,21 @@ fn parse_mcp_rows(pairs: &[(String, String)]) -> Vec<crate::persona::McpServer> 
         .collect()
 }
 
+/// Every value submitted for `key`, in order, trimmed and non-empty. Used for
+/// the repeated `skill` checkboxes and `plugin_path` rows.
+fn all_fields(pairs: &[(String, String)], key: &str) -> Vec<String> {
+    pairs
+        .iter()
+        .filter(|(k, _)| k == key)
+        .map(|(_, v)| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .collect()
+}
+
 /// Save (create or update) a persona from the personas-page form. The body is
-/// read as raw key/value pairs so the repeated MCP-row fields survive (axum's
-/// typed `Form` can't collect duplicate keys into a list). Skills and
-/// marketplaces aren't editable yet (delivery is pending), so any stored values
-/// are carried through unchanged rather than read from the form.
+/// read as raw key/value pairs so the repeated rows (MCP servers, plugins) and
+/// the `skill` checkboxes survive — axum's typed `Form` can't collect duplicate
+/// keys into a list.
 async fn save_persona(
     State(_host): State<Arc<Host>>,
     Form(pairs): Form<Vec<(String, String)>>,
@@ -257,21 +267,13 @@ async fn save_persona(
         )
             .into_response();
     }
-    // Carry an existing persona's identity and not-yet-editable fields through:
-    // its email (so editing a stock persona keeps the harness identity) and its
-    // stored skills / marketplaces (which the form shows read-only). A brand-new
-    // persona gets its own email and empty lists.
-    let existing = match crate::persona::persona_by_slug(&junto_home, &slug) {
-        Ok(existing) => existing,
+    // Preserve an existing persona's email so editing a stock persona keeps the
+    // harness identity; a brand-new custom persona gets its own.
+    let email = match crate::persona::persona_by_slug(&junto_home, &slug) {
+        Ok(Some(existing)) => existing.email,
+        Ok(None) => format!("{slug}@junto.local"),
         Err(err) => return internal(format!("reading personas: {err}")),
     };
-    let email = existing
-        .as_ref()
-        .map(|p| p.email.clone())
-        .unwrap_or_else(|| format!("{slug}@junto.local"));
-    let (skills, marketplaces) = existing
-        .map(|p| (p.skills, p.marketplaces))
-        .unwrap_or_default();
     let trimmed = |s: &str| {
         let t = s.trim();
         (!t.is_empty()).then(|| t.to_string())
@@ -286,8 +288,8 @@ async fn save_persona(
         role: trimmed(field(&pairs, "role")),
         model: trimmed(field(&pairs, "model")),
         mcp_servers: parse_mcp_rows(&pairs),
-        skills,
-        marketplaces,
+        skills: all_fields(&pairs, "skill"),
+        plugins: all_fields(&pairs, "plugin_path"),
     };
     match crate::persona::save_persona(&junto_home, persona) {
         Ok(()) => Redirect::to("/personas").into_response(),

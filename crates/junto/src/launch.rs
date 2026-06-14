@@ -867,17 +867,19 @@ async fn run_turn(
 }
 
 /// Build the per-turn ACP config from a persona. MCP servers cross to any
-/// harness (standard ACP); the role and model ride the Claude adapter's `_meta`
-/// extensions, so they are only carried for Claude personas (other harnesses
-/// would ignore them, and `docs/.../agent-personas-design.md` defers OpenCode's
-/// own role/model surface). Skills + marketplaces (the per-persona
-/// `CLAUDE_CONFIG_DIR`) are not yet delivered — see the design's §6 open item.
+/// harness (standard ACP); the role, model, skills, and plugins ride the Claude
+/// adapter's `_meta` extensions (the SDK options the adapter spreads), so they
+/// are only carried for Claude personas — other harnesses would ignore them,
+/// and `docs/.../agent-personas-design.md` defers OpenCode's own surface.
 fn acp_config(persona: &crate::persona::Persona, harness: Harness) -> crate::acp::AcpPersona {
     let claude = harness.id == "claude";
+    let claude_only = |items: &[String]| if claude { items.to_vec() } else { Vec::new() };
     crate::acp::AcpPersona {
         mcp_servers: persona.mcp_servers.clone(),
         system_prompt: if claude { persona.role.clone() } else { None },
         model: if claude { persona.model.clone() } else { None },
+        skills: claude_only(&persona.skills),
+        plugins: claude_only(&persona.plugins),
     }
 }
 
@@ -1457,19 +1459,23 @@ mod tests {
                 name: "junto".into(),
                 url: "http://127.0.0.1:1727/mcp".into(),
             }],
-            skills: vec![],
-            marketplaces: vec![],
+            skills: vec!["diagnose".into()],
+            plugins: vec!["/abs/plugin".into()],
         };
-        // Claude personas carry the role + model over the adapter's _meta.
+        // Claude personas carry role + model + skills + plugins over _meta.
         let claude = acp_config(&persona, harness_by_id("claude"));
         assert_eq!(claude.system_prompt.as_deref(), Some("be careful"));
         assert_eq!(claude.model.as_deref(), Some("claude-opus-4-8"));
         assert_eq!(claude.mcp_servers.len(), 1);
+        assert_eq!(claude.skills, vec!["diagnose".to_string()]);
+        assert_eq!(claude.plugins, vec!["/abs/plugin".to_string()]);
         // Other harnesses get MCP (standard ACP) but not the Claude _meta extras.
         let opencode = acp_config(&persona, harness_by_id("opencode"));
         assert!(opencode.system_prompt.is_none());
         assert!(opencode.model.is_none());
         assert_eq!(opencode.mcp_servers.len(), 1);
+        assert!(opencode.skills.is_empty());
+        assert!(opencode.plugins.is_empty());
     }
 
     #[test]
