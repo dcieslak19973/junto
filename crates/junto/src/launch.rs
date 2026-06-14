@@ -125,6 +125,18 @@ pub(crate) fn harness_by_id(id: &str) -> Harness {
         .unwrap_or(HARNESSES[0])
 }
 
+/// The registry harness already serving a channel — the harness whose agent
+/// member is in `party`, if any. This is the channel's established agent: one
+/// agent per channel (`docs/adr/0024`), so a launch reuses it and the picker
+/// only appears before one is set. Non-registry agents in the Party (ones
+/// junto doesn't drive) don't count.
+pub(crate) fn channel_harness(party: &[Member]) -> Option<Harness> {
+    HARNESSES
+        .iter()
+        .copied()
+        .find(|harness| party.iter().any(|member| member.email == harness.email))
+}
+
 /// Every registered harness (for the launch picker and settings).
 pub(crate) fn all_harnesses() -> &'static [Harness] {
     HARNESSES

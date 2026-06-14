@@ -1239,25 +1239,31 @@ pub fn channel_html(
             Some(text) => format!("<p class=\"meta hint\">⚠ {}</p>", escape_html(text)),
             None => String::new(),
         };
-        // The harness picker — who runs this work (docs/adr/0024). Shown only
-        // when there's a choice.
+        // One agent per channel (docs/adr/0024): the picker chooses the agent
+        // only the first time. Once an agent serves the channel, show it fixed
+        // — every session here uses that one agent.
         let harnesses = crate::launch::all_harnesses();
-        let harness_picker = if harnesses.len() > 1 {
-            let options: String = harnesses
-                .iter()
-                .map(|harness| {
-                    format!(
-                        "<option value=\"{id}\">{label}</option>",
-                        id = escape_html(harness.id),
-                        label = escape_html(harness.label),
-                    )
-                })
-                .collect();
-            format!(
-                "<select name=\"harness\" title=\"which agent runs this work\">{options}</select>"
-            )
-        } else {
-            String::new()
+        let harness_picker = match crate::launch::channel_harness(&view.party) {
+            Some(agent) => format!(
+                "<span class=\"chip\" title=\"this channel's agent\">agent: {}</span>",
+                escape_html(agent.label)
+            ),
+            None if harnesses.len() > 1 => {
+                let options: String = harnesses
+                    .iter()
+                    .map(|harness| {
+                        format!(
+                            "<option value=\"{id}\">{label}</option>",
+                            id = escape_html(harness.id),
+                            label = escape_html(harness.label),
+                        )
+                    })
+                    .collect();
+                format!(
+                    "<select name=\"harness\" title=\"which agent runs this channel\">{options}</select>"
+                )
+            }
+            None => String::new(),
         };
         format!(
             "<section class=\"board\" id=\"start-work\">\

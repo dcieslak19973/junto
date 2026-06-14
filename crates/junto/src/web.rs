@@ -348,7 +348,14 @@ async fn launch_session(
     // MemberAdded) so the agent joins and starts work in one motion — the
     // grant is recorded, not hidden. A non-founder can't grant: they get
     // add_member's error naming who can (docs/adr/0017).
-    let harness = crate::launch::harness_by_id(form.harness.trim());
+    // One agent per channel (for now): if an agent already serves this channel
+    // (is in the Party), reuse it — the picker only chooses the agent the first
+    // time. Otherwise the form's selection becomes the channel's agent, granted
+    // below.
+    let harness = match crate::launch::channel_harness(&view.party) {
+        Some(established) => established,
+        None => crate::launch::harness_by_id(form.harness.trim()),
+    };
     let harness_member = harness.member();
     let harness_is_member = view.party.iter().any(|m| m.email == harness_member.email);
     if !view.party.is_empty() && !harness_is_member {
