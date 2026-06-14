@@ -518,9 +518,19 @@ impl Host {
         author: &Member,
         code: Option<&str>,
     ) -> Result<()> {
-        self.authorize_human_write(view, author)?;
         if view.party.is_empty() {
             return Ok(());
+        }
+        // The MCP/agent surface keeps the operational message — agents really do
+        // grant membership with `junto add-member` / the `add_member` tool. The
+        // human surface (authorize_human_write) carries the plain-language variant.
+        if !is_member(view, author) {
+            bail!(
+                "{} <{}> is not a member of this channel — the founding member can grant \
+                 membership (junto add-member, or the add_member tool; docs/adr/0017)",
+                author.display_name,
+                author.email
+            );
         }
         let Some(code) = code else {
             bail!(
@@ -553,16 +563,28 @@ impl Host {
         if view.party.is_empty() {
             return Ok(());
         }
-        if !view.party.iter().any(|member| member.email == author.email) {
+        if !is_member(view, author) {
+            // Human surface: keep this plain. The reader is a person, not an
+            // agent, so no CLI/MCP/ADR jargon — and naming the git identity makes
+            // an identity mismatch (a checkout whose git config differs from your
+            // membership) diagnosable at a glance.
             bail!(
-                "{} <{}> is not a member of this channel — the founding member can grant \
-                 membership (junto add-member, or the add_member tool; docs/adr/0017)",
+                "You're acting as {} <{}> (your git identity), who isn't a member of this \
+                 channel — so this can't be recorded. Only members can act on a channel; its \
+                 founder can add you as one.",
                 author.display_name,
                 author.email
             );
         }
         Ok(())
     }
+}
+
+/// Whether `author` is in the channel's Party — membership is by stable email
+/// (`docs/adr/0017`). Shared by both write surfaces, which format their own
+/// (human vs agent) refusal message.
+fn is_member(view: &ChannelView, author: &Member) -> bool {
+    view.party.iter().any(|member| member.email == author.email)
 }
 
 /// The result of opening a channel: its id, and the founding member's
