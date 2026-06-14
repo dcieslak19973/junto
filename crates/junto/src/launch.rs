@@ -144,18 +144,38 @@ pub(crate) fn harness_status() -> HarnessStatus {
         },
         None => "detecting…",
     };
-    // Auth status only — junto never stores a key; the harness owns its auth.
-    let auth = if std::env::var_os("ANTHROPIC_API_KEY").is_some() {
-        "Claude: API key (ANTHROPIC_API_KEY set)"
-    } else {
-        "Claude: subscription login (no API key)"
-    };
     HarnessStatus {
         protocol,
         detail,
         backend,
-        auth,
+        auth: claude_auth_mode(),
         hint: harness_hint(),
+    }
+}
+
+/// Detect how Claude Code will authenticate, **read-only** — junto never
+/// stores a credential; the harness owns its auth (`docs/adr/0024`). Mirrors
+/// Claude Code's own precedence: cloud routing flags, then a gateway base-url,
+/// then a direct key/token, else the subscription login.
+fn claude_auth_mode() -> &'static str {
+    let flag = |key: &str| {
+        std::env::var(key)
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    };
+    let present = |key: &str| std::env::var_os(key).is_some_and(|v| !v.is_empty());
+    if flag("CLAUDE_CODE_USE_BEDROCK") {
+        "Claude via AWS Bedrock"
+    } else if flag("CLAUDE_CODE_USE_VERTEX") {
+        "Claude via Google Vertex"
+    } else if flag("CLAUDE_CODE_USE_FOUNDRY") {
+        "Claude via Microsoft Foundry"
+    } else if present("ANTHROPIC_BASE_URL") {
+        "Claude via a gateway (ANTHROPIC_BASE_URL)"
+    } else if present("ANTHROPIC_API_KEY") || present("ANTHROPIC_AUTH_TOKEN") {
+        "Claude: API key"
+    } else {
+        "Claude: subscription login (no API key)"
     }
 }
 
