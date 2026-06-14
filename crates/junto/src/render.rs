@@ -777,7 +777,8 @@ fn page_shell(
          <a class=\"chan open-link\" href=\"/new#open-channel\">open a channel…</a>\
          <a class=\"chan open-link\" href=\"/new#setup-repo\">set up a repo…</a>\
          </details>\n\
-         <a class=\"chan open-link side-settings\" href=\"/settings\">⚙ settings</a>\n\
+         <a class=\"chan open-link side-settings\" href=\"/personas\">✦ personas</a>\n\
+         <a class=\"chan open-link\" href=\"/settings\">⚙ settings</a>\n\
          </nav>\n\
          <main>\n{content}</main>\n\
          </div>{ACT_FEEDBACK_SCRIPT}</body></html>\n",
@@ -973,6 +974,146 @@ pub fn settings_html(
         host = escape_html(host_url),
     );
     page_shell("junto — settings", nav, None, &content)
+}
+
+/// The "/personas" page — create, edit, and delete reusable agent personas
+/// (`docs/superpowers/specs/2026-06-13-agent-personas-design.md`). A persona is
+/// a named config over a harness; it is what the launch picker offers. Each
+/// existing persona carries an inline edit form (in a `<details>`) and a delete
+/// button; a blank create form sits at the bottom, mirroring `/new`.
+pub fn personas_html(nav: &[ChannelSummary], personas: &[crate::persona::Persona]) -> String {
+    let mut cards = String::new();
+    for persona in personas {
+        let harness_label = crate::launch::all_harnesses()
+            .iter()
+            .find(|h| h.id == persona.harness)
+            .map(|h| h.label)
+            .unwrap_or(persona.harness.as_str());
+        let summary = persona_summary(persona);
+        let _ = writeln!(
+            cards,
+            "<section class=\"board\">\
+             <h2 class=\"board-head\">{name} <span class=\"when\">· {harness}</span></h2>\
+             <p class=\"meta\">{summary}</p>\
+             <details class=\"ledger\"><summary class=\"view\">edit</summary>{form}</details>\
+             <form class=\"act\" method=\"post\" action=\"/personas/{slug}/delete\">\
+             <button class=\"danger\">delete</button></form>\
+             </section>",
+            name = escape_html(&persona.name),
+            harness = escape_html(harness_label),
+            summary = escape_html(&summary),
+            form = persona_form(Some(persona)),
+            slug = escape_html(&persona.slug),
+        );
+    }
+    let content = format!(
+        "<h1>personas</h1>\n\
+         <p class=\"meta\">a persona is a named, reusable configuration over a harness — \
+         what the start-work picker offers. Config is machine-local; only a persona's \
+         identity enters the record when it does work.</p>\n\
+         {cards}\
+         <section class=\"board\" id=\"new-persona\"><h2 class=\"board-head\">new persona</h2>\
+         {create}</section>\n",
+        create = persona_form(None),
+    );
+    page_shell("junto — personas", nav, None, &content)
+}
+
+/// A one-line summary of a persona's config, for the list.
+fn persona_summary(persona: &crate::persona::Persona) -> String {
+    let mut parts = Vec::new();
+    if let Some(model) = &persona.model {
+        parts.push(format!("model {model}"));
+    }
+    if !persona.mcp_servers.is_empty() {
+        parts.push(format!(
+            "{} MCP server{}",
+            persona.mcp_servers.len(),
+            if persona.mcp_servers.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ));
+    }
+    if !persona.skills.is_empty() {
+        parts.push(format!("{} skill(s)", persona.skills.len()));
+    }
+    if !persona.marketplaces.is_empty() {
+        parts.push(format!("{} marketplace(s)", persona.marketplaces.len()));
+    }
+    if persona.role.is_some() {
+        parts.push("custom role".to_string());
+    }
+    if parts.is_empty() {
+        format!("the bare {} harness, no extra config", persona.harness)
+    } else {
+        parts.join(" · ")
+    }
+}
+
+/// The create/edit form for a persona. `Some` prefills for an edit (slug is a
+/// hidden, immutable field); `None` renders a blank create form (the server
+/// derives the slug from the name). Skills and marketplaces apply to Claude
+/// personas only — shown always with a note rather than reveal-on-select, to
+/// keep the surface JS-free.
+fn persona_form(persona: Option<&crate::persona::Persona>) -> String {
+    let slug = persona.map(|p| p.slug.as_str()).unwrap_or("");
+    let name = persona.map(|p| p.name.as_str()).unwrap_or("");
+    let role = persona.and_then(|p| p.role.as_deref()).unwrap_or("");
+    let model = persona.and_then(|p| p.model.as_deref()).unwrap_or("");
+    let selected_harness = persona.map(|p| p.harness.as_str()).unwrap_or("");
+    let mcp = persona
+        .map(|p| {
+            p.mcp_servers
+                .iter()
+                .map(|server| format!("{} {}", server.name, server.url))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    let skills = persona.map(|p| p.skills.join("\n")).unwrap_or_default();
+    let marketplaces = persona
+        .map(|p| p.marketplaces.join("\n"))
+        .unwrap_or_default();
+    let harness_options: String = crate::launch::all_harnesses()
+        .iter()
+        .map(|harness| {
+            let selected = if harness.id == selected_harness
+                || (selected_harness.is_empty()
+                    && harness.id == crate::launch::all_harnesses()[0].id)
+            {
+                " selected"
+            } else {
+                ""
+            };
+            format!(
+                "<option value=\"{id}\"{selected}>{label}</option>",
+                id = escape_html(harness.id),
+                label = escape_html(harness.label),
+            )
+        })
+        .collect();
+    format!(
+        "<form class=\"act persona-form\" method=\"post\" action=\"/personas\">\
+         <input type=\"hidden\" name=\"slug\" value=\"{slug}\">\
+         <label>name<input name=\"name\" value=\"{name}\" placeholder=\"e.g. Security Reviewer\" required></label>\
+         <label>harness<select name=\"harness\">{harness_options}</select></label>\
+         <label>role / system-prompt<textarea name=\"role\" rows=\"3\" placeholder=\"how this agent should behave (optional)\">{role}</textarea></label>\
+         <label>model<input name=\"model\" value=\"{model}\" placeholder=\"optional model override\"></label>\
+         <label>MCP servers<textarea name=\"mcp_servers\" rows=\"2\" placeholder=\"one per line: name url\">{mcp}</textarea></label>\
+         <label>skills <span class=\"when\">(Claude only)</span><textarea name=\"skills\" rows=\"2\" placeholder=\"one skill name per line\">{skills}</textarea></label>\
+         <label>marketplaces <span class=\"when\">(Claude only)</span><textarea name=\"marketplaces\" rows=\"2\" placeholder=\"one marketplace per line\">{marketplaces}</textarea></label>\
+         <button class=\"primary\">save</button>\
+         </form>",
+        slug = escape_html(slug),
+        name = escape_html(name),
+        role = escape_html(role),
+        model = escape_html(model),
+        mcp = escape_html(&mcp),
+        skills = escape_html(&skills),
+        marketplaces = escape_html(&marketplaces),
+    )
 }
 
 /// The set-up-a-repo form: the terminal-less `junto init`. Registers the
@@ -1239,31 +1380,43 @@ pub fn channel_html(
             Some(text) => format!("<p class=\"meta hint\">⚠ {}</p>", escape_html(text)),
             None => String::new(),
         };
-        // One agent per channel (docs/adr/0024): the picker chooses the agent
-        // only the first time. Once an agent serves the channel, show it fixed
-        // — every session here uses that one agent.
-        let harnesses = crate::launch::all_harnesses();
-        let harness_picker = match crate::launch::channel_harness(&view.party) {
-            Some(agent) => format!(
+        // One agent per channel (docs/adr/0024): the picker chooses the persona
+        // only the first time. Once a persona serves the channel, show it fixed
+        // — every session here runs that one persona. Personas are machine-local
+        // config, so resolve them here the way the harness picker resolved the
+        // registry; a read failure just hides the picker (launch falls back to
+        // the default persona).
+        let personas = crate::host::junto_home()
+            .ok()
+            .map(|home| {
+                let established = crate::persona::channel_persona(&home, &view.party)
+                    .ok()
+                    .flatten();
+                let all = crate::persona::all_personas(&home).unwrap_or_default();
+                (established, all)
+            })
+            .unwrap_or((None, Vec::new()));
+        let harness_picker = match personas {
+            (Some(agent), _) => format!(
                 "<span class=\"chip\" title=\"this channel's agent\">agent: {}</span>",
-                escape_html(agent.label)
+                escape_html(&agent.name)
             ),
-            None if harnesses.len() > 1 => {
-                let options: String = harnesses
+            (None, all) if all.len() > 1 => {
+                let options: String = all
                     .iter()
-                    .map(|harness| {
+                    .map(|persona| {
                         format!(
-                            "<option value=\"{id}\">{label}</option>",
-                            id = escape_html(harness.id),
-                            label = escape_html(harness.label),
+                            "<option value=\"{slug}\">{name}</option>",
+                            slug = escape_html(&persona.slug),
+                            name = escape_html(&persona.name),
                         )
                     })
                     .collect();
                 format!(
-                    "<select name=\"harness\" title=\"which agent runs this channel\">{options}</select>"
+                    "<select name=\"persona\" title=\"which persona runs this channel\">{options}</select>"
                 )
             }
-            None => String::new(),
+            (None, _) => String::new(),
         };
         format!(
             "<section class=\"board\" id=\"start-work\">\
@@ -2264,6 +2417,17 @@ form.act.option button.primary{flex:none;min-width:7rem}\
 form.act.option input[name=rationale]{color:var(--soft);font-style:italic}\
 form.act.busy{opacity:.65}\
 form.act button:disabled{cursor:wait}\
+form.act button.danger{color:var(--muted)}\
+form.act button.danger:hover{color:#f38ba8;border-color:#f38ba8}\
+form.persona-form{flex-direction:column;align-items:stretch}\
+form.persona-form label{display:flex;flex-direction:column;gap:.25rem;font-size:.8rem;\
+color:var(--muted)}\
+form.persona-form input,form.persona-form select{flex:none;min-width:0;width:100%}\
+form.persona-form textarea{background:var(--bg);color:var(--text);border:1px solid var(--border);\
+border-radius:.45rem;padding:.32rem .6rem;font:.84rem ui-monospace,SFMono-Regular,Menlo,monospace;\
+resize:vertical}\
+form.persona-form textarea:focus{outline:1px solid var(--accent)}\
+form.persona-form button.primary{align-self:flex-start}\
 a.back-link{color:var(--muted);font-size:.84rem}\
 a.back-link:hover{color:var(--soft)}";
 

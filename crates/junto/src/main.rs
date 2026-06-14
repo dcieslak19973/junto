@@ -14,6 +14,7 @@ mod init;
 mod launch;
 mod mcp;
 mod members;
+mod persona;
 mod render;
 mod web;
 
