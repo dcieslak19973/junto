@@ -68,7 +68,7 @@
 
 | Noun | Meaning |
 |---|---|
-| **Skill** | Agent-authorable instructions (markdown) — a reusable how-to. *(Not called a "playbook" — that's the work-type term above.)* |
+| **Skill** | Agent-authorable instructions (markdown) — a reusable how-to; **= the Agent Skills standard ([agentskills.io](https://agentskills.io) / `SKILL.md`)** that Claude, OpenCode, Codex et al. load. junto authors and *evolves* these rather than inventing a rival concept. *(Not called a "playbook" — that's the work-type term above; and the broader self-improvement targets are separate nouns: **Workflow**, **Agent**.)* |
 | **Workflow (Definition)** | Agent-automation script — a conductor coordinating sub-agents (the *automation* sense of "workflow"). |
 | **Agent Definition** | An agent's config (markdown). |
 | **Policy Version** | A versioned snapshot of skills/workflows/agent-defs — for the self-improvement loop's provenance + rollback. |
