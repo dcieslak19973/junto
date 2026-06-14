@@ -186,10 +186,28 @@ pub(crate) async fn run_turn_acp(
             }
         };
 
-        // 3. prompt — updates stream into `answer` while we await the response.
+        // 3. set the session mode so file edits are auto-accepted. A headless
+        // turn can't answer a permission prompt, and junto's Gates are the real
+        // approval layer (`docs/adr/0023`/`0024`). The adapter resolves its
+        // default mode from Claude settings (often `dontAsk`, which *denies*
+        // every edit), so junto sets it explicitly here — `session/new` params
+        // don't drive it. Other tools still surface a prompt, which
+        // `answer_agent_request` allows.
         request(
             &mut stdin,
             3,
+            "session/set_mode",
+            json!({ "sessionId": session_id, "modeId": "acceptEdits" }),
+        )
+        .await?;
+        pump_until(&mut reader, &mut stdin, 3, live, session, &mut sink)
+            .await
+            .context("ACP session/set_mode")?;
+
+        // 4. prompt — updates stream into `answer` while we await the response.
+        request(
+            &mut stdin,
+            4,
             "session/prompt",
             json!({
                 "sessionId": session_id,
@@ -198,7 +216,7 @@ pub(crate) async fn run_turn_acp(
         )
         .await?;
         let mut answer = String::new();
-        let result = pump_until(&mut reader, &mut stdin, 3, live, session, &mut answer)
+        let result = pump_until(&mut reader, &mut stdin, 4, live, session, &mut answer)
             .await
             .context("ACP session/prompt")?;
 
