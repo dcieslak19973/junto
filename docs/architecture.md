@@ -216,6 +216,10 @@ MCP = agent-mediated, session-scoped, pull. B–E are persistent, event-driven, 
 
 **Practical:** (1) Likely **Jira DC + Confluence DC** (consistent self-hosted theme; verify DC-vs-Cloud API like the forges). (2) **Minimize bidirectionality — where integrations die** (conflict/loops/mapping-drift/rate-limits). Prefer one-way: junto→Confluence publish (easy), Jira→junto trigger + junto→Jira status (tractable) over full field sync. Don't let the channel become a worse Jira — link/reflect status, don't mirror schema. Each connector = maintenance tax; add lazily, driven by a Playbook that needs it.
 
+## Consideration: recall at gate/check-failure time (not only session start)
+
+The recall bridge (ADR 0013) injects the channel brief once, at session start. The higher-leverage moment is when a consequential action *fails a check or gate*: that is exactly when the agent should be handed back the relevant ledger entry — the "why" — plus how to fix it, then iterate. Session-start injection seeds context; gate-rejection recall *closes the loop* (reject → re-surface the decision record → read → fix → iterate). Forward direction once gates are wired: the gate-rejection path should carry the relevant record, not just a verdict. (External corroboration: Michal (Safe Intelligence), conference talk *Capturing decisions for humans and AI alike*, 2026, builds its whole agent loop around reject → link the agent back to the decision record → fix.)
+
 ## Complementary idea (parked, not the core)
 An async **"team dashboard"** (read everyone's append-only logs + git/PR state, emit per-person LLM summaries + resume-suggestions — mirroring ACE's `/dashboard/*`). Good optional add-on; the partition-by-author append-only pattern carried straight into the durable-record design.
 
