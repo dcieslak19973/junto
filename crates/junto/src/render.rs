@@ -924,6 +924,24 @@ pub fn settings_html(
         Some((name, email)) => format!("{} &lt;{}&gt;", escape_html(name), escape_html(email)),
         None => "(no git user configured)".to_string(),
     };
+    // Registered harnesses (docs/adr/0024) — the agents junto can drive; the
+    // first is the launch default.
+    let harness_rows: String = crate::launch::all_harnesses()
+        .iter()
+        .enumerate()
+        .map(|(index, harness)| {
+            let default = if index == 0 {
+                " <span class=\"when\">(default)</span>"
+            } else {
+                ""
+            };
+            format!(
+                "<dt>{label}{default}</dt><dd><span class=\"when\">{summary}</span></dd>",
+                label = escape_html(harness.label),
+                summary = escape_html(&harness.adapter_summary()),
+            )
+        })
+        .collect();
     let content = format!(
         "<h1>settings</h1>\n\
          <p class=\"meta\">how this machine runs junto — read-only for now</p>\n\
@@ -933,6 +951,10 @@ pub fn settings_html(
          <dt>execution backend</dt><dd>{backend}</dd>\
          <dt>auth</dt><dd>{auth}</dd>\
          </dl>{hint}</section>\n\
+         <section class=\"board\"><h2 class=\"board-head\">harnesses</h2>\
+         <dl class=\"settings\">{harness_rows}</dl>\
+         <p class=\"meta\">the agents junto can drive; pick one per launch on a channel's \
+         start-work form (docs/adr/0024)</p></section>\n\
          <section class=\"board\"><h2 class=\"board-head\">substrates</h2>\
          <ul class=\"settings-list\">{substrate_items}</ul>\
          <p class=\"meta\"><a class=\"view\" href=\"/new#setup-repo\">+ set up another repo</a></p>\
@@ -1217,6 +1239,32 @@ pub fn channel_html(
             Some(text) => format!("<p class=\"meta hint\">⚠ {}</p>", escape_html(text)),
             None => String::new(),
         };
+        // One agent per channel (docs/adr/0024): the picker chooses the agent
+        // only the first time. Once an agent serves the channel, show it fixed
+        // — every session here uses that one agent.
+        let harnesses = crate::launch::all_harnesses();
+        let harness_picker = match crate::launch::channel_harness(&view.party) {
+            Some(agent) => format!(
+                "<span class=\"chip\" title=\"this channel's agent\">agent: {}</span>",
+                escape_html(agent.label)
+            ),
+            None if harnesses.len() > 1 => {
+                let options: String = harnesses
+                    .iter()
+                    .map(|harness| {
+                        format!(
+                            "<option value=\"{id}\">{label}</option>",
+                            id = escape_html(harness.id),
+                            label = escape_html(harness.label),
+                        )
+                    })
+                    .collect();
+                format!(
+                    "<select name=\"harness\" title=\"which agent runs this channel\">{options}</select>"
+                )
+            }
+            None => String::new(),
+        };
         format!(
             "<section class=\"board\" id=\"start-work\">\
              <h2 class=\"board-head\">start work</h2>\n\
@@ -1225,10 +1273,11 @@ pub fn channel_html(
              sync test\" required>\
              <input name=\"workspace\" value=\"{workspace}\" placeholder=\"workspace repo path \
              (remembered after first launch)\"{ws_required}>\
+             {harness_picker}\
              <button class=\"primary\">launch</button>\
              </form>\
-             <p class=\"meta\">spawns Claude Code headless in the workspace \
-             (docs/adr/0023); progress lands below as the session's state and artifacts</p>\
+             <p class=\"meta\">spawns the selected agent headless in the workspace \
+             (docs/adr/0023/0024); progress lands below as the session's state and artifacts</p>\
              {hint}</section>\n",
             workspace = escape_html(
                 &workspace
