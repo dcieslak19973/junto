@@ -554,9 +554,14 @@ impl Host {
             return Ok(());
         }
         if !view.party.iter().any(|member| member.email == author.email) {
+            // Human surface: keep this plain. The reader is a person, not an
+            // agent, so no CLI/MCP/ADR jargon — and naming the git identity makes
+            // an identity mismatch (a checkout whose git config differs from your
+            // membership) diagnosable at a glance.
             bail!(
-                "{} <{}> is not a member of this channel — the founding member can grant \
-                 membership (junto add-member, or the add_member tool; docs/adr/0017)",
+                "You're acting as {} <{}> (your git identity), who isn't a member of this \
+                 channel — so this can't be recorded. Only members can act on a channel; its \
+                 founder can add you as one.",
                 author.display_name,
                 author.email
             );
