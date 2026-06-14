@@ -182,27 +182,6 @@ async fn personas_page(State(host): State<Arc<Host>>) -> Response {
     }
 }
 
-/// The create/edit form body for a persona. Lists (MCP servers, skills,
-/// marketplaces) arrive newline-separated from textareas; an empty `slug` means
-/// create (the server derives one from the name).
-#[derive(Debug, Deserialize)]
-struct PersonaForm {
-    #[serde(default)]
-    slug: String,
-    name: String,
-    harness: String,
-    #[serde(default)]
-    role: String,
-    #[serde(default)]
-    model: String,
-    #[serde(default)]
-    mcp_servers: String,
-    #[serde(default)]
-    skills: String,
-    #[serde(default)]
-    marketplaces: String,
-}
-
 /// Lowercase, hyphenate, and trim a name into a stable slug for a new persona.
 fn slugify(name: &str) -> String {
     let mut slug = String::new();
@@ -219,17 +198,44 @@ fn slugify(name: &str) -> String {
     slug.trim_matches('-').to_string()
 }
 
-/// Split a textarea into trimmed, non-empty lines.
-fn lines(text: &str) -> Vec<String> {
-    text.lines()
-        .map(|line| line.trim().to_string())
-        .filter(|line| !line.is_empty())
+/// The first value submitted for `key`, or `""`.
+fn field<'a>(pairs: &'a [(String, String)], key: &str) -> &'a str {
+    pairs
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("")
+}
+
+/// Pair the repeated `mcp_name`/`mcp_url` fields into MCP servers, in order,
+/// dropping any row where either side is blank (the trailing add-row, a row
+/// the user left empty). The form renders one `mcp_name` and one `mcp_url`
+/// per row, so the i-th of each belong together.
+fn parse_mcp_rows(pairs: &[(String, String)]) -> Vec<crate::persona::McpServer> {
+    let names = pairs.iter().filter(|(k, _)| k == "mcp_name");
+    let urls = pairs.iter().filter(|(k, _)| k == "mcp_url");
+    names
+        .zip(urls)
+        .filter_map(|((_, name), (_, url))| {
+            let (name, url) = (name.trim(), url.trim());
+            (!name.is_empty() && !url.is_empty()).then(|| crate::persona::McpServer {
+                name: name.to_string(),
+                url: url.to_string(),
+            })
+        })
         .collect()
 }
 
-/// Save (create or update) a persona from the personas-page form.
-async fn save_persona(State(_host): State<Arc<Host>>, Form(form): Form<PersonaForm>) -> Response {
-    let name = form.name.trim().to_string();
+/// Save (create or update) a persona from the personas-page form. The body is
+/// read as raw key/value pairs so the repeated MCP-row fields survive (axum's
+/// typed `Form` can't collect duplicate keys into a list). Skills and
+/// marketplaces aren't editable yet (delivery is pending), so any stored values
+/// are carried through unchanged rather than read from the form.
+async fn save_persona(
+    State(_host): State<Arc<Host>>,
+    Form(pairs): Form<Vec<(String, String)>>,
+) -> Response {
+    let name = field(&pairs, "name").trim().to_string();
     if name.is_empty() {
         return (StatusCode::BAD_REQUEST, "a name is required").into_response();
     }
@@ -238,10 +244,11 @@ async fn save_persona(State(_host): State<Arc<Host>>, Form(form): Form<PersonaFo
         Err(err) => return internal(format!("no junto home: {err}")),
     };
     // On edit the slug is fixed; on create derive it from the name.
-    let slug = if form.slug.trim().is_empty() {
+    let form_slug = field(&pairs, "slug").trim();
+    let slug = if form_slug.is_empty() {
         slugify(&name)
     } else {
-        form.slug.trim().to_string()
+        form_slug.to_string()
     };
     if slug.is_empty() {
         return (
@@ -250,39 +257,37 @@ async fn save_persona(State(_host): State<Arc<Host>>, Form(form): Form<PersonaFo
         )
             .into_response();
     }
-    // Preserve an existing persona's email (so editing a stock persona keeps the
-    // harness identity); a brand-new custom persona gets its own.
-    let email = match crate::persona::persona_by_slug(&junto_home, &slug) {
-        Ok(Some(existing)) => existing.email,
-        Ok(None) => format!("{slug}@junto.local"),
+    // Carry an existing persona's identity and not-yet-editable fields through:
+    // its email (so editing a stock persona keeps the harness identity) and its
+    // stored skills / marketplaces (which the form shows read-only). A brand-new
+    // persona gets its own email and empty lists.
+    let existing = match crate::persona::persona_by_slug(&junto_home, &slug) {
+        Ok(existing) => existing,
         Err(err) => return internal(format!("reading personas: {err}")),
     };
-    let mcp_servers = lines(&form.mcp_servers)
-        .iter()
-        .filter_map(|line| {
-            let (server_name, url) = line.split_once(char::is_whitespace)?;
-            Some(crate::persona::McpServer {
-                name: server_name.trim().to_string(),
-                url: url.trim().to_string(),
-            })
-        })
-        .collect();
-    let trimmed = |s: String| {
-        let t = s.trim().to_string();
-        if t.is_empty() { None } else { Some(t) }
+    let email = existing
+        .as_ref()
+        .map(|p| p.email.clone())
+        .unwrap_or_else(|| format!("{slug}@junto.local"));
+    let (skills, marketplaces) = existing
+        .map(|p| (p.skills, p.marketplaces))
+        .unwrap_or_default();
+    let trimmed = |s: &str| {
+        let t = s.trim();
+        (!t.is_empty()).then(|| t.to_string())
     };
     let persona = crate::persona::Persona {
         slug,
         name,
-        harness: crate::launch::harness_by_id(form.harness.trim())
+        harness: crate::launch::harness_by_id(field(&pairs, "harness").trim())
             .id
             .to_string(),
         email,
-        role: trimmed(form.role),
-        model: trimmed(form.model),
-        mcp_servers,
-        skills: lines(&form.skills),
-        marketplaces: lines(&form.marketplaces),
+        role: trimmed(field(&pairs, "role")),
+        model: trimmed(field(&pairs, "model")),
+        mcp_servers: parse_mcp_rows(&pairs),
+        skills,
+        marketplaces,
     };
     match crate::persona::save_persona(&junto_home, persona) {
         Ok(()) => Redirect::to("/personas").into_response(),
@@ -1179,6 +1184,32 @@ mod tests {
     use junto_kernel::{ApprovalRequirement, GateStatus, Member, Standing};
     use std::process::Command as StdCommand;
     use tempfile::TempDir;
+
+    #[test]
+    fn parse_mcp_rows_pairs_names_with_urls_and_drops_blanks() {
+        let pairs = vec![
+            ("name".into(), "Reviewer".into()),
+            ("mcp_name".into(), "junto".into()),
+            ("mcp_url".into(), "http://127.0.0.1:1727/mcp".into()),
+            // A blank trailing row (the add-row) is dropped.
+            ("mcp_name".into(), "  ".into()),
+            ("mcp_url".into(), "".into()),
+            // A half-filled row (name but no url) is dropped too.
+            ("mcp_name".into(), "orphan".into()),
+            ("mcp_url".into(), "".into()),
+        ];
+        let servers = parse_mcp_rows(&pairs);
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "junto");
+        assert_eq!(servers[0].url, "http://127.0.0.1:1727/mcp");
+    }
+
+    #[test]
+    fn slugify_makes_a_stable_kebab_slug() {
+        assert_eq!(slugify("Security Reviewer"), "security-reviewer");
+        assert_eq!(slugify("  Doc Writer!! "), "doc-writer");
+        assert_eq!(slugify("***"), "");
+    }
 
     /// A test host: one fresh git repo, the member-code store in its own temp
     /// dir, a channel founded by the repo's git user (the web-write author —

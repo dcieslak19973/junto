@@ -1013,7 +1013,7 @@ pub fn personas_html(nav: &[ChannelSummary], personas: &[crate::persona::Persona
          identity enters the record when it does work.</p>\n\
          {cards}\
          <section class=\"board\" id=\"new-persona\"><h2 class=\"board-head\">new persona</h2>\
-         {create}</section>\n",
+         {create}</section>\n{ADD_MCP_SCRIPT}",
         create = persona_form(None),
     );
     page_shell("junto — personas", nav, None, &content)
@@ -1052,30 +1052,55 @@ fn persona_summary(persona: &crate::persona::Persona) -> String {
     }
 }
 
+/// One MCP-server row: a labeled `name` + `url` pair. The handler reads the
+/// repeated `mcp_name`/`mcp_url` fields in order and zips the i-th of each, so
+/// blank rows drop out and order is preserved.
+fn mcp_row(name: &str, url: &str) -> String {
+    format!(
+        "<div class=\"mcp-row\">\
+         <input name=\"mcp_name\" value=\"{name}\" placeholder=\"name\" aria-label=\"MCP server name\">\
+         <input name=\"mcp_url\" value=\"{url}\" placeholder=\"https://… (streamable HTTP)\" aria-label=\"MCP server URL\">\
+         </div>",
+        name = escape_html(name),
+        url = escape_html(url),
+    )
+}
+
 /// The create/edit form for a persona. `Some` prefills for an edit (slug is a
 /// hidden, immutable field); `None` renders a blank create form (the server
-/// derives the slug from the name). Skills and marketplaces apply to Claude
-/// personas only — shown always with a note rather than reveal-on-select, to
-/// keep the surface JS-free.
+/// derives the slug from the name). MCP servers are structured `name`+`url`
+/// rows (one blank trailing row to add another; `+ add server` clones a row
+/// when JS is on). Skills and marketplaces are **not editable yet** — they are
+/// shown read-only because delivery isn't wired (a per-persona Claude config
+/// dir; see the design's §6 open item). The handler carries any stored values
+/// through unchanged, so saving the form never silently drops them.
 fn persona_form(persona: Option<&crate::persona::Persona>) -> String {
     let slug = persona.map(|p| p.slug.as_str()).unwrap_or("");
     let name = persona.map(|p| p.name.as_str()).unwrap_or("");
     let role = persona.and_then(|p| p.role.as_deref()).unwrap_or("");
     let model = persona.and_then(|p| p.model.as_deref()).unwrap_or("");
     let selected_harness = persona.map(|p| p.harness.as_str()).unwrap_or("");
-    let mcp = persona
-        .map(|p| {
-            p.mcp_servers
+    // Existing servers as filled rows, plus one blank row to add another.
+    let mut mcp_rows = String::new();
+    if let Some(persona) = persona {
+        for server in &persona.mcp_servers {
+            mcp_rows.push_str(&mcp_row(&server.name, &server.url));
+        }
+    }
+    mcp_rows.push_str(&mcp_row("", ""));
+    // Skills / marketplaces: stored values shown read-only until delivery lands.
+    let read_only_list = |items: &[String]| {
+        if items.is_empty() {
+            "<span class=\"when\">none</span>".to_string()
+        } else {
+            items
                 .iter()
-                .map(|server| format!("{} {}", server.name, server.url))
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default();
-    let skills = persona.map(|p| p.skills.join("\n")).unwrap_or_default();
-    let marketplaces = persona
-        .map(|p| p.marketplaces.join("\n"))
-        .unwrap_or_default();
+                .map(|item| format!("<span class=\"chip\">{}</span>", escape_html(item)))
+                .collect::<String>()
+        }
+    };
+    let skills = read_only_list(persona.map(|p| p.skills.as_slice()).unwrap_or(&[]));
+    let marketplaces = read_only_list(persona.map(|p| p.marketplaces.as_slice()).unwrap_or(&[]));
     let harness_options: String = crate::launch::all_harnesses()
         .iter()
         .map(|harness| {
@@ -1101,18 +1126,19 @@ fn persona_form(persona: Option<&crate::persona::Persona>) -> String {
          <label>harness<select name=\"harness\">{harness_options}</select></label>\
          <label>role / system-prompt<textarea name=\"role\" rows=\"3\" placeholder=\"how this agent should behave (optional)\">{role}</textarea></label>\
          <label>model<input name=\"model\" value=\"{model}\" placeholder=\"optional model override\"></label>\
-         <label>MCP servers<textarea name=\"mcp_servers\" rows=\"2\" placeholder=\"one per line: name url\">{mcp}</textarea></label>\
-         <label>skills <span class=\"when\">(Claude only)</span><textarea name=\"skills\" rows=\"2\" placeholder=\"one skill name per line\">{skills}</textarea></label>\
-         <label>marketplaces <span class=\"when\">(Claude only)</span><textarea name=\"marketplaces\" rows=\"2\" placeholder=\"one marketplace per line\">{marketplaces}</textarea></label>\
+         <div class=\"field\"><span class=\"field-label\">MCP servers</span>\
+         <div class=\"mcp-rows\">{mcp_rows}</div>\
+         <button type=\"button\" class=\"add-mcp\">+ add server</button></div>\
+         <div class=\"field\"><span class=\"field-label\">skills <span class=\"when\">(Claude only · not yet applied)</span></span>\
+         <div class=\"chips\">{skills}</div></div>\
+         <div class=\"field\"><span class=\"field-label\">marketplaces <span class=\"when\">(Claude only · not yet applied)</span></span>\
+         <div class=\"chips\">{marketplaces}</div></div>\
          <button class=\"primary\">save</button>\
          </form>",
         slug = escape_html(slug),
         name = escape_html(name),
         role = escape_html(role),
         model = escape_html(model),
-        mcp = escape_html(&mcp),
-        skills = escape_html(&skills),
-        marketplaces = escape_html(&marketplaces),
     )
 }
 
@@ -2225,6 +2251,16 @@ var b=e.submitter;setTimeout(function(){f.classList.add('busy');\
 f.querySelectorAll('button').forEach(function(x){x.disabled=true});\
 if(b){b.textContent='recording\\u2026'}},0)});</script>";
 
+/// Progressive enhancement for the personas form: clone a blank MCP-server row
+/// when `+ add server` is clicked. Without JS the form still works — each save
+/// adds the one trailing blank row the server rendered.
+const ADD_MCP_SCRIPT: &str = "<script>document.addEventListener('click',function(e)\
+{var b=e.target;if(!b.classList||!b.classList.contains('add-mcp'))return;\
+var rows=b.previousElementSibling;var last=rows.lastElementChild;\
+var clone=last.cloneNode(true);\
+clone.querySelectorAll('input').forEach(function(i){i.value=''});\
+rows.appendChild(clone);});</script>";
+
 /// The dark theme, keyed to the app icon palette (`docs/adr/0018`): one CSS
 /// blob, no external assets — the pages must render identically in
 /// the desktop shell's webview and a plain browser, offline. (JS: a single
@@ -2428,6 +2464,14 @@ border-radius:.45rem;padding:.32rem .6rem;font:.84rem ui-monospace,SFMono-Regula
 resize:vertical}\
 form.persona-form textarea:focus{outline:1px solid var(--accent)}\
 form.persona-form button.primary{align-self:flex-start}\
+form.persona-form .field{display:flex;flex-direction:column;gap:.3rem}\
+form.persona-form .field-label{font-size:.8rem;color:var(--muted)}\
+.mcp-rows{display:flex;flex-direction:column;gap:.35rem}\
+.mcp-row{display:flex;gap:.4rem}\
+.mcp-row input[name=mcp_name]{flex:0 0 9rem}\
+.mcp-row input[name=mcp_url]{flex:1}\
+form.persona-form button.add-mcp{align-self:flex-start;font-size:.8rem;padding:.2rem .6rem}\
+.chips{display:flex;flex-wrap:wrap;gap:.3rem}\
 a.back-link{color:var(--muted);font-size:.84rem}\
 a.back-link:hover{color:var(--soft)}";
 
