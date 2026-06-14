@@ -10,12 +10,15 @@
 mod acp;
 mod agent;
 mod binding;
+mod grader;
 mod host;
 mod init;
 mod launch;
 mod mcp;
 mod members;
+mod outcome;
 mod render;
+mod verify;
 mod web;
 
 use std::path::PathBuf;
