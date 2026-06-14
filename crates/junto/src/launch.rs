@@ -106,6 +106,79 @@ pub(crate) fn harness_hint() -> Option<&'static str> {
     None
 }
 
+/// A read-only snapshot of how this machine runs the harness, for the settings
+/// page (`docs/adr/0023`/`0024`). Non-blocking — the WSL probe is only read if
+/// already detected.
+pub(crate) struct HarnessStatus {
+    /// `ACP` or `claude -p (CLI)`.
+    pub(crate) protocol: &'static str,
+    /// A detail line: the ACP adapter command, or why ACP is off.
+    pub(crate) detail: String,
+    /// `native`, `WSL`, or `detecting…`.
+    pub(crate) backend: &'static str,
+    /// How the harness authenticates — read-only status, never a stored key
+    /// (auth stays with the harness, `docs/adr/0024`).
+    pub(crate) auth: &'static str,
+    /// The flashing/setup suggestion, if any.
+    pub(crate) hint: Option<&'static str>,
+}
+
+/// Build the harness status shown on the settings page.
+pub(crate) fn harness_status() -> HarnessStatus {
+    let (protocol, detail) = match acp_adapter_command() {
+        Some(command) => ("ACP", format!("adapter: {}", command.join(" "))),
+        None if std::env::var("JUNTO_HARNESS_PROTOCOL").ok().as_deref() == Some("cli") => (
+            "claude -p (CLI)",
+            "ACP disabled (JUNTO_HARNESS_PROTOCOL=cli)".to_string(),
+        ),
+        None => (
+            "claude -p (CLI)",
+            "ACP unavailable (Node not found) — using the claude -p fallback".to_string(),
+        ),
+    };
+    // Read the backend only if already detected; otherwise warm it off-thread.
+    let backend = match HARNESS_CHOICE.get() {
+        Some(choice) => match choice.backend {
+            HarnessBackend::Native => "native",
+            HarnessBackend::Wsl => "WSL",
+        },
+        None => "detecting…",
+    };
+    HarnessStatus {
+        protocol,
+        detail,
+        backend,
+        auth: claude_auth_mode(),
+        hint: harness_hint(),
+    }
+}
+
+/// Detect how Claude Code will authenticate, **read-only** — junto never
+/// stores a credential; the harness owns its auth (`docs/adr/0024`). Mirrors
+/// Claude Code's own precedence: cloud routing flags, then a gateway base-url,
+/// then a direct key/token, else the subscription login.
+fn claude_auth_mode() -> &'static str {
+    let flag = |key: &str| {
+        std::env::var(key)
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    };
+    let present = |key: &str| std::env::var_os(key).is_some_and(|v| !v.is_empty());
+    if flag("CLAUDE_CODE_USE_BEDROCK") {
+        "Claude via AWS Bedrock"
+    } else if flag("CLAUDE_CODE_USE_VERTEX") {
+        "Claude via Google Vertex"
+    } else if flag("CLAUDE_CODE_USE_FOUNDRY") {
+        "Claude via Microsoft Foundry"
+    } else if present("ANTHROPIC_BASE_URL") {
+        "Claude via a gateway (ANTHROPIC_BASE_URL)"
+    } else if present("ANTHROPIC_API_KEY") || present("ANTHROPIC_AUTH_TOKEN") {
+        "Claude: API key"
+    } else {
+        "Claude: subscription login (no API key)"
+    }
+}
+
 fn detect_harness_choice() -> HarnessChoice {
     // A test/override stub always runs natively (and never probes WSL).
     if std::env::var_os("JUNTO_HARNESS_CMD").is_some() {
