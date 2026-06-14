@@ -81,7 +81,7 @@
 - **join / invite** — manage the Party.
 - **run** (act) — execute work in an **Agent Session** → Artifacts (+ Provenance + Events).
 - **propose** — surface a change/finding for a Gate.
-- **route** — the Gate decides the path (auto / approve / review / hard-gate), per the playbook's routing function.
+- **route** — the Gate decides the path (auto / approve / review / hard-gate), per the playbook's **Routing Policy**. The `auto` path is the **autonomy envelope** (ADR 0026): a human ratifies the Routing Policy for a region, and inside it a Grader-`satisfied` Deliverable auto-resolves the Gate **and emits a notification** (release notes) instead of pausing — outside it the Gate still waits for a human. Two invariants: editing a Routing Policy never routes to `auto` (no self-widening), and the grade is *read*, never *grants* autonomy (grade ≠ consent).
 - **approve / reject** — pass or block a consequential action; record a rationale (not a checkbox).
 - **promote** — (self-improvement) accept a Policy Version into use; versioned, reversible.
 - **ratify** — confirm a ledger entry as *verified* (often the slow loop / AAR).
