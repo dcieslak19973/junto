@@ -312,6 +312,10 @@ struct LaunchForm {
     /// The workspace repo; empty falls back to the remembered mapping.
     #[serde(default)]
     workspace: String,
+    /// Which harness runs it (`claude`, `opencode`); empty/unknown → default
+    /// (`docs/adr/0024`).
+    #[serde(default)]
+    harness: String,
 }
 
 /// Launch an Agent Session from the channel page: resolve the workspace
@@ -344,8 +348,9 @@ async fn launch_session(
     // MemberAdded) so the agent joins and starts work in one motion — the
     // grant is recorded, not hidden. A non-founder can't grant: they get
     // add_member's error naming who can (docs/adr/0017).
-    let harness = crate::launch::harness_member();
-    let harness_is_member = view.party.iter().any(|m| m.email == harness.email);
+    let harness = crate::launch::harness_by_id(form.harness.trim());
+    let harness_member = harness.member();
+    let harness_is_member = view.party.iter().any(|m| m.email == harness_member.email);
     if !view.party.is_empty() && !harness_is_member {
         let granter = match crate::host::git_user(&substrate) {
             Ok(granter) => granter,
@@ -355,7 +360,7 @@ async fn launch_session(
                 ));
             }
         };
-        if let Err(err) = host.add_member(&channel, &granter, harness).await {
+        if let Err(err) = host.add_member(&channel, &granter, harness_member).await {
             return (StatusCode::FORBIDDEN, format!("{err:#}")).into_response();
         }
     }
@@ -386,7 +391,16 @@ async fn launch_session(
             _ => return internal("workspace vanished after remembering".into()),
         }
     };
-    match crate::launch::launch(host.clone(), id, channel.clone(), workspace, intent).await {
+    match crate::launch::launch(
+        host.clone(),
+        id,
+        channel.clone(),
+        workspace,
+        intent,
+        harness,
+    )
+    .await
+    {
         Ok(_session) => Redirect::to(&format!("/channels/{id}")).into_response(),
         Err(err) => internal(format!("launch failed: {err:#}")),
     }
@@ -1467,6 +1481,7 @@ mod tests {
             Form(LaunchForm {
                 intent: "do the stub thing".into(),
                 workspace: workspace.path().display().to_string(),
+                harness: String::new(),
             }),
         )
         .await;
@@ -1591,6 +1606,7 @@ mod tests {
             Form(LaunchForm {
                 intent: "start in a fresh channel".into(),
                 workspace: workspace.path().display().to_string(),
+                harness: String::new(),
             }),
         )
         .await;

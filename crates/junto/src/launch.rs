@@ -34,12 +34,106 @@ use junto_kernel::{
 
 use crate::host::Host;
 
-/// The launched harness's member identity — sessions are authored as the
-/// agent, never as the operator (`docs/adr/0012`/`0020`). One concrete
-/// harness for now (rule of three); this constant moves behind the
-/// `AgentHarnessAdapter` trait when the second harness lands.
+/// A registered agent harness — its member identity and how junto drives it
+/// (`docs/adr/0024`). Adding one is *data here*, not a new code path: junto's
+/// ACP client is identical for all; the differences are the adapter command
+/// and the agent's identity. This is what ACP's capability model gives us in
+/// place of a per-vendor trait.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Harness {
+    /// Stable id used in forms and the session mapping (e.g. `claude`).
+    pub(crate) id: &'static str,
+    /// Display label and the agent member's name (e.g. `Claude Code`).
+    pub(crate) label: &'static str,
+    /// The agent member's stable email identity.
+    pub(crate) email: &'static str,
+}
+
+/// Every harness junto can drive. Claude is the default (first).
+const HARNESSES: &[Harness] = &[
+    Harness {
+        id: "claude",
+        label: "Claude Code",
+        email: "claude-code@anthropic.com",
+    },
+    Harness {
+        id: "opencode",
+        label: "OpenCode",
+        email: "opencode@opencode.ai",
+    },
+];
+
+impl Harness {
+    /// The agent's member identity — sessions are authored as the agent, never
+    /// the operator (`docs/adr/0012`/`0020`).
+    pub(crate) fn member(&self) -> Member {
+        Member::agent(self.label, self.email)
+    }
+
+    /// The ACP adapter command for this harness (OS-aware), or `None` if it has
+    /// no ACP entry point. Each is overridable via its env var.
+    fn acp_command(&self) -> Option<Vec<String>> {
+        let (default, var) = match self.id {
+            // Claude's adapter runs Claude Code's SDK (same subscription auth);
+            // on Windows the launcher is `npx.cmd` (Rust won't append `.cmd`).
+            "claude" => (
+                if cfg!(windows) {
+                    "npx.cmd -y @agentclientprotocol/claude-agent-acp"
+                } else {
+                    "npx -y @agentclientprotocol/claude-agent-acp"
+                },
+                "JUNTO_ACP_CLAUDE_CMD",
+            ),
+            // OpenCode speaks ACP natively — no adapter package.
+            "opencode" => (
+                if cfg!(windows) {
+                    "opencode.cmd acp"
+                } else {
+                    "opencode acp"
+                },
+                "JUNTO_ACP_OPENCODE_CMD",
+            ),
+            _ => return None,
+        };
+        let cmd = std::env::var(var).unwrap_or_else(|_| default.to_string());
+        let parts: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
+        if parts.is_empty() { None } else { Some(parts) }
+    }
+
+    /// Whether this harness has a non-ACP CLI fallback (`claude -p`). Only
+    /// Claude does; the rest are ACP-only.
+    fn has_cli_fallback(&self) -> bool {
+        self.id == "claude"
+    }
+
+    /// A one-line description of how junto reaches this harness, for settings.
+    pub(crate) fn adapter_summary(&self) -> String {
+        match self.acp_command() {
+            Some(command) => format!("ACP — {}", command.join(" ")),
+            None if self.has_cli_fallback() => "claude -p (CLI)".to_string(),
+            None => "(no adapter)".to_string(),
+        }
+    }
+}
+
+/// The harness for an id, or the default (Claude) when unknown/empty.
+pub(crate) fn harness_by_id(id: &str) -> Harness {
+    HARNESSES
+        .iter()
+        .copied()
+        .find(|harness| harness.id == id)
+        .unwrap_or(HARNESSES[0])
+}
+
+/// Every registered harness (for the launch picker and settings).
+pub(crate) fn all_harnesses() -> &'static [Harness] {
+    HARNESSES
+}
+
+/// The default harness's member identity — back-compat for callers (and tests)
+/// that predate per-launch harness selection.
 pub fn harness_member() -> Member {
-    Member::agent("Claude Code", "claude-code@anthropic.com")
+    HARNESSES[0].member()
 }
 
 /// The harness command line, overridable for tests (`JUNTO_HARNESS_CMD`
@@ -125,7 +219,7 @@ pub(crate) struct HarnessStatus {
 
 /// Build the harness status shown on the settings page.
 pub(crate) fn harness_status() -> HarnessStatus {
-    let (protocol, detail) = match acp_adapter_command() {
+    let (protocol, detail) = match acp_adapter_command(HARNESSES[0]) {
         Some(command) => ("ACP", format!("adapter: {}", command.join(" "))),
         None if std::env::var("JUNTO_HARNESS_PROTOCOL").ok().as_deref() == Some("cli") => (
             "claude -p (CLI)",
@@ -392,10 +486,19 @@ struct HarnessSessionsFile {
 struct HarnessSessionRecord {
     /// The junto session — the `SessionStarted` entry's id.
     junto: EntryId,
-    /// The harness's own session id (what `--resume` takes).
+    /// The harness's own session id (what resume takes).
     harness: String,
+    /// Which harness produced it (`claude`, `opencode`) — so steering resumes
+    /// the same one. Defaults to `claude` for records written before
+    /// multi-harness support.
+    #[serde(default = "default_harness_id")]
+    harness_id: String,
     /// Turns run so far (names the artifact files).
     turns: u32,
+}
+
+fn default_harness_id() -> String {
+    "claude".to_string()
 }
 
 fn harness_sessions_path(junto_home: &Path) -> PathBuf {
@@ -433,7 +536,22 @@ pub fn harness_session_for(junto_home: &Path, junto: &EntryId) -> Result<Option<
         .map(|record| record.harness))
 }
 
-fn record_turn(junto_home: &Path, junto: &EntryId, harness: Option<String>) -> Result<u32> {
+/// Which harness ran a junto session, if recorded — so steering resumes the
+/// same one (`docs/adr/0024`).
+pub(crate) fn harness_id_for(junto_home: &Path, junto: &EntryId) -> Result<Option<String>> {
+    Ok(load_harness_sessions(junto_home)?
+        .sessions
+        .into_iter()
+        .find(|record| record.junto == *junto)
+        .map(|record| record.harness_id))
+}
+
+fn record_turn(
+    junto_home: &Path,
+    junto: &EntryId,
+    harness: Option<String>,
+    harness_id: &str,
+) -> Result<u32> {
     let mut file = load_harness_sessions(junto_home)?;
     let turn = match file.sessions.iter_mut().find(|r| r.junto == *junto) {
         Some(record) => {
@@ -441,12 +559,14 @@ fn record_turn(junto_home: &Path, junto: &EntryId, harness: Option<String>) -> R
             if let Some(harness) = harness {
                 record.harness = harness;
             }
+            record.harness_id = harness_id.to_string();
             record.turns
         }
         None => {
             file.sessions.push(HarnessSessionRecord {
                 junto: *junto,
                 harness: harness.unwrap_or_default(),
+                harness_id: harness_id.to_string(),
                 turns: 1,
             });
             1
@@ -675,26 +795,46 @@ async fn run_turn(
     resume: Option<&str>,
     live: &LiveSessions,
     session: EntryId,
+    harness: Harness,
 ) -> TurnOutcome {
-    if let Some(adapter) = acp_adapter_command() {
+    if let Some(adapter) = acp_adapter_command(harness) {
         match crate::acp::run_turn_acp(&adapter, workspace, prompt, resume, live, session).await {
             Ok(outcome) => return outcome,
             Err(err) => {
-                tracing::warn!("ACP turn setup failed ({err:#}); falling back to claude -p");
-                live.publish(
-                    session,
-                    LiveEvent::new("status", "ACP unavailable — falling back to claude -p"),
-                );
+                tracing::warn!("ACP turn setup failed for {} ({err:#})", harness.label);
+                if harness.has_cli_fallback() {
+                    live.publish(
+                        session,
+                        LiveEvent::new("status", "ACP unavailable — falling back to claude -p"),
+                    );
+                } else {
+                    return TurnOutcome {
+                        result: format!("{} could not start over ACP: {err:#}", harness.label),
+                        harness_session: None,
+                        failed: true,
+                    };
+                }
             }
         }
     }
-    run_turn_cli(workspace, prompt, resume, live, session).await
+    if harness.has_cli_fallback() {
+        run_turn_cli(workspace, prompt, resume, live, session).await
+    } else {
+        TurnOutcome {
+            result: format!(
+                "{} needs ACP, but no adapter is available (is Node installed?)",
+                harness.label
+            ),
+            harness_session: None,
+            failed: true,
+        }
+    }
 }
 
-/// The ACP adapter command for the harness, or `None` to use the `claude -p`
+/// The ACP adapter command for `harness`, or `None` to use the `claude -p`
 /// CLI. ACP is preferred; fall back when a test stub is set, when forced to
-/// `cli`, or when Node (which the adapter needs) is absent.
-fn acp_adapter_command() -> Option<Vec<String>> {
+/// `cli`, or when Node (which the adapters need) is absent.
+fn acp_adapter_command(harness: Harness) -> Option<Vec<String>> {
     if std::env::var_os("JUNTO_HARNESS_CMD").is_some() {
         return None; // tests drive the stub over the CLI path
     }
@@ -704,18 +844,7 @@ fn acp_adapter_command() -> Option<Vec<String>> {
     if !node_available() {
         return None;
     }
-    // The published Claude Code ACP adapter (overridable). It runs Claude
-    // Code's SDK — same subscription auth as `claude -p`, no API token. On
-    // Windows the launcher is `npx.cmd` (Rust's spawn won't auto-append the
-    // `.cmd` extension the way a shell does).
-    let default = if cfg!(windows) {
-        "npx.cmd -y @agentclientprotocol/claude-agent-acp"
-    } else {
-        "npx -y @agentclientprotocol/claude-agent-acp"
-    };
-    let cmd = std::env::var("JUNTO_ACP_CLAUDE_CMD").unwrap_or_else(|_| default.to_string());
-    let parts: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
-    if parts.is_empty() { None } else { Some(parts) }
+    harness.acp_command()
 }
 
 /// Is Node on PATH? The ACP adapter is a Node package; probed once and cached.
@@ -948,6 +1077,7 @@ pub async fn launch(
     channel_ref: String,
     workspace: PathBuf,
     intent: String,
+    harness: Harness,
 ) -> Result<EntryId> {
     let session = EntryId::new();
     append(
@@ -956,7 +1086,7 @@ pub async fn launch(
         LedgerEntry {
             id: session,
             channel,
-            author: harness_member(),
+            author: harness.member(),
             timestamp: Timestamp::now(),
             payload: EntryPayload::SessionStarted {
                 intent: intent.clone(),
@@ -969,7 +1099,16 @@ pub async fn launch(
         "{intent}\n\n(Launched from junto channel '{channel_ref}'; junto session {session}. \
          Do the work in this repository.)"
     );
-    spawn_turn(host, channel, channel_ref, workspace, session, prompt, None);
+    spawn_turn(
+        host,
+        channel,
+        channel_ref,
+        workspace,
+        session,
+        prompt,
+        None,
+        harness,
+    );
     Ok(session)
 }
 
@@ -992,6 +1131,12 @@ pub async fn steer(
              elsewhere or before the mapping existed; start a new session instead"
         );
     };
+    // Steer the same harness that ran the session.
+    let harness = harness_by_id(
+        harness_id_for(&junto_home, &session)?
+            .as_deref()
+            .unwrap_or("claude"),
+    );
     append(
         &host,
         &channel_ref,
@@ -1016,6 +1161,7 @@ pub async fn steer(
         session,
         message,
         Some(harness_session),
+        harness,
     );
     Ok(())
 }
@@ -1032,12 +1178,29 @@ fn spawn_turn(
     session: EntryId,
     prompt: String,
     resume: Option<String>,
+    harness: Harness,
 ) {
     tokio::spawn(async move {
         host.live().begin(session);
-        let outcome = run_turn(&workspace, &prompt, resume.as_deref(), host.live(), session).await;
-        if let Err(err) =
-            record_outcome(&host, &channel_ref, channel, session, &workspace, &outcome).await
+        let outcome = run_turn(
+            &workspace,
+            &prompt,
+            resume.as_deref(),
+            host.live(),
+            session,
+            harness,
+        )
+        .await;
+        if let Err(err) = record_outcome(
+            &host,
+            &channel_ref,
+            channel,
+            session,
+            &workspace,
+            &outcome,
+            harness,
+        )
+        .await
         {
             tracing::warn!("recording session {session} outcome failed: {err:#}");
         }
@@ -1065,9 +1228,15 @@ async fn record_outcome(
     session: EntryId,
     workspace: &Path,
     outcome: &TurnOutcome,
+    harness: Harness,
 ) -> Result<()> {
     let junto_home = crate::host::junto_home()?;
-    let turn = record_turn(&junto_home, &session, outcome.harness_session.clone())?;
+    let turn = record_turn(
+        &junto_home,
+        &session,
+        outcome.harness_session.clone(),
+        harness.id,
+    )?;
 
     // The result memo artifact.
     let memo = store_artifact(
@@ -1082,7 +1251,7 @@ async fn record_outcome(
         LedgerEntry {
             id: EntryId::new(),
             channel,
-            author: harness_member(),
+            author: harness.member(),
             timestamp: Timestamp::now(),
             payload: EntryPayload::ArtifactAttached {
                 target: session,
@@ -1141,7 +1310,7 @@ async fn record_outcome(
         LedgerEntry {
             id: EntryId::new(),
             channel,
-            author: harness_member(),
+            author: harness.member(),
             timestamp: Timestamp::now(),
             payload: EntryPayload::SessionUpdated {
                 target: session,
@@ -1328,7 +1497,7 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            record_turn(home.path(), &session, Some("h-123".into())).unwrap(),
+            record_turn(home.path(), &session, Some("h-123".into()), "claude").unwrap(),
             1
         );
         assert_eq!(
@@ -1338,7 +1507,10 @@ mod tests {
             Some("h-123")
         );
         // A later turn increments and may refresh the harness id.
-        assert_eq!(record_turn(home.path(), &session, None).unwrap(), 2);
+        assert_eq!(
+            record_turn(home.path(), &session, None, "claude").unwrap(),
+            2
+        );
         assert_eq!(
             harness_session_for(home.path(), &session)
                 .unwrap()
