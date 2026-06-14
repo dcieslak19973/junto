@@ -31,6 +31,15 @@ The kernel provides the **gate-engine** (a state machine + approvals); a **Playb
 
 Likewise the **verifier is a per-playbook slot, not one model** (research pressure-test): "ledger entry" means *pre-registration / reproducible re-run* for research (verify **before** evidence), *AAR ratification* for incidents (verify **after** action), *tests pass* for code (mechanical). The kernel stores the ledger entry; the **Playbook supplies what "verified" means.**
 
+A Playbook's **Rubric** (what a Grader scores a Deliverable against) need not be opaque test code — it can be a **human-readable *and* executable** artifact. The clearest worked instance is **BDD/Gherkin (Cucumber)** for the code-PR Playbook: scenarios a human reviews in plain language *and* a Grader runs, closing the gap that prose specs leave open ("how do we know the code actually adheres to the spec?"). It also keeps the verification artifact reviewable — one less opaque "AI test" for a human to audit. (External corroboration: Michal (Safe Intelligence), conference talk *Capturing decisions for humans and AI alike*, 2026.) This is a Playbook-supplied Rubric *format*, not a kernel concern — the kernel only stores the entry and its verification state.
+
+> **What those terms mean** (for readers new to them):
+> - **BDD (Behavior-Driven Development)** — writing a spec as concrete behavior examples ("given this situation, when X happens, then Y results") so the *same* artifact is spec, acceptance test, and documentation.
+> - **Gherkin** — the plain-language syntax those examples are written in: structured English with keywords `Feature` / `Scenario` / `Given` / `When` / `Then`. Readable by a non-coder.
+> - **Cucumber** — the tool that *runs* Gherkin. You write small "step definitions" binding each `Given/When/Then` line to real code, so the readable scenario executes as a test and reports pass/fail. It exists across languages (Ruby originally; JVM, JS, and a Rust `cucumber` crate).
+>
+> The payoff: one artifact a human can **read and sign off on** and a Grader can **run mechanically**. junto would borrow this as *one* candidate Rubric format — a Playbook's choice, not a kernel dependency.
+
 ## The boundaries
 
 | Boundary | Adapter | Targets | Status |
