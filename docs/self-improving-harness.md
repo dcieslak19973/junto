@@ -286,7 +286,7 @@ Don't build two pipelines. These same events are *also* the provenance / verifie
 
 ### Event model (minimum)
 
-- session.started   (an Agent Session — see domain-model.md)
+- session.started   (a Session — see domain-model.md)
 - session.completed
 - session.failed
 - proposal.created

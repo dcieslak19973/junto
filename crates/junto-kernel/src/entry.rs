@@ -172,7 +172,7 @@ pub enum EntryPayload {
     /// entries that reference it against its `requirement`.
     Proposal {
         /// A generic, repo-agnostic descriptor of the action being proposed
-        /// (so a research-persona gate behaves identically to a code-PR gate).
+        /// (so a research-playbook gate behaves identically to a code-PR gate).
         action: String,
         /// Why the action is proposed.
         rationale: String,

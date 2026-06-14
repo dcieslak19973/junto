@@ -7,7 +7,7 @@
 //! far:** Member, Provenance, the Gate engine, the Ledger (and its entries),
 //! and Agent Sessions with their Artifacts (as ledger entries — [`session`]).
 //! **Planned, not yet modelled:** Channel (today just a [`ChannelId`]),
-//! Message, Outcome, and Event. It contains
+//! Message, Deliverable, and Event. It contains
 //! **no playbook-specific logic and no vendor names**: those live in playbook
 //! crates and behind adapter traits, respectively.
 //!

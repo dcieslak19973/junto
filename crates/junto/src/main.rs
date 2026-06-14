@@ -8,13 +8,13 @@
 //! `?`-propagate — unlike the library crates.
 
 mod acp;
+mod agent;
 mod binding;
 mod host;
 mod init;
 mod launch;
 mod mcp;
 mod members;
-mod persona;
 mod render;
 mod web;
 

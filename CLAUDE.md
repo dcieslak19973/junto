@@ -77,7 +77,7 @@ The substrate is **`git push`/`fetch` of custom `refs/junto/*` over the standard
 2. ✅ **Terminal-less for humans.** The point (Dan, 2026-06-09): humans don't *work* through a terminal agent harness (Claude Code, OpenCode, Gemini CLI, Goose…) — junto's human surface is a GUI (think Mux's UI). One-time CLI setup plumbing (`junto init` / `junto serve`) is acceptable, especially dogfood-era. **Agents do** run shells under the hood — their output is **captured as verifiable Artifacts (diffs, logs, charts), never rendered as scrollback.** This is why cross-platform PTY capture matters.
 3. ✅ **Durable record = git refs** (`refs/junto/*`, partitioned by author). Append-only; **no CRDT** — concurrent writes interleave by `(ts, author)`. Dedicated refs, never working-tree files (no `git status` pollution). The record holds **decisions/intent + provenance + digests, not raw agent transcripts** (those live outside the repo).
 4. ✅ **Vendor-neutral by adapters.** Every external dependency sits behind a swappable adapter; **no vendor name reaches the kernel** — branch on **capability flags, not vendor identity**.
-5. ✅ **Kernel ↔ Playbook seam.** **No playbook-specific logic in the kernel.** The kernel is generic (Channel · Member/Party · Message · Artifact · Provenance · Agent Session · Gate engine · Ledger · Outcome · Event). A Playbook *supplies* its Lifecycle, **gate-routing function** (the single most playbook-specific thing), Verifier, offered tools/agents, and artifact renderers.
+5. ✅ **Kernel ↔ Playbook seam.** **No playbook-specific logic in the kernel.** The kernel is generic (Channel · Member/Party · Message · Artifact · Provenance · Session · Gate engine · Ledger · Deliverable · Event). A Playbook *supplies* its Lifecycle, **Routing Policy** (gate-routing — the single most playbook-specific thing), **Outcome + Rubric** (what verified means; a Grader evaluates), offered tools/agents, and artifact renderers. (Terminology per ADR 0025.)
 
 ## Cross-platform rules (Win + Mac — first-class, tested on both)
 
@@ -131,12 +131,13 @@ This codebase is meant to be **navigable by both humans and agents** (it's the s
 
 ## Ubiquitous language — use these names in code
 
-The full table is [`docs/domain-model.md`](docs/domain-model.md) — **read it before naming types.** The naming traps an agent *will* get wrong while coding:
+The full table is [`docs/domain-model.md`](docs/domain-model.md) — **read it before naming types.** **Terminology is aligned on Anthropic's Managed Agents ([ADR 0025](docs/adr/0025-align-terminology-on-anthropic-managed-agents.md)); the big-bang rename PR may still be in flight, so trust ADR 0025 over any stale name you find.** The naming traps an agent *will* get wrong while coding:
 
-- **Agent Session** — always qualified, never bare "session". Bare "session" is overloaded (terminal/login) and **Ace calls its *channels* "Sessions"** — the opposite layer from ours. One Channel → many Agent Sessions.
+- **Session** (was "Agent Session") — one agent execution. An **Agent** (was "Persona") is the reusable config (model · system · tools · MCP · skills) a machine Member runs: *an agent Member runs an Agent*. `MemberKind::{Human, Agent}` unchanged.
 - **Channel** = one unit of inquiry. **Playbook** = the *type* stamped on a channel (code-PR / research / prod-troubleshooting / self-improvement). Not "Channel Kind".
 - **Ledger** = one per channel, holding many **entries** (decisions/findings/claims, each provenance-bound with a verification state). The research "hypothesis ledger" is just a research channel's ledger.
-- **Member** (human *or* agent — agents are first-class) · **Party** (the set of Members) · **Gate** (checkpoint a consequential action must pass) · **Artifact** (verifiable output, not scrollback) · **Provenance** (a *relation* on artifacts/entries, not a standalone entity) · **Outcome** (PR | memo | fix | promoted policy | parked).
+- **Member** (human *or* agent — agents are first-class) · **Party** (the set of Members) · **Gate** (checkpoint a consequential action must pass — junto's, no Anthropic equivalent) · **Artifact** (verifiable output, not scrollback) · **Provenance** (a *relation* on artifacts/entries, not a standalone entity).
+- **Deliverable** (was "Outcome") = what the channel produced (PR | memo | fix | promoted policy | parked). **Outcome** now = the *target* ("what done looks like" = description + **Rubric**); a **Grader** scores a Deliverable against the Rubric. The standalone **Verifier** noun is retired (a Playbook supplies an Outcome + Rubric; a Grader evaluates). Gate-routing is the **Routing Policy** layer, not "Rubric".
 - Adapter/boundary nouns: **SubstrateProvider · ForgeAdapter · AgentHarnessAdapter · ExecutionBackend · ChatConnector · Connector · MemoryProvider · InferenceEndpoint**. All declare **Capabilities**.
 
 ## Design docs (source of truth — read before large changes)

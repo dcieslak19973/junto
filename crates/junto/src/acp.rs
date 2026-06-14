@@ -22,16 +22,16 @@ use tokio::process::{ChildStdin, ChildStdout};
 
 use junto_kernel::EntryId;
 
+use crate::agent::McpServer;
 use crate::launch::{LiveEvent, LiveSessions, TURN_TIMEOUT, TurnOutcome};
-use crate::persona::McpServer;
 
-/// A persona's config as it crosses into one ACP turn
+/// A agent's config as it crosses into one ACP turn
 /// (`docs/superpowers/specs/2026-06-13-agent-personas-design.md`). `mcp_servers`
 /// is standard ACP (`session/new` `mcpServers`) and applies to any harness;
 /// `system_prompt` and `model` ride the Claude adapter's `_meta` extensions and
-/// are only populated for Claude personas (the caller gates them on harness).
+/// are only populated for Claude agents (the caller gates them on harness).
 #[derive(Default)]
-pub(crate) struct AcpPersona {
+pub(crate) struct AcpAgent {
     /// MCP servers to offer the agent.
     pub(crate) mcp_servers: Vec<McpServer>,
     /// The role / system-prompt (Claude only) → `_meta.systemPrompt`.
@@ -45,7 +45,7 @@ pub(crate) struct AcpPersona {
     pub(crate) plugins: Vec<String>,
 }
 
-impl AcpPersona {
+impl AcpAgent {
     /// The `session/new` `mcpServers` array — one `{type:"http", name, url}`
     /// element per server (the shape the adapter expects for HTTP servers).
     fn mcp_json(&self) -> Value {
@@ -57,7 +57,7 @@ impl AcpPersona {
         )
     }
 
-    /// The `_meta` object for `session/new`, or `None` when the persona carries
+    /// The `_meta` object for `session/new`, or `None` when the agent carries
     /// no Claude-adapter extras. `systemPrompt` rides the top level; `model`,
     /// `skills`, and `plugins` go under `claudeCode.options` (which the adapter
     /// spreads into the Claude Agent SDK's options), each only when present.
@@ -103,7 +103,7 @@ pub(crate) async fn run_turn_acp(
     resume: Option<&str>,
     live: &LiveSessions,
     session: EntryId,
-    persona: &AcpPersona,
+    agent: &AcpAgent,
 ) -> Result<TurnOutcome> {
     let (program, args) = adapter.split_first().context("empty ACP adapter command")?;
     let mut command = tokio::process::Command::new(program);
@@ -156,7 +156,7 @@ pub(crate) async fn run_turn_acp(
                     &mut stdin,
                     2,
                     "session/load",
-                    json!({ "sessionId": prior, "cwd": cwd, "mcpServers": persona.mcp_json() }),
+                    json!({ "sessionId": prior, "cwd": cwd, "mcpServers": agent.mcp_json() }),
                 )
                 .await?;
                 pump_until(&mut reader, &mut stdin, 2, live, session, &mut sink)
@@ -165,13 +165,13 @@ pub(crate) async fn run_turn_acp(
                 prior.to_string()
             }
             None => {
-                // The persona's config rides session/new: mcpServers (standard
-                // ACP) plus, for Claude personas, the adapter's _meta extras
+                // The agent's config rides session/new: mcpServers (standard
+                // ACP) plus, for Claude agents, the adapter's _meta extras
                 // (systemPrompt, claudeCode.options.model).
                 let mut params = serde_json::Map::new();
                 params.insert("cwd".to_string(), json!(cwd));
-                params.insert("mcpServers".to_string(), persona.mcp_json());
-                if let Some(meta) = persona.meta_json() {
+                params.insert("mcpServers".to_string(), agent.mcp_json());
+                if let Some(meta) = agent.meta_json() {
                     params.insert("_meta".to_string(), meta);
                 }
                 request(&mut stdin, 2, "session/new", Value::Object(params)).await?;
@@ -396,7 +396,7 @@ mod tests {
 
     #[test]
     fn mcp_json_is_the_http_server_shape_the_adapter_expects() {
-        let persona = AcpPersona {
+        let agent = AcpAgent {
             mcp_servers: vec![McpServer {
                 name: "junto".into(),
                 url: "http://127.0.0.1:1727/mcp".into(),
@@ -404,7 +404,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            persona.mcp_json(),
+            agent.mcp_json(),
             json!([{ "type": "http", "name": "junto", "url": "http://127.0.0.1:1727/mcp" }])
         );
     }
@@ -412,10 +412,10 @@ mod tests {
     #[test]
     fn meta_json_builds_only_the_present_claude_extras() {
         // No extras → no _meta at all.
-        assert!(AcpPersona::default().meta_json().is_none());
+        assert!(AcpAgent::default().meta_json().is_none());
         // systemPrompt rides the top level; model/skills/plugins nest under
         // claudeCode.options (the SDK options the adapter spreads).
-        let persona = AcpPersona {
+        let agent = AcpAgent {
             system_prompt: Some("be careful".into()),
             model: Some("claude-opus-4-8".into()),
             skills: vec!["diagnose".into(), "caveman".into()],
@@ -423,7 +423,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            persona.meta_json(),
+            agent.meta_json(),
             Some(json!({
                 "systemPrompt": "be careful",
                 "claudeCode": { "options": {

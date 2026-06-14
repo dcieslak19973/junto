@@ -226,7 +226,7 @@ concrete):
 - the child's genesis-adjacent entry records *diverged from parent, at this
   point*; the parent gets a matching entry — both ledgers carry the
   relationship with provenance both ways;
-- the child's **Outcome** (`domain-model.md`) is concrete: converged-back or
+- the child's **Deliverable** (`domain-model.md`) is concrete: converged-back or
   parked;
 - the focus board nests side-quests under their parent (shallow tree).
 
@@ -351,7 +351,7 @@ board is a pane of glass **over a record**.
 6. **The unit is the inquiry, not the agent** — and plan for verification
    asymmetry (the agent-command-center risk). A kanban of agent sessions
    makes the fleet the subject; junto already chose the Channel as the unit
-   with Agent Sessions subordinate. Deeper: agents produce verifiable work
+   with Sessions subordinate. Deeper: agents produce verifiable work
    far faster than humans can verify it, so an attention surface that
    assumes every item deserves human eyes becomes a slop inbox. The escape
    is already in the design — gate routing (`adr/0004`/`0007`) lets
