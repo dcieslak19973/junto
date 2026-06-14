@@ -50,7 +50,7 @@ How junto answers the *"another app"* cold-start: it is valuable to **one person
 - **Player:** the agent-heavy developer — the persona we dogfood daily.
 - **Lead job:** **decision memory** — *your repo remembers why.* Agents re-derive and contradict past decisions; CLAUDE.md bloats, ADRs are heavyweight, commit messages are write-only.
 - **The delta** over agent memory files: **verification states** — memory with *standing* (provisional / ratified / parked), where a ratified decision outranks a stray note and **parked dead-ends stop agents from re-trying them**.
-- **Recall is a membership concern:** joining a channel *means* receiving its context, injected by junto at join time once Channel/Party/Agent Session are modelled; until then a harness SessionStart hook injects the channel brief (`docs/adr/0013`).
+- **Recall is a membership concern:** joining a channel *means* receiving its context, injected by junto at join time once Channel/Party/Session are modelled; until then a harness SessionStart hook injects the channel brief (`docs/adr/0013`).
 - **Gates solo** = the async + durable layer: the harness gates *mechanics* ("may I run this command"), junto gates *outcomes* ("should this merge") — see the position recorded on `pluggability.md` open question #1.
 
 Teams then grow out of the solo install: the record already syncs through the forge, so adding a second member is sharing refs, not adopting a platform.
@@ -67,7 +67,7 @@ The **same spine serves every kind of work** — *members deliberate → agent-a
 
 The "rule-of-three" set to build concretely *before* extracting the framework:
 
-| Playbook | The inquiry | Outcome | Gate before acting |
+| Playbook | The inquiry | Deliverable | Gate before acting |
 |---|---|---|---|
 | **code-PR** (built-in default) | "should we build/change X?" | a PR | commissioner first-pass → CODEOWNERS |
 | **research / analysis** | "what's true about X?" | memo / result / decision | domain-expert sign-off; **hypothesis-ledger + provenance** guard against false-discovery |

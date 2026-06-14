@@ -8,16 +8,18 @@
   Channel  (one unit of inquiry; has a playbook)
    ├─ Party            — the Members (human + agent) on it
    ├─ Conversation     — append-only Messages
-   ├─ Agent Session(s)— agent executions → Artifacts (+ Provenance + Events)
+   ├─ Session(s)       — agent executions → Artifacts (+ Provenance + Events)
    ├─ Gate(s)          — checkpoints consequential actions must pass
    ├─ Ledger           — the durable, append-only record (synced via Substrate)
    │    └─ entries          decisions / findings / claims (provenance-bound, with a
    │                        verification state); entries reference Artifacts
-   └─ Outcome          — what it produced (PR | memo | fix | promoted policy | parked)
+   └─ Deliverable      — what it produced (PR | memo | fix | promoted policy | parked)
 
-  Playbook  supplies: Lifecycle (stages) · Gate-routing function · Verifier
+  Playbook  supplies: Lifecycle (stages) · Routing Policy · Outcome (+ Rubric, Grader)
                           · offered tools/agents · artifact kinds + renderers
 ```
+
+> **Terminology aligned on Anthropic's Managed Agents (ADR 0025).** `Persona → Agent` (the config), `Outcome (produced) → Deliverable` so **Outcome** = the *target* (description + Rubric), `Agent Session → Session`, routing "Rubric" → **Routing Policy**; adopt **Rubric** (verification criteria) + **Grader**; the **Verifier** noun retires. The tables below are mid-migration — ADR 0025 is the source of truth until the big-bang rename PR lands.
 
 ## Core nouns
 
@@ -27,20 +29,23 @@
 | **Home substrate** | The one place a channel's durable record lives (today: one git repo's `refs/junto/*`). Exactly one per channel. A storage/admin fact, *not* the channel's scope — it may be a repo entirely unrelated to the repo(s) the inquiry works through. | ✅ kernel |
 | **Channel binding** | Which channel(s) a working session consults and records into — a property of the **working checkout** (worktree), never derivable from the repo. Dogfood bridge: committed project default + uncommitted per-worktree override; destination: a membership concern (join at session start, ADR 0013). | 🔵 dogfood convention |
 | **Workspace** | The machine-local repo(s) a channel's Agent Sessions execute in — a channel→repos mapping in machine config (`~/.junto/workspaces.toml`), set at first launch and remembered. A **machine fact, never ledger content** (paths don't sync); shaped as a list so one channel can span several repos later (v1 uses exactly one, and it must be a git repo). The inverse of Channel binding: binding says which channels a checkout consults; workspace says where a channel's agents execute. | 🔵 dogfood convention (Dan, 2026-06-12) |
-| **Playbook** | The *type* stamped on a channel; supplies its lifecycle, gate-routing, verifier, tools, renderers. (code-PR / research / prod-troubleshooting / self-improvement.) | ✅ kernel concept; playbooks are plugins |
+| **Playbook** | The *type* stamped on a channel; supplies its lifecycle, **Routing Policy** (gate-routing), **Outcome + Rubric** (what verified means), tools, renderers. (code-PR / research / prod-troubleshooting / self-improvement.) | ✅ kernel concept; playbooks are plugins |
 | **Member** | A participant in a channel — **human or agent** (agents are first-class). | ✅ kernel |
 | **Party** | The set of Members on a channel (its roster / ACL). | ✅ kernel |
 | **Role** | A Member's function in a channel (commissioner, reviewer, approver…). | ⚠️ first-class noun, or just per-playbook labels? |
 | **Message** | One append-only entry in the channel Conversation, from a Member. | ✅ kernel |
 | **Artifact** | A verifiable output produced in-channel (diff, chart, log table, test result, memo, query result) — **not scrollback**; rendered on the surface. | ✅ kernel |
 | **Provenance** | The binding of an Artifact/claim to the exact inputs that produced it (command, commit, data as-of, seed, env) → re-runnable. | ✅ kernel (a relation, not a free-standing thing) |
-| **Agent Session** | One agent execution (a Harness invocation on an Execution Backend) → Artifacts + Events; has live state (working / blocked / awaiting-approval / done / error). **Always qualified "Agent Session"** — bare "session" is reserved (overloaded: terminal/login session; and Ace *used to* call its channels "Sessions" — its API now says "Channel" too (0.1.70), but the trap stands). | ✅ kernel |
+| **Session** | One agent execution (an **Agent** running on an Execution Backend) → Artifacts + Events; has live state (working / blocked / awaiting-approval / done / error). Aligned with Anthropic's "Session" (ADR 0025); the old "Agent Session" qualifier is dropped. | ✅ kernel |
+| **Agent** | A reusable, machine-local **config** (model · system · tools · MCP · skills) that a machine Member runs — Anthropic's "Agent" (was junto's "Persona", ledger `251c4bba`). Distinct from a Member: *an agent Member runs an Agent*. | ✅ kernel |
 | **Gate** | A checkpoint a *consequential action* must pass before it happens; routed (auto / one-approver / full-review / hard-gated); records approver + rationale. | ✅ kernel (engine) |
 | **Ledger** | The channel's durable, append-only, provenance-bound record (synced via the Substrate). The research "hypothesis ledger" is just *the ledger of a research channel*. | ✅ kernel |
 | **Ledger entry** | One decision / finding / claim in the ledger: question, options, rationale, outcome — provenance-bound, with a **verification state** (provisional → ratified \| parked/falsified). References Artifacts. The "why" that outlives the channel. | ✅ kernel (the load-bearing noun) |
-| **Outcome** | What the channel produced — a PR, memo, fix, promoted policy, or *parked dead-end*. One of several per playbook. | ✅ kernel |
+| **Deliverable** | What the channel produced — a PR, memo, fix, promoted policy, or *parked dead-end*. One of several per playbook. (Was junto's "Outcome"; renamed in ADR 0025 so "Outcome" can take Anthropic's meaning.) | ✅ kernel |
+| **Outcome** | The *target* — "what done looks like" for a piece of work: a description + a **Rubric**. Anthropic's "Outcome" (ADR 0025). A Playbook supplies the Outcome shape; a **Grader** evaluates a Deliverable against it. | ✅ kernel |
+| **Rubric** | The gradeable verification criteria (markdown) a **Grader** scores a Deliverable against — Anthropic's "Rubric". Supplies "what verified means" for a playbook. *(Not the routing layer — that is now **Routing Policy**, ADR 0007/0025.)* | ✅ playbook-specific |
+| **Grader** | A clean-context evaluator that scores a Deliverable against a Rubric (separate context window — clean-room judgment) and returns per-criterion pass/fail. Anthropic's "Grader". | ✅ kernel |
 | **Lifecycle / Stage** | The playbook-specific sequence of states a channel moves through (this is "the workflow of a playbook" in the process sense). | ✅ playbook-specific |
-| **Verifier** | What "verified" *means* for this playbook (tests pass · reproducible re-run / pre-registration · AAR ratification · eval). | ✅ playbook-specific |
 | **Event** | The observability/provenance atom (`session.*`, `proposal.*`, `eval.*`, `policy.*`); one stream → dashboards + the self-improvement playbook + the Record. | ✅ kernel (cross-cutting) |
 
 ## Boundary nouns (the pluggable edges — adapters)

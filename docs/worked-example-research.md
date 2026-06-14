@@ -32,7 +32,7 @@ Only after these does a finding earn **domain-expert sign-off**, which gates the
 
 ## The scenario
 
-A quant analyst notices a candidate signal: a backtest shows Sharpe ≈ 2.3. **Question: is this a real edge, or an artifact of having searched many variants (selection bias)?** Persona: analyst (human) + a research agent; a senior researcher / risk officer is the sign-off before any capital is allocated.
+A quant analyst notices a candidate signal: a backtest shows Sharpe ≈ 2.3. **Question: is this a real edge, or an artifact of having searched many variants (selection bias)?** Party: analyst (human) + a research agent; a senior researcher / risk officer is the sign-off before any capital is allocated.
 
 ## Walk-through (the shared spine, this playbook's shape)
 
@@ -46,7 +46,7 @@ A quant analyst notices a candidate signal: a backtest shows Sharpe ≈ 2.3. **Q
 
 5. **Epistemic gate (the centerpiece above).** Pre-registered? ledger-corrected? reproducible? out-of-sample? Here the finding *fails robustness* → routed to **"parked / falsified,"** not to sign-off.
 
-6. **Outcome — including the negative result, kept first-class.** The parked channel is **institutional memory of a dead end**: "S looked promising, here's exactly why it isn't, here's the re-runnable proof." Next quarter, when someone re-proposes S, the answer already exists. *Negative results are an asset* — don't delete.
+6. **Deliverable — including the negative result, kept first-class.** The parked channel is **institutional memory of a dead end**: "S looked promising, here's exactly why it isn't, here's the re-runnable proof." Next quarter, when someone re-proposes S, the answer already exists. *Negative results are an asset* — don't delete.
 
 7. **(Counterfactual) the positive path.** Had it survived out-of-sample + correction, the ratified finding → senior sign-off → *then* a consequential action (allocate capital) behind its own gate. Provenance + ledger become the audit trail (relevant under SEC 17a-4 / MiFID II-style retention).
 

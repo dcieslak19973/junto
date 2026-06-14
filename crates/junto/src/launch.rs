@@ -64,8 +64,8 @@ const HARNESSES: &[Harness] = &[
 ];
 
 impl Harness {
-    /// The agent's member identity. Personas now own authorship
-    /// ([`crate::persona::Persona::member`]); this remains for the stock-Claude
+    /// The agent's member identity. Agents now own authorship
+    /// ([`crate::agent::Agent::member`]); this remains for the stock-Claude
     /// identity tests assert against.
     #[cfg(test)]
     pub(crate) fn member(&self) -> Member {
@@ -127,14 +127,14 @@ pub(crate) fn harness_by_id(id: &str) -> Harness {
         .unwrap_or(HARNESSES[0])
 }
 
-/// Every registered harness (for settings and the persona form's harness
-/// picker). The established agent per channel is now resolved at the persona
-/// layer (`crate::persona::channel_persona`).
+/// Every registered harness (for settings and the agent form's harness
+/// picker). The established agent per channel is now resolved at the agent
+/// layer (`crate::agent::channel_agent`).
 pub(crate) fn all_harnesses() -> &'static [Harness] {
     HARNESSES
 }
 
-/// The default harness's member identity — the stock Claude persona authors as
+/// The default harness's member identity — the stock Claude agent authors as
 /// this, so tests assert against it.
 #[cfg(test)]
 pub fn harness_member() -> Member {
@@ -498,11 +498,11 @@ struct HarnessSessionRecord {
     /// multi-harness support.
     #[serde(default = "default_harness_id")]
     harness_id: String,
-    /// Which persona ran it — so steering rebuilds the same persona (its
-    /// identity + config). Empty for records written before personas existed;
-    /// steering then falls back to the stock persona for `harness_id`.
+    /// Which agent ran it — so steering rebuilds the same agent (its
+    /// identity + config). Empty for records written before agents existed;
+    /// steering then falls back to the stock agent for `harness_id`.
     #[serde(default)]
-    persona_slug: String,
+    agent_slug: String,
     /// Turns run so far (names the artifact files).
     turns: u32,
 }
@@ -556,13 +556,13 @@ pub(crate) fn harness_id_for(junto_home: &Path, junto: &EntryId) -> Result<Optio
         .map(|record| record.harness_id))
 }
 
-/// Which persona ran a junto session, if recorded (empty when pre-personas).
-pub(crate) fn persona_slug_for(junto_home: &Path, junto: &EntryId) -> Result<Option<String>> {
+/// Which agent ran a junto session, if recorded (empty when pre-agents).
+pub(crate) fn agent_slug_for(junto_home: &Path, junto: &EntryId) -> Result<Option<String>> {
     Ok(load_harness_sessions(junto_home)?
         .sessions
         .into_iter()
         .find(|record| record.junto == *junto)
-        .map(|record| record.persona_slug)
+        .map(|record| record.agent_slug)
         .filter(|slug| !slug.is_empty()))
 }
 
@@ -571,7 +571,7 @@ fn record_turn(
     junto: &EntryId,
     harness: Option<String>,
     harness_id: &str,
-    persona_slug: &str,
+    agent_slug: &str,
 ) -> Result<u32> {
     let mut file = load_harness_sessions(junto_home)?;
     let turn = match file.sessions.iter_mut().find(|r| r.junto == *junto) {
@@ -581,7 +581,7 @@ fn record_turn(
                 record.harness = harness;
             }
             record.harness_id = harness_id.to_string();
-            record.persona_slug = persona_slug.to_string();
+            record.agent_slug = agent_slug.to_string();
             record.turns
         }
         None => {
@@ -589,7 +589,7 @@ fn record_turn(
                 junto: *junto,
                 harness: harness.unwrap_or_default(),
                 harness_id: harness_id.to_string(),
-                persona_slug: persona_slug.to_string(),
+                agent_slug: agent_slug.to_string(),
                 turns: 1,
             });
             1
@@ -818,19 +818,13 @@ async fn run_turn(
     resume: Option<&str>,
     live: &LiveSessions,
     session: EntryId,
-    persona: &crate::persona::Persona,
+    agent: &crate::agent::Agent,
 ) -> TurnOutcome {
-    let harness = harness_by_id(&persona.harness);
+    let harness = harness_by_id(&agent.harness);
     if let Some(adapter) = acp_adapter_command(harness) {
-        let acp_persona = acp_config(persona, harness);
+        let acp_agent = acp_config(agent, harness);
         match crate::acp::run_turn_acp(
-            &adapter,
-            workspace,
-            prompt,
-            resume,
-            live,
-            session,
-            &acp_persona,
+            &adapter, workspace, prompt, resume, live, session, &acp_agent,
         )
         .await
         {
@@ -866,20 +860,20 @@ async fn run_turn(
     }
 }
 
-/// Build the per-turn ACP config from a persona. MCP servers cross to any
+/// Build the per-turn ACP config from an Agent. MCP servers cross to any
 /// harness (standard ACP); the role, model, skills, and plugins ride the Claude
 /// adapter's `_meta` extensions (the SDK options the adapter spreads), so they
-/// are only carried for Claude personas — other harnesses would ignore them,
+/// are only carried for Claude agents — other harnesses would ignore them,
 /// and `docs/.../agent-personas-design.md` defers OpenCode's own surface.
-fn acp_config(persona: &crate::persona::Persona, harness: Harness) -> crate::acp::AcpPersona {
+fn acp_config(agent: &crate::agent::Agent, harness: Harness) -> crate::acp::AcpAgent {
     let claude = harness.id == "claude";
     let claude_only = |items: &[String]| if claude { items.to_vec() } else { Vec::new() };
-    crate::acp::AcpPersona {
-        mcp_servers: persona.mcp_servers.clone(),
-        system_prompt: if claude { persona.role.clone() } else { None },
-        model: if claude { persona.model.clone() } else { None },
-        skills: claude_only(&persona.skills),
-        plugins: claude_only(&persona.plugins),
+    crate::acp::AcpAgent {
+        mcp_servers: agent.mcp_servers.clone(),
+        system_prompt: if claude { agent.role.clone() } else { None },
+        model: if claude { agent.model.clone() } else { None },
+        skills: claude_only(&agent.skills),
+        plugins: claude_only(&agent.plugins),
     }
 }
 
@@ -1129,7 +1123,7 @@ pub async fn launch(
     channel_ref: String,
     workspace: PathBuf,
     intent: String,
-    persona: crate::persona::Persona,
+    agent: crate::agent::Agent,
 ) -> Result<EntryId> {
     let session = EntryId::new();
     append(
@@ -1138,7 +1132,7 @@ pub async fn launch(
         LedgerEntry {
             id: session,
             channel,
-            author: persona.member(),
+            author: agent.member(),
             timestamp: Timestamp::now(),
             payload: EntryPayload::SessionStarted {
                 intent: intent.clone(),
@@ -1159,7 +1153,7 @@ pub async fn launch(
         session,
         prompt,
         None,
-        persona,
+        agent,
     );
     Ok(session)
 }
@@ -1183,8 +1177,8 @@ pub async fn steer(
              elsewhere or before the mapping existed; start a new session instead"
         );
     };
-    // Steer the same persona (identity + config) that ran the session.
-    let persona = resume_persona(&junto_home, &session)?;
+    // Steer the same agent (identity + config) that ran the session.
+    let agent = resume_agent(&junto_home, &session)?;
     append(
         &host,
         &channel_ref,
@@ -1209,24 +1203,24 @@ pub async fn steer(
         session,
         message,
         Some(harness_session),
-        persona,
+        agent,
     );
     Ok(())
 }
 
-/// Rebuild the persona that should run a resumed turn: the recorded persona by
-/// slug, falling back to the stock persona for the recorded harness (its slug
+/// Rebuild the agent that should run a resumed turn: the recorded agent by
+/// slug, falling back to the stock agent for the recorded harness (its slug
 /// equals the harness id), and finally the default harness. Seed-on-read means
-/// a stock slug always resolves; only a deleted custom persona falls through.
-fn resume_persona(junto_home: &Path, session: &EntryId) -> Result<crate::persona::Persona> {
-    let slug = persona_slug_for(junto_home, session)?
+/// a stock slug always resolves; only a deleted custom agent falls through.
+fn resume_agent(junto_home: &Path, session: &EntryId) -> Result<crate::agent::Agent> {
+    let slug = agent_slug_for(junto_home, session)?
         .or(harness_id_for(junto_home, session)?)
         .unwrap_or_else(|| HARNESSES[0].id.to_string());
-    if let Some(persona) = crate::persona::persona_by_slug(junto_home, &slug)? {
-        return Ok(persona);
+    if let Some(agent) = crate::agent::agent_by_slug(junto_home, &slug)? {
+        return Ok(agent);
     }
-    crate::persona::persona_by_slug(junto_home, HARNESSES[0].id)?
-        .context("no default persona available to resume the session")
+    crate::agent::agent_by_slug(junto_home, HARNESSES[0].id)?
+        .context("no default agent available to resume the session")
 }
 
 /// Run one turn in the background and record its outcome: artifacts
@@ -1241,7 +1235,7 @@ fn spawn_turn(
     session: EntryId,
     prompt: String,
     resume: Option<String>,
-    persona: crate::persona::Persona,
+    agent: crate::agent::Agent,
 ) {
     tokio::spawn(async move {
         host.live().begin(session);
@@ -1251,7 +1245,7 @@ fn spawn_turn(
             resume.as_deref(),
             host.live(),
             session,
-            &persona,
+            &agent,
         )
         .await;
         if let Err(err) = record_outcome(
@@ -1261,7 +1255,7 @@ fn spawn_turn(
             session,
             &workspace,
             &outcome,
-            &persona,
+            &agent,
         )
         .await
         {
@@ -1291,16 +1285,16 @@ async fn record_outcome(
     session: EntryId,
     workspace: &Path,
     outcome: &TurnOutcome,
-    persona: &crate::persona::Persona,
+    agent: &crate::agent::Agent,
 ) -> Result<()> {
     let junto_home = crate::host::junto_home()?;
-    let harness = harness_by_id(&persona.harness);
+    let harness = harness_by_id(&agent.harness);
     let turn = record_turn(
         &junto_home,
         &session,
         outcome.harness_session.clone(),
         harness.id,
-        &persona.slug,
+        &agent.slug,
     )?;
 
     // The result memo artifact.
@@ -1316,7 +1310,7 @@ async fn record_outcome(
         LedgerEntry {
             id: EntryId::new(),
             channel,
-            author: persona.member(),
+            author: agent.member(),
             timestamp: Timestamp::now(),
             payload: EntryPayload::ArtifactAttached {
                 target: session,
@@ -1342,7 +1336,7 @@ async fn record_outcome(
             LedgerEntry {
                 id: EntryId::new(),
                 channel,
-                author: persona.member(),
+                author: agent.member(),
                 timestamp: Timestamp::now(),
                 payload: EntryPayload::ArtifactAttached {
                     target: session,
@@ -1375,7 +1369,7 @@ async fn record_outcome(
         LedgerEntry {
             id: EntryId::new(),
             channel,
-            author: persona.member(),
+            author: agent.member(),
             timestamp: Timestamp::now(),
             payload: EntryPayload::SessionUpdated {
                 target: session,
@@ -1448,29 +1442,29 @@ mod tests {
 
     #[test]
     fn acp_config_carries_claude_extras_but_mcp_crosses_to_any_harness() {
-        let persona = crate::persona::Persona {
+        let agent = crate::agent::Agent {
             slug: "reviewer".into(),
             name: "Reviewer".into(),
             harness: "claude".into(),
             email: "reviewer@junto.local".into(),
             role: Some("be careful".into()),
             model: Some("claude-opus-4-8".into()),
-            mcp_servers: vec![crate::persona::McpServer {
+            mcp_servers: vec![crate::agent::McpServer {
                 name: "junto".into(),
                 url: "http://127.0.0.1:1727/mcp".into(),
             }],
             skills: vec!["diagnose".into()],
             plugins: vec!["/abs/plugin".into()],
         };
-        // Claude personas carry role + model + skills + plugins over _meta.
-        let claude = acp_config(&persona, harness_by_id("claude"));
+        // Claude agents carry role + model + skills + plugins over _meta.
+        let claude = acp_config(&agent, harness_by_id("claude"));
         assert_eq!(claude.system_prompt.as_deref(), Some("be careful"));
         assert_eq!(claude.model.as_deref(), Some("claude-opus-4-8"));
         assert_eq!(claude.mcp_servers.len(), 1);
         assert_eq!(claude.skills, vec!["diagnose".to_string()]);
         assert_eq!(claude.plugins, vec!["/abs/plugin".to_string()]);
         // Other harnesses get MCP (standard ACP) but not the Claude _meta extras.
-        let opencode = acp_config(&persona, harness_by_id("opencode"));
+        let opencode = acp_config(&agent, harness_by_id("opencode"));
         assert!(opencode.system_prompt.is_none());
         assert!(opencode.model.is_none());
         assert_eq!(opencode.mcp_servers.len(), 1);

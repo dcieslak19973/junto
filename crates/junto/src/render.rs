@@ -777,7 +777,7 @@ fn page_shell(
          <a class=\"chan open-link\" href=\"/new#open-channel\">open a channel…</a>\
          <a class=\"chan open-link\" href=\"/new#setup-repo\">set up a repo…</a>\
          </details>\n\
-         <a class=\"chan open-link side-settings\" href=\"/personas\">✦ personas</a>\n\
+         <a class=\"chan open-link side-settings\" href=\"/agents\">✦ agents</a>\n\
          <a class=\"chan open-link\" href=\"/settings\">⚙ settings</a>\n\
          </nav>\n\
          <main>\n{content}</main>\n\
@@ -976,77 +976,77 @@ pub fn settings_html(
     page_shell("junto — settings", nav, None, &content)
 }
 
-/// The "/personas" page — create, edit, and delete reusable agent personas
-/// (`docs/superpowers/specs/2026-06-13-agent-personas-design.md`). A persona is
+/// The "/agents" page — create, edit, and delete reusable agent agents
+/// (`docs/superpowers/specs/2026-06-13-agent-personas-design.md`). A agent is
 /// a named config over a harness; it is what the launch picker offers. Each
-/// existing persona carries an inline edit form (in a `<details>`) and a delete
+/// existing agent carries an inline edit form (in a `<details>`) and a delete
 /// button; a blank create form sits at the bottom, mirroring `/new`.
-pub fn personas_html(nav: &[ChannelSummary], personas: &[crate::persona::Persona]) -> String {
+pub fn agents_html(nav: &[ChannelSummary], agents: &[crate::agent::Agent]) -> String {
     let mut cards = String::new();
-    for persona in personas {
+    for agent in agents {
         let harness_label = crate::launch::all_harnesses()
             .iter()
-            .find(|h| h.id == persona.harness)
+            .find(|h| h.id == agent.harness)
             .map(|h| h.label)
-            .unwrap_or(persona.harness.as_str());
-        let summary = persona_summary(persona);
+            .unwrap_or(agent.harness.as_str());
+        let summary = agent_summary(agent);
         let _ = writeln!(
             cards,
             "<section class=\"board\">\
              <h2 class=\"board-head\">{name} <span class=\"when\">· {harness}</span></h2>\
              <p class=\"meta\">{summary}</p>\
              <details class=\"ledger\"><summary class=\"view\">edit</summary>{form}</details>\
-             <form class=\"act\" method=\"post\" action=\"/personas/{slug}/delete\">\
+             <form class=\"act\" method=\"post\" action=\"/agents/{slug}/delete\">\
              <button class=\"danger\">delete</button></form>\
              </section>",
-            name = escape_html(&persona.name),
+            name = escape_html(&agent.name),
             harness = escape_html(harness_label),
             summary = escape_html(&summary),
-            form = persona_form(Some(persona)),
-            slug = escape_html(&persona.slug),
+            form = agent_form(Some(agent)),
+            slug = escape_html(&agent.slug),
         );
     }
     let content = format!(
-        "<h1>personas</h1>\n\
-         <p class=\"meta\">a persona is a named, reusable configuration over a harness — \
-         what the start-work picker offers. Config is machine-local; only a persona's \
+        "<h1>agents</h1>\n\
+         <p class=\"meta\">an Agent is a named, reusable configuration over a harness — \
+         what the start-work picker offers. Config is machine-local; only an Agent's \
          identity enters the record when it does work.</p>\n\
          {cards}\
-         <section class=\"board\" id=\"new-persona\"><h2 class=\"board-head\">new persona</h2>\
+         <section class=\"board\" id=\"new-agent\"><h2 class=\"board-head\">new agent</h2>\
          {create}</section>\n{ADD_MCP_SCRIPT}",
-        create = persona_form(None),
+        create = agent_form(None),
     );
-    page_shell("junto — personas", nav, None, &content)
+    page_shell("junto — agents", nav, None, &content)
 }
 
-/// A one-line summary of a persona's config, for the list.
-fn persona_summary(persona: &crate::persona::Persona) -> String {
+/// A one-line summary of an Agent's config, for the list.
+fn agent_summary(agent: &crate::agent::Agent) -> String {
     let mut parts = Vec::new();
-    if let Some(model) = &persona.model {
+    if let Some(model) = &agent.model {
         parts.push(format!("model {model}"));
     }
-    if !persona.mcp_servers.is_empty() {
+    if !agent.mcp_servers.is_empty() {
         parts.push(format!(
             "{} MCP server{}",
-            persona.mcp_servers.len(),
-            if persona.mcp_servers.len() == 1 {
+            agent.mcp_servers.len(),
+            if agent.mcp_servers.len() == 1 {
                 ""
             } else {
                 "s"
             }
         ));
     }
-    if !persona.skills.is_empty() {
-        parts.push(format!("{} skill(s)", persona.skills.len()));
+    if !agent.skills.is_empty() {
+        parts.push(format!("{} skill(s)", agent.skills.len()));
     }
-    if !persona.plugins.is_empty() {
-        parts.push(format!("{} plugin(s)", persona.plugins.len()));
+    if !agent.plugins.is_empty() {
+        parts.push(format!("{} plugin(s)", agent.plugins.len()));
     }
-    if persona.role.is_some() {
+    if agent.role.is_some() {
         parts.push("custom role".to_string());
     }
     if parts.is_empty() {
-        format!("the bare {} harness, no extra config", persona.harness)
+        format!("the bare {} harness, no extra config", agent.harness)
     } else {
         parts.join(" · ")
     }
@@ -1078,11 +1078,11 @@ fn plugin_row(path: &str) -> String {
 }
 
 /// The skills picker: a checkbox per skill discovered under the Claude config
-/// dir's `skills/` (name + its `SKILL.md` description), checked when the persona
-/// enables it. Any skill the persona stored that isn't discovered on this
+/// dir's `skills/` (name + its `SKILL.md` description), checked when the agent
+/// enables it. Any skill the agent stored that isn't discovered on this
 /// machine is still shown (checked, flagged) so editing never silently drops it.
 fn skills_checklist(selected: &[String]) -> String {
-    let discovered = crate::persona::discover_skills();
+    let discovered = crate::agent::discover_skills();
     let mut html = String::new();
     for skill in &discovered {
         let checked = if selected.iter().any(|s| s == &skill.name) {
@@ -1115,32 +1115,32 @@ fn skills_checklist(selected: &[String]) -> String {
     }
 }
 
-/// The create/edit form for a persona. `Some` prefills for an edit (slug is a
+/// The create/edit form for an Agent. `Some` prefills for an edit (slug is a
 /// hidden, immutable field); `None` renders a blank create form (the server
 /// derives the slug from the name). MCP servers and local plugins are
 /// structured rows (one blank trailing row to add another; `+ add` clones a row
 /// when JS is on). Skills are a checklist of what's installed under the Claude
-/// config dir. All of these are delivered to Claude personas over ACP `_meta`.
-fn persona_form(persona: Option<&crate::persona::Persona>) -> String {
-    let slug = persona.map(|p| p.slug.as_str()).unwrap_or("");
-    let name = persona.map(|p| p.name.as_str()).unwrap_or("");
-    let role = persona.and_then(|p| p.role.as_deref()).unwrap_or("");
-    let model = persona.and_then(|p| p.model.as_deref()).unwrap_or("");
-    let selected_harness = persona.map(|p| p.harness.as_str()).unwrap_or("");
+/// config dir. All of these are delivered to Claude agents over ACP `_meta`.
+fn agent_form(agent: Option<&crate::agent::Agent>) -> String {
+    let slug = agent.map(|p| p.slug.as_str()).unwrap_or("");
+    let name = agent.map(|p| p.name.as_str()).unwrap_or("");
+    let role = agent.and_then(|p| p.role.as_deref()).unwrap_or("");
+    let model = agent.and_then(|p| p.model.as_deref()).unwrap_or("");
+    let selected_harness = agent.map(|p| p.harness.as_str()).unwrap_or("");
     // Existing servers / plugins as filled rows, plus one blank row to add more.
     let mut mcp_rows = String::new();
     let mut plugin_rows = String::new();
-    if let Some(persona) = persona {
-        for server in &persona.mcp_servers {
+    if let Some(agent) = agent {
+        for server in &agent.mcp_servers {
             mcp_rows.push_str(&mcp_row(&server.name, &server.url));
         }
-        for path in &persona.plugins {
+        for path in &agent.plugins {
             plugin_rows.push_str(&plugin_row(path));
         }
     }
     mcp_rows.push_str(&mcp_row("", ""));
     plugin_rows.push_str(&plugin_row(""));
-    let skills = skills_checklist(persona.map(|p| p.skills.as_slice()).unwrap_or(&[]));
+    let skills = skills_checklist(agent.map(|p| p.skills.as_slice()).unwrap_or(&[]));
     let harness_options: String = crate::launch::all_harnesses()
         .iter()
         .map(|harness| {
@@ -1160,7 +1160,7 @@ fn persona_form(persona: Option<&crate::persona::Persona>) -> String {
         })
         .collect();
     format!(
-        "<form class=\"act persona-form\" method=\"post\" action=\"/personas\">\
+        "<form class=\"act agent-form\" method=\"post\" action=\"/agents\">\
          <input type=\"hidden\" name=\"slug\" value=\"{slug}\">\
          <label>name<input name=\"name\" value=\"{name}\" placeholder=\"e.g. Security Reviewer\" required></label>\
          <label>harness<select name=\"harness\">{harness_options}</select></label>\
@@ -1447,23 +1447,23 @@ pub fn channel_html(
             Some(text) => format!("<p class=\"meta hint\">⚠ {}</p>", escape_html(text)),
             None => String::new(),
         };
-        // One agent per channel (docs/adr/0024): the picker chooses the persona
-        // only the first time. Once a persona serves the channel, show it fixed
-        // — every session here runs that one persona. Personas are machine-local
+        // One agent per channel (docs/adr/0024): the picker chooses the agent
+        // only the first time. Once an Agent serves the channel, show it fixed
+        // — every session here runs that one agent. Agents are machine-local
         // config, so resolve them here the way the harness picker resolved the
         // registry; a read failure just hides the picker (launch falls back to
-        // the default persona).
-        let personas = crate::host::junto_home()
+        // the default agent).
+        let agents = crate::host::junto_home()
             .ok()
             .map(|home| {
-                let established = crate::persona::channel_persona(&home, &view.party)
+                let established = crate::agent::channel_agent(&home, &view.party)
                     .ok()
                     .flatten();
-                let all = crate::persona::all_personas(&home).unwrap_or_default();
+                let all = crate::agent::all_agents(&home).unwrap_or_default();
                 (established, all)
             })
             .unwrap_or((None, Vec::new()));
-        let harness_picker = match personas {
+        let harness_picker = match agents {
             (Some(agent), _) => format!(
                 "<span class=\"chip\" title=\"this channel's agent\">agent: {}</span>",
                 escape_html(&agent.name)
@@ -1471,16 +1471,16 @@ pub fn channel_html(
             (None, all) if all.len() > 1 => {
                 let options: String = all
                     .iter()
-                    .map(|persona| {
+                    .map(|agent| {
                         format!(
                             "<option value=\"{slug}\">{name}</option>",
-                            slug = escape_html(&persona.slug),
-                            name = escape_html(&persona.name),
+                            slug = escape_html(&agent.slug),
+                            name = escape_html(&agent.name),
                         )
                     })
                     .collect();
                 format!(
-                    "<select name=\"persona\" title=\"which persona runs this channel\">{options}</select>"
+                    "<select name=\"agent\" title=\"which agent runs this channel\">{options}</select>"
                 )
             }
             (None, _) => String::new(),
@@ -2292,7 +2292,7 @@ var b=e.submitter;setTimeout(function(){f.classList.add('busy');\
 f.querySelectorAll('button').forEach(function(x){x.disabled=true});\
 if(b){b.textContent='recording\\u2026'}},0)});</script>";
 
-/// Progressive enhancement for the personas form: clone a blank row (MCP server
+/// Progressive enhancement for the agents form: clone a blank row (MCP server
 /// or plugin path) when a `+ add` button is clicked. Without JS the form still
 /// works — each save adds the one trailing blank row the server rendered.
 const ADD_MCP_SCRIPT: &str = "<script>document.addEventListener('click',function(e)\
@@ -2496,23 +2496,23 @@ form.act.busy{opacity:.65}\
 form.act button:disabled{cursor:wait}\
 form.act button.danger{color:var(--muted)}\
 form.act button.danger:hover{color:#f38ba8;border-color:#f38ba8}\
-form.persona-form{flex-direction:column;align-items:stretch}\
-form.persona-form label{display:flex;flex-direction:column;gap:.25rem;font-size:.8rem;\
+form.agent-form{flex-direction:column;align-items:stretch}\
+form.agent-form label{display:flex;flex-direction:column;gap:.25rem;font-size:.8rem;\
 color:var(--muted)}\
-form.persona-form input,form.persona-form select{flex:none;min-width:0;width:100%}\
-form.persona-form textarea{background:var(--bg);color:var(--text);border:1px solid var(--border);\
+form.agent-form input,form.agent-form select{flex:none;min-width:0;width:100%}\
+form.agent-form textarea{background:var(--bg);color:var(--text);border:1px solid var(--border);\
 border-radius:.45rem;padding:.32rem .6rem;font:.84rem ui-monospace,SFMono-Regular,Menlo,monospace;\
 resize:vertical}\
-form.persona-form textarea:focus{outline:1px solid var(--accent)}\
-form.persona-form button.primary{align-self:flex-start}\
-form.persona-form .field{display:flex;flex-direction:column;gap:.3rem}\
-form.persona-form .field-label{font-size:.8rem;color:var(--muted)}\
+form.agent-form textarea:focus{outline:1px solid var(--accent)}\
+form.agent-form button.primary{align-self:flex-start}\
+form.agent-form .field{display:flex;flex-direction:column;gap:.3rem}\
+form.agent-form .field-label{font-size:.8rem;color:var(--muted)}\
 .rows{display:flex;flex-direction:column;gap:.35rem}\
 .mcp-row{display:flex;gap:.4rem}\
 .mcp-row input[name=mcp_name]{flex:0 0 9rem}\
 .mcp-row input[name=mcp_url]{flex:1}\
 .row input{width:100%}\
-form.persona-form button.add-row{align-self:flex-start;font-size:.8rem;padding:.2rem .6rem}\
+form.agent-form button.add-row{align-self:flex-start;font-size:.8rem;padding:.2rem .6rem}\
 .chips{display:flex;flex-wrap:wrap;gap:.3rem}\
 .checks{display:flex;flex-direction:column;gap:.2rem;max-height:14rem;overflow:auto;\
 border:1px solid var(--border);border-radius:.45rem;padding:.4rem}\

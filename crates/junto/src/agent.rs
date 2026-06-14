@@ -1,12 +1,12 @@
-//! Personas — named, reusable, machine-local configurations over a Harness
+//! Agents — named, reusable, machine-local configurations over a Harness
 //! (`docs/superpowers/specs/2026-06-13-agent-personas-design.md`).
 //!
-//! A **Persona** is the thing a human picks when starting work: it references a
+//! An **Agent** is the thing a human picks when starting work: it references a
 //! [`Harness`](crate::launch::Harness) (the engine) and carries a role, an
 //! optional model, MCP servers, and (Claude-only) skills + local plugins.
-//! One harness → many personas. The config is a **machine fact**
-//! (`~/.junto/personas.toml`) and never enters the ledger; only the persona's
-//! identity (its agent [`Member`]) lands there when it authors work.
+//! One harness → many Agents. The config is a **machine fact**
+//! (`~/.junto/agents.toml`) and never enters the ledger; only the Agent's
+//! identity (its [`Member`]) lands there when it authors work.
 
 use std::path::{Path, PathBuf};
 
@@ -17,7 +17,7 @@ use junto_kernel::Member;
 
 use crate::launch::all_harnesses;
 
-/// An MCP server a persona offers its agent — forwarded to the harness over ACP
+/// An MCP server an Agent offers — forwarded to the harness over ACP
 /// (`session/new` `mcpServers`). v1 is URL-shaped (streamable HTTP); command /
 /// env variants can join later (rule of three).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,15 +30,15 @@ pub(crate) struct McpServer {
 
 /// A named, reusable configuration over a harness — see the module docs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Persona {
+pub(crate) struct Agent {
     /// Stable id and member-email stem; immutable after creation.
     pub(crate) slug: String,
     /// Display label (and the agent member's name).
     pub(crate) name: String,
-    /// The harness this persona runs on (`claude`, `opencode`).
+    /// The harness this agent runs on (`claude`, `opencode`).
     pub(crate) harness: String,
-    /// The persona's stable agent-member identity (`<slug>@junto.local` for
-    /// custom personas; the harness's own email for stock personas, so existing
+    /// The agent's stable agent-member identity (`<slug>@junto.local` for
+    /// custom agents; the harness's own email for stock agents, so existing
     /// channels keep resolving).
     pub(crate) email: String,
     /// The role / system-prompt, if any.
@@ -47,7 +47,7 @@ pub(crate) struct Persona {
     /// An optional model override.
     #[serde(default)]
     pub(crate) model: Option<String>,
-    /// MCP servers the persona offers.
+    /// MCP servers the agent offers.
     #[serde(default)]
     pub(crate) mcp_servers: Vec<McpServer>,
     /// Claude-only: skills to enable, by name (matching the `SKILL.md` `name`
@@ -62,32 +62,32 @@ pub(crate) struct Persona {
     pub(crate) plugins: Vec<String>,
 }
 
-impl Persona {
-    /// The persona's agent-member identity — sessions and outcomes are authored
-    /// as the persona, never the operator (`docs/adr/0012`/`0020`).
+impl Agent {
+    /// The Agent's member identity — sessions and deliverables are authored
+    /// as the agent, never the operator (`docs/adr/0012`/`0020`).
     pub(crate) fn member(&self) -> Member {
         Member::agent(self.name.clone(), self.email.clone())
     }
 }
 
-/// The on-disk shape of `~/.junto/personas.toml`.
+/// The on-disk shape of `~/.junto/agents.toml`.
 #[derive(Debug, Default, Serialize, Deserialize)]
-struct PersonasFile {
+struct AgentsFile {
     #[serde(default)]
-    personas: Vec<Persona>,
+    agents: Vec<Agent>,
 }
 
-fn personas_path(junto_home: &Path) -> PathBuf {
-    junto_home.join("personas.toml")
+fn agents_path(junto_home: &Path) -> PathBuf {
+    junto_home.join("agents.toml")
 }
 
-/// One stock persona per registered harness — the bare engine with no extra
+/// One stock agent per registered harness — the bare engine with no extra
 /// config, identified by the harness's own member email. Used to seed an empty
 /// store so the launch picker is never empty and there's something to clone.
-fn stock_personas() -> Vec<Persona> {
+fn stock_agents() -> Vec<Agent> {
     all_harnesses()
         .iter()
-        .map(|harness| Persona {
+        .map(|harness| Agent {
             slug: harness.id.to_string(),
             name: harness.label.to_string(),
             harness: harness.id.to_string(),
@@ -101,7 +101,7 @@ fn stock_personas() -> Vec<Persona> {
         .collect()
 }
 
-/// A skill discovered on this machine, for the persona form's picker.
+/// A skill discovered on this machine, for the agent form's picker.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DiscoveredSkill {
     /// The skill's name (matches the SDK `skills` option and `SKILL.md` `name`).
@@ -111,7 +111,7 @@ pub(crate) struct DiscoveredSkill {
 }
 
 /// The Claude config dir skills are discovered from — `CLAUDE_CONFIG_DIR` if
-/// set (matching the ACP adapter), else `~/.claude`. The persona's `skills`
+/// set (matching the ACP adapter), else `~/.claude`. The agent's `skills`
 /// option enables among the skills in this dir's `skills/` subtree.
 fn claude_config_dir() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
@@ -189,74 +189,74 @@ fn parse_skill_frontmatter(text: &str, dir_name: &str) -> DiscoveredSkill {
     DiscoveredSkill { name, description }
 }
 
-/// Every persona — the stored set, or the stock seed when none are stored yet.
+/// Every agent — the stored set, or the stock seed when none are stored yet.
 /// Seed-on-read (computed, not written): the file stays empty until the user
 /// actually saves an edit.
-pub(crate) fn all_personas(junto_home: &Path) -> Result<Vec<Persona>> {
-    let stored = read_file(junto_home)?.personas;
+pub(crate) fn all_agents(junto_home: &Path) -> Result<Vec<Agent>> {
+    let stored = read_file(junto_home)?.agents;
     if stored.is_empty() {
-        Ok(stock_personas())
+        Ok(stock_agents())
     } else {
         Ok(stored)
     }
 }
 
-/// The persona already serving a channel — the persona whose agent member is in
-/// `party`, if any. This resolves the established agent at the persona layer:
+/// The agent already serving a channel — the agent whose agent member is in
+/// `party`, if any. This resolves the established agent at the agent layer:
 /// one agent per channel
 /// (`docs/adr/0024`/`docs/superpowers/specs/2026-06-13-agent-personas-design.md`),
-/// so a launch reuses the established persona and the picker only appears before
-/// one is set. The persona's harness drives the turn.
-pub(crate) fn channel_persona(junto_home: &Path, party: &[Member]) -> Result<Option<Persona>> {
-    Ok(all_personas(junto_home)?
+/// so a launch reuses the established agent and the picker only appears before
+/// one is set. The agent's harness drives the turn.
+pub(crate) fn channel_agent(junto_home: &Path, party: &[Member]) -> Result<Option<Agent>> {
+    Ok(all_agents(junto_home)?
         .into_iter()
-        .find(|persona| party.iter().any(|member| member.email == persona.email)))
+        .find(|agent| party.iter().any(|member| member.email == agent.email)))
 }
 
-/// The persona for a slug, resolving against the stock seed for an empty store.
-pub(crate) fn persona_by_slug(junto_home: &Path, slug: &str) -> Result<Option<Persona>> {
-    Ok(all_personas(junto_home)?
+/// The agent for a slug, resolving against the stock seed for an empty store.
+pub(crate) fn agent_by_slug(junto_home: &Path, slug: &str) -> Result<Option<Agent>> {
+    Ok(all_agents(junto_home)?
         .into_iter()
-        .find(|persona| persona.slug == slug))
+        .find(|agent| agent.slug == slug))
 }
 
-/// Save (insert or replace by slug) a persona. The first save of any persona
+/// Save (insert or replace by slug) an Agent. The first save of any Agent
 /// materializes the store, so the stock seed must be folded in first — without
-/// it, saving one edited stock persona would silently drop the others.
-pub(crate) fn save_persona(junto_home: &Path, persona: Persona) -> Result<()> {
-    let mut personas = all_personas(junto_home)?;
-    match personas.iter_mut().find(|p| p.slug == persona.slug) {
-        Some(existing) => *existing = persona,
-        None => personas.push(persona),
+/// it, saving one edited stock agent would silently drop the others.
+pub(crate) fn save_agent(junto_home: &Path, agent: Agent) -> Result<()> {
+    let mut agents = all_agents(junto_home)?;
+    match agents.iter_mut().find(|p| p.slug == agent.slug) {
+        Some(existing) => *existing = agent,
+        None => agents.push(agent),
     }
-    write_file(junto_home, &PersonasFile { personas })
+    write_file(junto_home, &AgentsFile { agents })
 }
 
-/// Delete a persona by slug. Deleting from an unmaterialized store first folds
-/// in the stock seed, so removing one stock persona keeps the rest.
-pub(crate) fn delete_persona(junto_home: &Path, slug: &str) -> Result<()> {
-    let mut personas = all_personas(junto_home)?;
-    personas.retain(|p| p.slug != slug);
-    write_file(junto_home, &PersonasFile { personas })
+/// Delete an Agent by slug. Deleting from an unmaterialized store first folds
+/// in the stock seed, so removing one stock agent keeps the rest.
+pub(crate) fn delete_agent(junto_home: &Path, slug: &str) -> Result<()> {
+    let mut agents = all_agents(junto_home)?;
+    agents.retain(|p| p.slug != slug);
+    write_file(junto_home, &AgentsFile { agents })
 }
 
-fn read_file(junto_home: &Path) -> Result<PersonasFile> {
-    let path = personas_path(junto_home);
+fn read_file(junto_home: &Path) -> Result<AgentsFile> {
+    let path = agents_path(junto_home);
     if !path.exists() {
-        return Ok(PersonasFile::default());
+        return Ok(AgentsFile::default());
     }
     let text =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
 }
 
-fn write_file(junto_home: &Path, file: &PersonasFile) -> Result<()> {
+fn write_file(junto_home: &Path, file: &AgentsFile) -> Result<()> {
     std::fs::create_dir_all(junto_home)
         .with_context(|| format!("creating {}", junto_home.display()))?;
-    let path = personas_path(junto_home);
+    let path = agents_path(junto_home);
     std::fs::write(
         &path,
-        toml::to_string_pretty(file).context("serializing personas")?,
+        toml::to_string_pretty(file).context("serializing agents")?,
     )
     .with_context(|| format!("writing {}", path.display()))?;
     Ok(())
@@ -266,8 +266,8 @@ fn write_file(junto_home: &Path, file: &PersonasFile) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn sample(slug: &str) -> Persona {
-        Persona {
+    fn sample(slug: &str) -> Agent {
+        Agent {
             slug: slug.to_string(),
             name: "Security Reviewer".to_string(),
             harness: "claude".to_string(),
@@ -302,26 +302,26 @@ mod tests {
     }
 
     #[test]
-    fn empty_store_seeds_stock_personas() {
+    fn empty_store_seeds_stock_agents() {
         let home = tempfile::tempdir().expect("tempdir");
-        let personas = all_personas(home.path()).expect("all_personas");
+        let agents = all_agents(home.path()).expect("all_agents");
         // One per registered harness, identified by the harness's own email.
-        assert_eq!(personas.len(), all_harnesses().len());
+        assert_eq!(agents.len(), all_harnesses().len());
         assert!(
-            personas
+            agents
                 .iter()
                 .any(|p| p.slug == "claude" && p.email == "claude-code@anthropic.com"),
-            "stock Claude persona reuses the harness email so existing channels resolve"
+            "stock Claude agent reuses the harness email so existing channels resolve"
         );
         // Seed-on-read does not write the file.
-        assert!(!personas_path(home.path()).exists());
+        assert!(!agents_path(home.path()).exists());
     }
 
     #[test]
     fn save_then_load_round_trips() {
         let home = tempfile::tempdir().expect("tempdir");
-        save_persona(home.path(), sample("security-reviewer")).expect("save");
-        let found = persona_by_slug(home.path(), "security-reviewer")
+        save_agent(home.path(), sample("security-reviewer")).expect("save");
+        let found = agent_by_slug(home.path(), "security-reviewer")
             .expect("by_slug")
             .expect("present");
         assert_eq!(found, sample("security-reviewer"));
@@ -330,24 +330,24 @@ mod tests {
     #[test]
     fn first_save_materializes_store_with_stock_preserved() {
         let home = tempfile::tempdir().expect("tempdir");
-        save_persona(home.path(), sample("security-reviewer")).expect("save");
-        let personas = all_personas(home.path()).expect("all_personas");
+        save_agent(home.path(), sample("security-reviewer")).expect("save");
+        let agents = all_agents(home.path()).expect("all_agents");
         // The stock seed survives the first custom save.
-        assert!(personas.iter().any(|p| p.slug == "claude"));
-        assert!(personas.iter().any(|p| p.slug == "security-reviewer"));
+        assert!(agents.iter().any(|p| p.slug == "claude"));
+        assert!(agents.iter().any(|p| p.slug == "security-reviewer"));
     }
 
     #[test]
     fn save_replaces_by_slug() {
         let home = tempfile::tempdir().expect("tempdir");
-        save_persona(home.path(), sample("reviewer")).expect("save");
+        save_agent(home.path(), sample("reviewer")).expect("save");
         let mut edited = sample("reviewer");
         edited.name = "Renamed".to_string();
-        save_persona(home.path(), edited).expect("re-save");
-        let all = all_personas(home.path()).expect("all");
+        save_agent(home.path(), edited).expect("re-save");
+        let all = all_agents(home.path()).expect("all");
         assert_eq!(all.iter().filter(|p| p.slug == "reviewer").count(), 1);
         assert_eq!(
-            persona_by_slug(home.path(), "reviewer")
+            agent_by_slug(home.path(), "reviewer")
                 .expect("by_slug")
                 .expect("present")
                 .name,
@@ -358,43 +358,43 @@ mod tests {
     #[test]
     fn delete_removes_by_slug() {
         let home = tempfile::tempdir().expect("tempdir");
-        save_persona(home.path(), sample("reviewer")).expect("save");
-        delete_persona(home.path(), "reviewer").expect("delete");
+        save_agent(home.path(), sample("reviewer")).expect("save");
+        delete_agent(home.path(), "reviewer").expect("delete");
         assert!(
-            persona_by_slug(home.path(), "reviewer")
+            agent_by_slug(home.path(), "reviewer")
                 .expect("by_slug")
                 .is_none()
         );
     }
 
     #[test]
-    fn channel_persona_resolves_the_established_persona() {
+    fn channel_agent_resolves_the_established_agent() {
         let home = tempfile::tempdir().expect("tempdir");
-        save_persona(home.path(), sample("security-reviewer")).expect("save");
+        save_agent(home.path(), sample("security-reviewer")).expect("save");
         let party = vec![
             Member::human("Dan", "dan@example.com"),
             Member::agent("Security Reviewer", "security-reviewer@junto.local"),
         ];
-        let resolved = channel_persona(home.path(), &party)
-            .expect("channel_persona")
+        let resolved = channel_agent(home.path(), &party)
+            .expect("channel_agent")
             .expect("present");
         assert_eq!(resolved.slug, "security-reviewer");
         assert_eq!(resolved.harness, "claude");
     }
 
     #[test]
-    fn channel_persona_is_none_without_a_persona_member() {
+    fn channel_agent_is_none_without_a_agent_member() {
         let home = tempfile::tempdir().expect("tempdir");
         let party = vec![Member::human("Dan", "dan@example.com")];
         assert!(
-            channel_persona(home.path(), &party)
-                .expect("channel_persona")
+            channel_agent(home.path(), &party)
+                .expect("channel_agent")
                 .is_none()
         );
     }
 
     #[test]
-    fn persona_authors_as_itself() {
+    fn agent_authors_as_itself() {
         let member = sample("security-reviewer").member();
         assert_eq!(member.email, "security-reviewer@junto.local");
         assert_eq!(member.display_name, "Security Reviewer");

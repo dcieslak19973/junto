@@ -43,8 +43,8 @@ pub fn router(host: Arc<Host>) -> Router {
         .route("/", get(index_page))
         .route("/new", get(new_page))
         .route("/settings", get(settings_page))
-        .route("/personas", get(personas_page).post(save_persona))
-        .route("/personas/{slug}/delete", post(delete_persona))
+        .route("/agents", get(agents_page).post(save_agent))
+        .route("/agents/{slug}/delete", post(delete_agent))
         .route("/channels", post(open_channel))
         .route("/repos", post(setup_repo))
         .route("/channels/{channel}", get(channel_page))
@@ -166,23 +166,23 @@ async fn settings_page(State(host): State<Arc<Host>>) -> Response {
     .into_response()
 }
 
-/// The "/personas" page behind the sidebar's ✦: create, edit, and delete the
-/// reusable agent personas the launch picker offers
+/// The "/agents" page behind the sidebar's ✦: create, edit, and delete the
+/// reusable agent agents the launch picker offers
 /// (`docs/superpowers/specs/2026-06-13-agent-personas-design.md`).
-async fn personas_page(State(host): State<Arc<Host>>) -> Response {
+async fn agents_page(State(host): State<Arc<Host>>) -> Response {
     let mut nav = host.inventory().await.unwrap_or_default();
     nav.sort_by_key(|summary| std::cmp::Reverse(summary.last_activity));
     let junto_home = match crate::host::junto_home() {
         Ok(home) => home,
         Err(err) => return internal(format!("no junto home: {err}")),
     };
-    match crate::persona::all_personas(&junto_home) {
-        Ok(personas) => Html(render::personas_html(&nav, &personas)).into_response(),
-        Err(err) => internal(format!("reading personas: {err}")),
+    match crate::agent::all_agents(&junto_home) {
+        Ok(agents) => Html(render::agents_html(&nav, &agents)).into_response(),
+        Err(err) => internal(format!("reading agents: {err}")),
     }
 }
 
-/// Lowercase, hyphenate, and trim a name into a stable slug for a new persona.
+/// Lowercase, hyphenate, and trim a name into a stable slug for a new agent.
 fn slugify(name: &str) -> String {
     let mut slug = String::new();
     let mut prev_dash = false;
@@ -211,14 +211,14 @@ fn field<'a>(pairs: &'a [(String, String)], key: &str) -> &'a str {
 /// dropping any row where either side is blank (the trailing add-row, a row
 /// the user left empty). The form renders one `mcp_name` and one `mcp_url`
 /// per row, so the i-th of each belong together.
-fn parse_mcp_rows(pairs: &[(String, String)]) -> Vec<crate::persona::McpServer> {
+fn parse_mcp_rows(pairs: &[(String, String)]) -> Vec<crate::agent::McpServer> {
     let names = pairs.iter().filter(|(k, _)| k == "mcp_name");
     let urls = pairs.iter().filter(|(k, _)| k == "mcp_url");
     names
         .zip(urls)
         .filter_map(|((_, name), (_, url))| {
             let (name, url) = (name.trim(), url.trim());
-            (!name.is_empty() && !url.is_empty()).then(|| crate::persona::McpServer {
+            (!name.is_empty() && !url.is_empty()).then(|| crate::agent::McpServer {
                 name: name.to_string(),
                 url: url.to_string(),
             })
@@ -237,11 +237,11 @@ fn all_fields(pairs: &[(String, String)], key: &str) -> Vec<String> {
         .collect()
 }
 
-/// Save (create or update) a persona from the personas-page form. The body is
+/// Save (create or update) an Agent from the agents-page form. The body is
 /// read as raw key/value pairs so the repeated rows (MCP servers, plugins) and
 /// the `skill` checkboxes survive — axum's typed `Form` can't collect duplicate
 /// keys into a list.
-async fn save_persona(
+async fn save_agent(
     State(_host): State<Arc<Host>>,
     Form(pairs): Form<Vec<(String, String)>>,
 ) -> Response {
@@ -267,18 +267,18 @@ async fn save_persona(
         )
             .into_response();
     }
-    // Preserve an existing persona's email so editing a stock persona keeps the
-    // harness identity; a brand-new custom persona gets its own.
-    let email = match crate::persona::persona_by_slug(&junto_home, &slug) {
+    // Preserve an existing agent's email so editing a stock agent keeps the
+    // harness identity; a brand-new custom agent gets its own.
+    let email = match crate::agent::agent_by_slug(&junto_home, &slug) {
         Ok(Some(existing)) => existing.email,
         Ok(None) => format!("{slug}@junto.local"),
-        Err(err) => return internal(format!("reading personas: {err}")),
+        Err(err) => return internal(format!("reading agents: {err}")),
     };
     let trimmed = |s: &str| {
         let t = s.trim();
         (!t.is_empty()).then(|| t.to_string())
     };
-    let persona = crate::persona::Persona {
+    let agent = crate::agent::Agent {
         slug,
         name,
         harness: crate::launch::harness_by_id(field(&pairs, "harness").trim())
@@ -291,21 +291,21 @@ async fn save_persona(
         skills: all_fields(&pairs, "skill"),
         plugins: all_fields(&pairs, "plugin_path"),
     };
-    match crate::persona::save_persona(&junto_home, persona) {
-        Ok(()) => Redirect::to("/personas").into_response(),
-        Err(err) => internal(format!("saving persona: {err}")),
+    match crate::agent::save_agent(&junto_home, agent) {
+        Ok(()) => Redirect::to("/agents").into_response(),
+        Err(err) => internal(format!("saving agent: {err}")),
     }
 }
 
-/// Delete a persona by slug from the personas page.
-async fn delete_persona(State(_host): State<Arc<Host>>, Path(slug): Path<String>) -> Response {
+/// Delete an Agent by slug from the agents page.
+async fn delete_agent(State(_host): State<Arc<Host>>, Path(slug): Path<String>) -> Response {
     let junto_home = match crate::host::junto_home() {
         Ok(home) => home,
         Err(err) => return internal(format!("no junto home: {err}")),
     };
-    match crate::persona::delete_persona(&junto_home, &slug) {
-        Ok(()) => Redirect::to("/personas").into_response(),
-        Err(err) => internal(format!("deleting persona: {err}")),
+    match crate::agent::delete_agent(&junto_home, &slug) {
+        Ok(()) => Redirect::to("/agents").into_response(),
+        Err(err) => internal(format!("deleting agent: {err}")),
     }
 }
 
@@ -457,14 +457,14 @@ struct LaunchForm {
     /// The workspace repo; empty falls back to the remembered mapping.
     #[serde(default)]
     workspace: String,
-    /// Which persona runs it (its slug); empty/unknown → the default persona
+    /// Which agent runs it (its slug); empty/unknown → the default agent
     /// (`docs/superpowers/specs/2026-06-13-agent-personas-design.md`).
     #[serde(default)]
-    persona: String,
+    agent: String,
 }
 
 /// Launch an Agent Session from the channel page: resolve the workspace
-/// (remembering a newly typed one), check the persona's member is in the
+/// (remembering a newly typed one), check the agent's member is in the
 /// Party, and spawn the first turn in the background.
 async fn launch_session(
     State(host): State<Arc<Host>>,
@@ -490,29 +490,29 @@ async fn launch_session(
         Ok(home) => home,
         Err(err) => return internal(format!("no junto home: {err}")),
     };
-    // The session's author is the persona's member (docs/adr/0020); its entries
+    // The session's author is the agent's member (docs/adr/0020); its entries
     // only project once it is in the Party (docs/adr/0017). Rather than reject
-    // a launch in a fresh channel, bring the persona in: if the human at the
+    // a launch in a fresh channel, bring the agent in: if the human at the
     // keyboard founded this channel, auto-grant membership (a founder-authored
     // MemberAdded) so the agent joins and starts work in one motion — the
     // grant is recorded, not hidden. A non-founder can't grant: they get
     // add_member's error naming who can (docs/adr/0017).
-    // One agent per channel (docs/adr/0024): if a persona already serves this
+    // One agent per channel (docs/adr/0024): if an Agent already serves this
     // channel (its member is in the Party), reuse it — the picker only chooses
-    // the persona the first time. Otherwise the form's selection becomes the
-    // channel's persona (the default persona for an empty/unknown slug),
+    // the agent the first time. Otherwise the form's selection becomes the
+    // channel's agent (the default agent for an empty/unknown slug),
     // granted below.
-    let persona = match crate::persona::channel_persona(&junto_home, &view.party) {
+    let agent = match crate::agent::channel_agent(&junto_home, &view.party) {
         Ok(Some(established)) => established,
-        Ok(None) => match resolve_form_persona(&junto_home, form.persona.trim()) {
-            Ok(persona) => persona,
-            Err(err) => return internal(format!("reading personas: {err}")),
+        Ok(None) => match resolve_form_agent(&junto_home, form.agent.trim()) {
+            Ok(agent) => agent,
+            Err(err) => return internal(format!("reading agents: {err}")),
         },
-        Err(err) => return internal(format!("reading personas: {err}")),
+        Err(err) => return internal(format!("reading agents: {err}")),
     };
-    let persona_member = persona.member();
-    let persona_is_member = view.party.iter().any(|m| m.email == persona_member.email);
-    if !view.party.is_empty() && !persona_is_member {
+    let agent_member = agent.member();
+    let agent_is_member = view.party.iter().any(|m| m.email == agent_member.email);
+    if !view.party.is_empty() && !agent_is_member {
         let granter = match crate::host::git_user(&substrate) {
             Ok(granter) => granter,
             Err(err) => {
@@ -521,7 +521,7 @@ async fn launch_session(
                 ));
             }
         };
-        if let Err(err) = host.add_member(&channel, &granter, persona_member).await {
+        if let Err(err) = host.add_member(&channel, &granter, agent_member).await {
             return (StatusCode::FORBIDDEN, format!("{err:#}")).into_response();
         }
     }
@@ -548,36 +548,27 @@ async fn launch_session(
             _ => return internal("workspace vanished after remembering".into()),
         }
     };
-    match crate::launch::launch(
-        host.clone(),
-        id,
-        channel.clone(),
-        workspace,
-        intent,
-        persona,
-    )
-    .await
-    {
+    match crate::launch::launch(host.clone(), id, channel.clone(), workspace, intent, agent).await {
         Ok(_session) => Redirect::to(&format!("/channels/{id}")).into_response(),
         Err(err) => internal(format!("launch failed: {err:#}")),
     }
 }
 
-/// Resolve the persona a launch form selected: the named slug, or the default
-/// persona (the first, the stock entry for the default harness) when the field
-/// is empty or names no known persona.
-fn resolve_form_persona(
+/// Resolve the agent a launch form selected: the named slug, or the default
+/// agent (the first, the stock entry for the default harness) when the field
+/// is empty or names no known agent.
+fn resolve_form_agent(
     junto_home: &std::path::Path,
     slug: &str,
-) -> anyhow::Result<crate::persona::Persona> {
+) -> anyhow::Result<crate::agent::Agent> {
     if !slug.is_empty()
-        && let Some(persona) = crate::persona::persona_by_slug(junto_home, slug)?
+        && let Some(agent) = crate::agent::agent_by_slug(junto_home, slug)?
     {
-        return Ok(persona);
+        return Ok(agent);
     }
-    let mut all = crate::persona::all_personas(junto_home)?;
+    let mut all = crate::agent::all_agents(junto_home)?;
     if all.is_empty() {
-        anyhow::bail!("no personas available");
+        anyhow::bail!("no agents available");
     }
     Ok(all.remove(0))
 }
@@ -1683,7 +1674,7 @@ mod tests {
             Form(LaunchForm {
                 intent: "do the stub thing".into(),
                 workspace: workspace.path().display().to_string(),
-                persona: String::new(),
+                agent: String::new(),
             }),
         )
         .await;
@@ -1808,7 +1799,7 @@ mod tests {
             Form(LaunchForm {
                 intent: "start in a fresh channel".into(),
                 workspace: workspace.path().display().to_string(),
-                persona: String::new(),
+                agent: String::new(),
             }),
         )
         .await;
