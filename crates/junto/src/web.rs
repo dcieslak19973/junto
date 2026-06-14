@@ -461,6 +461,10 @@ struct LaunchForm {
     /// (`docs/superpowers/specs/2026-06-13-agent-personas-design.md`).
     #[serde(default)]
     agent: String,
+    /// `"outcome"` runs the code-PR push-gate (the verify/Grader loop,
+    /// `docs/adr/0025`); anything else runs a single turn.
+    #[serde(default)]
+    mode: String,
 }
 
 /// Launch an Agent Session from the channel page: resolve the workspace
@@ -548,7 +552,15 @@ async fn launch_session(
             _ => return internal("workspace vanished after remembering".into()),
         }
     };
-    match crate::launch::launch(host.clone(), id, channel.clone(), workspace, intent, agent).await {
+    // "outcome" runs the code-PR push-gate (the verify/Grader loop, docs/adr/0025);
+    // otherwise a single turn (docs/adr/0023).
+    let launched = if form.mode.trim() == "outcome" {
+        crate::launch::launch_outcome(host.clone(), id, channel.clone(), workspace, intent, agent)
+            .await
+    } else {
+        crate::launch::launch(host.clone(), id, channel.clone(), workspace, intent, agent).await
+    };
+    match launched {
         Ok(_session) => Redirect::to(&format!("/channels/{id}")).into_response(),
         Err(err) => internal(format!("launch failed: {err:#}")),
     }
@@ -1675,6 +1687,7 @@ mod tests {
                 intent: "do the stub thing".into(),
                 workspace: workspace.path().display().to_string(),
                 agent: String::new(),
+                mode: String::new(),
             }),
         )
         .await;
@@ -1800,6 +1813,7 @@ mod tests {
                 intent: "start in a fresh channel".into(),
                 workspace: workspace.path().display().to_string(),
                 agent: String::new(),
+                mode: String::new(),
             }),
         )
         .await;

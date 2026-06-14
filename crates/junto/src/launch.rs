@@ -1381,6 +1381,492 @@ async fn record_outcome(
     .await
 }
 
+// ---- the Outcome loop: the code-PR push-gate (docs/adr/0025) ----
+
+/// The iteration budget for an Outcome loop before it escalates to a Gate.
+const MAX_OUTCOME_ITERATIONS: u32 = 3;
+
+/// Launch an **Outcome-driven** Agent Session — the code-PR push-gate. The
+/// worker does the work; junto verifies it (mechanical checks + the Grader);
+/// findings feed back until the Outcome is satisfied or the iteration budget
+/// runs out, at which point it escalates to a human Gate. Returns the new
+/// session id immediately; the loop runs in the background.
+pub async fn launch_outcome(
+    host: std::sync::Arc<Host>,
+    channel: ChannelId,
+    channel_ref: String,
+    workspace: PathBuf,
+    intent: String,
+    agent: crate::agent::Agent,
+) -> Result<EntryId> {
+    let session = EntryId::new();
+    append(
+        &host,
+        &channel_ref,
+        LedgerEntry {
+            id: session,
+            channel,
+            author: agent.member(),
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::SessionStarted {
+                intent: intent.clone(),
+            },
+        },
+    )
+    .await?;
+    spawn_outcome_loop(
+        host,
+        channel,
+        channel_ref,
+        workspace,
+        session,
+        intent,
+        agent,
+    );
+    Ok(session)
+}
+
+/// Drive the Outcome loop in the background: worker turn → verify → feed back →
+/// revise, until satisfied or `MAX_OUTCOME_ITERATIONS`, then record the terminal.
+fn spawn_outcome_loop(
+    host: std::sync::Arc<Host>,
+    channel: ChannelId,
+    channel_ref: String,
+    workspace: PathBuf,
+    session: EntryId,
+    intent: String,
+    agent: crate::agent::Agent,
+) {
+    tokio::spawn(async move {
+        host.live().begin(session);
+
+        // Each step owns its own clones so the spawned futures stay `Send`.
+        let w_host = host.clone();
+        let w_ref = channel_ref.clone();
+        let w_ws = workspace.clone();
+        let w_agent = agent.clone();
+        let mut harness_session: Option<String> = None;
+        let worker = async move |feedback: Option<String>| {
+            run_worker_turn(
+                &w_host,
+                &w_ref,
+                channel,
+                session,
+                &w_ws,
+                &w_agent,
+                &intent,
+                feedback.as_deref(),
+                &mut harness_session,
+            )
+            .await;
+        };
+        let v_host = host.clone();
+        let v_ref = channel_ref.clone();
+        let v_ws = workspace.clone();
+        let v_agent = agent.clone();
+        let verify =
+            async move || verify_one(&v_host, &v_ref, channel, session, &v_ws, &v_agent).await;
+
+        let terminal = crate::outcome::drive_loop(MAX_OUTCOME_ITERATIONS, worker, verify).await;
+
+        if let Err(err) = finish_outcome(
+            &host,
+            &channel_ref,
+            channel,
+            session,
+            &workspace,
+            &agent,
+            &terminal,
+        )
+        .await
+        {
+            tracing::warn!("recording outcome terminal for session {session} failed: {err:#}");
+        }
+        host.live().finish(session);
+        if let Ok(crate::host::Resolution::Resolved { ledger, id, .. }) =
+            host.resolve(&channel_ref).await
+        {
+            let _ = ledger
+                .lock()
+                .await
+                .substrate_mut()
+                .sync("origin", &id)
+                .await;
+        }
+    });
+}
+
+/// Run one worker turn (resuming the worker's session after the first), then
+/// capture its memo + diff artifacts with the session left `Working`.
+#[allow(clippy::too_many_arguments)]
+async fn run_worker_turn(
+    host: &Host,
+    channel_ref: &str,
+    channel: ChannelId,
+    session: EntryId,
+    workspace: &Path,
+    agent: &crate::agent::Agent,
+    intent: &str,
+    feedback: Option<&str>,
+    harness_session: &mut Option<String>,
+) {
+    let prompt = match feedback {
+        None => format!(
+            "{intent}\n\n(Launched from junto channel '{channel_ref}'; junto session \
+             {session}. Do the work in this repository.)"
+        ),
+        Some(findings) => format!(
+            "Verification found problems with your last change. Fix them, then stop.\n\n{findings}"
+        ),
+    };
+    let outcome = run_turn(
+        workspace,
+        &prompt,
+        harness_session.as_deref(),
+        host.live(),
+        session,
+        agent,
+    )
+    .await;
+    if outcome.harness_session.is_some() {
+        *harness_session = outcome.harness_session.clone();
+    }
+    if let Err(err) = capture_turn(
+        host,
+        channel_ref,
+        channel,
+        session,
+        workspace,
+        &outcome,
+        agent,
+        SessionState::Working,
+    )
+    .await
+    {
+        tracing::warn!("capturing worker turn for session {session} failed: {err:#}");
+    }
+}
+
+/// Verify one iteration: run the mechanical checks first; if all pass, run the
+/// Grader in a fresh (clean-context) session over the workspace diff. The
+/// Grader's reply is captured as a `grader-report` Artifact (docs/adr/0025).
+async fn verify_one(
+    host: &Host,
+    channel_ref: &str,
+    channel: ChannelId,
+    session: EntryId,
+    workspace: &Path,
+    agent: &crate::agent::Agent,
+) -> crate::outcome::VerifyOutcome {
+    let checks_ws = workspace.to_path_buf();
+    let results = tokio::task::spawn_blocking(move || {
+        crate::verify::run_checks(&checks_ws, &crate::verify::default_cargo_checks())
+    })
+    .await
+    .unwrap_or_default();
+
+    if let Some(feedback) = crate::verify::mechanical_feedback(&results) {
+        host.live().publish(
+            session,
+            LiveEvent::new("status", "mechanical checks failed — sending back to fix"),
+        );
+        return crate::outcome::VerifyOutcome {
+            satisfied: false,
+            feedback,
+        };
+    }
+
+    // Mechanical green → the Grader judges the diff in a fresh session.
+    let diff = workspace_diff(workspace).unwrap_or_default();
+    let prompt = crate::grader::grader_prompt(crate::grader::default_code_pr_rubric(), &diff);
+    host.live().publish(
+        session,
+        LiveEvent::new("status", "checks green — grading the diff"),
+    );
+    let graded = run_turn(workspace, &prompt, None, host.live(), session, agent).await;
+
+    if let Err(err) =
+        store_grader_report(host, channel_ref, channel, session, &graded.result, agent).await
+    {
+        tracing::warn!("storing grader report for session {session} failed: {err:#}");
+    }
+    let verdict = crate::grader::parse_verdict(&graded.result);
+    crate::outcome::VerifyOutcome {
+        satisfied: verdict.satisfied,
+        feedback: verdict.feedback,
+    }
+}
+
+/// Capture a turn's result memo + workspace diff as Artifacts and fold the
+/// session to `state`. The shared turn-recording path for the Outcome loop.
+#[allow(clippy::too_many_arguments)]
+async fn capture_turn(
+    host: &Host,
+    channel_ref: &str,
+    channel: ChannelId,
+    session: EntryId,
+    workspace: &Path,
+    outcome: &TurnOutcome,
+    agent: &crate::agent::Agent,
+    state: SessionState,
+) -> Result<()> {
+    let junto_home = crate::host::junto_home()?;
+    let harness = harness_by_id(&agent.harness);
+    let turn = record_turn(
+        &junto_home,
+        &session,
+        outcome.harness_session.clone(),
+        harness.id,
+        &agent.slug,
+    )?;
+    let memo = store_artifact(
+        &junto_home,
+        &session,
+        &format!("turn-{turn}-result.md"),
+        &outcome.result,
+    )?;
+    append(
+        host,
+        channel_ref,
+        LedgerEntry {
+            id: EntryId::new(),
+            channel,
+            author: agent.member(),
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::ArtifactAttached {
+                target: session,
+                kind: "memo".into(),
+                description: snippet(&outcome.result, 240),
+                provenance: vec![memo],
+            },
+        },
+    )
+    .await?;
+    if let Some(diff) = workspace_diff(workspace) {
+        let diff_ref = store_artifact(
+            &junto_home,
+            &session,
+            &format!("turn-{turn}-diff.patch"),
+            &diff,
+        )?;
+        append(
+            host,
+            channel_ref,
+            LedgerEntry {
+                id: EntryId::new(),
+                channel,
+                author: agent.member(),
+                timestamp: Timestamp::now(),
+                payload: EntryPayload::ArtifactAttached {
+                    target: session,
+                    kind: "diff".into(),
+                    description: format!("uncommitted changes after turn {turn}"),
+                    provenance: vec![diff_ref],
+                },
+            },
+        )
+        .await?;
+    }
+    append(
+        host,
+        channel_ref,
+        LedgerEntry {
+            id: EntryId::new(),
+            channel,
+            author: agent.member(),
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::SessionUpdated {
+                target: session,
+                state,
+                note: format!("turn {turn}: {}", snippet(&outcome.result, 160)),
+            },
+        },
+    )
+    .await
+}
+
+/// Store the Grader's reply as a `grader-report` Artifact on the worker session.
+async fn store_grader_report(
+    host: &Host,
+    channel_ref: &str,
+    channel: ChannelId,
+    session: EntryId,
+    report: &str,
+    agent: &crate::agent::Agent,
+) -> Result<()> {
+    let junto_home = crate::host::junto_home()?;
+    let stored = store_artifact(
+        &junto_home,
+        &session,
+        &format!("grade-{}.md", EntryId::new()),
+        report,
+    )?;
+    append(
+        host,
+        channel_ref,
+        LedgerEntry {
+            id: EntryId::new(),
+            channel,
+            author: agent.member(),
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::ArtifactAttached {
+                target: session,
+                kind: "grader-report".into(),
+                description: snippet(report, 240),
+                provenance: vec![stored],
+            },
+        },
+    )
+    .await
+}
+
+/// Record the loop's terminal: `Done` when satisfied, or an escalation Gate (a
+/// `Proposal` for a human to accept the unfinished work, the session left
+/// `AwaitingApproval`) when the iteration budget ran out (docs/adr/0025).
+async fn finish_outcome(
+    host: &Host,
+    channel_ref: &str,
+    channel: ChannelId,
+    session: EntryId,
+    workspace: &Path,
+    agent: &crate::agent::Agent,
+    terminal: &crate::outcome::LoopTerminal,
+) -> Result<()> {
+    // The ACE-style outcome signal (gated) for the future self-improvement
+    // Playbook to learn from — recorded for every terminal.
+    if let Err(err) =
+        store_outcome_signal(host, channel_ref, channel, session, terminal, agent).await
+    {
+        tracing::warn!("storing outcome signal for session {session} failed: {err:#}");
+    }
+    match terminal {
+        crate::outcome::LoopTerminal::Satisfied { iterations } => {
+            append(
+                host,
+                channel_ref,
+                LedgerEntry {
+                    id: EntryId::new(),
+                    channel,
+                    author: agent.member(),
+                    timestamp: Timestamp::now(),
+                    payload: EntryPayload::SessionUpdated {
+                        target: session,
+                        state: SessionState::Done,
+                        note: format!("verified green after {iterations} iteration(s)"),
+                    },
+                },
+            )
+            .await
+        }
+        crate::outcome::LoopTerminal::MaxIterationsReached {
+            iterations,
+            last_feedback,
+        } => {
+            let junto_home = crate::host::junto_home()?;
+            let mut provenance = Vec::new();
+            if let Some(diff) = workspace_diff(workspace) {
+                provenance.push(store_artifact(
+                    &junto_home,
+                    &session,
+                    "escalation-diff.patch",
+                    &diff,
+                )?);
+            }
+            append(
+                host,
+                channel_ref,
+                LedgerEntry {
+                    id: EntryId::new(),
+                    channel,
+                    author: agent.member(),
+                    timestamp: Timestamp::now(),
+                    payload: EntryPayload::Proposal {
+                        action: "Accept this deliverable despite unmet verification".into(),
+                        rationale: format!(
+                            "The Outcome loop hit its {iterations}-iteration budget without \
+                             passing verification. Latest findings:\n\n{last_feedback}"
+                        ),
+                        provenance,
+                        requirement: junto_kernel::ApprovalRequirement::Count(1),
+                        frame: None,
+                    },
+                },
+            )
+            .await?;
+            append(
+                host,
+                channel_ref,
+                LedgerEntry {
+                    id: EntryId::new(),
+                    channel,
+                    author: agent.member(),
+                    timestamp: Timestamp::now(),
+                    payload: EntryPayload::SessionUpdated {
+                        target: session,
+                        state: SessionState::AwaitingApproval,
+                        note: format!(
+                            "escalated to a Gate after {iterations} iterations without passing \
+                             verification"
+                        ),
+                    },
+                },
+            )
+            .await
+        }
+    }
+}
+
+/// Store the loop's structured outcome signal (success/partial/failure-shaped,
+/// docs/adr/0025 / the ACE comparison) as an `outcome-signal` Artifact — the
+/// gated `record_outcome` the self-improvement Playbook will learn from.
+async fn store_outcome_signal(
+    host: &Host,
+    channel_ref: &str,
+    channel: ChannelId,
+    session: EntryId,
+    terminal: &crate::outcome::LoopTerminal,
+    agent: &crate::agent::Agent,
+) -> Result<()> {
+    let junto_home = crate::host::junto_home()?;
+    let (iterations, feedback) = match terminal {
+        crate::outcome::LoopTerminal::Satisfied { iterations } => (*iterations, String::new()),
+        crate::outcome::LoopTerminal::MaxIterationsReached {
+            iterations,
+            last_feedback,
+        } => (*iterations, last_feedback.clone()),
+    };
+    let result = terminal.result();
+    let body = serde_json::json!({
+        "playbook": "code-pr",
+        "result": result.as_str(),
+        "iterations": iterations,
+        "max_iterations": MAX_OUTCOME_ITERATIONS,
+        "feedback": feedback,
+    })
+    .to_string();
+    let stored = store_artifact(&junto_home, &session, "outcome-signal.json", &body)?;
+    append(
+        host,
+        channel_ref,
+        LedgerEntry {
+            id: EntryId::new(),
+            channel,
+            author: agent.member(),
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::ArtifactAttached {
+                target: session,
+                kind: "outcome-signal".into(),
+                description: format!(
+                    "outcome: {} after {iterations} iteration(s)",
+                    result.as_str()
+                ),
+                provenance: vec![stored],
+            },
+        },
+    )
+    .await
+}
+
 /// Append one entry to the channel's ledger via the host.
 async fn append(host: &Host, channel_ref: &str, entry: LedgerEntry) -> Result<()> {
     match host.resolve(channel_ref).await? {

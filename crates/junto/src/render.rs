@@ -1494,10 +1494,14 @@ pub fn channel_html(
              <input name=\"workspace\" value=\"{workspace}\" placeholder=\"workspace repo path \
              (remembered after first launch)\"{ws_required}>\
              {harness_picker}\
+             <label class=\"mode\" title=\"verify each change against the rubric and re-run until it passes (docs/adr/0025)\">\
+             <input type=\"checkbox\" name=\"mode\" value=\"outcome\"> code-PR push-gate (verify loop)</label>\
              <button class=\"primary\">launch</button>\
              </form>\
              <p class=\"meta\">spawns the selected agent headless in the workspace \
-             (docs/adr/0023/0024); progress lands below as the session's state and artifacts</p>\
+             (docs/adr/0023/0024); progress lands below as the session's state and artifacts. \
+             With the push-gate checked, junto runs the verify loop — mechanical checks + a \
+             Grader — and feeds findings back until it passes or escalates to a gate (docs/adr/0025)</p>\
              {hint}</section>\n",
             workspace = escape_html(
                 &workspace
