@@ -13,6 +13,12 @@
             "type": "command",
             "command": "curl -sf -m 2 http://127.0.0.1:1727/channels/junto-dev/brief",
             "timeout": 5
+          },
+          {
+            "//": "Serena MCP is the global plugin instance — it boots project-agnostic (no --project). This injects an instruction so the agent activates the project up front instead of hitting a 'no active project' error on first symbol-tool call. Bare echo, no operators: under PowerShell it prints one word per line, harmless for context injection (content is identical across shells).",
+            "type": "command",
+            "command": "echo Serena MCP starts with no active project. Call activate_project with project junto before using Serena symbol tools.",
+            "timeout": 5
           }
         ]
       }
