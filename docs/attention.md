@@ -72,6 +72,16 @@ The attention design must generalize without rework:
   that affects people changes behavior; this stays a private mirror, not a
   management report).
 
+> 🔎 **External corroboration** (reviewed 2026-06-14, [`junto-dev` ledger
+> entry `58902102`](https://www.youtube.com/watch?v=pmoDeA3RBZY)): Vincent's
+> "doc factories" talk frames the engineer running agent swarms as a
+> **factory manager** whose bottleneck is no longer tokens but *taste* and
+> *brain space to keep an eye on all the sessions* — and answers "how do you
+> manage 10+ agents?" with "how do you manage 10+ staff? It's the soft
+> skills." That is the attention-router thesis from lived experience: at
+> scale the scarce resource is the human's attention across many in-flight
+> inquiries, which is exactly what this surface is built to route.
+
 ## ✅ Not a queue — a focus board (what the research says)
 
 A flat queue implies a linear list you drain to zero. Real work is several

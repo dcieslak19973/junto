@@ -139,6 +139,30 @@ capabilities() → {
 - **`data_residency` ties execution to the trust regime.** You can't run a PHI/trading-research agent on a public vendor sandbox — regulated mode constrains backends to `local`/`tenant`. This axis and `SubstrateProvider` (below) are linked: regulated deployments pin *both*.
 - **Auth per backend** — SSH keys, platform tokens, sandbox provisioning creds. Same "junto holds as few secrets as possible" posture; managed platforms own their model auth too.
 
+### 🆕 Concurrency budget (resource governance — separate axis from worktree pooling)
+
+**The lesson (field report, `junto-dev` entry `86273858`, from the "doc factories" talk):** a maintainer running agent swarms had every PR spawn a new git worktree — 70–80 active in a day — and *heavy concurrent test runs across them "nuked his machine."* junto's planned answer to the *proliferation* half is **treehouse-style pooled worktrees** (`competitive-landscape.md`: a bounded, cache-warm, reusable pool — *reuse, don't recreate* — strictly better than his own "I should've cloned 10×" workaround). But pooling bounds the **number of isolated worktrees**, not the **amount of compute running at once** — ten pooled trees all running `cargo test` still thrash a laptop. **These are two different limits and junto must not conflate them:**
+
+| Limit | Bounds | Owned by | Lever |
+|---|---|---|---|
+| **Isolation-pool size** | how many worktrees exist / persist (disk, checkout, warm cache) | the worktree pool (treehouse model) | pool capacity |
+| **Concurrency budget** | how much work executes *simultaneously* (CPU / RAM / IO) | a kernel **execution governor** in front of `ExecutionBackend` | execution slots |
+
+🔵 **Design (rule-of-three: build the simple local version first, extract later):**
+
+- **A session holds a slot only while it executes a heavy command, not for its whole life.** A session mostly *thinking* (waiting on the model) costs ~nothing; a session running a build/test pegs the box. So the governor is a **semaphore acquired around command execution**, released on completion — not a cap on live sessions. v1: any non-interactive shell exec takes one slot; later, **weighted slots** (a build = N, a lint = 1) or **live load-sampling** (back off when system load crosses a threshold — the principled form of the "self-heal when overloaded" tooling he hand-rolled).
+- **The budget is a `capabilities()` value of the backend, because only the backend knows its capacity.** `local` derives a small budget (e.g. from core count); a remote-sandbox fleet or managed platform is effectively unbounded (provision more). So *the same code* that bursts to provisioned compute (below) is *how you raise the budget* — the local cap and the elastic cap are one mechanism with different ceilings.
+- **Saturation is an attention/observability fact, not silent thrash.** A session blocked on an execution slot is exactly the "*what is each agent waiting on*" signal `attention.md` wants surfaced — a stalled or queued fleet stays diagnosable at a glance instead of melting the machine quietly.
+- **Cross-platform caveat (CLAUDE.md):** "overload" and load-sampling APIs differ Win/Mac, and worktree-cleanup races with live processes (Windows file locks). v1's fixed core-derived slot count is portable and safe; defer live-sampling until it earns its keep.
+
+### 🆕 Elastic / on-demand provisioning (deferred concept — the high end of the spectrum)
+
+Today's spectrum table *selects* among fixed backends. A natural extension — **deferred, not built** (rule of three: capture the seam so the concurrency-budget design isn't baked local-only) — is a backend that **provisions compute on demand**: a fresh isolated environment *per session*, run there, torn down after. This turns the concurrency budget from a *fixed local cap* into an *elastic* one — **burst to provisioned compute instead of queueing** when the local budget saturates.
+
+- **Candidate provisioners** (all map onto `ExecutionBackend` as *provisioners*, not fixed *locations*): **k8s** (pod-per-session — enterprise-native, in-tenant), **Firecracker** (microVMs — strong isolation + fast boot; what several serverless platforms use underneath), **Daytona** (dev-environment / AI-sandbox provisioning), **Modal** (serverless containers, pay-per-second). These are the same idea at different isolation/cost/latency points.
+- **New capability flags (🔵):** `provisioning: "static" | "on-demand"`, plus a cost/elasticity hint (always-on pod vs pay-per-second function) and lifecycle (`ephemeral` per-session vs `pooled`). The existing `data_residency` flag already gates them — regulated work provisions in-tenant k8s, never a vendor cloud like Modal.
+- **Why defer but capture now:** junto isn't running fleets at that scale dogfood-era, and a provisioning adapter is a maintenance tax (the "don't boil the ocean" discipline below). But the concurrency-budget governor must treat its ceiling as a **backend capability**, not a constant, so that adding an elastic backend later *raises the budget* without reworking the governor.
+
 ## `SubstrateProvider` (🆕 from the research pressure-test)
 
 junto's *channel abstraction* is shared; the **substrate underneath is swappable.** The durable record always lives in **git refs** (`refs/junto/*`); what differs is how they're synced/authorized:

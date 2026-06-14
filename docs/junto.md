@@ -129,6 +129,7 @@ junto has **no terminal as a human surface.** The terminal pane — the organizi
 - 🔵 **Why it's coherent:** the terminal was always *how an agent executes*, never the *alignment surface*. Maggie's bottleneck (deciding what to build) and structured deliberation live nowhere near a command line. Taking the thesis literally ⇒ terminal-less.
 - 🔵 **What replaces it:** the channel/inquiry surface (deliberation + ledger entries), artifact renderers (diffs, charts, docs, browser preview), and review surfaces. Agent output is **verifiable artifacts, not scrollback** (provenance binding).
 - ✅ **Scope DECIDED:** terminal-less for *humans*; agents keep the shell under the hood (Open Decision #4).
+- 🔎 **External corroboration** (reviewed 2026-06-14, [`junto-dev` ledger entry `58902102`](https://www.youtube.com/watch?v=pmoDeA3RBZY)): Vincent's "doc factories" talk is subtitled *"how OpenClaw ships faster than you can read the diff."* When agent output outpaces human reading, scrollback review collapses and you are forced onto **verified records and artifacts** instead of watching a terminal — an outside articulation of exactly why junto binds artifacts to provenance rather than rendering shell output.
 
 ## Core constraint: MIT licensed (✅ Dan, 2026-06-08)
 

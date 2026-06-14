@@ -46,6 +46,8 @@ Self-improvement is only as good as its measure of "better." This is the load-be
 - **Drift / runaway** — feedback loops oscillate or quietly degrade. Need **versioning, rollback, an immutable safety core** the loop can't touch.
 - **Trust boundary** — data (skills/workflows) is far safer to self-modify than code (the harness). Escalate autonomy only as evals earn trust.
 
+> 🔎 **External corroboration (reviewed 2026-06-14, [`junto-dev` ledger entry `58902102`](https://www.youtube.com/watch?v=pmoDeA3RBZY)):** Vincent's "doc factories" talk — a maintainer running agent swarms at ~3,000 commits/day — independently lands on evals as the load-bearing piece: *"there is evals, surprisingly… we decided to make a fake Slack of sorts, with both synthetic models and real models, so we can run evaluation loops to check that each of the providers and the channels work."* An outside team building at scale reaching for a held-out, synthetic+real eval harness after a large refactor is field evidence for THE CRUX, not just an argument for it.
+
 ## Driving objectives: quality, human-attention, and cost — not just task success
 
 The harness optimizes for "better," so **what "better" means is the whole design** (this is THE CRUX). "More/faster output" is the wrong objective — it **amplifies the AI-PR-flood** from the companion doc (the 105-open / 96-stale / single-reviewer case). So "better" must be **multi-dimensional**:
