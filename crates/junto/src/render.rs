@@ -777,7 +777,8 @@ fn page_shell(
          <a class=\"chan open-link\" href=\"/new#open-channel\">open a channel…</a>\
          <a class=\"chan open-link\" href=\"/new#setup-repo\">set up a repo…</a>\
          </details>\n\
-         <a class=\"chan open-link side-settings\" href=\"/settings\">⚙ settings</a>\n\
+         <a class=\"chan open-link side-settings\" href=\"/personas\">✦ personas</a>\n\
+         <a class=\"chan open-link\" href=\"/settings\">⚙ settings</a>\n\
          </nav>\n\
          <main>\n{content}</main>\n\
          </div>{ACT_FEEDBACK_SCRIPT}</body></html>\n",
@@ -973,6 +974,213 @@ pub fn settings_html(
         host = escape_html(host_url),
     );
     page_shell("junto — settings", nav, None, &content)
+}
+
+/// The "/personas" page — create, edit, and delete reusable agent personas
+/// (`docs/superpowers/specs/2026-06-13-agent-personas-design.md`). A persona is
+/// a named config over a harness; it is what the launch picker offers. Each
+/// existing persona carries an inline edit form (in a `<details>`) and a delete
+/// button; a blank create form sits at the bottom, mirroring `/new`.
+pub fn personas_html(nav: &[ChannelSummary], personas: &[crate::persona::Persona]) -> String {
+    let mut cards = String::new();
+    for persona in personas {
+        let harness_label = crate::launch::all_harnesses()
+            .iter()
+            .find(|h| h.id == persona.harness)
+            .map(|h| h.label)
+            .unwrap_or(persona.harness.as_str());
+        let summary = persona_summary(persona);
+        let _ = writeln!(
+            cards,
+            "<section class=\"board\">\
+             <h2 class=\"board-head\">{name} <span class=\"when\">· {harness}</span></h2>\
+             <p class=\"meta\">{summary}</p>\
+             <details class=\"ledger\"><summary class=\"view\">edit</summary>{form}</details>\
+             <form class=\"act\" method=\"post\" action=\"/personas/{slug}/delete\">\
+             <button class=\"danger\">delete</button></form>\
+             </section>",
+            name = escape_html(&persona.name),
+            harness = escape_html(harness_label),
+            summary = escape_html(&summary),
+            form = persona_form(Some(persona)),
+            slug = escape_html(&persona.slug),
+        );
+    }
+    let content = format!(
+        "<h1>personas</h1>\n\
+         <p class=\"meta\">a persona is a named, reusable configuration over a harness — \
+         what the start-work picker offers. Config is machine-local; only a persona's \
+         identity enters the record when it does work.</p>\n\
+         {cards}\
+         <section class=\"board\" id=\"new-persona\"><h2 class=\"board-head\">new persona</h2>\
+         {create}</section>\n{ADD_MCP_SCRIPT}",
+        create = persona_form(None),
+    );
+    page_shell("junto — personas", nav, None, &content)
+}
+
+/// A one-line summary of a persona's config, for the list.
+fn persona_summary(persona: &crate::persona::Persona) -> String {
+    let mut parts = Vec::new();
+    if let Some(model) = &persona.model {
+        parts.push(format!("model {model}"));
+    }
+    if !persona.mcp_servers.is_empty() {
+        parts.push(format!(
+            "{} MCP server{}",
+            persona.mcp_servers.len(),
+            if persona.mcp_servers.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ));
+    }
+    if !persona.skills.is_empty() {
+        parts.push(format!("{} skill(s)", persona.skills.len()));
+    }
+    if !persona.plugins.is_empty() {
+        parts.push(format!("{} plugin(s)", persona.plugins.len()));
+    }
+    if persona.role.is_some() {
+        parts.push("custom role".to_string());
+    }
+    if parts.is_empty() {
+        format!("the bare {} harness, no extra config", persona.harness)
+    } else {
+        parts.join(" · ")
+    }
+}
+
+/// One MCP-server row: a labeled `name` + `url` pair. The handler reads the
+/// repeated `mcp_name`/`mcp_url` fields in order and zips the i-th of each, so
+/// blank rows drop out and order is preserved.
+fn mcp_row(name: &str, url: &str) -> String {
+    format!(
+        "<div class=\"mcp-row\">\
+         <input name=\"mcp_name\" value=\"{name}\" placeholder=\"name\" aria-label=\"MCP server name\">\
+         <input name=\"mcp_url\" value=\"{url}\" placeholder=\"https://… (streamable HTTP)\" aria-label=\"MCP server URL\">\
+         </div>",
+        name = escape_html(name),
+        url = escape_html(url),
+    )
+}
+
+/// One local-plugin path row (a single `plugin_path` field). Blank rows are
+/// dropped by the handler.
+fn plugin_row(path: &str) -> String {
+    format!(
+        "<div class=\"row\">\
+         <input name=\"plugin_path\" value=\"{path}\" placeholder=\"absolute path to a local plugin directory\" aria-label=\"local plugin path\">\
+         </div>",
+        path = escape_html(path),
+    )
+}
+
+/// The skills picker: a checkbox per skill discovered under the Claude config
+/// dir's `skills/` (name + its `SKILL.md` description), checked when the persona
+/// enables it. Any skill the persona stored that isn't discovered on this
+/// machine is still shown (checked, flagged) so editing never silently drops it.
+fn skills_checklist(selected: &[String]) -> String {
+    let discovered = crate::persona::discover_skills();
+    let mut html = String::new();
+    for skill in &discovered {
+        let checked = if selected.iter().any(|s| s == &skill.name) {
+            " checked"
+        } else {
+            ""
+        };
+        let _ = write!(
+            html,
+            "<label class=\"check\"><input type=\"checkbox\" name=\"skill\" value=\"{name}\"{checked}>\
+             <span class=\"skill-name\">{name}</span> <span class=\"when\">{desc}</span></label>",
+            name = escape_html(&skill.name),
+            desc = escape_html(&skill.description),
+        );
+    }
+    for stored in selected {
+        if !discovered.iter().any(|d| &d.name == stored) {
+            let _ = write!(
+                html,
+                "<label class=\"check\"><input type=\"checkbox\" name=\"skill\" value=\"{name}\" checked>\
+                 <span class=\"skill-name\">{name}</span> <span class=\"when\">(not found on this machine)</span></label>",
+                name = escape_html(stored),
+            );
+        }
+    }
+    if html.is_empty() {
+        "<span class=\"when\">no skills found under ~/.claude/skills</span>".to_string()
+    } else {
+        html
+    }
+}
+
+/// The create/edit form for a persona. `Some` prefills for an edit (slug is a
+/// hidden, immutable field); `None` renders a blank create form (the server
+/// derives the slug from the name). MCP servers and local plugins are
+/// structured rows (one blank trailing row to add another; `+ add` clones a row
+/// when JS is on). Skills are a checklist of what's installed under the Claude
+/// config dir. All of these are delivered to Claude personas over ACP `_meta`.
+fn persona_form(persona: Option<&crate::persona::Persona>) -> String {
+    let slug = persona.map(|p| p.slug.as_str()).unwrap_or("");
+    let name = persona.map(|p| p.name.as_str()).unwrap_or("");
+    let role = persona.and_then(|p| p.role.as_deref()).unwrap_or("");
+    let model = persona.and_then(|p| p.model.as_deref()).unwrap_or("");
+    let selected_harness = persona.map(|p| p.harness.as_str()).unwrap_or("");
+    // Existing servers / plugins as filled rows, plus one blank row to add more.
+    let mut mcp_rows = String::new();
+    let mut plugin_rows = String::new();
+    if let Some(persona) = persona {
+        for server in &persona.mcp_servers {
+            mcp_rows.push_str(&mcp_row(&server.name, &server.url));
+        }
+        for path in &persona.plugins {
+            plugin_rows.push_str(&plugin_row(path));
+        }
+    }
+    mcp_rows.push_str(&mcp_row("", ""));
+    plugin_rows.push_str(&plugin_row(""));
+    let skills = skills_checklist(persona.map(|p| p.skills.as_slice()).unwrap_or(&[]));
+    let harness_options: String = crate::launch::all_harnesses()
+        .iter()
+        .map(|harness| {
+            let selected = if harness.id == selected_harness
+                || (selected_harness.is_empty()
+                    && harness.id == crate::launch::all_harnesses()[0].id)
+            {
+                " selected"
+            } else {
+                ""
+            };
+            format!(
+                "<option value=\"{id}\"{selected}>{label}</option>",
+                id = escape_html(harness.id),
+                label = escape_html(harness.label),
+            )
+        })
+        .collect();
+    format!(
+        "<form class=\"act persona-form\" method=\"post\" action=\"/personas\">\
+         <input type=\"hidden\" name=\"slug\" value=\"{slug}\">\
+         <label>name<input name=\"name\" value=\"{name}\" placeholder=\"e.g. Security Reviewer\" required></label>\
+         <label>harness<select name=\"harness\">{harness_options}</select></label>\
+         <label>role / system-prompt<textarea name=\"role\" rows=\"3\" placeholder=\"how this agent should behave (optional)\">{role}</textarea></label>\
+         <label>model<input name=\"model\" value=\"{model}\" placeholder=\"optional model override\"></label>\
+         <div class=\"field\"><span class=\"field-label\">MCP servers</span>\
+         <div class=\"rows\">{mcp_rows}</div>\
+         <button type=\"button\" class=\"add-row\">+ add server</button></div>\
+         <div class=\"field\"><span class=\"field-label\">skills <span class=\"when\">(Claude only · installed under ~/.claude/skills)</span></span>\
+         <div class=\"checks\">{skills}</div></div>\
+         <div class=\"field\"><span class=\"field-label\">local plugins <span class=\"when\">(Claude only · a plugin's skills become available)</span></span>\
+         <div class=\"rows\">{plugin_rows}</div>\
+         <button type=\"button\" class=\"add-row\">+ add plugin</button></div>\
+         <button class=\"primary\">save</button>\
+         </form>",
+        slug = escape_html(slug),
+        name = escape_html(name),
+        role = escape_html(role),
+        model = escape_html(model),
+    )
 }
 
 /// The set-up-a-repo form: the terminal-less `junto init`. Registers the
@@ -1239,31 +1447,43 @@ pub fn channel_html(
             Some(text) => format!("<p class=\"meta hint\">⚠ {}</p>", escape_html(text)),
             None => String::new(),
         };
-        // One agent per channel (docs/adr/0024): the picker chooses the agent
-        // only the first time. Once an agent serves the channel, show it fixed
-        // — every session here uses that one agent.
-        let harnesses = crate::launch::all_harnesses();
-        let harness_picker = match crate::launch::channel_harness(&view.party) {
-            Some(agent) => format!(
+        // One agent per channel (docs/adr/0024): the picker chooses the persona
+        // only the first time. Once a persona serves the channel, show it fixed
+        // — every session here runs that one persona. Personas are machine-local
+        // config, so resolve them here the way the harness picker resolved the
+        // registry; a read failure just hides the picker (launch falls back to
+        // the default persona).
+        let personas = crate::host::junto_home()
+            .ok()
+            .map(|home| {
+                let established = crate::persona::channel_persona(&home, &view.party)
+                    .ok()
+                    .flatten();
+                let all = crate::persona::all_personas(&home).unwrap_or_default();
+                (established, all)
+            })
+            .unwrap_or((None, Vec::new()));
+        let harness_picker = match personas {
+            (Some(agent), _) => format!(
                 "<span class=\"chip\" title=\"this channel's agent\">agent: {}</span>",
-                escape_html(agent.label)
+                escape_html(&agent.name)
             ),
-            None if harnesses.len() > 1 => {
-                let options: String = harnesses
+            (None, all) if all.len() > 1 => {
+                let options: String = all
                     .iter()
-                    .map(|harness| {
+                    .map(|persona| {
                         format!(
-                            "<option value=\"{id}\">{label}</option>",
-                            id = escape_html(harness.id),
-                            label = escape_html(harness.label),
+                            "<option value=\"{slug}\">{name}</option>",
+                            slug = escape_html(&persona.slug),
+                            name = escape_html(&persona.name),
                         )
                     })
                     .collect();
                 format!(
-                    "<select name=\"harness\" title=\"which agent runs this channel\">{options}</select>"
+                    "<select name=\"persona\" title=\"which persona runs this channel\">{options}</select>"
                 )
             }
-            None => String::new(),
+            (None, _) => String::new(),
         };
         format!(
             "<section class=\"board\" id=\"start-work\">\
@@ -2072,6 +2292,16 @@ var b=e.submitter;setTimeout(function(){f.classList.add('busy');\
 f.querySelectorAll('button').forEach(function(x){x.disabled=true});\
 if(b){b.textContent='recording\\u2026'}},0)});</script>";
 
+/// Progressive enhancement for the personas form: clone a blank row (MCP server
+/// or plugin path) when a `+ add` button is clicked. Without JS the form still
+/// works — each save adds the one trailing blank row the server rendered.
+const ADD_MCP_SCRIPT: &str = "<script>document.addEventListener('click',function(e)\
+{var b=e.target;if(!b.classList||!b.classList.contains('add-row'))return;\
+var rows=b.previousElementSibling;var last=rows.lastElementChild;\
+var clone=last.cloneNode(true);\
+clone.querySelectorAll('input').forEach(function(i){i.value=''});\
+rows.appendChild(clone);});</script>";
+
 /// The dark theme, keyed to the app icon palette (`docs/adr/0018`): one CSS
 /// blob, no external assets — the pages must render identically in
 /// the desktop shell's webview and a plain browser, offline. (JS: a single
@@ -2264,6 +2494,32 @@ form.act.option button.primary{flex:none;min-width:7rem}\
 form.act.option input[name=rationale]{color:var(--soft);font-style:italic}\
 form.act.busy{opacity:.65}\
 form.act button:disabled{cursor:wait}\
+form.act button.danger{color:var(--muted)}\
+form.act button.danger:hover{color:#f38ba8;border-color:#f38ba8}\
+form.persona-form{flex-direction:column;align-items:stretch}\
+form.persona-form label{display:flex;flex-direction:column;gap:.25rem;font-size:.8rem;\
+color:var(--muted)}\
+form.persona-form input,form.persona-form select{flex:none;min-width:0;width:100%}\
+form.persona-form textarea{background:var(--bg);color:var(--text);border:1px solid var(--border);\
+border-radius:.45rem;padding:.32rem .6rem;font:.84rem ui-monospace,SFMono-Regular,Menlo,monospace;\
+resize:vertical}\
+form.persona-form textarea:focus{outline:1px solid var(--accent)}\
+form.persona-form button.primary{align-self:flex-start}\
+form.persona-form .field{display:flex;flex-direction:column;gap:.3rem}\
+form.persona-form .field-label{font-size:.8rem;color:var(--muted)}\
+.rows{display:flex;flex-direction:column;gap:.35rem}\
+.mcp-row{display:flex;gap:.4rem}\
+.mcp-row input[name=mcp_name]{flex:0 0 9rem}\
+.mcp-row input[name=mcp_url]{flex:1}\
+.row input{width:100%}\
+form.persona-form button.add-row{align-self:flex-start;font-size:.8rem;padding:.2rem .6rem}\
+.chips{display:flex;flex-wrap:wrap;gap:.3rem}\
+.checks{display:flex;flex-direction:column;gap:.2rem;max-height:14rem;overflow:auto;\
+border:1px solid var(--border);border-radius:.45rem;padding:.4rem}\
+label.check{display:flex;align-items:baseline;gap:.4rem;font-size:.82rem;color:var(--text)}\
+label.check input{flex:0 0 auto}\
+label.check .skill-name{font-weight:500}\
+label.check .when{flex:1;min-width:0}\
 a.back-link{color:var(--muted);font-size:.84rem}\
 a.back-link:hover{color:var(--soft)}";
 

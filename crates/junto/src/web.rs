@@ -43,6 +43,8 @@ pub fn router(host: Arc<Host>) -> Router {
         .route("/", get(index_page))
         .route("/new", get(new_page))
         .route("/settings", get(settings_page))
+        .route("/personas", get(personas_page).post(save_persona))
+        .route("/personas/{slug}/delete", post(delete_persona))
         .route("/channels", post(open_channel))
         .route("/repos", post(setup_repo))
         .route("/channels/{channel}", get(channel_page))
@@ -162,6 +164,149 @@ async fn settings_page(State(host): State<Arc<Host>>) -> Response {
         "http://127.0.0.1:1727",
     ))
     .into_response()
+}
+
+/// The "/personas" page behind the sidebar's ✦: create, edit, and delete the
+/// reusable agent personas the launch picker offers
+/// (`docs/superpowers/specs/2026-06-13-agent-personas-design.md`).
+async fn personas_page(State(host): State<Arc<Host>>) -> Response {
+    let mut nav = host.inventory().await.unwrap_or_default();
+    nav.sort_by_key(|summary| std::cmp::Reverse(summary.last_activity));
+    let junto_home = match crate::host::junto_home() {
+        Ok(home) => home,
+        Err(err) => return internal(format!("no junto home: {err}")),
+    };
+    match crate::persona::all_personas(&junto_home) {
+        Ok(personas) => Html(render::personas_html(&nav, &personas)).into_response(),
+        Err(err) => internal(format!("reading personas: {err}")),
+    }
+}
+
+/// Lowercase, hyphenate, and trim a name into a stable slug for a new persona.
+fn slugify(name: &str) -> String {
+    let mut slug = String::new();
+    let mut prev_dash = false;
+    for ch in name.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash {
+            slug.push('-');
+            prev_dash = true;
+        }
+    }
+    slug.trim_matches('-').to_string()
+}
+
+/// The first value submitted for `key`, or `""`.
+fn field<'a>(pairs: &'a [(String, String)], key: &str) -> &'a str {
+    pairs
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("")
+}
+
+/// Pair the repeated `mcp_name`/`mcp_url` fields into MCP servers, in order,
+/// dropping any row where either side is blank (the trailing add-row, a row
+/// the user left empty). The form renders one `mcp_name` and one `mcp_url`
+/// per row, so the i-th of each belong together.
+fn parse_mcp_rows(pairs: &[(String, String)]) -> Vec<crate::persona::McpServer> {
+    let names = pairs.iter().filter(|(k, _)| k == "mcp_name");
+    let urls = pairs.iter().filter(|(k, _)| k == "mcp_url");
+    names
+        .zip(urls)
+        .filter_map(|((_, name), (_, url))| {
+            let (name, url) = (name.trim(), url.trim());
+            (!name.is_empty() && !url.is_empty()).then(|| crate::persona::McpServer {
+                name: name.to_string(),
+                url: url.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Every value submitted for `key`, in order, trimmed and non-empty. Used for
+/// the repeated `skill` checkboxes and `plugin_path` rows.
+fn all_fields(pairs: &[(String, String)], key: &str) -> Vec<String> {
+    pairs
+        .iter()
+        .filter(|(k, _)| k == key)
+        .map(|(_, v)| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .collect()
+}
+
+/// Save (create or update) a persona from the personas-page form. The body is
+/// read as raw key/value pairs so the repeated rows (MCP servers, plugins) and
+/// the `skill` checkboxes survive — axum's typed `Form` can't collect duplicate
+/// keys into a list.
+async fn save_persona(
+    State(_host): State<Arc<Host>>,
+    Form(pairs): Form<Vec<(String, String)>>,
+) -> Response {
+    let name = field(&pairs, "name").trim().to_string();
+    if name.is_empty() {
+        return (StatusCode::BAD_REQUEST, "a name is required").into_response();
+    }
+    let junto_home = match crate::host::junto_home() {
+        Ok(home) => home,
+        Err(err) => return internal(format!("no junto home: {err}")),
+    };
+    // On edit the slug is fixed; on create derive it from the name.
+    let form_slug = field(&pairs, "slug").trim();
+    let slug = if form_slug.is_empty() {
+        slugify(&name)
+    } else {
+        form_slug.to_string()
+    };
+    if slug.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "the name has no slug-able characters — give it a plain-text name",
+        )
+            .into_response();
+    }
+    // Preserve an existing persona's email so editing a stock persona keeps the
+    // harness identity; a brand-new custom persona gets its own.
+    let email = match crate::persona::persona_by_slug(&junto_home, &slug) {
+        Ok(Some(existing)) => existing.email,
+        Ok(None) => format!("{slug}@junto.local"),
+        Err(err) => return internal(format!("reading personas: {err}")),
+    };
+    let trimmed = |s: &str| {
+        let t = s.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    };
+    let persona = crate::persona::Persona {
+        slug,
+        name,
+        harness: crate::launch::harness_by_id(field(&pairs, "harness").trim())
+            .id
+            .to_string(),
+        email,
+        role: trimmed(field(&pairs, "role")),
+        model: trimmed(field(&pairs, "model")),
+        mcp_servers: parse_mcp_rows(&pairs),
+        skills: all_fields(&pairs, "skill"),
+        plugins: all_fields(&pairs, "plugin_path"),
+    };
+    match crate::persona::save_persona(&junto_home, persona) {
+        Ok(()) => Redirect::to("/personas").into_response(),
+        Err(err) => internal(format!("saving persona: {err}")),
+    }
+}
+
+/// Delete a persona by slug from the personas page.
+async fn delete_persona(State(_host): State<Arc<Host>>, Path(slug): Path<String>) -> Response {
+    let junto_home = match crate::host::junto_home() {
+        Ok(home) => home,
+        Err(err) => return internal(format!("no junto home: {err}")),
+    };
+    match crate::persona::delete_persona(&junto_home, &slug) {
+        Ok(()) => Redirect::to("/personas").into_response(),
+        Err(err) => internal(format!("deleting persona: {err}")),
+    }
 }
 
 /// The form body for opening a channel from the index page.
@@ -312,14 +457,14 @@ struct LaunchForm {
     /// The workspace repo; empty falls back to the remembered mapping.
     #[serde(default)]
     workspace: String,
-    /// Which harness runs it (`claude`, `opencode`); empty/unknown → default
-    /// (`docs/adr/0024`).
+    /// Which persona runs it (its slug); empty/unknown → the default persona
+    /// (`docs/superpowers/specs/2026-06-13-agent-personas-design.md`).
     #[serde(default)]
-    harness: String,
+    persona: String,
 }
 
 /// Launch an Agent Session from the channel page: resolve the workspace
-/// (remembering a newly typed one), check the harness member is in the
+/// (remembering a newly typed one), check the persona's member is in the
 /// Party, and spawn the first turn in the background.
 async fn launch_session(
     State(host): State<Arc<Host>>,
@@ -341,24 +486,33 @@ async fn launch_session(
         )
             .into_response();
     }
-    // The session's author is the harness member (docs/adr/0020); its entries
+    let junto_home = match crate::host::junto_home() {
+        Ok(home) => home,
+        Err(err) => return internal(format!("no junto home: {err}")),
+    };
+    // The session's author is the persona's member (docs/adr/0020); its entries
     // only project once it is in the Party (docs/adr/0017). Rather than reject
-    // a launch in a fresh channel, bring the harness in: if the human at the
+    // a launch in a fresh channel, bring the persona in: if the human at the
     // keyboard founded this channel, auto-grant membership (a founder-authored
     // MemberAdded) so the agent joins and starts work in one motion — the
     // grant is recorded, not hidden. A non-founder can't grant: they get
     // add_member's error naming who can (docs/adr/0017).
-    // One agent per channel (for now): if an agent already serves this channel
-    // (is in the Party), reuse it — the picker only chooses the agent the first
-    // time. Otherwise the form's selection becomes the channel's agent, granted
-    // below.
-    let harness = match crate::launch::channel_harness(&view.party) {
-        Some(established) => established,
-        None => crate::launch::harness_by_id(form.harness.trim()),
+    // One agent per channel (docs/adr/0024): if a persona already serves this
+    // channel (its member is in the Party), reuse it — the picker only chooses
+    // the persona the first time. Otherwise the form's selection becomes the
+    // channel's persona (the default persona for an empty/unknown slug),
+    // granted below.
+    let persona = match crate::persona::channel_persona(&junto_home, &view.party) {
+        Ok(Some(established)) => established,
+        Ok(None) => match resolve_form_persona(&junto_home, form.persona.trim()) {
+            Ok(persona) => persona,
+            Err(err) => return internal(format!("reading personas: {err}")),
+        },
+        Err(err) => return internal(format!("reading personas: {err}")),
     };
-    let harness_member = harness.member();
-    let harness_is_member = view.party.iter().any(|m| m.email == harness_member.email);
-    if !view.party.is_empty() && !harness_is_member {
+    let persona_member = persona.member();
+    let persona_is_member = view.party.iter().any(|m| m.email == persona_member.email);
+    if !view.party.is_empty() && !persona_is_member {
         let granter = match crate::host::git_user(&substrate) {
             Ok(granter) => granter,
             Err(err) => {
@@ -367,14 +521,10 @@ async fn launch_session(
                 ));
             }
         };
-        if let Err(err) = host.add_member(&channel, &granter, harness_member).await {
+        if let Err(err) = host.add_member(&channel, &granter, persona_member).await {
             return (StatusCode::FORBIDDEN, format!("{err:#}")).into_response();
         }
     }
-    let junto_home = match crate::host::junto_home() {
-        Ok(home) => home,
-        Err(err) => return internal(format!("no junto home: {err}")),
-    };
     let workspace = if form.workspace.trim().is_empty() {
         match crate::launch::workspace_for(&junto_home, &id) {
             Ok(Some(workspace)) => workspace,
@@ -404,13 +554,32 @@ async fn launch_session(
         channel.clone(),
         workspace,
         intent,
-        harness,
+        persona,
     )
     .await
     {
         Ok(_session) => Redirect::to(&format!("/channels/{id}")).into_response(),
         Err(err) => internal(format!("launch failed: {err:#}")),
     }
+}
+
+/// Resolve the persona a launch form selected: the named slug, or the default
+/// persona (the first, the stock entry for the default harness) when the field
+/// is empty or names no known persona.
+fn resolve_form_persona(
+    junto_home: &std::path::Path,
+    slug: &str,
+) -> anyhow::Result<crate::persona::Persona> {
+    if !slug.is_empty()
+        && let Some(persona) = crate::persona::persona_by_slug(junto_home, slug)?
+    {
+        return Ok(persona);
+    }
+    let mut all = crate::persona::all_personas(junto_home)?;
+    if all.is_empty() {
+        anyhow::bail!("no personas available");
+    }
+    Ok(all.remove(0))
 }
 
 /// The form body for steering a session.
@@ -1018,6 +1187,32 @@ mod tests {
     use std::process::Command as StdCommand;
     use tempfile::TempDir;
 
+    #[test]
+    fn parse_mcp_rows_pairs_names_with_urls_and_drops_blanks() {
+        let pairs = vec![
+            ("name".into(), "Reviewer".into()),
+            ("mcp_name".into(), "junto".into()),
+            ("mcp_url".into(), "http://127.0.0.1:1727/mcp".into()),
+            // A blank trailing row (the add-row) is dropped.
+            ("mcp_name".into(), "  ".into()),
+            ("mcp_url".into(), "".into()),
+            // A half-filled row (name but no url) is dropped too.
+            ("mcp_name".into(), "orphan".into()),
+            ("mcp_url".into(), "".into()),
+        ];
+        let servers = parse_mcp_rows(&pairs);
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "junto");
+        assert_eq!(servers[0].url, "http://127.0.0.1:1727/mcp");
+    }
+
+    #[test]
+    fn slugify_makes_a_stable_kebab_slug() {
+        assert_eq!(slugify("Security Reviewer"), "security-reviewer");
+        assert_eq!(slugify("  Doc Writer!! "), "doc-writer");
+        assert_eq!(slugify("***"), "");
+    }
+
     /// A test host: one fresh git repo, the member-code store in its own temp
     /// dir, a channel founded by the repo's git user (the web-write author —
     /// a member, so human-surface acts authorize without any code), and one
@@ -1488,7 +1683,7 @@ mod tests {
             Form(LaunchForm {
                 intent: "do the stub thing".into(),
                 workspace: workspace.path().display().to_string(),
-                harness: String::new(),
+                persona: String::new(),
             }),
         )
         .await;
@@ -1613,7 +1808,7 @@ mod tests {
             Form(LaunchForm {
                 intent: "start in a fresh channel".into(),
                 workspace: workspace.path().display().to_string(),
-                harness: String::new(),
+                persona: String::new(),
             }),
         )
         .await;
