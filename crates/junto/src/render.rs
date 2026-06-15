@@ -888,9 +888,35 @@ pub fn index_html(summaries: &[ChannelSummary], attention: &[AttentionGroup]) ->
     page_shell("junto — channels", summaries, None, &content)
 }
 
-/// The redesigned index (redesign spec §3): top bar + bottom-pinned lineage
-/// strip + the focus board, scoped to one workspace. `summaries` and
-/// `attention` are already scoped to `active`.
+/// The shared redesigned shell (redesign spec §3): top bar + bottom-pinned
+/// lineage strip + a `main` pane. Every redesigned page is this chrome with a
+/// different `main`; `selected` highlights the active track in the strip.
+#[allow(clippy::too_many_arguments)]
+fn app_page(
+    title: &str,
+    workspaces: &[std::path::PathBuf],
+    active: &std::path::Path,
+    model: &LineageModel,
+    selected: Option<&ChannelId>,
+    identity: Option<&str>,
+    agents_working: usize,
+    open_gates: usize,
+    main: &str,
+) -> String {
+    format!(
+        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <title>{title}</title>\n<style>{CSS}{APP_CSS}</style></head>\n<body>\n\
+         {bar}\n<div class=\"strip\">{strip}</div>\n\
+         <main class=\"pane\">{main}</main>\n{ACT_FEEDBACK_SCRIPT}</body></html>\n",
+        title = escape_html(title),
+        bar = top_bar(workspaces, active, agents_working, open_gates, identity),
+        strip = lineage_strip(model, selected),
+    )
+}
+
+/// The redesigned index (redesign spec §3): the shared chrome over the focus
+/// board, scoped to one workspace. `attention` is already scoped to `active`.
 pub fn new_index_html(
     workspaces: &[std::path::PathBuf],
     active: &std::path::Path,
@@ -905,15 +931,16 @@ pub fn new_index_html(
         .flat_map(|group| &group.items)
         .filter(|item| matches!(item.kind, AttentionKind::Gate))
         .count();
-    format!(
-        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
-         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-         <title>junto</title>\n<style>{CSS}{APP_CSS}</style></head>\n<body>\n\
-         {bar}\n<div class=\"strip\">{strip}</div>\n\
-         <main class=\"pane\">{board}</main>\n</body></html>\n",
-        bar = top_bar(workspaces, active, agents_working, open_gates, identity),
-        strip = lineage_strip(model, None),
-        board = focus_board(attention, "/"),
+    app_page(
+        "junto",
+        workspaces,
+        active,
+        model,
+        None,
+        identity,
+        agents_working,
+        open_gates,
+        &focus_board(attention, "/"),
     )
 }
 
@@ -1862,7 +1889,44 @@ pub fn channel_html(
         name = escape_html(name),
         count = view.entries.len(),
     );
-    page_shell(&format!("junto — {name}"), nav, Some(id), &content)
+    // Wrapped in the redesigned chrome (top bar + strip) with this channel
+    // selected — so clicking a track from the index stays in the new surface.
+    // The chrome inputs are derived from `nav`: the distinct home substrates
+    // are the switchable workspaces, and the active workspace's channels shape
+    // the strip. (Identity is threaded in a later slice; the index carries it.)
+    let mut workspaces: Vec<std::path::PathBuf> = Vec::new();
+    for summary in nav {
+        if !workspaces.contains(&summary.substrate) {
+            workspaces.push(summary.substrate.clone());
+        }
+    }
+    let scoped: Vec<ChannelSummary> = nav
+        .iter()
+        .filter(|summary| summary.substrate == substrate)
+        .cloned()
+        .collect();
+    let model = LineageModel::from_summaries(&scoped, substrate);
+    let agents_working = view
+        .sessions
+        .values()
+        .filter(|session| session.state == SessionState::Working)
+        .count();
+    let open_gates = view
+        .gate_status
+        .values()
+        .filter(|status| **status == GateStatus::Pending)
+        .count();
+    app_page(
+        &format!("junto — {name}"),
+        &workspaces,
+        substrate,
+        &model,
+        Some(id),
+        None,
+        agents_working,
+        open_gates,
+        &content,
+    )
 }
 
 /// The human rendering of the brief's "standing decisions" tier: recent
@@ -2958,7 +3022,7 @@ mod tests {
         let repo = std::path::PathBuf::from("/x/junto-ledger");
         let summaries = vec![summary("junto-ledger", &repo, 1, 0)];
         let model = LineageModel::from_summaries(&summaries, &repo);
-        let html = new_index_html(&[repo.clone()], &repo, &model, &[], None);
+        let html = new_index_html(std::slice::from_ref(&repo), &repo, &model, &[], None);
         assert!(html.contains("class=\"topbar\""));
         assert!(html.contains("<svg")); // the strip
         assert!(html.contains("redesigned human surface")); // the new stylesheet
@@ -3211,55 +3275,29 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_groups_channels_by_substrate() {
+    fn channel_page_wears_the_redesigned_chrome_with_a_workspace_switcher() {
+        // The channel page now wraps its content in the top bar + lineage
+        // strip (no left sidebar); the workspace switcher lists the distinct
+        // home substrates from nav.
+        let repo = std::path::PathBuf::from("/repo/one");
         let nav = vec![
-            ChannelSummary {
-                id: ChannelId::new(),
-                name: Some("alpha".into()),
-                substrate: std::path::PathBuf::from("/repo/one"),
-                entry_count: 1,
-                last_activity: None,
-                open_gates: 0,
-                members: 1,
-                latest: None,
-                closed: false,
-            },
-            ChannelSummary {
-                id: ChannelId::new(),
-                name: Some("beta".into()),
-                substrate: std::path::PathBuf::from("/repo/two"),
-                entry_count: 1,
-                last_activity: None,
-                open_gates: 0,
-                members: 1,
-                latest: None,
-                closed: false,
-            },
+            summary("alpha", &repo, 10, 0),
+            summary("beta", std::path::Path::new("/repo/two"), 20, 0),
         ];
         let view = view_with(vec![]);
-        let html = channel_html(
-            &nav,
-            "alpha",
-            &nav[0].id,
-            &view,
-            std::path::Path::new("/r"),
-            None,
+        let html = channel_html(&nav, "alpha", &nav[0].id, &view, &repo, None);
+        assert!(html.contains("class=\"topbar\""), "{html}");
+        assert!(html.contains("redesigned human surface"), "new stylesheet");
+        assert!(html.contains("<svg"), "the lineage strip is present");
+        // The switcher offers both substrates by their directory names.
+        assert!(html.contains(">one</a>"), "{html}");
+        assert!(html.contains(">two</a>"), "{html}");
+        // The old sidebar is gone.
+        assert!(!html.contains("class=\"side\""), "no left sidebar");
+        assert!(
+            !html.contains("<div class=\"side-sub\""),
+            "no sidebar groups"
         );
-        assert!(html.contains("<div class=\"side-sub\""), "{html}");
-        assert!(html.contains(">one</div>"), "{html}");
-        assert!(html.contains(">two</div>"), "{html}");
-
-        // A single-substrate host gets no group headings.
-        let solo = vec![nav[0].clone()];
-        let html = channel_html(
-            &solo,
-            "alpha",
-            &solo[0].id,
-            &view,
-            std::path::Path::new("/r"),
-            None,
-        );
-        assert!(!html.contains("<div class=\"side-sub\""), "{html}");
     }
 
     #[test]
@@ -3580,48 +3618,20 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_lists_channels_and_marks_the_active_one() {
-        let active = ChannelId::new();
-        let other = ChannelId::new();
-        let nav = vec![
-            ChannelSummary {
-                id: active,
-                name: Some("alpha".into()),
-                substrate: std::path::PathBuf::from("/repo/a"),
-                entry_count: 3,
-                last_activity: None,
-                open_gates: 2,
-                members: 2,
-                latest: Some("assertion — the latest finding".into()),
-                closed: false,
-            },
-            ChannelSummary {
-                id: other,
-                name: Some("beta".into()),
-                substrate: std::path::PathBuf::from("/repo/b"),
-                entry_count: 1,
-                last_activity: None,
-                open_gates: 0,
-                members: 1,
-                latest: None,
-                closed: false,
-            },
-        ];
+    fn channel_page_strip_marks_the_active_channel() {
+        // On a channel page the strip is scoped to the channel's own home
+        // substrate, with that channel selected (its track marked).
+        let repo = std::path::PathBuf::from("/repo/a");
+        let alpha = summary("alpha", &repo, 30, 2);
+        let beta = summary("beta", &repo, 10, 0); // older → the main-line
+        let active = alpha.id;
+        let nav = vec![alpha, beta];
         let view = view_with(vec![]);
-        let html = channel_html(
-            &nav,
-            "alpha",
-            &active,
-            &view,
-            std::path::Path::new("/repo"),
-            None,
-        );
-        assert!(html.contains("chan active"));
-        assert!(html.contains("alpha"));
-        assert!(html.contains("beta"));
-        assert!(
-            html.contains("gatecount"),
-            "open gates surface in the sidebar"
-        );
+        let html = channel_html(&nav, "alpha", &active, &view, &repo, None);
+        assert!(html.contains("class=\"topbar\""));
+        assert!(html.contains("alpha"), "the active channel is a track");
+        assert!(html.contains("beta"), "the sibling channel is a track too");
+        // The active channel's track carries the selection class.
+        assert!(html.contains("track sel"), "active track is marked: {html}");
     }
 }
