@@ -2009,8 +2009,8 @@ pub fn channel_html(
         "<h1>{name}</h1>\n\
          <p class=\"meta\">{count} entries</p>\n\
          {rename}{lifecycle}{party}{strip}{start_work}{sessions}{standing}{recently}{footer}\
-         <details class=\"ledger\"><summary class=\"board-head\">the full ledger \
-         ({count} entries)</summary>\n{body}</details>\n{open_here}",
+         <details class=\"ledger\"><summary class=\"board-head\">channel history \
+         · {count} entries</summary>\n{body}</details>\n{open_here}",
         name = escape_html(name),
         count = view.entries.len(),
     );
