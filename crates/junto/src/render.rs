@@ -1388,13 +1388,15 @@ const STRIP_WINDOW: usize = 3;
 /// Vertical spacing between tracks, in SVG units.
 const STRIP_ROW: i32 = 30;
 
-/// One track's now-cap: a glowing filled dot when it's live/needs-you, an
-/// outlined hollow dot when it's quiet.
+/// One track's now-cap: a filled dot with a **static** halo when it's
+/// live/needs-you, an outlined hollow dot when it's quiet. Deliberately no
+/// animation or SVG filter — animating a blur-filtered element forces the
+/// webview to re-rasterize every frame, which makes the whole UI lag.
 fn strip_cap(x: i32, y: i32, color: &str, live: bool) -> String {
     if live {
         format!(
-            "<circle cx=\"{x}\" cy=\"{y}\" r=\"5.5\" fill=\"{color}\" class=\"capglow\" \
-             filter=\"url(#glow)\"/>"
+            "<circle cx=\"{x}\" cy=\"{y}\" r=\"9\" fill=\"{color}\" opacity=\"0.18\"/>\
+             <circle cx=\"{x}\" cy=\"{y}\" r=\"5\" fill=\"{color}\"/>"
         )
     } else {
         format!(
@@ -1419,11 +1421,7 @@ pub fn lineage_strip(model: &LineageModel, selected: Option<&ChannelId>) -> Stri
     let now_x = 1140;
     let y_of = |i: i32| spine_y - (i + 1) * STRIP_ROW;
 
-    let mut s = format!(
-        "<svg viewBox=\"0 0 1200 {height}\" role=\"img\"><defs><filter id=\"glow\">\
-         <feGaussianBlur stdDeviation=\"2.5\" result=\"b\"/><feMerge><feMergeNode in=\"b\"/>\
-         <feMergeNode in=\"SourceGraphic\"/></feMerge></filter></defs>"
-    );
+    let mut s = format!("<svg viewBox=\"0 0 1200 {height}\" role=\"img\">");
 
     // selected-track highlight band
     let sel_y = if selected == Some(&model.mainline.id) {
@@ -2667,8 +2665,7 @@ body{margin:0}\
 .ws-menu a{display:block;padding:8px 10px;border-radius:7px;color:var(--dim2);text-decoration:none;font-size:13px}\
 .ws-menu a:hover{background:#172030;color:var(--ink2)}\
 .topbar .live{display:flex;align-items:center;gap:7px;font-size:13px;color:var(--dim2)}\
-.topbar .pulse{width:8px;height:8px;border-radius:50%;background:var(--ok2);box-shadow:0 0 8px var(--ok2);animation:jpulse 1.6s infinite}\
-@keyframes jpulse{0%,100%{opacity:1}50%{opacity:.35}}\
+.topbar .pulse{width:8px;height:8px;border-radius:50%;background:var(--ok2);box-shadow:0 0 6px var(--ok2)}\
 .topbar .who{display:flex;align-items:center;gap:8px;color:var(--dim2);font-size:13px}\
 .topbar .pa{width:28px;height:28px;border-radius:7px;background:#2a3340;display:grid;place-items:center;font-weight:700;color:var(--dim2);font-size:12px}\
 .strip{background:#0e1217;border-bottom:1px solid var(--line2);padding:6px 0 0}\
@@ -2683,7 +2680,6 @@ body{margin:0}\
 .strip .nowlab{font:600 10px 'JetBrains Mono',monospace;fill:var(--accent2)}\
 .strip .axis{font:500 10px 'JetBrains Mono',monospace;fill:var(--faint2)}\
 .strip .strip-expand{font:600 11px Inter,system-ui,sans-serif;fill:var(--dim2);cursor:pointer}\
-.strip .capglow{animation:jpulse 1.8s infinite}\
 .pane{padding:20px 26px 60px}\
 ";
 
