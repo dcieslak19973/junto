@@ -2070,23 +2070,15 @@ fn standing_decisions_section(
         if index >= BRIEF_RECENT_FULL + BRIEF_OLDER_CLAMPED {
             let _ = writeln!(
                 items,
-                "<li class=\"older\">…and {} older standing decisions (in the full \
-                 ledger below)</li>",
+                "<div class=\"decision older\">…and {} older standing decisions (in the \
+                 full ledger below)</div>",
                 shape.ratified.len() - index
             );
             break;
         }
-        let (text, corrects) = match &entry.payload {
-            EntryPayload::Assertion { statement, .. } => (statement.as_str(), String::new()),
-            EntryPayload::Correction {
-                target, statement, ..
-            } => (
-                statement.as_str(),
-                format!(
-                    " <span class=\"by\">(correction of <code>{}</code>)</span>",
-                    short(target)
-                ),
-            ),
+        let (text, is_correction) = match &entry.payload {
+            EntryPayload::Assertion { statement, .. } => (statement.as_str(), false),
+            EntryPayload::Correction { statement, .. } => (statement.as_str(), true),
             _ => continue,
         };
         let body = if index < BRIEF_RECENT_FULL {
@@ -2094,24 +2086,26 @@ fn standing_decisions_section(
         } else {
             clamp(text, BRIEF_CLAMP)
         };
-        let by = last_act(notes, &entry.id, "ratified")
-            .map(|note| {
-                format!(
-                    " <span class=\"by\">— ratified by {}</span>",
-                    escape_html(&note.author.display_name)
-                )
-            })
-            .unwrap_or_default();
+        // The block's header: who settled it (and whether it revised an
+        // earlier decision) — no hash, the id lives in the full ledger.
+        let who = last_act(notes, &entry.id, "ratified")
+            .map(|note| format!("ratified by {}", escape_html(&note.author.display_name)))
+            .unwrap_or_else(|| "ratified".to_string());
+        let correction = if is_correction {
+            " · revises an earlier decision"
+        } else {
+            ""
+        };
         let _ = writeln!(
             items,
-            "<li><code>{id}</code>{corrects} {body}{by}</li>",
-            id = short(&entry.id),
+            "<div class=\"decision\"><div class=\"dec-meta\">{who}{correction}</div>\
+             <div class=\"dec-body\">{body}</div></div>",
             body = escape_html(&body),
         );
     }
     format!(
         "<section class=\"board\"><h2 class=\"board-head\">standing decisions \
-         (newest first)</h2>\n<ul class=\"standing\">{items}</ul></section>\n"
+         (newest first)</h2>\n<div class=\"decisions\">{items}</div></section>\n"
     )
 }
 
@@ -2803,6 +2797,12 @@ body{margin:0}\
 .strip .nowlab{font:600 10px 'JetBrains Mono',monospace;fill:var(--accent2)}\
 .strip .axis{font:500 10px 'JetBrains Mono',monospace;fill:var(--faint2)}\
 .strip .strip-expand{font:600 11px Inter,system-ui,sans-serif;fill:var(--dim2);cursor:pointer}\
+.decisions{display:flex;flex-direction:column}\
+.decision{border-top:1px solid var(--line2);padding:12px 0}\
+.decision:first-child{border-top:0}\
+.decision.older{color:var(--faint2);font-size:13px}\
+.dec-meta{font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--faint2);margin-bottom:5px}\
+.dec-body{color:var(--ink2);font-size:14px;line-height:1.55;overflow-wrap:anywhere}\
 .pane{padding:20px 26px 60px}\
 ";
 
