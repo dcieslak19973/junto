@@ -1325,6 +1325,10 @@ pub struct Track {
     pub name: Option<String>,
     /// An open gate awaits the member on this channel.
     pub needs_you: bool,
+    /// When the channel was last active — places the track's right end along
+    /// the strip's time axis (a quiet channel ends earlier, only recent work
+    /// reaches "now").
+    pub last_activity: Option<junto_kernel::Timestamp>,
 }
 
 impl Track {
@@ -1334,6 +1338,7 @@ impl Track {
             id: ChannelId::new(),
             name: None,
             needs_you: false,
+            last_activity: None,
         }
     }
 }
@@ -1355,6 +1360,7 @@ impl LineageModel {
             id: s.id,
             name: s.name.clone(),
             needs_you: s.open_gates > 0,
+            last_activity: s.last_activity,
         };
         let dir = substrate
             .file_name()
@@ -1368,10 +1374,16 @@ impl LineageModel {
         }
         // newest-first
         open.sort_by_key(|s| std::cmp::Reverse(s.last_activity));
-        let main_idx = open
-            .iter()
-            .position(|s| s.name == dir)
-            .unwrap_or(open.len() - 1); // else the oldest (the de-facto trunk)
+        // The main-line is the ambient channel (name == repo dir) if one
+        // exists; absent that, the **busiest** channel (most entries) is the
+        // de-facto trunk — until real lineage edges name a true spine.
+        let main_idx = open.iter().position(|s| s.name == dir).unwrap_or_else(|| {
+            open.iter()
+                .enumerate()
+                .max_by_key(|(_, s)| s.entry_count)
+                .map(|(i, _)| i)
+                .unwrap_or(0)
+        });
         let mainline = track(open[main_idx]);
         let branches = open
             .iter()
@@ -1404,6 +1416,30 @@ fn strip_cap(x: i32, y: i32, color: &str, live: bool) -> String {
              stroke-width=\"2\"/>"
         )
     }
+}
+
+/// The strip's left timeline edge (px) and the `now` edge.
+const STRIP_LEFT_X: f64 = 240.0;
+const STRIP_NOW_X: f64 = 1140.0;
+/// The age (minutes) that maps to the strip's left edge — ~7 days.
+const STRIP_MAX_MIN: f64 = 10_080.0;
+
+/// Map an age (minutes) to an x along the strip's time axis: 0 → `now`,
+/// [`STRIP_MAX_MIN`] and older → the left edge. Log-scaled so a long span
+/// still leaves recent activity legible.
+fn strip_age_x(age_min: f64) -> i32 {
+    let frac = ((age_min.max(0.0) + 1.0).ln() / (STRIP_MAX_MIN + 1.0).ln()).clamp(0.0, 1.0);
+    (STRIP_NOW_X - frac * (STRIP_NOW_X - STRIP_LEFT_X)).round() as i32
+}
+
+/// Where a track's right end sits, from when it was last active.
+fn strip_time_x(last_activity: Option<junto_kernel::Timestamp>) -> i32 {
+    let now = junto_kernel::Timestamp::now().as_millis();
+    let age_min = match last_activity {
+        Some(t) => (now.saturating_sub(t.as_millis()) as f64) / 60_000.0,
+        None => STRIP_MAX_MIN,
+    };
+    strip_age_x(age_min)
 }
 
 /// The bottom-pinned, windowed lineage strip (redesign spec §3.2): the
@@ -1458,25 +1494,28 @@ pub fn lineage_strip(model: &LineageModel, selected: Option<&ChannelId>) -> Stri
         );
     }
 
-    // branches (flat lines, newest nearest the spine)
+    // branches: flat lines, newest nearest the spine, ending at last-activity
+    // along the time axis (only recent work reaches "now").
+    let left_x = STRIP_LEFT_X as i32;
     for (i, b) in shown.iter().enumerate() {
         let ty = y_of(i as i32);
         let color = if b.needs_you { "#ffb454" } else { "#7d8696" };
         let label = b.name.as_deref().unwrap_or("(unopened)");
         let sel = if Some(&b.id) == selected { " sel" } else { "" };
         let href = b.name.clone().unwrap_or_else(|| b.id.to_string());
+        let end_x = strip_time_x(b.last_activity).max(left_x + 1);
         let _ = write!(
             s,
             "<a href=\"/channels/{href}\"><text x=\"200\" y=\"{}\" text-anchor=\"end\" \
              class=\"track{sel}\">{label}</text>\
-             <line class=\"track-line\" x1=\"220\" y1=\"{ty}\" x2=\"{now_x}\" y2=\"{ty}\" \
+             <line class=\"track-line\" x1=\"{left_x}\" y1=\"{ty}\" x2=\"{end_x}\" y2=\"{ty}\" \
              stroke=\"{color}\" stroke-width=\"{}\"/>\
-             <circle cx=\"220\" cy=\"{ty}\" r=\"4\" fill=\"{color}\"/>{cap}</a>",
+             <circle cx=\"{left_x}\" cy=\"{ty}\" r=\"4\" fill=\"{color}\"/>{cap}</a>",
             ty,
             if b.needs_you { 3 } else { 2 },
             href = escape_html(&href),
             label = escape_html(label),
-            cap = strip_cap(now_x, ty, color, b.needs_you),
+            cap = strip_cap(end_x, ty, color, b.needs_you),
         );
     }
 
@@ -1499,17 +1538,23 @@ pub fn lineage_strip(model: &LineageModel, selected: Option<&ChannelId>) -> Stri
         cap = strip_cap(now_x, spine_y, "#5b9dff", true),
     );
 
-    // time axis below the spine label
+    // time axis below the spine label, ticks placed on the same time scale
     let axis_y = spine_y + 42;
-    let _ = write!(
-        s,
-        "<g class=\"axis\">\
-         <text x=\"430\" y=\"{axis_y}\" text-anchor=\"middle\">5d</text>\
-         <text x=\"600\" y=\"{axis_y}\" text-anchor=\"middle\">3d</text>\
-         <text x=\"760\" y=\"{axis_y}\" text-anchor=\"middle\">1d</text>\
-         <text x=\"920\" y=\"{axis_y}\" text-anchor=\"middle\">8h</text>\
-         <text x=\"1010\" y=\"{axis_y}\" text-anchor=\"middle\">3h</text></g></svg>"
-    );
+    let _ = write!(s, "<g class=\"axis\">");
+    for (age_min, label) in [
+        (7200.0, "5d"),
+        (4320.0, "3d"),
+        (1440.0, "1d"),
+        (480.0, "8h"),
+        (180.0, "3h"),
+    ] {
+        let _ = write!(
+            s,
+            "<text x=\"{}\" y=\"{axis_y}\" text-anchor=\"middle\">{label}</text>",
+            strip_age_x(age_min),
+        );
+    }
+    s.push_str("</g></svg>");
     s
 }
 
