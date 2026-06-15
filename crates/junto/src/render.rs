@@ -1255,6 +1255,77 @@ fn wait_time(millis: i64) -> Option<String> {
     }
 }
 
+// ---- the lineage strip (redesigned human surface, §3.2) ----
+
+/// One track on the lineage strip — a channel rendered as a horizontal line.
+/// Diverge/converge edges arrive with the lineage ADR (`docs/attention.md`);
+/// in the redesign-first surface every track is flat.
+pub struct Track {
+    pub id: ChannelId,
+    pub name: Option<String>,
+    /// An open gate awaits the member on this channel.
+    pub needs_you: bool,
+    pub last_activity: Option<junto_kernel::Timestamp>,
+}
+
+impl Track {
+    /// A placeholder main-line for the no-channel case (an empty workspace).
+    pub fn empty() -> Self {
+        Track {
+            id: ChannelId::new(),
+            name: None,
+            needs_you: false,
+            last_activity: None,
+        }
+    }
+}
+
+/// The strip's model for one workspace: the ambient channel pinned as the
+/// bottom main-line, the rest stacked above newest-first.
+pub struct LineageModel {
+    pub mainline: Track,
+    pub branches: Vec<Track>,
+}
+
+impl LineageModel {
+    /// Shape the (workspace-scoped) summaries. The **main-line** is the
+    /// ambient channel — its name equals the substrate's directory name;
+    /// absent that, the least-recently-active open channel (the de-facto
+    /// trunk). The rest are branches, newest-first. Closed channels drop out.
+    pub fn from_summaries(summaries: &[ChannelSummary], substrate: &std::path::Path) -> Self {
+        let track = |s: &ChannelSummary| Track {
+            id: s.id,
+            name: s.name.clone(),
+            needs_you: s.open_gates > 0,
+            last_activity: s.last_activity,
+        };
+        let dir = substrate
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned());
+        let mut open: Vec<&ChannelSummary> = summaries.iter().filter(|s| !s.closed).collect();
+        if open.is_empty() {
+            return LineageModel {
+                mainline: Track::empty(),
+                branches: Vec::new(),
+            };
+        }
+        // newest-first
+        open.sort_by_key(|s| std::cmp::Reverse(s.last_activity));
+        let main_idx = open
+            .iter()
+            .position(|s| s.name == dir)
+            .unwrap_or(open.len() - 1); // else the oldest (the de-facto trunk)
+        let mainline = track(open[main_idx]);
+        let branches = open
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != main_idx)
+            .map(|(_, s)| track(s))
+            .collect();
+        LineageModel { mainline, branches }
+    }
+}
+
 // ---- the focus board (docs/attention.md) ----
 
 /// The needs-you board: every act awaiting the member, grouped by inquiry —
@@ -2563,6 +2634,40 @@ mod tests {
     use super::*;
     use junto_kernel::{EntryId, Member, Timestamp};
     use std::collections::HashMap;
+
+    fn summary(name: &str, repo: &std::path::Path, secs: i64, gates: usize) -> ChannelSummary {
+        ChannelSummary {
+            id: ChannelId::new(),
+            name: Some(name.to_string()),
+            substrate: repo.to_path_buf(),
+            entry_count: 1,
+            last_activity: Some(Timestamp::from_millis(secs * 1000)),
+            open_gates: gates,
+            members: 1,
+            latest: None,
+            closed: false,
+        }
+    }
+
+    #[test]
+    fn lineage_model_pins_ambient_as_mainline_and_orders_branches_newest_first() {
+        let repo = std::path::PathBuf::from("/x/junto-ledger");
+        // ambient channel shares the repo's dir name; others are side tracks.
+        let summaries = vec![
+            summary("agent-ui", &repo, 30, 0),
+            summary("junto-ledger", &repo, 10, 0),
+            summary("ui-redesign", &repo, 90, 1),
+        ];
+        let model = LineageModel::from_summaries(&summaries, &repo);
+        assert_eq!(model.mainline.name.as_deref(), Some("junto-ledger"));
+        let names: Vec<_> = model
+            .branches
+            .iter()
+            .map(|t| t.name.as_deref().unwrap())
+            .collect();
+        assert_eq!(names, vec!["ui-redesign", "agent-ui"]);
+        assert!(model.branches[0].needs_you); // ui-redesign has an open gate
+    }
 
     fn view_with(entries: Vec<LedgerEntry>) -> ChannelView {
         let mut standings = HashMap::new();
