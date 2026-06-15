@@ -915,12 +915,89 @@ fn app_page(
     )
 }
 
+/// The "all channels" cards section — one card per channel with its preview,
+/// entry count, members, and last-activity (the detail the compact strip
+/// can't carry). Closed channels archive in a collapsed section below.
+fn channel_cards(summaries: &[ChannelSummary]) -> String {
+    let mut cards = String::new();
+    let mut closed_cards = String::new();
+    for summary in summaries {
+        let display_name = summary.name.as_deref().unwrap_or("(unopened)");
+        let href = summary
+            .name
+            .clone()
+            .unwrap_or_else(|| summary.id.to_string());
+        let gates = if summary.closed {
+            "<span class=\"badge quiet\">closed</span>".to_string()
+        } else if summary.open_gates > 0 {
+            format!(
+                "<span class=\"badge pending\">{} open gate{}</span>",
+                summary.open_gates,
+                if summary.open_gates == 1 { "" } else { "s" }
+            )
+        } else {
+            "<span class=\"badge quiet\">no open gates</span>".to_string()
+        };
+        let preview = summary
+            .latest
+            .as_deref()
+            .map(|latest| format!("<div class=\"preview\">{}</div>", escape_html(latest)))
+            .unwrap_or_default();
+        let when = summary
+            .last_activity
+            .map(|ts| format!(" · active {}", escape_html(&ago(ts.as_millis()))))
+            .unwrap_or_default();
+        let members = if summary.members > 0 {
+            format!(
+                " · {} member{}",
+                summary.members,
+                if summary.members == 1 { "" } else { "s" }
+            )
+        } else {
+            String::new()
+        };
+        let card = format!(
+            "<a class=\"card-link\" href=\"/channels/{href}\"><article class=\"card chan-card\">\
+             <header><h2>{name}</h2><span class=\"spacer\"></span>{gates}</header>\
+             {preview}\
+             <div class=\"meta-line\">{count} entries{members}{when}</div>\
+             </article></a>\n",
+            href = escape_html(&href),
+            name = escape_html(display_name),
+            count = summary.entry_count,
+        );
+        if summary.closed {
+            closed_cards.push_str(&card);
+        } else {
+            cards.push_str(&card);
+        }
+    }
+    let open_count = summaries.iter().filter(|s| !s.closed).count();
+    let body = if open_count == 0 {
+        "<p class=\"empty\">no open channels — open one below</p>".to_string()
+    } else {
+        format!("<div class=\"cards\">{cards}</div>")
+    };
+    let archive = if closed_cards.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<details class=\"ledger\"><summary class=\"board-head\">closed channels \
+             ({})</summary>\n<div class=\"cards\">{closed_cards}</div></details>\n",
+            summaries.len() - open_count
+        )
+    };
+    format!("<h2 class=\"board-head\">all channels</h2>\n{body}\n{archive}")
+}
+
 /// The redesigned index (redesign spec §3): the shared chrome over the focus
-/// board, scoped to one workspace. `attention` is already scoped to `active`.
+/// board plus the channel cards, scoped to one workspace. `summaries` and
+/// `attention` are already scoped to `active`.
 pub fn new_index_html(
     workspaces: &[std::path::PathBuf],
     active: &std::path::Path,
     model: &LineageModel,
+    summaries: &[ChannelSummary],
     attention: &[AttentionGroup],
     identity: Option<&str>,
 ) -> String {
@@ -931,6 +1008,11 @@ pub fn new_index_html(
         .flat_map(|group| &group.items)
         .filter(|item| matches!(item.kind, AttentionKind::Gate))
         .count();
+    let main = format!(
+        "{board}\n{cards}",
+        board = focus_board(attention, "/"),
+        cards = channel_cards(summaries),
+    );
     app_page(
         "junto",
         workspaces,
@@ -940,7 +1022,7 @@ pub fn new_index_html(
         identity,
         agents_working,
         open_gates,
-        &focus_board(attention, "/"),
+        &main,
     )
 }
 
@@ -1925,7 +2007,7 @@ pub fn channel_html(
     };
     let content = format!(
         "<h1>{name}</h1>\n\
-         <p class=\"meta\">channel {id} · {count} entries · read-only projection</p>\n\
+         <p class=\"meta\">{count} entries</p>\n\
          {rename}{lifecycle}{party}{strip}{start_work}{sessions}{standing}{recently}{footer}\
          <details class=\"ledger\"><summary class=\"board-head\">the full ledger \
          ({count} entries)</summary>\n{body}</details>\n{open_here}",
@@ -2273,14 +2355,12 @@ fn entry_card(entry: &LedgerEntry, view: &ChannelView, channel: &ChannelId) -> S
          <span class=\"who\" title=\"{email}\">{who}</span>\
          <span class=\"when\">{when}</span></header>\
          {statement}{target}{rationale}{provenance}\
-         <footer class=\"id\">{id}</footer>\
          {form}</article>",
         family = entry_family(&entry.payload),
         flag = if unrecognized { " flagged" } else { "" },
         email = escape_html(&entry.author.email),
         who = escape_html(&entry.author.display_name),
         when = escape_html(&iso_utc(entry.timestamp.as_millis())),
-        id = entry.id,
         form = verification_form(entry, view, channel),
     )
 }
@@ -2445,13 +2525,11 @@ fn sessions_section(view: &ChannelView, channel: &ChannelId) -> String {
              <span class=\"who\" title=\"{email}\">{who}</span>\
              <span class=\"when\">{when}</span></header>\
              <div class=\"statement\">{intent}</div>\
-             {artifacts}{steer}\
-             <footer class=\"id\">{id}</footer></article>",
+             {artifacts}{steer}</article>",
             email = escape_html(&entry.author.email),
             who = escape_html(&entry.author.display_name),
             when = escape_html(&iso_utc(entry.timestamp.as_millis())),
             intent = escape_html(intent),
-            id = entry.id,
         );
     }
     if cards.is_empty() {
@@ -3063,9 +3141,17 @@ mod tests {
         let repo = std::path::PathBuf::from("/x/junto-ledger");
         let summaries = vec![summary("junto-ledger", &repo, 1, 0)];
         let model = LineageModel::from_summaries(&summaries, &repo);
-        let html = new_index_html(std::slice::from_ref(&repo), &repo, &model, &[], None);
+        let html = new_index_html(
+            std::slice::from_ref(&repo),
+            &repo,
+            &model,
+            &summaries,
+            &[],
+            None,
+        );
         assert!(html.contains("class=\"topbar\""));
         assert!(html.contains("<svg")); // the strip
+        assert!(html.contains("all channels")); // the cards section is back
         assert!(html.contains("redesigned human surface")); // the new stylesheet
     }
 

@@ -150,6 +150,7 @@ async fn index_page(
                     std::path::Path::new(""),
                     &empty,
                     &[],
+                    &[],
                     None,
                 ))
                 .into_response();
@@ -175,6 +176,7 @@ async fn index_page(
                 &substrates,
                 &active,
                 &model,
+                &scoped,
                 &scoped_attention,
                 who,
             ))
