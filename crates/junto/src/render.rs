@@ -790,6 +790,10 @@ fn page_shell(
 /// the landing page of the one surface (`docs/adr/0015`). Leads with the
 /// focus board (what needs you, grouped by inquiry — `docs/attention.md`),
 /// then the channel cards: who is on each, how alive it is, the latest entry.
+// Superseded by `new_index_html` (the redesigned index); kept with its test
+// until Plan 3 retires the remaining `page_shell`-based pages (and with it
+// `ago` and the `ChannelSummary::{members, latest}` card fields it reads).
+#[allow(dead_code)]
 pub fn index_html(summaries: &[ChannelSummary], attention: &[AttentionGroup]) -> String {
     let mut cards = String::new();
     let mut closed_cards = String::new();
@@ -882,6 +886,35 @@ pub fn index_html(summaries: &[ChannelSummary], attention: &[AttentionGroup]) ->
         board = focus_board(attention, "/"),
     );
     page_shell("junto — channels", summaries, None, &content)
+}
+
+/// The redesigned index (redesign spec §3): top bar + bottom-pinned lineage
+/// strip + the focus board, scoped to one workspace. `summaries` and
+/// `attention` are already scoped to `active`.
+pub fn new_index_html(
+    workspaces: &[std::path::PathBuf],
+    active: &std::path::Path,
+    model: &LineageModel,
+    attention: &[AttentionGroup],
+    identity: Option<&str>,
+) -> String {
+    // Sessions wiring (the live-agent count) lands in a later plan slice.
+    let agents_working = 0;
+    let open_gates: usize = attention
+        .iter()
+        .flat_map(|group| &group.items)
+        .filter(|item| matches!(item.kind, AttentionKind::Gate))
+        .count();
+    format!(
+        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <title>junto</title>\n<style>{CSS}{APP_CSS}</style></head>\n<body>\n\
+         {bar}\n<div class=\"strip\">{strip}</div>\n\
+         <main class=\"pane\">{board}</main>\n</body></html>\n",
+        bar = top_bar(workspaces, active, agents_working, open_gates, identity),
+        strip = lineage_strip(model, None),
+        board = focus_board(attention, "/"),
+    )
 }
 
 /// The "/new" page — where the sidebar's "+ new" menu lands: open a channel
@@ -1265,7 +1298,6 @@ pub struct Track {
     pub name: Option<String>,
     /// An open gate awaits the member on this channel.
     pub needs_you: bool,
-    pub last_activity: Option<junto_kernel::Timestamp>,
 }
 
 impl Track {
@@ -1275,7 +1307,6 @@ impl Track {
             id: ChannelId::new(),
             name: None,
             needs_you: false,
-            last_activity: None,
         }
     }
 }
@@ -1297,7 +1328,6 @@ impl LineageModel {
             id: s.id,
             name: s.name.clone(),
             needs_you: s.open_gates > 0,
-            last_activity: s.last_activity,
         };
         let dir = substrate
             .file_name()
@@ -1324,6 +1354,178 @@ impl LineageModel {
             .collect();
         LineageModel { mainline, branches }
     }
+}
+
+/// Branches shown before the walk-back expander kicks in.
+const STRIP_WINDOW: usize = 3;
+/// Vertical spacing between tracks, in SVG units.
+const STRIP_ROW: i32 = 30;
+
+/// One track's now-cap: a glowing filled dot when it's live/needs-you, an
+/// outlined hollow dot when it's quiet.
+fn strip_cap(x: i32, y: i32, color: &str, live: bool) -> String {
+    if live {
+        format!(
+            "<circle cx=\"{x}\" cy=\"{y}\" r=\"5.5\" fill=\"{color}\" class=\"capglow\" \
+             filter=\"url(#glow)\"/>"
+        )
+    } else {
+        format!(
+            "<circle cx=\"{x}\" cy=\"{y}\" r=\"4.5\" fill=\"#0e1217\" stroke=\"{color}\" \
+             stroke-width=\"2\"/>"
+        )
+    }
+}
+
+/// The bottom-pinned, windowed lineage strip (redesign spec §3.2): the
+/// workspace's main-line pinned at the bottom, branches stacked above it
+/// newest-nearest-spine, windowed to [`STRIP_WINDOW`] with a "walk back"
+/// expander when older ones are hidden. `selected` highlights one track.
+/// Tracks are **flat** — diverge/converge edges arrive with the lineage ADR.
+pub fn lineage_strip(model: &LineageModel, selected: Option<&ChannelId>) -> String {
+    let hidden = model.branches.len().saturating_sub(STRIP_WINDOW);
+    let shown = &model.branches[..model.branches.len().min(STRIP_WINDOW)];
+    let n = shown.len() as i32;
+    let pad_top = 26;
+    let spine_y = pad_top + n * STRIP_ROW;
+    let height = spine_y + 54;
+    let now_x = 1140;
+    let y_of = |i: i32| spine_y - (i + 1) * STRIP_ROW;
+
+    let mut s = format!(
+        "<svg viewBox=\"0 0 1200 {height}\" role=\"img\"><defs><filter id=\"glow\">\
+         <feGaussianBlur stdDeviation=\"2.5\" result=\"b\"/><feMerge><feMergeNode in=\"b\"/>\
+         <feMergeNode in=\"SourceGraphic\"/></feMerge></filter></defs>"
+    );
+
+    // selected-track highlight band
+    let sel_y = if selected == Some(&model.mainline.id) {
+        Some(spine_y)
+    } else {
+        shown
+            .iter()
+            .position(|b| Some(&b.id) == selected)
+            .map(|i| y_of(i as i32))
+    };
+    if let Some(y) = sel_y {
+        let _ = write!(
+            s,
+            "<rect class=\"strip-sel\" x=\"0\" y=\"{}\" width=\"1200\" height=\"26\"/>",
+            y - 13
+        );
+    }
+
+    // now line + label
+    let _ = write!(
+        s,
+        "<line class=\"now\" x1=\"{now_x}\" y1=\"12\" x2=\"{now_x}\" y2=\"{}\"/>\
+         <text x=\"{now_x}\" y=\"9\" text-anchor=\"middle\" class=\"nowlab\">now</text>",
+        spine_y + 8
+    );
+
+    // walk-back expander (older history lives upward)
+    if hidden > 0 {
+        let _ = write!(
+            s,
+            "<a href=\"/?w=&expanded=1\"><text x=\"200\" y=\"16\" text-anchor=\"end\" \
+             class=\"strip-expand\">⌃ {hidden} older side-quest{} — walk back</text></a>",
+            if hidden == 1 { "" } else { "s" }
+        );
+    }
+
+    // branches (flat lines, newest nearest the spine)
+    for (i, b) in shown.iter().enumerate() {
+        let ty = y_of(i as i32);
+        let color = if b.needs_you { "#ffb454" } else { "#7d8696" };
+        let label = b.name.as_deref().unwrap_or("(unopened)");
+        let sel = if Some(&b.id) == selected { " sel" } else { "" };
+        let href = b.name.clone().unwrap_or_else(|| b.id.to_string());
+        let _ = write!(
+            s,
+            "<a href=\"/channels/{href}\"><text x=\"200\" y=\"{}\" text-anchor=\"end\" \
+             class=\"track{sel}\">{label}</text>\
+             <line class=\"track-line\" x1=\"220\" y1=\"{ty}\" x2=\"{now_x}\" y2=\"{ty}\" \
+             stroke=\"{color}\" stroke-width=\"{}\"/>\
+             <circle cx=\"220\" cy=\"{ty}\" r=\"4\" fill=\"{color}\"/>{cap}</a>",
+            ty,
+            if b.needs_you { 3 } else { 2 },
+            href = escape_html(&href),
+            label = escape_html(label),
+            cap = strip_cap(now_x, ty, color, b.needs_you),
+        );
+    }
+
+    // the pinned main-line at the bottom, label below the line
+    let sp = &model.mainline;
+    let sp_label = sp.name.as_deref().unwrap_or("(no channels)");
+    let sp_sel = if selected == Some(&sp.id) { " sel" } else { "" };
+    let sp_href = sp.name.clone().unwrap_or_else(|| sp.id.to_string());
+    let _ = write!(
+        s,
+        "<a href=\"/channels/{href}\">\
+         <line class=\"mainline\" x1=\"120\" y1=\"{spine_y}\" x2=\"{now_x}\" y2=\"{spine_y}\" \
+         stroke=\"#5b9dff\" stroke-width=\"3\"/>\
+         <circle cx=\"120\" cy=\"{spine_y}\" r=\"5\" fill=\"#5b9dff\"/>{cap}\
+         <text x=\"120\" y=\"{}\" text-anchor=\"start\" class=\"track mainline-label{sp_sel}\">\
+         {label} <tspan class=\"track-sub\">· main line</tspan></text></a>",
+        spine_y + 22,
+        href = escape_html(&sp_href),
+        label = escape_html(sp_label),
+        cap = strip_cap(now_x, spine_y, "#5b9dff", true),
+    );
+
+    // time axis below the spine label
+    let axis_y = spine_y + 42;
+    let _ = write!(
+        s,
+        "<g class=\"axis\">\
+         <text x=\"430\" y=\"{axis_y}\" text-anchor=\"middle\">5d</text>\
+         <text x=\"600\" y=\"{axis_y}\" text-anchor=\"middle\">3d</text>\
+         <text x=\"760\" y=\"{axis_y}\" text-anchor=\"middle\">1d</text>\
+         <text x=\"920\" y=\"{axis_y}\" text-anchor=\"middle\">8h</text>\
+         <text x=\"1010\" y=\"{axis_y}\" text-anchor=\"middle\">3h</text></g></svg>"
+    );
+    s
+}
+
+/// The redesigned top bar (redesign spec §3.1): wordmark, workspace switcher
+/// (scopes the strip), live status (agents working · gates awaiting you), and
+/// the identity the human-surface acts author as.
+pub fn top_bar(
+    workspaces: &[std::path::PathBuf],
+    active: &std::path::Path,
+    agents_working: usize,
+    open_gates: usize,
+    identity: Option<&str>,
+) -> String {
+    let dir = |p: &std::path::Path| {
+        p.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| p.display().to_string())
+    };
+    let mut menu = String::new();
+    for w in workspaces {
+        let _ = write!(
+            menu,
+            "<a href=\"/?w={}\">{}</a>",
+            escape_html(&w.display().to_string()),
+            escape_html(&dir(w)),
+        );
+    }
+    let who = identity.map(escape_html).unwrap_or_default();
+    format!(
+        "<header class=\"topbar\"><a class=\"brand\" href=\"/\"><span class=\"logo\">j</span>junto</a>\
+         <div class=\"ws\"><span class=\"ws-cur\">▣ {active} <span class=\"car\">▾</span></span>\
+         <div class=\"ws-menu\">{menu}</div></div>\
+         <span class=\"spacer\"></span>\
+         <span class=\"live\"><span class=\"pulse\"></span>{agents_working} agent{ap} working · \
+         {open_gates} gate{gp} need{gn} you</span>\
+         <span class=\"who\"><span class=\"pa\">D</span>{who}</span></header>",
+        active = escape_html(&dir(active)),
+        ap = if agents_working == 1 { "" } else { "s" },
+        gp = if open_gates == 1 { "" } else { "s" },
+        gn = if open_gates == 1 { "s" } else { "" },
+    )
 }
 
 // ---- the focus board (docs/attention.md) ----
@@ -2381,6 +2583,46 @@ rows.appendChild(clone);});</script>";
 /// blob, no external assets — the pages must render identically in
 /// the desktop shell's webview and a plain browser, offline. (JS: a single
 /// inline act-feedback script, [`ACT_FEEDBACK_SCRIPT`] — nothing else.)
+/// The redesigned surface's supplemental stylesheet (redesign spec §2),
+/// layered after [`CSS`] so the focus board keeps its existing styling while
+/// the new top bar and lineage strip get the new design language. The leading
+/// marker token lets tests assert the new sheet is in use.
+const APP_CSS: &str = "\
+/* redesigned human surface */\
+:root{--ink2:#e6e9ee;--dim2:#7d8696;--faint2:#525b69;--accent2:#5b9dff;--warn2:#ffb454;--ok2:#5fd3a6;--line2:#1f2630}\
+body{margin:0}\
+.topbar{display:flex;align-items:center;gap:14px;padding:12px 24px;border-bottom:1px solid var(--line2);background:#0e1217}\
+.topbar .brand{display:flex;align-items:center;gap:9px;font-weight:700;font-size:16px;color:var(--ink2);text-decoration:none}\
+.topbar .logo{width:24px;height:24px;border-radius:7px;background:linear-gradient(135deg,#5b9dff,#b98cff);display:grid;place-items:center;color:#fff;font-weight:800;font-size:14px}\
+.topbar .spacer{flex:1}\
+.ws{position:relative}\
+.ws-cur{display:inline-flex;align-items:center;gap:9px;padding:6px 11px;border:1px solid var(--line2);border-radius:9px;background:#10141a;color:var(--ink2);font-size:13px;font-weight:600;cursor:pointer}\
+.ws .car{color:var(--faint2);font-size:11px}\
+.ws-menu{position:absolute;top:38px;left:0;background:#11161d;border:1px solid var(--line2);border-radius:9px;padding:5px;min-width:200px;display:none;z-index:30;box-shadow:0 8px 24px #0008}\
+.ws:hover .ws-menu{display:block}\
+.ws-menu a{display:block;padding:8px 10px;border-radius:7px;color:var(--dim2);text-decoration:none;font-size:13px}\
+.ws-menu a:hover{background:#172030;color:var(--ink2)}\
+.topbar .live{display:flex;align-items:center;gap:7px;font-size:13px;color:var(--dim2)}\
+.topbar .pulse{width:8px;height:8px;border-radius:50%;background:var(--ok2);box-shadow:0 0 8px var(--ok2);animation:jpulse 1.6s infinite}\
+@keyframes jpulse{0%,100%{opacity:1}50%{opacity:.35}}\
+.topbar .who{display:flex;align-items:center;gap:8px;color:var(--dim2);font-size:13px}\
+.topbar .pa{width:28px;height:28px;border-radius:7px;background:#2a3340;display:grid;place-items:center;font-weight:700;color:var(--dim2);font-size:12px}\
+.strip{background:#0e1217;border-bottom:1px solid var(--line2);padding:6px 0 0}\
+.strip svg{width:100%;height:auto;display:block}\
+.strip .track{font:600 12px Inter,system-ui,sans-serif;fill:var(--dim2);cursor:pointer}\
+.strip .track.sel{fill:var(--warn2)}\
+.strip .mainline-label{font-weight:700;fill:var(--ink2)}\
+.strip .track-sub{font-weight:500;fill:var(--faint2);font-size:10px}\
+.strip .track-line,.strip .mainline,.strip a{cursor:pointer}\
+.strip .strip-sel{fill:#ffb4540d}\
+.strip .now{stroke:#5b9dff55;stroke-width:1.5;stroke-dasharray:3 5}\
+.strip .nowlab{font:600 10px 'JetBrains Mono',monospace;fill:var(--accent2)}\
+.strip .axis{font:500 10px 'JetBrains Mono',monospace;fill:var(--faint2)}\
+.strip .strip-expand{font:600 11px Inter,system-ui,sans-serif;fill:var(--dim2);cursor:pointer}\
+.strip .capglow{animation:jpulse 1.8s infinite}\
+.pane{padding:20px 26px 60px}\
+";
+
 const CSS: &str = "\
 :root{--bg:#11111b;--panel:#181825;--card:#1e1e2e;--border:#313244;--text:#cdd6f4;\
 --muted:#7f849c;--soft:#a6adc8;--accent:#89b4fa;--green:#a6e3a1;--yellow:#f9e2af;\
@@ -2667,6 +2909,59 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["ui-redesign", "agent-ui"]);
         assert!(model.branches[0].needs_you); // ui-redesign has an open gate
+    }
+
+    #[test]
+    fn lineage_strip_pins_mainline_windows_branches_and_marks_selection() {
+        let repo = std::path::PathBuf::from("/x/junto-ledger");
+        // 1 ambient + 5 branches → 2 hidden behind the expander (WINDOW = 3).
+        let summaries = vec![
+            summary("junto-ledger", &repo, 1, 0),
+            summary("ui-redesign", &repo, 90, 1),
+            summary("acp", &repo, 80, 0),
+            summary("terminology", &repo, 70, 0),
+            summary("agent-ui", &repo, 60, 0),
+            summary("ci", &repo, 50, 0),
+        ];
+        let model = LineageModel::from_summaries(&summaries, &repo);
+        let selected = model.branches[0].id; // ui-redesign
+        let html = lineage_strip(&model, Some(&selected));
+        assert!(html.contains("junto-ledger")); // the main-line label
+        assert!(html.contains("walk back")); // the expander, since hidden > 0
+        assert!(html.contains("ui-redesign"));
+        assert!(!html.contains(">ci<")); // 5th branch is windowed out
+        assert!(html.contains("strip-sel")); // selection highlight band
+    }
+
+    #[test]
+    fn top_bar_shows_workspace_live_status_and_identity() {
+        let workspaces = vec![
+            std::path::PathBuf::from("/x/junto-ledger"),
+            std::path::PathBuf::from("/x/wmux"),
+        ];
+        let html = top_bar(
+            &workspaces,
+            &std::path::PathBuf::from("/x/junto-ledger"),
+            1,
+            2,
+            Some("Dan Cieslak"),
+        );
+        assert!(html.contains("junto-ledger")); // active workspace
+        assert!(html.contains("wmux")); // switcher offers the other
+        assert!(html.contains("1 agent")); // live status
+        assert!(html.contains("2 gate")); // gate count
+        assert!(html.contains("Dan Cieslak")); // identity
+    }
+
+    #[test]
+    fn new_index_html_frames_top_bar_and_strip() {
+        let repo = std::path::PathBuf::from("/x/junto-ledger");
+        let summaries = vec![summary("junto-ledger", &repo, 1, 0)];
+        let model = LineageModel::from_summaries(&summaries, &repo);
+        let html = new_index_html(&[repo.clone()], &repo, &model, &[], None);
+        assert!(html.contains("class=\"topbar\""));
+        assert!(html.contains("<svg")); // the strip
+        assert!(html.contains("redesigned human surface")); // the new stylesheet
     }
 
     fn view_with(entries: Vec<LedgerEntry>) -> ChannelView {

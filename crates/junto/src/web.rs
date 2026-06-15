@@ -117,14 +117,68 @@ fn internal(message: String) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, message).into_response()
 }
 
-async fn index_page(State(host): State<Arc<Host>>) -> Response {
-    // One projection sweep yields both the board and the cards — projection
-    // is the page's whole cost, so it must not run twice.
+/// Index query: `?w=` scopes the page to one workspace (home substrate). An
+/// unrecognized `expanded` flag (the strip's walk-back link) is ignored for now.
+#[derive(Debug, Deserialize)]
+struct IndexQuery {
+    #[serde(default)]
+    w: String,
+}
+
+async fn index_page(
+    State(host): State<Arc<Host>>,
+    axum::extract::Query(query): axum::extract::Query<IndexQuery>,
+) -> Response {
+    let substrates = host.substrate_paths().unwrap_or_default();
+    // The active workspace: the requested one, else the first registered.
+    let active = if query.w.trim().is_empty() {
+        substrates.first().cloned()
+    } else {
+        Some(std::path::PathBuf::from(query.w.trim()))
+    };
+    // One projection sweep yields both the strip and the board.
     match host.overview().await {
-        Ok((mut summaries, attention)) => {
-            // Most recently active first — the resumption order.
-            summaries.sort_by_key(|summary| std::cmp::Reverse(summary.last_activity));
-            Html(render::index_html(&summaries, &attention)).into_response()
+        Ok((summaries, attention)) => {
+            let Some(active) = active else {
+                // No registered substrate at all: render an empty shell.
+                let empty = render::LineageModel {
+                    mainline: render::Track::empty(),
+                    branches: Vec::new(),
+                };
+                return Html(render::new_index_html(
+                    &substrates,
+                    std::path::Path::new(""),
+                    &empty,
+                    &[],
+                    None,
+                ))
+                .into_response();
+            };
+            // Scope to the active workspace: its channels (for the strip) and
+            // their attention groups (for the board).
+            let scoped: Vec<_> = summaries
+                .iter()
+                .filter(|summary| summary.substrate == active)
+                .cloned()
+                .collect();
+            let in_workspace: std::collections::HashSet<ChannelId> =
+                scoped.iter().map(|summary| summary.id).collect();
+            let scoped_attention: Vec<_> = attention
+                .iter()
+                .filter(|group| in_workspace.contains(&group.channel))
+                .cloned()
+                .collect();
+            let model = render::LineageModel::from_summaries(&scoped, &active);
+            let identity = crate::host::git_user(&active).ok();
+            let who = identity.as_ref().map(|member| member.display_name.as_str());
+            Html(render::new_index_html(
+                &substrates,
+                &active,
+                &model,
+                &scoped_attention,
+                who,
+            ))
+            .into_response()
         }
         Err(err) => internal(format!("listing channels: {err}")),
     }
