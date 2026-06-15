@@ -1525,19 +1525,27 @@ fn strip_time_x(last_activity: Option<junto_kernel::Timestamp>) -> i32 {
 }
 
 /// The bottom-pinned, windowed lineage strip (redesign spec §3.2): the
-/// workspace's main-line pinned at the bottom, branches stacked above it
-/// newest-nearest-spine, windowed to [`STRIP_WINDOW`] with a "walk back"
-/// expander when older ones are hidden. `selected` highlights one track.
-/// Tracks are **flat** — diverge/converge edges arrive with the lineage ADR.
+/// workspace's main-line pinned at the bottom (the baseline), branches stacked
+/// above it with the **newest highest** and the oldest nearest the baseline,
+/// time increasing to the right. Windowed to [`STRIP_WINDOW`] with a "walk
+/// back" expander (toward the baseline) when older ones are hidden. `selected`
+/// highlights one track. Tracks are **flat** — diverge/converge edges arrive
+/// with the lineage ADR.
 pub fn lineage_strip(model: &LineageModel, selected: Option<&ChannelId>) -> String {
     let hidden = model.branches.len().saturating_sub(STRIP_WINDOW);
     let shown = &model.branches[..model.branches.len().min(STRIP_WINDOW)];
     let n = shown.len() as i32;
+    // Rows above the baseline: the shown branches, plus one for the expander
+    // (which sits nearest the baseline, since "older" is downward).
+    let extra = i32::from(hidden > 0);
+    let rows_above = n + extra;
     let pad_top = 26;
-    let spine_y = pad_top + n * STRIP_ROW;
+    let spine_y = pad_top + rows_above * STRIP_ROW;
     let height = spine_y + 54;
     let now_x = 1140;
-    let y_of = |i: i32| spine_y - (i + 1) * STRIP_ROW;
+    // Newest branch (index 0) sits at the top; oldest shown nearest the
+    // baseline (just above the expander row when present).
+    let y_of = |i: i32| spine_y - (rows_above - i) * STRIP_ROW;
 
     let mut s = format!("<svg viewBox=\"0 0 1200 {height}\" role=\"img\">");
 
@@ -1566,18 +1574,19 @@ pub fn lineage_strip(model: &LineageModel, selected: Option<&ChannelId>) -> Stri
         spine_y + 8
     );
 
-    // walk-back expander (older history lives upward)
+    // walk-back expander, nearest the baseline (older history lives downward)
     if hidden > 0 {
         let _ = write!(
             s,
-            "<a href=\"/?w=&expanded=1\"><text x=\"200\" y=\"16\" text-anchor=\"end\" \
-             class=\"strip-expand\">⌃ {hidden} older side-quest{} — walk back</text></a>",
+            "<a href=\"/?w=&expanded=1\"><text x=\"200\" y=\"{}\" text-anchor=\"end\" \
+             class=\"strip-expand\">⌄ {hidden} older side-quest{} — walk back</text></a>",
+            (spine_y - STRIP_ROW) + 4,
             if hidden == 1 { "" } else { "s" }
         );
     }
 
-    // branches: flat lines, newest nearest the spine, ending at last-activity
-    // along the time axis (only recent work reaches "now").
+    // branches: flat lines, newest highest, ending at last-activity along the
+    // time axis (only recent work reaches "now").
     let left_x = STRIP_LEFT_X as i32;
     for (i, b) in shown.iter().enumerate() {
         let ty = y_of(i as i32);
