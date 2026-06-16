@@ -1594,16 +1594,26 @@ pub fn lineage_strip(model: &LineageModel, selected: Option<&ChannelId>) -> Stri
         let label = b.name.as_deref().unwrap_or("(unopened)");
         let sel = if Some(&b.id) == selected { " sel" } else { "" };
         let href = b.name.clone().unwrap_or_else(|| b.id.to_string());
-        let end_x = strip_time_x(b.last_activity).max(left_x + 1);
+        let end_x = strip_time_x(b.last_activity).max(left_x + 80);
+        // The branch diverges off the baseline ~300px before its last-activity
+        // end — a curve up off the spine, then flat to the end cap (toprail's
+        // aesthetic). The diverge node sits on the main-line.
+        let dx = (end_x - 300).max(left_x);
+        let sw = if b.needs_you { 3 } else { 2 };
+        let path = format!(
+            "M{dx},{spine_y} C{c1},{spine_y} {c2},{ty} {c3},{ty} L{end_x},{ty}",
+            c1 = dx + 24,
+            c2 = dx + 14,
+            c3 = dx + 46,
+        );
         let _ = write!(
             s,
-            "<a href=\"/channels/{href}\"><text x=\"200\" y=\"{}\" text-anchor=\"end\" \
+            "<a href=\"/channels/{href}\"><text x=\"200\" y=\"{ylab}\" text-anchor=\"end\" \
              class=\"track{sel}\">{label}</text>\
-             <line class=\"track-line\" x1=\"{left_x}\" y1=\"{ty}\" x2=\"{end_x}\" y2=\"{ty}\" \
-             stroke=\"{color}\" stroke-width=\"{}\"/>\
-             <circle cx=\"{left_x}\" cy=\"{ty}\" r=\"4\" fill=\"{color}\"/>{cap}</a>",
-            ty,
-            if b.needs_you { 3 } else { 2 },
+             <path class=\"track-line\" d=\"{path}\" stroke=\"{color}\" stroke-width=\"{sw}\" \
+             fill=\"none\"/>\
+             <circle cx=\"{dx}\" cy=\"{spine_y}\" r=\"3\" fill=\"{color}\"/>{cap}</a>",
+            ylab = ty + 4,
             href = escape_html(&href),
             label = escape_html(label),
             cap = strip_cap(end_x, ty, color, b.needs_you),
