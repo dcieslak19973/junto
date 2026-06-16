@@ -790,6 +790,10 @@ fn page_shell(
 /// the landing page of the one surface (`docs/adr/0015`). Leads with the
 /// focus board (what needs you, grouped by inquiry — `docs/attention.md`),
 /// then the channel cards: who is on each, how alive it is, the latest entry.
+// Superseded by `new_index_html` (the redesigned index); kept with its test
+// until Plan 3 retires the remaining `page_shell`-based pages (and with it
+// `ago` and the `ChannelSummary::{members, latest}` card fields it reads).
+#[allow(dead_code)]
 pub fn index_html(summaries: &[ChannelSummary], attention: &[AttentionGroup]) -> String {
     let mut cards = String::new();
     let mut closed_cards = String::new();
@@ -882,6 +886,144 @@ pub fn index_html(summaries: &[ChannelSummary], attention: &[AttentionGroup]) ->
         board = focus_board(attention, "/"),
     );
     page_shell("junto — channels", summaries, None, &content)
+}
+
+/// The shared redesigned shell (redesign spec §3): top bar + bottom-pinned
+/// lineage strip + a `main` pane. Every redesigned page is this chrome with a
+/// different `main`; `selected` highlights the active track in the strip.
+#[allow(clippy::too_many_arguments)]
+fn app_page(
+    title: &str,
+    workspaces: &[std::path::PathBuf],
+    active: &std::path::Path,
+    model: &LineageModel,
+    selected: Option<&ChannelId>,
+    identity: Option<&str>,
+    agents_working: usize,
+    open_gates: usize,
+    main: &str,
+) -> String {
+    format!(
+        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <title>{title}</title>\n<style>{CSS}{APP_CSS}</style></head>\n<body>\n\
+         {bar}\n<div class=\"strip\">{strip}</div>\n\
+         <main class=\"pane\">{main}</main>\n{ACT_FEEDBACK_SCRIPT}{NAV_PROGRESS_SCRIPT}</body></html>\n",
+        title = escape_html(title),
+        bar = top_bar(workspaces, active, agents_working, open_gates, identity),
+        strip = lineage_strip(model, selected),
+    )
+}
+
+/// The "all channels" cards section — one card per channel with its preview,
+/// entry count, members, and last-activity (the detail the compact strip
+/// can't carry). Closed channels archive in a collapsed section below.
+fn channel_cards(summaries: &[ChannelSummary]) -> String {
+    let mut cards = String::new();
+    let mut closed_cards = String::new();
+    for summary in summaries {
+        let display_name = summary.name.as_deref().unwrap_or("(unopened)");
+        let href = summary
+            .name
+            .clone()
+            .unwrap_or_else(|| summary.id.to_string());
+        let gates = if summary.closed {
+            "<span class=\"badge quiet\">closed</span>".to_string()
+        } else if summary.open_gates > 0 {
+            format!(
+                "<span class=\"badge pending\">{} open gate{}</span>",
+                summary.open_gates,
+                if summary.open_gates == 1 { "" } else { "s" }
+            )
+        } else {
+            "<span class=\"badge quiet\">no open gates</span>".to_string()
+        };
+        let preview = summary
+            .latest
+            .as_deref()
+            .map(|latest| format!("<div class=\"preview\">{}</div>", escape_html(latest)))
+            .unwrap_or_default();
+        let when = summary
+            .last_activity
+            .map(|ts| format!(" · active {}", escape_html(&ago(ts.as_millis()))))
+            .unwrap_or_default();
+        let members = if summary.members > 0 {
+            format!(
+                " · {} member{}",
+                summary.members,
+                if summary.members == 1 { "" } else { "s" }
+            )
+        } else {
+            String::new()
+        };
+        let card = format!(
+            "<a class=\"card-link\" href=\"/channels/{href}\"><article class=\"card chan-card\">\
+             <header><h2>{name}</h2><span class=\"spacer\"></span>{gates}</header>\
+             {preview}\
+             <div class=\"meta-line\">{count} entries{members}{when}</div>\
+             </article></a>\n",
+            href = escape_html(&href),
+            name = escape_html(display_name),
+            count = summary.entry_count,
+        );
+        if summary.closed {
+            closed_cards.push_str(&card);
+        } else {
+            cards.push_str(&card);
+        }
+    }
+    let open_count = summaries.iter().filter(|s| !s.closed).count();
+    let body = if open_count == 0 {
+        "<p class=\"empty\">no open channels — open one below</p>".to_string()
+    } else {
+        format!("<div class=\"cards\">{cards}</div>")
+    };
+    let archive = if closed_cards.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<details class=\"ledger\"><summary class=\"board-head\">closed channels \
+             ({})</summary>\n<div class=\"cards\">{closed_cards}</div></details>\n",
+            summaries.len() - open_count
+        )
+    };
+    format!("<h2 class=\"board-head\">all channels</h2>\n{body}\n{archive}")
+}
+
+/// The redesigned index (redesign spec §3): the shared chrome over the focus
+/// board plus the channel cards, scoped to one workspace. `summaries` and
+/// `attention` are already scoped to `active`.
+pub fn new_index_html(
+    workspaces: &[std::path::PathBuf],
+    active: &std::path::Path,
+    model: &LineageModel,
+    summaries: &[ChannelSummary],
+    attention: &[AttentionGroup],
+    identity: Option<&str>,
+) -> String {
+    // Sessions wiring (the live-agent count) lands in a later plan slice.
+    let agents_working = 0;
+    let open_gates: usize = attention
+        .iter()
+        .flat_map(|group| &group.items)
+        .filter(|item| matches!(item.kind, AttentionKind::Gate))
+        .count();
+    let main = format!(
+        "{board}\n{cards}",
+        board = focus_board(attention, "/"),
+        cards = channel_cards(summaries),
+    );
+    app_page(
+        "junto",
+        workspaces,
+        active,
+        model,
+        None,
+        identity,
+        agents_working,
+        open_gates,
+        &main,
+    )
 }
 
 /// The "/new" page — where the sidebar's "+ new" menu lands: open a channel
@@ -1255,6 +1397,332 @@ fn wait_time(millis: i64) -> Option<String> {
     }
 }
 
+// ---- the lineage strip (redesigned human surface, §3.2) ----
+
+/// One track on the lineage strip — a channel rendered as a horizontal line.
+/// Diverge/converge edges arrive with the lineage ADR (`docs/attention.md`);
+/// in the redesign-first surface every track is flat.
+pub struct Track {
+    pub id: ChannelId,
+    pub name: Option<String>,
+    /// An open gate awaits the member on this channel.
+    pub needs_you: bool,
+    /// When the channel began (first entry) — its divergence point on the
+    /// time axis.
+    pub first_activity: Option<junto_kernel::Timestamp>,
+    /// When the channel was last active — its right end on the time axis (a
+    /// quiet channel ends earlier; only recent work reaches "now"). For a
+    /// converged channel this is also where it merges back.
+    pub last_activity: Option<junto_kernel::Timestamp>,
+    /// The channel is closed — drawn converging back to the baseline.
+    pub converged: bool,
+}
+
+impl Track {
+    /// A placeholder main-line for the no-channel case (an empty workspace).
+    pub fn empty() -> Self {
+        Track {
+            id: ChannelId::new(),
+            name: None,
+            needs_you: false,
+            first_activity: None,
+            last_activity: None,
+            converged: false,
+        }
+    }
+}
+
+/// The strip's model for one workspace: the ambient channel pinned as the
+/// bottom main-line, the rest stacked above newest-first.
+pub struct LineageModel {
+    pub mainline: Track,
+    pub branches: Vec<Track>,
+}
+
+impl LineageModel {
+    /// Shape the (workspace-scoped) summaries. The **main-line** is the
+    /// ambient channel — its name equals the substrate's directory name;
+    /// absent that, the least-recently-active open channel (the de-facto
+    /// trunk). The rest are branches, newest-first. Closed channels drop out.
+    pub fn from_summaries(summaries: &[ChannelSummary], substrate: &std::path::Path) -> Self {
+        let track = |s: &ChannelSummary| Track {
+            id: s.id,
+            name: s.name.clone(),
+            needs_you: s.open_gates > 0,
+            first_activity: s.first_activity,
+            last_activity: s.last_activity,
+            converged: s.closed,
+        };
+        let dir = substrate
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned());
+        if summaries.is_empty() {
+            return LineageModel {
+                mainline: Track::empty(),
+                branches: Vec::new(),
+            };
+        }
+        // The main-line is an OPEN channel — the ambient one (name == repo dir)
+        // if it exists, else the busiest (most entries) — the de-facto trunk
+        // until real lineage edges name a true spine.
+        let main_id = summaries
+            .iter()
+            .filter(|s| !s.closed)
+            .find(|s| s.name == dir)
+            .or_else(|| {
+                summaries
+                    .iter()
+                    .filter(|s| !s.closed)
+                    .max_by_key(|s| s.entry_count)
+            })
+            .or_else(|| summaries.first())
+            .map(|s| s.id);
+        let mainline = summaries
+            .iter()
+            .find(|s| Some(s.id) == main_id)
+            .map(track)
+            .unwrap_or_else(Track::empty);
+        // Branches: every other channel (open AND closed — closed ones show
+        // their merge-back), newest-first by last activity.
+        let mut others: Vec<&ChannelSummary> =
+            summaries.iter().filter(|s| Some(s.id) != main_id).collect();
+        others.sort_by_key(|s| std::cmp::Reverse(s.last_activity));
+        let branches = others.into_iter().map(track).collect();
+        LineageModel { mainline, branches }
+    }
+}
+
+/// Vertical spacing between tracks, in SVG units.
+const STRIP_ROW: i32 = 30;
+
+/// One track's now-cap: a filled dot with a **static** halo when it's
+/// live/needs-you, an outlined hollow dot when it's quiet. Deliberately no
+/// animation or SVG filter — animating a blur-filtered element forces the
+/// webview to re-rasterize every frame, which makes the whole UI lag.
+fn strip_cap(x: i32, y: i32, color: &str, live: bool) -> String {
+    if live {
+        format!(
+            "<circle cx=\"{x}\" cy=\"{y}\" r=\"9\" fill=\"{color}\" opacity=\"0.18\"/>\
+             <circle cx=\"{x}\" cy=\"{y}\" r=\"5\" fill=\"{color}\"/>"
+        )
+    } else {
+        format!(
+            "<circle cx=\"{x}\" cy=\"{y}\" r=\"4.5\" fill=\"#0e1217\" stroke=\"{color}\" \
+             stroke-width=\"2\"/>"
+        )
+    }
+}
+
+/// The strip's left timeline edge (px) and the `now` edge.
+const STRIP_LEFT_X: f64 = 240.0;
+const STRIP_NOW_X: f64 = 1140.0;
+/// The age (minutes) that maps to the strip's left edge — ~7 days.
+const STRIP_MAX_MIN: f64 = 10_080.0;
+
+/// Map an age (minutes) to an x along the strip's time axis: 0 → `now`,
+/// [`STRIP_MAX_MIN`] and older → the left edge. Log-scaled so a long span
+/// still leaves recent activity legible.
+fn strip_age_x(age_min: f64) -> i32 {
+    let frac = ((age_min.max(0.0) + 1.0).ln() / (STRIP_MAX_MIN + 1.0).ln()).clamp(0.0, 1.0);
+    (STRIP_NOW_X - frac * (STRIP_NOW_X - STRIP_LEFT_X)).round() as i32
+}
+
+/// Where a track's right end sits, from when it was last active.
+fn strip_time_x(last_activity: Option<junto_kernel::Timestamp>) -> i32 {
+    let now = junto_kernel::Timestamp::now().as_millis();
+    let age_min = match last_activity {
+        Some(t) => (now.saturating_sub(t.as_millis()) as f64) / 60_000.0,
+        None => STRIP_MAX_MIN,
+    };
+    strip_age_x(age_min)
+}
+
+/// The bottom-pinned lineage strip (redesign spec §3.2): the workspace's
+/// main-line pinned at the bottom (the baseline), branches stacked above it
+/// with the **newest highest** and the oldest nearest the baseline, time
+/// increasing to the right. All branches are shown (windowing for very busy
+/// workspaces is a later refinement). `selected` highlights one track.
+pub fn lineage_strip(model: &LineageModel, selected: Option<&ChannelId>) -> String {
+    let shown = &model.branches[..];
+    let n = shown.len() as i32;
+    let rows_above = n;
+    let pad_top = 26;
+    let spine_y = pad_top + rows_above * STRIP_ROW;
+    let height = spine_y + 54;
+    let now_x = 1140;
+    // Newest branch (index 0) sits at the top; the oldest nearest the baseline.
+    let y_of = |i: i32| spine_y - (rows_above - i) * STRIP_ROW;
+
+    let mut s = format!("<svg viewBox=\"0 0 1200 {height}\" role=\"img\">");
+
+    // selected-track highlight band
+    let sel_y = if selected == Some(&model.mainline.id) {
+        Some(spine_y)
+    } else {
+        shown
+            .iter()
+            .position(|b| Some(&b.id) == selected)
+            .map(|i| y_of(i as i32))
+    };
+    if let Some(y) = sel_y {
+        let _ = write!(
+            s,
+            "<rect class=\"strip-sel\" x=\"0\" y=\"{}\" width=\"1200\" height=\"26\"/>",
+            y - 13
+        );
+    }
+
+    // now line + label
+    let _ = write!(
+        s,
+        "<line class=\"now\" x1=\"{now_x}\" y1=\"12\" x2=\"{now_x}\" y2=\"{}\"/>\
+         <text x=\"{now_x}\" y=\"9\" text-anchor=\"middle\" class=\"nowlab\">now</text>",
+        spine_y + 8
+    );
+
+    // branches: each diverges off the baseline at its birth (first entry) and
+    // either ends open at its last-activity, or — if the channel is closed —
+    // curves back down to the baseline (a merge-back) at its close.
+    let left_x = STRIP_LEFT_X as i32;
+    for (i, b) in shown.iter().enumerate() {
+        let ty = y_of(i as i32);
+        let color = if b.needs_you {
+            "#ffb454"
+        } else if b.converged {
+            "#b98cff"
+        } else {
+            "#7d8696"
+        };
+        let label = b.name.as_deref().unwrap_or("(unopened)");
+        let sel = if Some(&b.id) == selected { " sel" } else { "" };
+        let href = b.name.clone().unwrap_or_else(|| b.id.to_string());
+        let end_x = strip_time_x(b.last_activity).max(left_x + 100);
+        // Diverge at the channel's birth, clamped so there's always a visible
+        // span up to the end (a one-entry channel still shows a short branch).
+        let dx = strip_time_x(b.first_activity).clamp(left_x, end_x - 70);
+        let sw = if b.needs_you { 3 } else { 2 };
+        let (path, end_marker) = if b.converged {
+            // up off the baseline, flat, then back down to the baseline (merge).
+            let mx = (end_x - 46).max(dx + 50);
+            (
+                format!(
+                    "M{dx},{spine_y} C{},{spine_y} {},{ty} {},{ty} L{mx},{ty} \
+                     C{},{ty} {},{spine_y} {end_x},{spine_y}",
+                    dx + 24,
+                    dx + 14,
+                    dx + 46,
+                    mx + 14,
+                    end_x - 24,
+                ),
+                // a green merge node on the baseline
+                format!(
+                    "<circle cx=\"{end_x}\" cy=\"{spine_y}\" r=\"4.5\" fill=\"#0e1217\" \
+                     stroke=\"#5fd3a6\" stroke-width=\"2\"/>"
+                ),
+            )
+        } else {
+            (
+                format!(
+                    "M{dx},{spine_y} C{},{spine_y} {},{ty} {},{ty} L{end_x},{ty}",
+                    dx + 24,
+                    dx + 14,
+                    dx + 46,
+                ),
+                strip_cap(end_x, ty, color, b.needs_you),
+            )
+        };
+        let _ = write!(
+            s,
+            "<a href=\"/channels/{href}\"><text x=\"200\" y=\"{ylab}\" text-anchor=\"end\" \
+             class=\"track{sel}\">{label}</text>\
+             <path class=\"track-line\" d=\"{path}\" stroke=\"{color}\" stroke-width=\"{sw}\" \
+             fill=\"none\"/>\
+             <circle cx=\"{dx}\" cy=\"{spine_y}\" r=\"3\" fill=\"{color}\"/>{end_marker}</a>",
+            ylab = ty + 4,
+            href = escape_html(&href),
+            label = escape_html(label),
+        );
+    }
+
+    // the pinned main-line at the bottom, label below the line
+    let sp = &model.mainline;
+    let sp_label = sp.name.as_deref().unwrap_or("(no channels)");
+    let sp_sel = if selected == Some(&sp.id) { " sel" } else { "" };
+    let sp_href = sp.name.clone().unwrap_or_else(|| sp.id.to_string());
+    let _ = write!(
+        s,
+        "<a href=\"/channels/{href}\">\
+         <line class=\"mainline\" x1=\"120\" y1=\"{spine_y}\" x2=\"{now_x}\" y2=\"{spine_y}\" \
+         stroke=\"#5b9dff\" stroke-width=\"3\"/>\
+         <circle cx=\"120\" cy=\"{spine_y}\" r=\"5\" fill=\"#5b9dff\"/>{cap}\
+         <text x=\"120\" y=\"{}\" text-anchor=\"start\" class=\"track mainline-label{sp_sel}\">\
+         {label} <tspan class=\"track-sub\">· main line</tspan></text></a>",
+        spine_y + 22,
+        href = escape_html(&sp_href),
+        label = escape_html(sp_label),
+        cap = strip_cap(now_x, spine_y, "#5b9dff", true),
+    );
+
+    // time axis below the spine label, ticks placed on the same time scale
+    let axis_y = spine_y + 42;
+    let _ = write!(s, "<g class=\"axis\">");
+    for (age_min, label) in [
+        (7200.0, "5d"),
+        (4320.0, "3d"),
+        (1440.0, "1d"),
+        (480.0, "8h"),
+        (180.0, "3h"),
+    ] {
+        let _ = write!(
+            s,
+            "<text x=\"{}\" y=\"{axis_y}\" text-anchor=\"middle\">{label}</text>",
+            strip_age_x(age_min),
+        );
+    }
+    s.push_str("</g></svg>");
+    s
+}
+
+/// The redesigned top bar (redesign spec §3.1): wordmark, workspace switcher
+/// (scopes the strip), live status (agents working · gates awaiting you), and
+/// the identity the human-surface acts author as.
+pub fn top_bar(
+    workspaces: &[std::path::PathBuf],
+    active: &std::path::Path,
+    agents_working: usize,
+    open_gates: usize,
+    identity: Option<&str>,
+) -> String {
+    let dir = |p: &std::path::Path| {
+        p.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| p.display().to_string())
+    };
+    let mut menu = String::new();
+    for w in workspaces {
+        let _ = write!(
+            menu,
+            "<a href=\"/?w={}\">{}</a>",
+            escape_html(&w.display().to_string()),
+            escape_html(&dir(w)),
+        );
+    }
+    let who = identity.map(escape_html).unwrap_or_default();
+    format!(
+        "<header class=\"topbar\"><a class=\"brand\" href=\"/\"><span class=\"logo\">j</span>junto</a>\
+         <div class=\"ws\"><span class=\"ws-cur\">▣ {active} <span class=\"car\">▾</span></span>\
+         <div class=\"ws-menu\">{menu}</div></div>\
+         <span class=\"spacer\"></span>\
+         <span class=\"live\"><span class=\"pulse\"></span>{agents_working} agent{ap} working · \
+         {open_gates} gate{gp} need{gn} you</span>\
+         <span class=\"who\"><span class=\"pa\">D</span>{who}</span></header>",
+        active = escape_html(&dir(active)),
+        ap = if agents_working == 1 { "" } else { "s" },
+        gp = if open_gates == 1 { "" } else { "s" },
+        gn = if open_gates == 1 { "s" } else { "" },
+    )
+}
+
 // ---- the focus board (docs/attention.md) ----
 
 /// The needs-you board: every act awaiting the member, grouped by inquiry —
@@ -1391,12 +1859,22 @@ pub fn channel_html(
     substrate: &std::path::Path,
     workspace: Option<&std::path::Path>,
 ) -> String {
+    // The channel history shows the most recent entries (newest first); the
+    // full record lives in the durable refs. Rendering all of them inline is a
+    // heavy DOM (a 142-entry channel was ~240KB), so cap it.
+    const HISTORY_CAP: usize = 30;
+    let total = view.entries.len();
     let mut cards = String::new();
-    for entry in &view.entries {
+    for entry in view.entries.iter().rev().take(HISTORY_CAP) {
         let _ = writeln!(cards, "{}", entry_card(entry, view, id));
     }
     let body = if view.entries.is_empty() {
         "<p class=\"empty\">(no entries)</p>".to_string()
+    } else if total > HISTORY_CAP {
+        format!(
+            "{cards}<p class=\"meta\">…and {} older entries in the durable record</p>",
+            total - HISTORY_CAP
+        )
     } else {
         cards
     };
@@ -1582,14 +2060,51 @@ pub fn channel_html(
     };
     let content = format!(
         "<h1>{name}</h1>\n\
-         <p class=\"meta\">channel {id} · {count} entries · read-only projection</p>\n\
+         <p class=\"meta\">{count} entries</p>\n\
          {rename}{lifecycle}{party}{strip}{start_work}{sessions}{standing}{recently}{footer}\
-         <details class=\"ledger\"><summary class=\"board-head\">the full ledger \
-         ({count} entries)</summary>\n{body}</details>\n{open_here}",
+         <details class=\"ledger\"><summary class=\"board-head\">channel history \
+         · {count} entries</summary>\n{body}</details>\n{open_here}",
         name = escape_html(name),
         count = view.entries.len(),
     );
-    page_shell(&format!("junto — {name}"), nav, Some(id), &content)
+    // Wrapped in the redesigned chrome (top bar + strip) with this channel
+    // selected — so clicking a track from the index stays in the new surface.
+    // The chrome inputs are derived from `nav`: the distinct home substrates
+    // are the switchable workspaces, and the active workspace's channels shape
+    // the strip. (Identity is threaded in a later slice; the index carries it.)
+    let mut workspaces: Vec<std::path::PathBuf> = Vec::new();
+    for summary in nav {
+        if !workspaces.contains(&summary.substrate) {
+            workspaces.push(summary.substrate.clone());
+        }
+    }
+    let scoped: Vec<ChannelSummary> = nav
+        .iter()
+        .filter(|summary| summary.substrate == substrate)
+        .cloned()
+        .collect();
+    let model = LineageModel::from_summaries(&scoped, substrate);
+    let agents_working = view
+        .sessions
+        .values()
+        .filter(|session| session.state == SessionState::Working)
+        .count();
+    let open_gates = view
+        .gate_status
+        .values()
+        .filter(|status| **status == GateStatus::Pending)
+        .count();
+    app_page(
+        &format!("junto — {name}"),
+        &workspaces,
+        substrate,
+        &model,
+        Some(id),
+        None,
+        agents_working,
+        open_gates,
+        &content,
+    )
 }
 
 /// The human rendering of the brief's "standing decisions" tier: recent
@@ -1608,23 +2123,15 @@ fn standing_decisions_section(
         if index >= BRIEF_RECENT_FULL + BRIEF_OLDER_CLAMPED {
             let _ = writeln!(
                 items,
-                "<li class=\"older\">…and {} older standing decisions (in the full \
-                 ledger below)</li>",
+                "<div class=\"decision older\">…and {} older standing decisions (in the \
+                 full ledger below)</div>",
                 shape.ratified.len() - index
             );
             break;
         }
-        let (text, corrects) = match &entry.payload {
-            EntryPayload::Assertion { statement, .. } => (statement.as_str(), String::new()),
-            EntryPayload::Correction {
-                target, statement, ..
-            } => (
-                statement.as_str(),
-                format!(
-                    " <span class=\"by\">(correction of <code>{}</code>)</span>",
-                    short(target)
-                ),
-            ),
+        let (text, is_correction) = match &entry.payload {
+            EntryPayload::Assertion { statement, .. } => (statement.as_str(), false),
+            EntryPayload::Correction { statement, .. } => (statement.as_str(), true),
             _ => continue,
         };
         let body = if index < BRIEF_RECENT_FULL {
@@ -1632,24 +2139,26 @@ fn standing_decisions_section(
         } else {
             clamp(text, BRIEF_CLAMP)
         };
-        let by = last_act(notes, &entry.id, "ratified")
-            .map(|note| {
-                format!(
-                    " <span class=\"by\">— ratified by {}</span>",
-                    escape_html(&note.author.display_name)
-                )
-            })
-            .unwrap_or_default();
+        // The block's header: who settled it (and whether it revised an
+        // earlier decision) — no hash, the id lives in the full ledger.
+        let who = last_act(notes, &entry.id, "ratified")
+            .map(|note| format!("ratified by {}", escape_html(&note.author.display_name)))
+            .unwrap_or_else(|| "ratified".to_string());
+        let correction = if is_correction {
+            " · revises an earlier decision"
+        } else {
+            ""
+        };
         let _ = writeln!(
             items,
-            "<li><code>{id}</code>{corrects} {body}{by}</li>",
-            id = short(&entry.id),
+            "<div class=\"decision\"><div class=\"dec-meta\">{who}{correction}</div>\
+             <div class=\"dec-body\">{body}</div></div>",
             body = escape_html(&body),
         );
     }
     format!(
         "<section class=\"board\"><h2 class=\"board-head\">standing decisions \
-         (newest first)</h2>\n<ul class=\"standing\">{items}</ul></section>\n"
+         (newest first)</h2>\n<div class=\"decisions\">{items}</div></section>\n"
     )
 }
 
@@ -1893,14 +2402,12 @@ fn entry_card(entry: &LedgerEntry, view: &ChannelView, channel: &ChannelId) -> S
          <span class=\"who\" title=\"{email}\">{who}</span>\
          <span class=\"when\">{when}</span></header>\
          {statement}{target}{rationale}{provenance}\
-         <footer class=\"id\">{id}</footer>\
          {form}</article>",
         family = entry_family(&entry.payload),
         flag = if unrecognized { " flagged" } else { "" },
         email = escape_html(&entry.author.email),
         who = escape_html(&entry.author.display_name),
         when = escape_html(&iso_utc(entry.timestamp.as_millis())),
-        id = entry.id,
         form = verification_form(entry, view, channel),
     )
 }
@@ -2065,13 +2572,11 @@ fn sessions_section(view: &ChannelView, channel: &ChannelId) -> String {
              <span class=\"who\" title=\"{email}\">{who}</span>\
              <span class=\"when\">{when}</span></header>\
              <div class=\"statement\">{intent}</div>\
-             {artifacts}{steer}\
-             <footer class=\"id\">{id}</footer></article>",
+             {artifacts}{steer}</article>",
             email = escape_html(&entry.author.email),
             who = escape_html(&entry.author.display_name),
             when = escape_html(&iso_utc(entry.timestamp.as_millis())),
             intent = escape_html(intent),
-            id = entry.id,
         );
     }
     if cards.is_empty() {
@@ -2296,6 +2801,23 @@ var b=e.submitter;setTimeout(function(){f.classList.add('busy');\
 f.querySelectorAll('button').forEach(function(x){x.disabled=true});\
 if(b){b.textContent='recording\\u2026'}},0)});</script>";
 
+/// A top progress bar that fires the instant a same-origin link is clicked or
+/// a form submitted — acknowledging the user's intent during the unavoidable
+/// server-render beat. The bar lives in the soon-to-be-discarded page, so it
+/// simply animates toward 90% and is gone when the new page paints. A single
+/// transient element (not a continuous animation) — no lag.
+const NAV_PROGRESS_SCRIPT: &str = "<script>(function(){\
+var bar=document.createElement('div');bar.id='nav-progress';document.body.appendChild(bar);\
+function go(){requestAnimationFrame(function(){bar.classList.add('go')})}\
+document.addEventListener('click',function(e){\
+if(e.defaultPrevented||e.button!==0||e.metaKey||e.ctrlKey||e.shiftKey||e.altKey)return;\
+var a=e.target.closest&&e.target.closest('a[href]');if(!a)return;\
+var h=a.getAttribute('href');\
+if(!h||h.charAt(0)==='#'||a.target==='_blank'||/^[a-z]+:/i.test(h))return;go()},true);\
+document.addEventListener('submit',function(){go()},true);\
+window.addEventListener('pageshow',function(e){if(e.persisted)bar.classList.remove('go')});\
+})();</script>";
+
 /// Progressive enhancement for the agents form: clone a blank row (MCP server
 /// or plugin path) when a `+ add` button is clicked. Without JS the form still
 /// works — each save adds the one trailing blank row the server rendered.
@@ -2310,6 +2832,52 @@ rows.appendChild(clone);});</script>";
 /// blob, no external assets — the pages must render identically in
 /// the desktop shell's webview and a plain browser, offline. (JS: a single
 /// inline act-feedback script, [`ACT_FEEDBACK_SCRIPT`] — nothing else.)
+/// The redesigned surface's supplemental stylesheet (redesign spec §2),
+/// layered after [`CSS`] so the focus board keeps its existing styling while
+/// the new top bar and lineage strip get the new design language. The leading
+/// marker token lets tests assert the new sheet is in use.
+const APP_CSS: &str = "\
+/* redesigned human surface */\
+:root{--ink2:#e6e9ee;--dim2:#7d8696;--faint2:#525b69;--accent2:#5b9dff;--warn2:#ffb454;--ok2:#5fd3a6;--line2:#1f2630}\
+body{margin:0}\
+.topbar{display:flex;align-items:center;gap:14px;padding:12px 24px;border-bottom:1px solid var(--line2);background:#0e1217}\
+.topbar .brand{display:flex;align-items:center;gap:9px;font-weight:700;font-size:16px;color:var(--ink2);text-decoration:none}\
+.topbar .logo{width:24px;height:24px;border-radius:7px;background:linear-gradient(135deg,#5b9dff,#b98cff);display:grid;place-items:center;color:#fff;font-weight:800;font-size:14px}\
+.topbar .spacer{flex:1}\
+.ws{position:relative}\
+.ws-cur{display:inline-flex;align-items:center;gap:9px;padding:6px 11px;border:1px solid var(--line2);border-radius:9px;background:#10141a;color:var(--ink2);font-size:13px;font-weight:600;cursor:pointer}\
+.ws .car{color:var(--faint2);font-size:11px}\
+.ws-menu{position:absolute;top:38px;left:0;background:#11161d;border:1px solid var(--line2);border-radius:9px;padding:5px;min-width:200px;display:none;z-index:30;box-shadow:0 8px 24px #0008}\
+.ws:hover .ws-menu{display:block}\
+.ws-menu a{display:block;padding:8px 10px;border-radius:7px;color:var(--dim2);text-decoration:none;font-size:13px}\
+.ws-menu a:hover{background:#172030;color:var(--ink2)}\
+.topbar .live{display:flex;align-items:center;gap:7px;font-size:13px;color:var(--dim2)}\
+.topbar .pulse{width:8px;height:8px;border-radius:50%;background:var(--ok2);box-shadow:0 0 6px var(--ok2)}\
+.topbar .who{display:flex;align-items:center;gap:8px;color:var(--dim2);font-size:13px}\
+.topbar .pa{width:28px;height:28px;border-radius:7px;background:#2a3340;display:grid;place-items:center;font-weight:700;color:var(--dim2);font-size:12px}\
+.strip{background:#0e1217;border-bottom:1px solid var(--line2);padding:6px 0 0}\
+.strip svg{width:100%;height:auto;display:block}\
+.strip .track{font:600 12px Inter,system-ui,sans-serif;fill:var(--dim2);cursor:pointer}\
+.strip .track.sel{fill:var(--warn2)}\
+.strip .mainline-label{font-weight:700;fill:var(--ink2)}\
+.strip .track-sub{font-weight:500;fill:var(--faint2);font-size:10px}\
+.strip .track-line,.strip .mainline,.strip a{cursor:pointer}\
+.strip .strip-sel{fill:#ffb4540d}\
+.strip .now{stroke:#5b9dff55;stroke-width:1.5;stroke-dasharray:3 5}\
+.strip .nowlab{font:600 10px 'JetBrains Mono',monospace;fill:var(--accent2)}\
+.strip .axis{font:500 10px 'JetBrains Mono',monospace;fill:var(--faint2)}\
+.strip .strip-expand{font:600 11px Inter,system-ui,sans-serif;fill:var(--dim2);cursor:pointer}\
+#nav-progress{position:fixed;top:0;left:0;height:3px;width:100%;background:linear-gradient(90deg,var(--accent2),#b98cff);transform:scaleX(0);transform-origin:0 50%;opacity:0;z-index:100;transition:transform .8s cubic-bezier(.2,.8,.2,1),opacity .15s}\
+#nav-progress.go{opacity:1;transform:scaleX(.9)}\
+.decisions{display:flex;flex-direction:column}\
+.decision{border-top:1px solid var(--line2);padding:12px 0}\
+.decision:first-child{border-top:0}\
+.decision.older{color:var(--faint2);font-size:13px}\
+.dec-meta{font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--faint2);margin-bottom:5px}\
+.dec-body{color:var(--ink2);font-size:14px;line-height:1.55;overflow-wrap:anywhere}\
+.pane{padding:20px 26px 60px}\
+";
+
 const CSS: &str = "\
 :root{--bg:#11111b;--panel:#181825;--card:#1e1e2e;--border:#313244;--text:#cdd6f4;\
 --muted:#7f849c;--soft:#a6adc8;--accent:#89b4fa;--green:#a6e3a1;--yellow:#f9e2af;\
@@ -2564,6 +3132,100 @@ mod tests {
     use junto_kernel::{EntryId, Member, Timestamp};
     use std::collections::HashMap;
 
+    fn summary(name: &str, repo: &std::path::Path, secs: i64, gates: usize) -> ChannelSummary {
+        ChannelSummary {
+            id: ChannelId::new(),
+            name: Some(name.to_string()),
+            substrate: repo.to_path_buf(),
+            entry_count: 1,
+            last_activity: Some(Timestamp::from_millis(secs * 1000)),
+            first_activity: Some(Timestamp::from_millis(secs * 1000)),
+            open_gates: gates,
+            members: 1,
+            latest: None,
+            closed: false,
+        }
+    }
+
+    #[test]
+    fn lineage_model_pins_ambient_as_mainline_and_orders_branches_newest_first() {
+        let repo = std::path::PathBuf::from("/x/junto-ledger");
+        // ambient channel shares the repo's dir name; others are side tracks.
+        let summaries = vec![
+            summary("agent-ui", &repo, 30, 0),
+            summary("junto-ledger", &repo, 10, 0),
+            summary("ui-redesign", &repo, 90, 1),
+        ];
+        let model = LineageModel::from_summaries(&summaries, &repo);
+        assert_eq!(model.mainline.name.as_deref(), Some("junto-ledger"));
+        let names: Vec<_> = model
+            .branches
+            .iter()
+            .map(|t| t.name.as_deref().unwrap())
+            .collect();
+        assert_eq!(names, vec!["ui-redesign", "agent-ui"]);
+        assert!(model.branches[0].needs_you); // ui-redesign has an open gate
+    }
+
+    #[test]
+    fn lineage_strip_pins_mainline_shows_all_branches_and_marks_selection() {
+        let repo = std::path::PathBuf::from("/x/junto-ledger");
+        let summaries = vec![
+            summary("junto-ledger", &repo, 1, 0),
+            summary("ui-redesign", &repo, 90, 1),
+            summary("acp", &repo, 80, 0),
+            summary("terminology", &repo, 70, 0),
+            summary("agent-ui", &repo, 60, 0),
+            summary("ci", &repo, 50, 0),
+        ];
+        let model = LineageModel::from_summaries(&summaries, &repo);
+        let selected = model.branches[0].id; // ui-redesign (newest)
+        let html = lineage_strip(&model, Some(&selected));
+        assert!(html.contains("junto-ledger")); // the main-line label
+        assert!(html.contains("ui-redesign"));
+        assert!(html.contains(">ci<")); // every branch is shown (no windowing)
+        assert!(html.contains("strip-sel")); // selection highlight band
+    }
+
+    #[test]
+    fn top_bar_shows_workspace_live_status_and_identity() {
+        let workspaces = vec![
+            std::path::PathBuf::from("/x/junto-ledger"),
+            std::path::PathBuf::from("/x/wmux"),
+        ];
+        let html = top_bar(
+            &workspaces,
+            &std::path::PathBuf::from("/x/junto-ledger"),
+            1,
+            2,
+            Some("Dan Cieslak"),
+        );
+        assert!(html.contains("junto-ledger")); // active workspace
+        assert!(html.contains("wmux")); // switcher offers the other
+        assert!(html.contains("1 agent")); // live status
+        assert!(html.contains("2 gate")); // gate count
+        assert!(html.contains("Dan Cieslak")); // identity
+    }
+
+    #[test]
+    fn new_index_html_frames_top_bar_and_strip() {
+        let repo = std::path::PathBuf::from("/x/junto-ledger");
+        let summaries = vec![summary("junto-ledger", &repo, 1, 0)];
+        let model = LineageModel::from_summaries(&summaries, &repo);
+        let html = new_index_html(
+            std::slice::from_ref(&repo),
+            &repo,
+            &model,
+            &summaries,
+            &[],
+            None,
+        );
+        assert!(html.contains("class=\"topbar\""));
+        assert!(html.contains("<svg")); // the strip
+        assert!(html.contains("all channels")); // the cards section is back
+        assert!(html.contains("redesigned human surface")); // the new stylesheet
+    }
+
     fn view_with(entries: Vec<LedgerEntry>) -> ChannelView {
         let mut standings = HashMap::new();
         let mut gate_status = HashMap::new();
@@ -2811,55 +3473,29 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_groups_channels_by_substrate() {
+    fn channel_page_wears_the_redesigned_chrome_with_a_workspace_switcher() {
+        // The channel page now wraps its content in the top bar + lineage
+        // strip (no left sidebar); the workspace switcher lists the distinct
+        // home substrates from nav.
+        let repo = std::path::PathBuf::from("/repo/one");
         let nav = vec![
-            ChannelSummary {
-                id: ChannelId::new(),
-                name: Some("alpha".into()),
-                substrate: std::path::PathBuf::from("/repo/one"),
-                entry_count: 1,
-                last_activity: None,
-                open_gates: 0,
-                members: 1,
-                latest: None,
-                closed: false,
-            },
-            ChannelSummary {
-                id: ChannelId::new(),
-                name: Some("beta".into()),
-                substrate: std::path::PathBuf::from("/repo/two"),
-                entry_count: 1,
-                last_activity: None,
-                open_gates: 0,
-                members: 1,
-                latest: None,
-                closed: false,
-            },
+            summary("alpha", &repo, 10, 0),
+            summary("beta", std::path::Path::new("/repo/two"), 20, 0),
         ];
         let view = view_with(vec![]);
-        let html = channel_html(
-            &nav,
-            "alpha",
-            &nav[0].id,
-            &view,
-            std::path::Path::new("/r"),
-            None,
+        let html = channel_html(&nav, "alpha", &nav[0].id, &view, &repo, None);
+        assert!(html.contains("class=\"topbar\""), "{html}");
+        assert!(html.contains("redesigned human surface"), "new stylesheet");
+        assert!(html.contains("<svg"), "the lineage strip is present");
+        // The switcher offers both substrates by their directory names.
+        assert!(html.contains(">one</a>"), "{html}");
+        assert!(html.contains(">two</a>"), "{html}");
+        // The old sidebar is gone.
+        assert!(!html.contains("class=\"side\""), "no left sidebar");
+        assert!(
+            !html.contains("<div class=\"side-sub\""),
+            "no sidebar groups"
         );
-        assert!(html.contains("<div class=\"side-sub\""), "{html}");
-        assert!(html.contains(">one</div>"), "{html}");
-        assert!(html.contains(">two</div>"), "{html}");
-
-        // A single-substrate host gets no group headings.
-        let solo = vec![nav[0].clone()];
-        let html = channel_html(
-            &solo,
-            "alpha",
-            &solo[0].id,
-            &view,
-            std::path::Path::new("/r"),
-            None,
-        );
-        assert!(!html.contains("<div class=\"side-sub\""), "{html}");
     }
 
     #[test]
@@ -3180,48 +3816,20 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_lists_channels_and_marks_the_active_one() {
-        let active = ChannelId::new();
-        let other = ChannelId::new();
-        let nav = vec![
-            ChannelSummary {
-                id: active,
-                name: Some("alpha".into()),
-                substrate: std::path::PathBuf::from("/repo/a"),
-                entry_count: 3,
-                last_activity: None,
-                open_gates: 2,
-                members: 2,
-                latest: Some("assertion — the latest finding".into()),
-                closed: false,
-            },
-            ChannelSummary {
-                id: other,
-                name: Some("beta".into()),
-                substrate: std::path::PathBuf::from("/repo/b"),
-                entry_count: 1,
-                last_activity: None,
-                open_gates: 0,
-                members: 1,
-                latest: None,
-                closed: false,
-            },
-        ];
+    fn channel_page_strip_marks_the_active_channel() {
+        // On a channel page the strip is scoped to the channel's own home
+        // substrate, with that channel selected (its track marked).
+        let repo = std::path::PathBuf::from("/repo/a");
+        let alpha = summary("alpha", &repo, 30, 2);
+        let beta = summary("beta", &repo, 10, 0); // older → the main-line
+        let active = alpha.id;
+        let nav = vec![alpha, beta];
         let view = view_with(vec![]);
-        let html = channel_html(
-            &nav,
-            "alpha",
-            &active,
-            &view,
-            std::path::Path::new("/repo"),
-            None,
-        );
-        assert!(html.contains("chan active"));
-        assert!(html.contains("alpha"));
-        assert!(html.contains("beta"));
-        assert!(
-            html.contains("gatecount"),
-            "open gates surface in the sidebar"
-        );
+        let html = channel_html(&nav, "alpha", &active, &view, &repo, None);
+        assert!(html.contains("class=\"topbar\""));
+        assert!(html.contains("alpha"), "the active channel is a track");
+        assert!(html.contains("beta"), "the sibling channel is a track too");
+        // The active channel's track carries the selection class.
+        assert!(html.contains("track sel"), "active track is marked: {html}");
     }
 }
