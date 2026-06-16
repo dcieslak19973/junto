@@ -888,6 +888,33 @@ pub fn index_html(summaries: &[ChannelSummary], attention: &[AttentionGroup]) ->
     page_shell("junto — channels", summaries, None, &content)
 }
 
+/// A styled error page for the human surface — so a refused act (e.g. "not a
+/// member") reads as a calm card with a way back, not a bare plain-text body
+/// on a blank page. Self-contained styling (it may render before any chrome).
+pub fn error_page(title: &str, message: &str) -> String {
+    format!(
+        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <title>junto</title><style>\
+         body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#0b0d10;\
+         color:#e6e9ee;font:15px/1.6 Inter,system-ui,sans-serif}}\
+         .card{{max-width:460px;margin:24px;padding:30px 32px;background:#13171d;\
+         border:1px solid #1f2630;border-radius:14px;text-align:center}}\
+         .mark{{width:46px;height:46px;margin:0 auto 16px;border-radius:13px;\
+         background:#ffb4541a;color:#ffb454;display:grid;place-items:center;font-size:22px}}\
+         h1{{margin:0 0 8px;font-size:18px;font-weight:600}}\
+         p{{margin:0 0 22px;color:#a6adc8}}\
+         a.back{{display:inline-block;padding:9px 18px;border-radius:9px;background:#5b9dff;\
+         color:#fff;text-decoration:none;font-weight:500;font-size:14px}}\
+         a.back:hover{{filter:brightness(1.08)}}\
+         </style></head>\n<body><div class=\"card\"><div class=\"mark\">⚠</div>\
+         <h1>{title}</h1><p>{message}</p>\
+         <a class=\"back\" href=\"javascript:history.back()\">← Go back</a></div></body></html>\n",
+        title = escape_html(title),
+        message = escape_html(message),
+    )
+}
+
 /// The shared redesigned shell (redesign spec §3): top bar + bottom-pinned
 /// lineage strip + a `main` pane. Every redesigned page is this chrome with a
 /// different `main`; `selected` highlights the active track in the strip.
