@@ -1407,10 +1407,15 @@ pub struct Track {
     pub name: Option<String>,
     /// An open gate awaits the member on this channel.
     pub needs_you: bool,
-    /// When the channel was last active — places the track's right end along
-    /// the strip's time axis (a quiet channel ends earlier, only recent work
-    /// reaches "now").
+    /// When the channel began (first entry) — its divergence point on the
+    /// time axis.
+    pub first_activity: Option<junto_kernel::Timestamp>,
+    /// When the channel was last active — its right end on the time axis (a
+    /// quiet channel ends earlier; only recent work reaches "now"). For a
+    /// converged channel this is also where it merges back.
     pub last_activity: Option<junto_kernel::Timestamp>,
+    /// The channel is closed — drawn converging back to the baseline.
+    pub converged: bool,
 }
 
 impl Track {
@@ -1420,7 +1425,9 @@ impl Track {
             id: ChannelId::new(),
             name: None,
             needs_you: false,
+            first_activity: None,
             last_activity: None,
+            converged: false,
         }
     }
 }
@@ -1442,37 +1449,45 @@ impl LineageModel {
             id: s.id,
             name: s.name.clone(),
             needs_you: s.open_gates > 0,
+            first_activity: s.first_activity,
             last_activity: s.last_activity,
+            converged: s.closed,
         };
         let dir = substrate
             .file_name()
             .map(|n| n.to_string_lossy().into_owned());
-        let mut open: Vec<&ChannelSummary> = summaries.iter().filter(|s| !s.closed).collect();
-        if open.is_empty() {
+        if summaries.is_empty() {
             return LineageModel {
                 mainline: Track::empty(),
                 branches: Vec::new(),
             };
         }
-        // newest-first
-        open.sort_by_key(|s| std::cmp::Reverse(s.last_activity));
-        // The main-line is the ambient channel (name == repo dir) if one
-        // exists; absent that, the **busiest** channel (most entries) is the
-        // de-facto trunk — until real lineage edges name a true spine.
-        let main_idx = open.iter().position(|s| s.name == dir).unwrap_or_else(|| {
-            open.iter()
-                .enumerate()
-                .max_by_key(|(_, s)| s.entry_count)
-                .map(|(i, _)| i)
-                .unwrap_or(0)
-        });
-        let mainline = track(open[main_idx]);
-        let branches = open
+        // The main-line is an OPEN channel — the ambient one (name == repo dir)
+        // if it exists, else the busiest (most entries) — the de-facto trunk
+        // until real lineage edges name a true spine.
+        let main_id = summaries
             .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != main_idx)
-            .map(|(_, s)| track(s))
-            .collect();
+            .filter(|s| !s.closed)
+            .find(|s| s.name == dir)
+            .or_else(|| {
+                summaries
+                    .iter()
+                    .filter(|s| !s.closed)
+                    .max_by_key(|s| s.entry_count)
+            })
+            .or_else(|| summaries.first())
+            .map(|s| s.id);
+        let mainline = summaries
+            .iter()
+            .find(|s| Some(s.id) == main_id)
+            .map(track)
+            .unwrap_or_else(Track::empty);
+        // Branches: every other channel (open AND closed — closed ones show
+        // their merge-back), newest-first by last activity.
+        let mut others: Vec<&ChannelSummary> =
+            summaries.iter().filter(|s| Some(s.id) != main_id).collect();
+        others.sort_by_key(|s| std::cmp::Reverse(s.last_activity));
+        let branches = others.into_iter().map(track).collect();
         LineageModel { mainline, branches }
     }
 }
@@ -1585,38 +1600,67 @@ pub fn lineage_strip(model: &LineageModel, selected: Option<&ChannelId>) -> Stri
         );
     }
 
-    // branches: flat lines, newest highest, ending at last-activity along the
-    // time axis (only recent work reaches "now").
+    // branches: each diverges off the baseline at its birth (first entry) and
+    // either ends open at its last-activity, or — if the channel is closed —
+    // curves back down to the baseline (a merge-back) at its close.
     let left_x = STRIP_LEFT_X as i32;
     for (i, b) in shown.iter().enumerate() {
         let ty = y_of(i as i32);
-        let color = if b.needs_you { "#ffb454" } else { "#7d8696" };
+        let color = if b.needs_you {
+            "#ffb454"
+        } else if b.converged {
+            "#b98cff"
+        } else {
+            "#7d8696"
+        };
         let label = b.name.as_deref().unwrap_or("(unopened)");
         let sel = if Some(&b.id) == selected { " sel" } else { "" };
         let href = b.name.clone().unwrap_or_else(|| b.id.to_string());
-        let end_x = strip_time_x(b.last_activity).max(left_x + 80);
-        // The branch diverges off the baseline ~300px before its last-activity
-        // end — a curve up off the spine, then flat to the end cap (toprail's
-        // aesthetic). The diverge node sits on the main-line.
-        let dx = (end_x - 300).max(left_x);
+        let end_x = strip_time_x(b.last_activity).max(left_x + 100);
+        // Diverge at the channel's birth, clamped so there's always a visible
+        // span up to the end (a one-entry channel still shows a short branch).
+        let dx = strip_time_x(b.first_activity).clamp(left_x, end_x - 70);
         let sw = if b.needs_you { 3 } else { 2 };
-        let path = format!(
-            "M{dx},{spine_y} C{c1},{spine_y} {c2},{ty} {c3},{ty} L{end_x},{ty}",
-            c1 = dx + 24,
-            c2 = dx + 14,
-            c3 = dx + 46,
-        );
+        let (path, end_marker) = if b.converged {
+            // up off the baseline, flat, then back down to the baseline (merge).
+            let mx = (end_x - 46).max(dx + 50);
+            (
+                format!(
+                    "M{dx},{spine_y} C{},{spine_y} {},{ty} {},{ty} L{mx},{ty} \
+                     C{},{ty} {},{spine_y} {end_x},{spine_y}",
+                    dx + 24,
+                    dx + 14,
+                    dx + 46,
+                    mx + 14,
+                    end_x - 24,
+                ),
+                // a green merge node on the baseline
+                format!(
+                    "<circle cx=\"{end_x}\" cy=\"{spine_y}\" r=\"4.5\" fill=\"#0e1217\" \
+                     stroke=\"#5fd3a6\" stroke-width=\"2\"/>"
+                ),
+            )
+        } else {
+            (
+                format!(
+                    "M{dx},{spine_y} C{},{spine_y} {},{ty} {},{ty} L{end_x},{ty}",
+                    dx + 24,
+                    dx + 14,
+                    dx + 46,
+                ),
+                strip_cap(end_x, ty, color, b.needs_you),
+            )
+        };
         let _ = write!(
             s,
             "<a href=\"/channels/{href}\"><text x=\"200\" y=\"{ylab}\" text-anchor=\"end\" \
              class=\"track{sel}\">{label}</text>\
              <path class=\"track-line\" d=\"{path}\" stroke=\"{color}\" stroke-width=\"{sw}\" \
              fill=\"none\"/>\
-             <circle cx=\"{dx}\" cy=\"{spine_y}\" r=\"3\" fill=\"{color}\"/>{cap}</a>",
+             <circle cx=\"{dx}\" cy=\"{spine_y}\" r=\"3\" fill=\"{color}\"/>{end_marker}</a>",
             ylab = ty + 4,
             href = escape_html(&href),
             label = escape_html(label),
-            cap = strip_cap(end_x, ty, color, b.needs_you),
         );
     }
 
@@ -3086,6 +3130,7 @@ mod tests {
             substrate: repo.to_path_buf(),
             entry_count: 1,
             last_activity: Some(Timestamp::from_millis(secs * 1000)),
+            first_activity: Some(Timestamp::from_millis(secs * 1000)),
             open_gates: gates,
             members: 1,
             latest: None,

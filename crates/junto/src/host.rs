@@ -130,6 +130,9 @@ pub struct ChannelSummary {
     pub substrate: PathBuf,
     pub entry_count: usize,
     pub last_activity: Option<Timestamp>,
+    /// When the channel began — its first entry (genesis). Places the
+    /// channel's divergence point on the lineage strip's time axis.
+    pub first_activity: Option<Timestamp>,
     /// Pending proposals — the "needs your attention" signal.
     pub open_gates: usize,
     /// The Party's size (`docs/adr/0017`); 0 for pre-genesis channels.
@@ -642,6 +645,7 @@ fn summarize(id: &ChannelId, view: &ChannelView, substrate: &Path) -> ChannelSum
         substrate: substrate.to_path_buf(),
         entry_count: view.entries.len(),
         last_activity: view.entries.iter().map(|entry| entry.timestamp).max(),
+        first_activity: view.entries.iter().map(|entry| entry.timestamp).min(),
         open_gates: view
             .gate_status
             .values()
