@@ -19,7 +19,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use junto_kernel::{
     ChannelId, ChannelView, EntryId, EntryPayload, GateStatus, Ledger, LedgerEntry, Member,
-    SubstrateProvider, Timestamp,
+    Standing, SubstrateProvider, Timestamp,
 };
 use junto_substrate_git::GitRefsSubstrate;
 use serde::{Deserialize, Serialize};
@@ -143,6 +143,36 @@ pub struct ChannelSummary {
     /// Whether the channel is closed (`docs/adr/0022`) — out of the working
     /// set; the surfaces demote it.
     pub closed: bool,
+    /// The channel's milestone entries (recent-most last) — settled decisions,
+    /// attached artifacts, and open gates — for plotting as nodes along the
+    /// channel's track on the lineage strip. Curated (not every entry) so a
+    /// busy channel's line stays legible.
+    pub milestones: Vec<Milestone>,
+}
+
+/// One notable event on a channel's track — a settled decision, an attached
+/// artifact, or an open gate — plotted as a node on the lineage strip at the
+/// time it happened.
+#[derive(Debug, Clone)]
+pub struct Milestone {
+    /// When it happened — places the node along the strip's time axis.
+    pub at: Timestamp,
+    /// What kind of node to draw.
+    pub kind: MilestoneKind,
+    /// A short label for the node's tooltip.
+    pub label: String,
+}
+
+/// The kind of a [`Milestone`] — drives the node's shape/colour on the strip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MilestoneKind {
+    /// A settled decision (a ratified assertion, or a correction that is the
+    /// live text of settled territory).
+    Decision,
+    /// An attached artifact (`docs/adr/0020`).
+    Artifact,
+    /// An open gate (a pending proposal) awaiting a member.
+    Gate,
 }
 
 /// What kind of act an [`AttentionItem`] awaits (`docs/attention.md`:
@@ -637,6 +667,68 @@ pub fn attention_for_view(id: &ChannelId, view: &ChannelView) -> AttentionGroup 
     }
 }
 
+/// The most milestone nodes a channel's track carries — bounds clutter on a
+/// busy channel (the most recent win).
+const MILESTONE_CAP: usize = 12;
+
+/// A short, single-line label for a milestone node's tooltip.
+fn milestone_label(text: &str) -> String {
+    let text = text.trim();
+    let cut: String = text.chars().take(70).collect();
+    if cut.chars().count() < text.chars().count() {
+        format!("{}…", cut.trim_end())
+    } else {
+        cut
+    }
+}
+
+/// The curated milestone events on a channel — settled decisions (ratified
+/// assertions, plus corrections that carry settled territory's live text),
+/// attached artifacts, and open gates — in canonical order, capped to the
+/// most recent [`MILESTONE_CAP`]. Verification acts fold into their targets,
+/// matching the brief's "state, not history" model.
+fn channel_milestones(view: &ChannelView) -> Vec<Milestone> {
+    let mut milestones: Vec<Milestone> = view
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            let (kind, text) = match &entry.payload {
+                EntryPayload::Assertion { statement, .. }
+                    if view.standing(&entry.id) == Some(Standing::Ratified) =>
+                {
+                    (MilestoneKind::Decision, statement.as_str())
+                }
+                // A correction of an assertion is the live text of settled
+                // territory (its target carries a standing).
+                EntryPayload::Correction {
+                    target, statement, ..
+                } if view.standings.contains_key(target) => {
+                    (MilestoneKind::Decision, statement.as_str())
+                }
+                EntryPayload::ArtifactAttached { description, .. } => {
+                    (MilestoneKind::Artifact, description.as_str())
+                }
+                EntryPayload::Proposal { action, .. }
+                    if view.gate_status(&entry.id) == Some(GateStatus::Pending) =>
+                {
+                    (MilestoneKind::Gate, action.as_str())
+                }
+                _ => return None,
+            };
+            Some(Milestone {
+                at: entry.timestamp,
+                kind,
+                label: milestone_label(text),
+            })
+        })
+        .collect();
+    // Keep the most recent — entries are in canonical (oldest-first) order.
+    if milestones.len() > MILESTONE_CAP {
+        milestones = milestones.split_off(milestones.len() - MILESTONE_CAP);
+    }
+    milestones
+}
+
 /// Fold one projected channel into its discovery summary.
 fn summarize(id: &ChannelId, view: &ChannelView, substrate: &Path) -> ChannelSummary {
     ChannelSummary {
@@ -654,6 +746,7 @@ fn summarize(id: &ChannelId, view: &ChannelView, substrate: &Path) -> ChannelSum
         members: view.party.len(),
         latest: view.entries.last().map(preview),
         closed: view.closed,
+        milestones: channel_milestones(view),
     }
 }
 
