@@ -126,10 +126,13 @@ pub struct Ledger<S: SubstrateProvider> {
     cache: std::sync::Mutex<HashMap<ChannelId, (std::time::Instant, ChannelView)>>,
 }
 
-/// How long a cached [`ChannelView`] is served before re-projecting. Short
-/// enough that background sync's incoming entries surface promptly; long
-/// enough that clicking around the human surface doesn't re-shell-out to git.
-const PROJECTION_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long a cached [`ChannelView`] is served before re-projecting. Sized to
+/// cover human-paced click-around (a few seconds between navigations) so the
+/// surface stays snappy without re-shelling-out to git each time. Local writes
+/// — including agent writes over the in-process MCP surface — invalidate
+/// immediately; only entries fetched from a *remote* by background sync can be
+/// this stale, which is acceptable for the human read surface.
+const PROJECTION_TTL: std::time::Duration = std::time::Duration::from_secs(15);
 
 impl<S: SubstrateProvider> Ledger<S> {
     /// Wrap a substrate.
