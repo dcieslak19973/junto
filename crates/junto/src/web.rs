@@ -67,6 +67,9 @@ pub fn router(host: Arc<Host>) -> Router {
         .route("/channels/{channel}/brief", get(channel_brief))
         .route("/channels/{channel}/entries/{entry}/{act}", post(verify))
         .with_state(host)
+        // Wrap any plain-text error response in a styled page (so a refused
+        // act reads as a calm card, not a bare body on a blank page).
+        .layer(axum::middleware::map_response(prettify_errors))
 }
 
 /// Resolve and project a channel reference, or surface the failure as an
@@ -115,6 +118,36 @@ async fn project(
 
 fn internal(message: String) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, message).into_response()
+}
+
+/// Response layer: turn any error-status plain-text response (the handlers'
+/// `(StatusCode, message)` returns) into a styled error page, so the human
+/// surface never shows a bare body on a blank page. Already-HTML and success
+/// responses pass through untouched.
+async fn prettify_errors(response: Response) -> Response {
+    let status = response.status();
+    if !status.is_client_error() && !status.is_server_error() {
+        return response;
+    }
+    if let Some(content_type) = response.headers().get(header::CONTENT_TYPE)
+        && content_type
+            .to_str()
+            .is_ok_and(|value| value.starts_with("text/html"))
+    {
+        return response;
+    }
+    let title = match status {
+        StatusCode::FORBIDDEN => "You can’t do that here",
+        StatusCode::BAD_REQUEST => "That needs a small fix",
+        StatusCode::CONFLICT => "That conflicts with the record",
+        StatusCode::NOT_FOUND => "Not found",
+        _ => "Something went wrong",
+    };
+    let message = match axum::body::to_bytes(response.into_body(), 64 * 1024).await {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(_) => "Unknown error.".to_string(),
+    };
+    (status, Html(render::error_page(title, &message))).into_response()
 }
 
 /// Index query: `?w=` scopes the page to one workspace (home substrate). An
@@ -1270,6 +1303,38 @@ mod tests {
         assert_eq!(slugify("Security Reviewer"), "security-reviewer");
         assert_eq!(slugify("  Doc Writer!! "), "doc-writer");
         assert_eq!(slugify("***"), "");
+    }
+
+    #[tokio::test]
+    async fn error_responses_become_a_styled_page() {
+        // A plain-text refusal (what authorize_human_write returns) becomes a
+        // styled HTML page that preserves the message and offers a way back.
+        let raw = (StatusCode::FORBIDDEN, "you aren’t a member of this channel").into_response();
+        let pretty = prettify_errors(raw).await;
+        assert_eq!(pretty.status(), StatusCode::FORBIDDEN);
+        let is_html = pretty
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("text/html"));
+        assert!(is_html, "rendered as HTML");
+        let bytes = axum::body::to_bytes(pretty.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let html = String::from_utf8_lossy(&bytes);
+        assert!(html.contains("you aren’t a member of this channel"));
+        assert!(html.contains("Go back"));
+    }
+
+    #[tokio::test]
+    async fn success_responses_pass_through_unchanged() {
+        let raw = Html("<h1>ok</h1>").into_response();
+        let same = prettify_errors(raw).await;
+        assert_eq!(same.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(same.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], b"<h1>ok</h1>");
     }
 
     /// A test host: one fresh git repo, the member-code store in its own temp

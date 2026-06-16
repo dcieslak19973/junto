@@ -21,7 +21,7 @@ use junto_kernel::{
 };
 use std::fmt::Write as _;
 
-use crate::host::{AttentionGroup, AttentionKind, ChannelSummary};
+use crate::host::{AttentionGroup, AttentionKind, ChannelSummary, Milestone, MilestoneKind};
 
 /// `Name <email>` plus an `(agent)` marker — humans are the unmarked case.
 fn member_label(member: &Member) -> String {
@@ -888,6 +888,33 @@ pub fn index_html(summaries: &[ChannelSummary], attention: &[AttentionGroup]) ->
     page_shell("junto — channels", summaries, None, &content)
 }
 
+/// A styled error page for the human surface — so a refused act (e.g. "not a
+/// member") reads as a calm card with a way back, not a bare plain-text body
+/// on a blank page. Self-contained styling (it may render before any chrome).
+pub fn error_page(title: &str, message: &str) -> String {
+    format!(
+        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <title>junto</title><style>\
+         body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#0b0d10;\
+         color:#e6e9ee;font:15px/1.6 Inter,system-ui,sans-serif}}\
+         .card{{max-width:460px;margin:24px;padding:30px 32px;background:#13171d;\
+         border:1px solid #1f2630;border-radius:14px;text-align:center}}\
+         .mark{{width:46px;height:46px;margin:0 auto 16px;border-radius:13px;\
+         background:#ffb4541a;color:#ffb454;display:grid;place-items:center;font-size:22px}}\
+         h1{{margin:0 0 8px;font-size:18px;font-weight:600}}\
+         p{{margin:0 0 22px;color:#a6adc8}}\
+         a.back{{display:inline-block;padding:9px 18px;border-radius:9px;background:#5b9dff;\
+         color:#fff;text-decoration:none;font-weight:500;font-size:14px}}\
+         a.back:hover{{filter:brightness(1.08)}}\
+         </style></head>\n<body><div class=\"card\"><div class=\"mark\">⚠</div>\
+         <h1>{title}</h1><p>{message}</p>\
+         <a class=\"back\" href=\"javascript:history.back()\">← Go back</a></div></body></html>\n",
+        title = escape_html(title),
+        message = escape_html(message),
+    )
+}
+
 /// The shared redesigned shell (redesign spec §3): top bar + bottom-pinned
 /// lineage strip + a `main` pane. Every redesigned page is this chrome with a
 /// different `main`; `selected` highlights the active track in the strip.
@@ -1416,6 +1443,8 @@ pub struct Track {
     pub last_activity: Option<junto_kernel::Timestamp>,
     /// The channel is closed — drawn converging back to the baseline.
     pub converged: bool,
+    /// Milestone events plotted as nodes along the track (recent-most last).
+    pub milestones: Vec<Milestone>,
 }
 
 impl Track {
@@ -1428,6 +1457,7 @@ impl Track {
             first_activity: None,
             last_activity: None,
             converged: false,
+            milestones: Vec::new(),
         }
     }
 }
@@ -1452,6 +1482,7 @@ impl LineageModel {
             first_activity: s.first_activity,
             last_activity: s.last_activity,
             converged: s.closed,
+            milestones: s.milestones.clone(),
         };
         let dir = substrate
             .file_name()
@@ -1535,6 +1566,41 @@ fn strip_time_x(last_activity: Option<junto_kernel::Timestamp>) -> i32 {
         None => STRIP_MAX_MIN,
     };
     strip_age_x(age_min)
+}
+
+/// Milestone nodes along a track between `x_lo` and `x_hi` at height `y`,
+/// each positioned at its timestamp and shaped by kind (decision dot ·
+/// artifact diamond · gate square), with the label as a hover tooltip.
+fn milestone_nodes(y: i32, x_lo: i32, x_hi: i32, milestones: &[Milestone]) -> String {
+    if x_hi <= x_lo {
+        return String::new();
+    }
+    let mut s = String::new();
+    for m in milestones {
+        let x = strip_time_x(Some(m.at)).clamp(x_lo, x_hi);
+        let shape = match m.kind {
+            MilestoneKind::Decision => {
+                format!("<circle cx=\"{x}\" cy=\"{y}\" r=\"3.5\" fill=\"#5b9dff\"/>")
+            }
+            MilestoneKind::Artifact => format!(
+                "<rect x=\"{}\" y=\"{}\" width=\"7\" height=\"7\" fill=\"#b98cff\" \
+                 transform=\"rotate(45 {x} {y})\"/>",
+                x - 3,
+                y - 3,
+            ),
+            MilestoneKind::Gate => format!(
+                "<rect x=\"{}\" y=\"{}\" width=\"7\" height=\"7\" rx=\"1\" fill=\"#ffb454\"/>",
+                x - 3,
+                y - 3,
+            ),
+        };
+        let _ = write!(
+            s,
+            "<g class=\"mnode\">{shape}<title>{}</title></g>",
+            escape_html(&m.label),
+        );
+    }
+    s
 }
 
 /// The bottom-pinned lineage strip (redesign spec §3.2): the workspace's
@@ -1631,13 +1697,21 @@ pub fn lineage_strip(model: &LineageModel, selected: Option<&ChannelId>) -> Stri
                 strip_cap(end_x, ty, color, b.needs_you),
             )
         };
+        // Milestone nodes ride the flat top of the branch (between the curve
+        // up and the end/merge), positioned by their own timestamps.
+        let node_hi = if b.converged {
+            (end_x - 50).max(dx + 50)
+        } else {
+            end_x - 4
+        };
+        let nodes = milestone_nodes(ty, dx + 48, node_hi, &b.milestones);
         let _ = write!(
             s,
             "<a href=\"/channels/{href}\"><text x=\"200\" y=\"{ylab}\" text-anchor=\"end\" \
              class=\"track{sel}\">{label}</text>\
              <path class=\"track-line\" d=\"{path}\" stroke=\"{color}\" stroke-width=\"{sw}\" \
              fill=\"none\"/>\
-             <circle cx=\"{dx}\" cy=\"{spine_y}\" r=\"3\" fill=\"{color}\"/>{end_marker}</a>",
+             <circle cx=\"{dx}\" cy=\"{spine_y}\" r=\"3\" fill=\"{color}\"/>{end_marker}{nodes}</a>",
             ylab = ty + 4,
             href = escape_html(&href),
             label = escape_html(label),
@@ -1654,13 +1728,14 @@ pub fn lineage_strip(model: &LineageModel, selected: Option<&ChannelId>) -> Stri
         "<a href=\"/channels/{href}\">\
          <line class=\"mainline\" x1=\"120\" y1=\"{spine_y}\" x2=\"{now_x}\" y2=\"{spine_y}\" \
          stroke=\"#5b9dff\" stroke-width=\"3\"/>\
-         <circle cx=\"120\" cy=\"{spine_y}\" r=\"5\" fill=\"#5b9dff\"/>{cap}\
+         <circle cx=\"120\" cy=\"{spine_y}\" r=\"5\" fill=\"#5b9dff\"/>{cap}{nodes}\
          <text x=\"120\" y=\"{}\" text-anchor=\"start\" class=\"track mainline-label{sp_sel}\">\
          {label} <tspan class=\"track-sub\">· main line</tspan></text></a>",
         spine_y + 22,
         href = escape_html(&sp_href),
         label = escape_html(sp_label),
         cap = strip_cap(now_x, spine_y, "#5b9dff", true),
+        nodes = milestone_nodes(spine_y, 128, now_x - 6, &sp.milestones),
     );
 
     // time axis below the spine label, ticks placed on the same time scale
@@ -2867,6 +2942,8 @@ body{margin:0}\
 .strip .nowlab{font:600 10px 'JetBrains Mono',monospace;fill:var(--accent2)}\
 .strip .axis{font:500 10px 'JetBrains Mono',monospace;fill:var(--faint2)}\
 .strip .strip-expand{font:600 11px Inter,system-ui,sans-serif;fill:var(--dim2);cursor:pointer}\
+.strip .mnode{cursor:pointer}\
+.strip .mnode:hover{filter:brightness(1.25)}\
 #nav-progress{position:fixed;top:0;left:0;height:3px;width:100%;background:linear-gradient(90deg,var(--accent2),#b98cff);transform:scaleX(0);transform-origin:0 50%;opacity:0;z-index:100;transition:transform .8s cubic-bezier(.2,.8,.2,1),opacity .15s}\
 #nav-progress.go{opacity:1;transform:scaleX(.9)}\
 .decisions{display:flex;flex-direction:column}\
@@ -3144,6 +3221,7 @@ mod tests {
             members: 1,
             latest: None,
             closed: false,
+            milestones: Vec::new(),
         }
     }
 
@@ -3165,6 +3243,35 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["ui-redesign", "agent-ui"]);
         assert!(model.branches[0].needs_you); // ui-redesign has an open gate
+    }
+
+    #[test]
+    fn lineage_strip_plots_milestone_nodes_with_tooltips() {
+        let repo = std::path::PathBuf::from("/x/junto-ledger");
+        let mut main = summary("junto-ledger", &repo, 100, 0);
+        main.milestones = vec![
+            Milestone {
+                at: Timestamp::from_millis(50_000),
+                kind: MilestoneKind::Decision,
+                label: "ratified the strip flip".into(),
+            },
+            Milestone {
+                at: Timestamp::from_millis(80_000),
+                kind: MilestoneKind::Artifact,
+                label: "diff render.rs".into(),
+            },
+        ];
+        let model = LineageModel::from_summaries(&[main], &repo);
+        let html = lineage_strip(&model, None);
+        assert!(html.contains("class=\"mnode\""), "nodes are drawn");
+        assert!(
+            html.contains("ratified the strip flip"),
+            "decision label is a tooltip: {html}"
+        );
+        assert!(
+            html.contains("diff render.rs"),
+            "artifact label is a tooltip"
+        );
     }
 
     #[test]
