@@ -117,12 +117,27 @@ impl ChannelView {
 #[derive(Debug)]
 pub struct Ledger<S: SubstrateProvider> {
     substrate: S,
+    /// A short-lived projection cache (`docs/adr/0002` projections are pure
+    /// over the log). Reads re-fold from the substrate, which for the git-refs
+    /// backend means spawning `git` per request — costly under the human
+    /// surface's click-through. Cached views serve rapid navigation; a local
+    /// [`Ledger::append`] invalidates the channel, and a [`PROJECTION_TTL`]
+    /// bound keeps sync-fetched changes from lingering stale.
+    cache: std::sync::Mutex<HashMap<ChannelId, (std::time::Instant, ChannelView)>>,
 }
+
+/// How long a cached [`ChannelView`] is served before re-projecting. Short
+/// enough that background sync's incoming entries surface promptly; long
+/// enough that clicking around the human surface doesn't re-shell-out to git.
+const PROJECTION_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl<S: SubstrateProvider> Ledger<S> {
     /// Wrap a substrate.
     pub fn new(substrate: S) -> Self {
-        Self { substrate }
+        Self {
+            substrate,
+            cache: std::sync::Mutex::new(HashMap::new()),
+        }
     }
 
     /// Mutable access to the wrapped substrate, for backend-specific
@@ -143,7 +158,14 @@ impl<S: SubstrateProvider> Ledger<S> {
     /// # Errors
     /// Propagates any error from the underlying [`SubstrateProvider`].
     pub async fn append(&mut self, entry: LedgerEntry) -> Result<()> {
-        self.substrate.append(entry).await
+        let channel = entry.channel;
+        self.substrate.append(entry).await?;
+        // Invalidate the channel's cached projection so the writer sees their
+        // own write immediately (the TTL covers entries that arrive by sync).
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.remove(&channel);
+        }
+        Ok(())
     }
 
     /// Project the Channel's log into a [`ChannelView`].
@@ -174,6 +196,14 @@ impl<S: SubstrateProvider> Ledger<S> {
     /// # Errors
     /// Propagates any error from the underlying [`SubstrateProvider`].
     pub async fn project(&self, channel: &ChannelId) -> Result<ChannelView> {
+        // Fast path: a fresh cached projection avoids re-folding the log (and,
+        // for the git-refs backend, re-spawning `git`) on rapid navigation.
+        if let Ok(cache) = self.cache.lock()
+            && let Some((at, view)) = cache.get(channel)
+            && at.elapsed() < PROJECTION_TTL
+        {
+            return Ok(view.clone());
+        }
         let mut entries = self.substrate.entries(channel).await?;
         entries.sort_by(LedgerEntry::canonical_cmp);
         // Keep the first occurrence of each id (in canonical order), so a
@@ -234,7 +264,7 @@ impl<S: SubstrateProvider> Ledger<S> {
             })
             .unwrap_or(false);
 
-        Ok(ChannelView {
+        let view = ChannelView {
             name,
             entries,
             party,
@@ -243,7 +273,11 @@ impl<S: SubstrateProvider> Ledger<S> {
             gate_status,
             sessions,
             closed,
-        })
+        };
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.insert(*channel, (std::time::Instant::now(), view.clone()));
+        }
+        Ok(view)
     }
 
     /// Fold the **Party** out of an ordered entry list (`docs/adr/0017`): the
@@ -558,6 +592,27 @@ mod tests {
         // Original entry is untouched in the log; correction is its own entry.
         assert!(view.entries.iter().any(|e| e.id == original));
         assert!(view.entries.iter().any(|e| e.id == correction));
+    }
+
+    #[tokio::test]
+    async fn projection_cache_reflects_appends_immediately() {
+        // Prime the cache with an empty projection, then append: the next
+        // project must see the new entry. If append failed to invalidate, the
+        // within-TTL cached empty view would (wrongly) still be served.
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let alice = Member::human("Alice", "alice@example.com");
+        assert!(ledger.project(&channel).await.unwrap().entries.is_empty());
+        let id = EntryId::new();
+        ledger
+            .append(entry(id, channel, alice, 1, assertion("hello")))
+            .await
+            .unwrap();
+        let view = ledger.project(&channel).await.unwrap();
+        assert!(
+            view.entries.iter().any(|e| e.id == id),
+            "append invalidates the cached projection"
+        );
     }
 
     #[tokio::test]
