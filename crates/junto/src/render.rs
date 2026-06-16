@@ -908,7 +908,7 @@ fn app_page(
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <title>{title}</title>\n<style>{CSS}{APP_CSS}</style></head>\n<body>\n\
          {bar}\n<div class=\"strip\">{strip}</div>\n\
-         <main class=\"pane\">{main}</main>\n{ACT_FEEDBACK_SCRIPT}</body></html>\n",
+         <main class=\"pane\">{main}</main>\n{ACT_FEEDBACK_SCRIPT}{NAV_PROGRESS_SCRIPT}</body></html>\n",
         title = escape_html(title),
         bar = top_bar(workspaces, active, agents_working, open_gates, identity),
         strip = lineage_strip(model, selected),
@@ -2801,6 +2801,23 @@ var b=e.submitter;setTimeout(function(){f.classList.add('busy');\
 f.querySelectorAll('button').forEach(function(x){x.disabled=true});\
 if(b){b.textContent='recording\\u2026'}},0)});</script>";
 
+/// A top progress bar that fires the instant a same-origin link is clicked or
+/// a form submitted — acknowledging the user's intent during the unavoidable
+/// server-render beat. The bar lives in the soon-to-be-discarded page, so it
+/// simply animates toward 90% and is gone when the new page paints. A single
+/// transient element (not a continuous animation) — no lag.
+const NAV_PROGRESS_SCRIPT: &str = "<script>(function(){\
+var bar=document.createElement('div');bar.id='nav-progress';document.body.appendChild(bar);\
+function go(){requestAnimationFrame(function(){bar.classList.add('go')})}\
+document.addEventListener('click',function(e){\
+if(e.defaultPrevented||e.button!==0||e.metaKey||e.ctrlKey||e.shiftKey||e.altKey)return;\
+var a=e.target.closest&&e.target.closest('a[href]');if(!a)return;\
+var h=a.getAttribute('href');\
+if(!h||h.charAt(0)==='#'||a.target==='_blank'||/^[a-z]+:/i.test(h))return;go()},true);\
+document.addEventListener('submit',function(){go()},true);\
+window.addEventListener('pageshow',function(e){if(e.persisted)bar.classList.remove('go')});\
+})();</script>";
+
 /// Progressive enhancement for the agents form: clone a blank row (MCP server
 /// or plugin path) when a `+ add` button is clicked. Without JS the form still
 /// works — each save adds the one trailing blank row the server rendered.
@@ -2850,6 +2867,8 @@ body{margin:0}\
 .strip .nowlab{font:600 10px 'JetBrains Mono',monospace;fill:var(--accent2)}\
 .strip .axis{font:500 10px 'JetBrains Mono',monospace;fill:var(--faint2)}\
 .strip .strip-expand{font:600 11px Inter,system-ui,sans-serif;fill:var(--dim2);cursor:pointer}\
+#nav-progress{position:fixed;top:0;left:0;height:3px;width:100%;background:linear-gradient(90deg,var(--accent2),#b98cff);transform:scaleX(0);transform-origin:0 50%;opacity:0;z-index:100;transition:transform .8s cubic-bezier(.2,.8,.2,1),opacity .15s}\
+#nav-progress.go{opacity:1;transform:scaleX(.9)}\
 .decisions{display:flex;flex-direction:column}\
 .decision{border-top:1px solid var(--line2);padding:12px 0}\
 .decision:first-child{border-top:0}\
