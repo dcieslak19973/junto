@@ -1492,8 +1492,6 @@ impl LineageModel {
     }
 }
 
-/// Branches shown before the walk-back expander kicks in.
-const STRIP_WINDOW: usize = 3;
 /// Vertical spacing between tracks, in SVG units.
 const STRIP_ROW: i32 = 30;
 
@@ -1539,27 +1537,20 @@ fn strip_time_x(last_activity: Option<junto_kernel::Timestamp>) -> i32 {
     strip_age_x(age_min)
 }
 
-/// The bottom-pinned, windowed lineage strip (redesign spec §3.2): the
-/// workspace's main-line pinned at the bottom (the baseline), branches stacked
-/// above it with the **newest highest** and the oldest nearest the baseline,
-/// time increasing to the right. Windowed to [`STRIP_WINDOW`] with a "walk
-/// back" expander (toward the baseline) when older ones are hidden. `selected`
-/// highlights one track. Tracks are **flat** — diverge/converge edges arrive
-/// with the lineage ADR.
+/// The bottom-pinned lineage strip (redesign spec §3.2): the workspace's
+/// main-line pinned at the bottom (the baseline), branches stacked above it
+/// with the **newest highest** and the oldest nearest the baseline, time
+/// increasing to the right. All branches are shown (windowing for very busy
+/// workspaces is a later refinement). `selected` highlights one track.
 pub fn lineage_strip(model: &LineageModel, selected: Option<&ChannelId>) -> String {
-    let hidden = model.branches.len().saturating_sub(STRIP_WINDOW);
-    let shown = &model.branches[..model.branches.len().min(STRIP_WINDOW)];
+    let shown = &model.branches[..];
     let n = shown.len() as i32;
-    // Rows above the baseline: the shown branches, plus one for the expander
-    // (which sits nearest the baseline, since "older" is downward).
-    let extra = i32::from(hidden > 0);
-    let rows_above = n + extra;
+    let rows_above = n;
     let pad_top = 26;
     let spine_y = pad_top + rows_above * STRIP_ROW;
     let height = spine_y + 54;
     let now_x = 1140;
-    // Newest branch (index 0) sits at the top; oldest shown nearest the
-    // baseline (just above the expander row when present).
+    // Newest branch (index 0) sits at the top; the oldest nearest the baseline.
     let y_of = |i: i32| spine_y - (rows_above - i) * STRIP_ROW;
 
     let mut s = format!("<svg viewBox=\"0 0 1200 {height}\" role=\"img\">");
@@ -1588,17 +1579,6 @@ pub fn lineage_strip(model: &LineageModel, selected: Option<&ChannelId>) -> Stri
          <text x=\"{now_x}\" y=\"9\" text-anchor=\"middle\" class=\"nowlab\">now</text>",
         spine_y + 8
     );
-
-    // walk-back expander, nearest the baseline (older history lives downward)
-    if hidden > 0 {
-        let _ = write!(
-            s,
-            "<a href=\"/?w=&expanded=1\"><text x=\"200\" y=\"{}\" text-anchor=\"end\" \
-             class=\"strip-expand\">⌄ {hidden} older side-quest{} — walk back</text></a>",
-            (spine_y - STRIP_ROW) + 4,
-            if hidden == 1 { "" } else { "s" }
-        );
-    }
 
     // branches: each diverges off the baseline at its birth (first entry) and
     // either ends open at its last-activity, or — if the channel is closed —
@@ -1879,12 +1859,22 @@ pub fn channel_html(
     substrate: &std::path::Path,
     workspace: Option<&std::path::Path>,
 ) -> String {
+    // The channel history shows the most recent entries (newest first); the
+    // full record lives in the durable refs. Rendering all of them inline is a
+    // heavy DOM (a 142-entry channel was ~240KB), so cap it.
+    const HISTORY_CAP: usize = 30;
+    let total = view.entries.len();
     let mut cards = String::new();
-    for entry in &view.entries {
+    for entry in view.entries.iter().rev().take(HISTORY_CAP) {
         let _ = writeln!(cards, "{}", entry_card(entry, view, id));
     }
     let body = if view.entries.is_empty() {
         "<p class=\"empty\">(no entries)</p>".to_string()
+    } else if total > HISTORY_CAP {
+        format!(
+            "{cards}<p class=\"meta\">…and {} older entries in the durable record</p>",
+            total - HISTORY_CAP
+        )
     } else {
         cards
     };
@@ -3159,9 +3149,8 @@ mod tests {
     }
 
     #[test]
-    fn lineage_strip_pins_mainline_windows_branches_and_marks_selection() {
+    fn lineage_strip_pins_mainline_shows_all_branches_and_marks_selection() {
         let repo = std::path::PathBuf::from("/x/junto-ledger");
-        // 1 ambient + 5 branches → 2 hidden behind the expander (WINDOW = 3).
         let summaries = vec![
             summary("junto-ledger", &repo, 1, 0),
             summary("ui-redesign", &repo, 90, 1),
@@ -3171,12 +3160,11 @@ mod tests {
             summary("ci", &repo, 50, 0),
         ];
         let model = LineageModel::from_summaries(&summaries, &repo);
-        let selected = model.branches[0].id; // ui-redesign
+        let selected = model.branches[0].id; // ui-redesign (newest)
         let html = lineage_strip(&model, Some(&selected));
         assert!(html.contains("junto-ledger")); // the main-line label
-        assert!(html.contains("walk back")); // the expander, since hidden > 0
         assert!(html.contains("ui-redesign"));
-        assert!(!html.contains(">ci<")); // 5th branch is windowed out
+        assert!(html.contains(">ci<")); // every branch is shown (no windowing)
         assert!(html.contains("strip-sel")); // selection highlight band
     }
 
