@@ -17,7 +17,7 @@
 //! `.claude/settings.json` / CLAUDE.md content is kept, junto's entries are
 //! added beside it; only the junto-owned convention file is rewritten.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
@@ -110,6 +110,48 @@ pub async fn run(
          sessions get briefs via the SessionStart hook (`junto brief` must be on PATH)."
     );
     Ok(())
+}
+
+/// Auto-heal a fresh git worktree's agent member code (`docs/adr/0017`). The
+/// local binding (`.junto.local.toml`) is gitignored, so `git worktree add`
+/// never carries it over and a new worktree starts unable to write to the
+/// ledger. This copies the member code from the repo's **primary worktree** —
+/// same machine, same operator, so the right agent — into `dir`'s local
+/// binding, if `dir` lacks one. Idempotent and safe to call anywhere: outside
+/// a linked worktree the source resolves to `dir` itself, making it a no-op.
+pub fn seed_worktree(dir: &Path) -> Result<binding::WorktreeSeed> {
+    let primary = primary_worktree(dir)?;
+    binding::seed_member_code_from(dir, &primary)
+}
+
+/// The repo's primary (main) worktree root. A linked worktree shares the
+/// primary's `.git` as its common git dir, so the primary worktree is that
+/// common dir's parent; in the primary worktree itself this resolves back to
+/// the primary. Falls back to `dir` when git can't tell us (not a repo).
+fn primary_worktree(dir: &Path) -> Result<PathBuf> {
+    let mut command = std::process::Command::new("git");
+    command.args([
+        "-C",
+        &dir.display().to_string(),
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+    ]);
+    crate::launch::no_console_window(&mut command);
+    let out = command.output().context("running git rev-parse")?;
+    if !out.status.success() {
+        return Ok(dir.to_path_buf());
+    }
+    let common_dir = PathBuf::from(
+        String::from_utf8(out.stdout)
+            .context("git rev-parse output not utf-8")?
+            .trim(),
+    );
+    // `<root>/.git` → `<root>`; tolerate an unexpected shape by falling back.
+    Ok(common_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| dir.to_path_buf()))
 }
 
 /// The junto-owned convention file's name, relative to the repo root.
@@ -329,6 +371,60 @@ mod tests {
     }
 
     use crate::host::test_home::HomeGuard;
+
+    fn git(dir: &Path, args: &[&str]) {
+        assert!(
+            StdCommand::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success(),
+            "git {args:?} failed in {}",
+            dir.display()
+        );
+    }
+
+    #[test]
+    fn seed_worktree_copies_the_primary_checkout_code_into_a_fresh_worktree() {
+        let primary = git_repo();
+        // A commit so `git worktree add` has a ref to check out.
+        std::fs::write(primary.path().join("README.md"), "x").unwrap();
+        git(primary.path(), &["add", "."]);
+        git(primary.path(), &["commit", "-q", "-m", "init"]);
+        // The primary checkout carries the agent code (gitignored locally).
+        binding::write_local_member_code(primary.path(), "Code42").unwrap();
+
+        // A worktree gets tracked files only — never the gitignored binding.
+        let worktree = tempfile::tempdir().unwrap();
+        let wt_path = worktree.path().join("wt");
+        git(
+            primary.path(),
+            &["worktree", "add", "-q", &wt_path.to_string_lossy(), "HEAD"],
+        );
+        assert_eq!(
+            binding::local_member_code(&wt_path).unwrap(),
+            None,
+            "premise: the worktree starts with no code"
+        );
+
+        let outcome = seed_worktree(&wt_path).unwrap();
+        assert_eq!(outcome, binding::WorktreeSeed::Seeded);
+        assert_eq!(
+            binding::local_member_code(&wt_path).unwrap().as_deref(),
+            Some("Code42")
+        );
+    }
+
+    #[test]
+    fn seed_worktree_on_the_primary_checkout_is_a_safe_no_op() {
+        let primary = git_repo();
+        binding::write_local_member_code(primary.path(), "Code42").unwrap();
+        // Not a linked worktree: source resolves to itself, so an existing
+        // code is simply reported as already present.
+        let outcome = seed_worktree(primary.path()).unwrap();
+        assert!(matches!(outcome, binding::WorktreeSeed::AlreadyPresent));
+    }
 
     #[tokio::test]
     async fn init_is_idempotent_and_wires_everything() {

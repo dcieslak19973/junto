@@ -101,7 +101,9 @@ enum Command {
     },
     /// Print the briefs of every channel this checkout is bound to
     /// (.junto.toml + .junto.local.toml) — the SessionStart recall hook
-    /// (docs/adr/0013). Best-effort: never fails session start.
+    /// (docs/adr/0013). Also auto-heals a fresh git worktree by seeding its
+    /// agent member code from the primary checkout (docs/adr/0017).
+    /// Best-effort: never fails session start.
     Brief {
         /// The checkout directory. Defaults to the current directory.
         #[arg(long, default_value = ".")]
@@ -294,6 +296,16 @@ async fn brief(dir: PathBuf) -> Result<()> {
             }
             Err(err) => eprintln!("junto brief: resolving '{channel}': {err:#}"),
         }
+    }
+    // Auto-heal a fresh worktree: the local binding is gitignored, so a new
+    // `git worktree add` starts without an agent code; copy it from the
+    // primary worktree (docs/adr/0017). Best-effort — never fail session start.
+    match init::seed_worktree(&dir) {
+        Ok(binding::WorktreeSeed::Seeded) => {
+            eprintln!("junto brief: seeded this worktree's member code from the primary checkout");
+        }
+        Ok(_) => {}
+        Err(err) => eprintln!("junto brief: seeding worktree member code: {err:#}"),
     }
     // Relay this checkout's agent member code into session context, if the
     // operator put one in the local (gitignored) binding (docs/adr/0017).
