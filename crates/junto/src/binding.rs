@@ -8,7 +8,9 @@
 //! - `.junto.toml` (committed) — the project's ambient channel(s); every
 //!   clone/worktree inherits it.
 //! - `.junto.local.toml` (gitignored) — this checkout's additional channels,
-//!   e.g. the inquiry a worktree exists for.
+//!   e.g. the inquiry a worktree exists for. Because it is gitignored, a fresh
+//!   `git worktree add` never carries it over; [`seed_member_code_from`]
+//!   auto-heals that by copying the agent code from the primary worktree.
 //!
 //! The effective binding is the union, committed first. This is the
 //! dogfood-era bridge: the destination is membership (join at session start,
@@ -81,6 +83,37 @@ pub fn write_local_member_code(checkout_dir: &Path, code: &str) -> Result<()> {
     );
     std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
+}
+
+/// The outcome of seeding a checkout's member code from another checkout.
+#[derive(Debug, PartialEq, Eq)]
+pub enum WorktreeSeed {
+    /// The member code was copied in from the source checkout.
+    Seeded,
+    /// The checkout already had a member code; it was left untouched.
+    AlreadyPresent,
+    /// The source checkout had no member code to copy.
+    NothingToCopy,
+}
+
+/// Seed `checkout_dir`'s local member code from `source_dir`'s, if (and only
+/// if) `checkout_dir` lacks one. This auto-heals a fresh git worktree: the
+/// local binding is gitignored (`docs/adr/0017`), so `git worktree add` never
+/// carries it over and the worktree starts with no agent code to write with.
+/// Copying it from the primary worktree picks the right agent — same machine,
+/// same operator — and is idempotent: an existing code is never overwritten,
+/// and the worktree's own local channel additions are preserved.
+pub fn seed_member_code_from(checkout_dir: &Path, source_dir: &Path) -> Result<WorktreeSeed> {
+    if local_member_code(checkout_dir)?.is_some() {
+        return Ok(WorktreeSeed::AlreadyPresent);
+    }
+    match local_member_code(source_dir)? {
+        Some(code) => {
+            write_local_member_code(checkout_dir, &code)?;
+            Ok(WorktreeSeed::Seeded)
+        }
+        None => Ok(WorktreeSeed::NothingToCopy),
+    }
 }
 
 /// Write the committed project binding.
@@ -158,6 +191,65 @@ mod tests {
             bound_channels(dir.path()).unwrap(),
             vec!["my-worktree-inquiry".to_string()],
             "local channel additions survive the relay write"
+        );
+    }
+
+    #[test]
+    fn seed_copies_the_code_when_the_checkout_lacks_one() {
+        let primary = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        write_local_member_code(primary.path(), "Abc123").unwrap();
+
+        let outcome = seed_member_code_from(worktree.path(), primary.path()).unwrap();
+        assert_eq!(outcome, WorktreeSeed::Seeded);
+        assert_eq!(
+            local_member_code(worktree.path()).unwrap().as_deref(),
+            Some("Abc123")
+        );
+    }
+
+    #[test]
+    fn seed_is_a_no_op_when_the_checkout_already_has_a_code() {
+        let primary = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        write_local_member_code(primary.path(), "Source").unwrap();
+        write_local_member_code(worktree.path(), "Existing").unwrap();
+
+        let outcome = seed_member_code_from(worktree.path(), primary.path()).unwrap();
+        assert!(matches!(outcome, WorktreeSeed::AlreadyPresent));
+        assert_eq!(
+            local_member_code(worktree.path()).unwrap().as_deref(),
+            Some("Existing"),
+            "an existing code is never overwritten"
+        );
+    }
+
+    #[test]
+    fn seed_reports_nothing_to_copy_when_the_source_has_no_code() {
+        let primary = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+
+        let outcome = seed_member_code_from(worktree.path(), primary.path()).unwrap();
+        assert!(matches!(outcome, WorktreeSeed::NothingToCopy));
+        assert_eq!(local_member_code(worktree.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn seed_preserves_local_channels_in_the_worktree() {
+        let primary = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        write_local_member_code(primary.path(), "Abc123").unwrap();
+        std::fs::write(
+            worktree.path().join(LOCAL_BINDING),
+            "channels = [\"worktree-inquiry\"]\n",
+        )
+        .unwrap();
+
+        seed_member_code_from(worktree.path(), primary.path()).unwrap();
+        assert_eq!(
+            bound_channels(worktree.path()).unwrap(),
+            vec!["worktree-inquiry".to_string()],
+            "the worktree's own local channel additions survive seeding"
         );
     }
 
