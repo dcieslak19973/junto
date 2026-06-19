@@ -25,7 +25,7 @@ use std::sync::{Mutex, OnceLock};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 use junto_kernel::{
     ChannelId, ContentDigest, EntryId, EntryPayload, LedgerEntry, Member, ProvenanceRef,
@@ -629,11 +629,29 @@ impl LiveEvent {
     }
 }
 
+/// A human's mid-turn signal to a running turn — the reverse direction of the
+/// live feed (human → turn). Delivered over a per-session control channel and
+/// acted on by the turn driver's `select!` loop (`docs/adr/0032`).
+#[derive(Debug)]
+pub(crate) enum TurnControl {
+    /// Stop the current prompt and end the turn.
+    Interrupt,
+    /// Stop the current prompt and re-prompt in place with this text.
+    Steer(String),
+}
+
+/// No turn is currently live for the session, so control could not be
+/// delivered. The caller falls back to the between-turns resume path.
+#[derive(Debug)]
+pub(crate) struct NotLive;
+
 /// Per-session live feed: a bounded replay buffer (for a page that loads
-/// mid-turn) plus a broadcast sender for the live tail.
+/// mid-turn), a broadcast sender for the live tail (host → human), and a
+/// control sender for mid-turn signals (human → turn).
 struct LiveFeed {
     buffer: Vec<LiveEvent>,
     sender: broadcast::Sender<LiveEvent>,
+    control: mpsc::Sender<TurnControl>,
 }
 
 /// The host's in-memory registry of running sessions' live feeds. Ephemeral —
@@ -644,17 +662,31 @@ pub struct LiveSessions {
 }
 
 impl LiveSessions {
-    /// Open a fresh feed for a session about to run (replaces any stale one).
-    fn begin(&self, session: EntryId) {
+    /// Open a fresh feed for a session about to run (replaces any stale one),
+    /// returning the control receiver the running turn selects on (human →
+    /// turn).
+    fn begin(&self, session: EntryId) -> mpsc::Receiver<TurnControl> {
         let (sender, _rx) = broadcast::channel(256);
+        // Capacity 1: one human, one in-flight signal at a time.
+        let (control, control_rx) = mpsc::channel(1);
         let mut map = self.inner.lock().expect("live sessions registry lock");
         map.insert(
             session,
             LiveFeed {
                 buffer: Vec::new(),
                 sender,
+                control,
             },
         );
+        control_rx
+    }
+
+    /// Deliver a human's control signal to the running turn, or `Err(NotLive)`
+    /// if no turn is currently streaming for the session.
+    pub(crate) fn control(&self, session: EntryId, signal: TurnControl) -> Result<(), NotLive> {
+        let map = self.inner.lock().expect("live sessions registry lock");
+        let feed = map.get(&session).ok_or(NotLive)?;
+        feed.control.try_send(signal).map_err(|_| NotLive)
     }
 
     /// Append an event: into the replay buffer (bounded) and to live tails.
@@ -1372,7 +1404,7 @@ fn spawn_turn(
     agent: crate::agent::Agent,
 ) {
     tokio::spawn(async move {
-        host.live().begin(session);
+        let _control_rx = host.live().begin(session);
         let outcome = run_turn(
             &workspace,
             &prompt,
@@ -1577,7 +1609,7 @@ fn spawn_outcome_loop(
     agent: crate::agent::Agent,
 ) {
     tokio::spawn(async move {
-        host.live().begin(session);
+        let _control_rx = host.live().begin(session);
 
         // Prepare a PR branch the worker commits onto (the push-gate's
         // deliverable). Best-effort: without it, grading falls back to the
@@ -2607,7 +2639,7 @@ mod tests {
         // No feed yet → no subscription.
         assert!(live.subscribe(session).is_none());
 
-        live.begin(session);
+        let _ = live.begin(session);
         live.publish(session, LiveEvent::new("assistant", "first"));
         let (buffer, mut receiver) = live.subscribe(session).expect("feed is live");
         assert_eq!(buffer.len(), 1, "late joiner replays what already happened");
@@ -2625,6 +2657,27 @@ mod tests {
             receiver.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Closed)
         ));
+    }
+
+    #[tokio::test]
+    async fn control_channel_delivers_to_live_turn_and_errors_when_idle() {
+        let live = LiveSessions::default();
+        let session = EntryId::new();
+
+        // No feed yet → control reports NotLive.
+        assert!(live.control(session, TurnControl::Interrupt).is_err());
+
+        let mut control_rx = live.begin(session);
+        live.control(session, TurnControl::Steer("focus on the parser".into()))
+            .expect("delivered to the live turn");
+        match control_rx.recv().await {
+            Some(TurnControl::Steer(msg)) => assert_eq!(msg, "focus on the parser"),
+            other => panic!("expected steer, got {other:?}"),
+        }
+
+        // After finish, control is NotLive again.
+        live.finish(session);
+        assert!(live.control(session, TurnControl::Interrupt).is_err());
     }
 
     #[test]
