@@ -157,3 +157,16 @@ When a code decision contradicts a doc, surface the conflict — don't silently 
 - This is a **Windows** machine, **PowerShell** shell — use PowerShell syntax (`$null`, `$env:VAR`, backtick line-continuation).
 - 🔵 Prefix tooling commands with `rtk` per the user's global RTK convention (token-optimized output) — e.g. `rtk cargo build`, `rtk cargo test`, `rtk git status`.
 - The "rule of three": **build concrete cases before extracting a framework.** Don't frameworkize an adapter or Playbook seam from a single example — build a few, then extract.
+
+## Agent skills
+
+Per-repo config the engineering skills (`to-issues`, `triage`, `to-prd`, `qa`, `improve-codebase-architecture`, `diagnose`, `tdd`, `grill-with-docs`) read. Edit the `docs/agents/*.md` files directly to change these.
+
+### Issue tracker
+Issues and PRDs live in **GitHub Issues** (via `gh`); junto's own `junto-dev` ledger stays for decisions/findings, not work-item tracking. See [`docs/agents/issue-tracker.md`](docs/agents/issue-tracker.md).
+
+### Triage labels
+The five canonical triage roles, default strings (`wontfix` already exists; the rest are created on first use). See [`docs/agents/triage-labels.md`](docs/agents/triage-labels.md).
+
+### Domain docs
+Single-context; the glossary is `docs/domain-model.md` (**not** `CONTEXT.md`) and decisions are in `docs/adr/`. See [`docs/agents/domain.md`](docs/agents/domain.md).
