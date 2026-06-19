@@ -12,6 +12,7 @@
 //! `session/prompt`) and the `session/update` notification stream. The typed
 //! `agent-client-protocol` crate is the upgrade path if this grows.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
 
@@ -19,11 +20,12 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines};
 use tokio::process::{ChildStdin, ChildStdout};
+use tokio::sync::mpsc;
 
 use junto_kernel::EntryId;
 
 use crate::agent::McpServer;
-use crate::launch::{LiveEvent, LiveSessions, TURN_TIMEOUT, TurnOutcome};
+use crate::launch::{LiveEvent, LiveSessions, TURN_TIMEOUT, TurnControl, TurnEnd, TurnOutcome};
 
 /// A agent's config as it crosses into one ACP turn
 /// (`docs/superpowers/specs/2026-06-13-agent-personas-design.md`). `mcp_servers`
@@ -95,7 +97,12 @@ impl AcpAgent {
 /// Run one ACP turn: spawn the adapter, handshake, start (`session/new`) or
 /// resume (`session/load`) a session, prompt, and stream updates into the live
 /// feed. `Err` means ACP could not be set up — the caller falls back to the
-/// CLI; a turn that ran but the agent failed returns `Ok` with `failed: true`.
+/// CLI; a turn that ran but the agent failed returns `Ok` with `end:
+/// TurnEnd::Failed`. A human interrupt resolves the prompt as `Interrupted`.
+// One ACP turn genuinely threads all of these (adapter, workspace, prompt,
+// resume, live feed, session, agent config, control channel); bundling them
+// into a struct would obscure more than it clarifies.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_turn_acp(
     adapter: &[String],
     workspace: &Path,
@@ -104,6 +111,7 @@ pub(crate) async fn run_turn_acp(
     live: &LiveSessions,
     session: EntryId,
     agent: &AcpAgent,
+    control: &mut mpsc::Receiver<TurnControl>,
 ) -> Result<TurnOutcome> {
     let (program, args) = adapter.split_first().context("empty ACP adapter command")?;
     let mut command = tokio::process::Command::new(program);
@@ -126,9 +134,10 @@ pub(crate) async fn run_turn_acp(
     let mut reader = BufReader::new(stdout).lines();
     let cwd = workspace.display().to_string();
 
-    // The whole exchange runs under the turn timeout; on timeout the future
-    // drops and kill_on_drop reaps the adapter (and its Claude Code child).
-    let exchange = async {
+    // Handshake (initialize → session → set_mode) under a setup-timeout budget;
+    // a setup failure or timeout bubbles as `Err` so the caller can fall back to
+    // the CLI (`docs/adr/0024`). On drop, kill_on_drop reaps the adapter.
+    let setup = async {
         // 1. initialize
         request(
             &mut stdin,
@@ -203,51 +212,94 @@ pub(crate) async fn run_turn_acp(
         pump_until(&mut reader, &mut stdin, 3, live, session, &mut sink)
             .await
             .context("ACP session/set_mode")?;
+        Ok::<String, anyhow::Error>(session_id)
+    };
+    let session_id = match tokio::time::timeout(TURN_TIMEOUT, setup).await {
+        Ok(Ok(session_id)) => session_id,
+        // A setup/handshake error → bubble up so the caller can fall back.
+        Ok(Err(err)) => return Err(err),
+        Err(_) => bail!("ACP setup exceeded the timeout"),
+    };
 
-        // 4. prompt — updates stream into `answer` while we await the response.
+    // 4. steerable prompt loop. Each prompt gets a fresh timeout budget (a steer
+    // is a new instruction). The adapter process + ACP session stay alive across
+    // a cancel → re-prompt, so a steer continues with full context in place
+    // (`docs/adr/0032`).
+    let mut text = prompt.to_string();
+    let mut answer = String::new();
+    let mut prompt_id = 4_i64;
+    // One feed state for the whole turn so segment ids stay unique across steer
+    // re-prompts (a fresh state per prompt would reuse seq 1 and clobber blocks).
+    let mut feed = FeedState::default();
+    loop {
         request(
             &mut stdin,
-            4,
+            prompt_id,
             "session/prompt",
             json!({
                 "sessionId": session_id,
-                "prompt": [{ "type": "text", "text": prompt }]
+                "prompt": [{ "type": "text", "text": text }]
             }),
         )
         .await?;
-        let mut answer = String::new();
-        let result = pump_until(&mut reader, &mut stdin, 4, live, session, &mut answer)
-            .await
-            .context("ACP session/prompt")?;
-
-        let stop = result
+        let pumped = match tokio::time::timeout(
+            TURN_TIMEOUT,
+            pump_prompt(
+                &mut reader,
+                &mut stdin,
+                prompt_id,
+                &session_id,
+                live,
+                session,
+                &mut answer,
+                control,
+                &mut feed,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(pumped)) => pumped,
+            Ok(Err(err)) => return Err(err.context("ACP session/prompt")),
+            Err(_) => {
+                return Ok(TurnOutcome {
+                    result: format!(
+                        "turn exceeded the {}-minute timeout and was killed (docs/adr/0023)",
+                        TURN_TIMEOUT.as_secs() / 60
+                    ),
+                    harness_session: Some(session_id),
+                    end: TurnEnd::TimedOut,
+                });
+            }
+        };
+        let stop = pumped
+            .result
             .get("stopReason")
             .and_then(|v| v.as_str())
-            .unwrap_or("end_turn");
-        Ok::<TurnOutcome, anyhow::Error>(TurnOutcome {
-            result: if answer.trim().is_empty() {
-                format!("(agent produced no message; stop reason: {stop})")
-            } else {
-                answer
-            },
-            harness_session: Some(session_id),
-            failed: stop != "end_turn",
-        })
-    };
-
-    match tokio::time::timeout(TURN_TIMEOUT, exchange).await {
-        Ok(Ok(outcome)) => Ok(outcome),
-        // A setup/handshake error → bubble up so the caller can fall back.
-        Ok(Err(err)) => Err(err),
-        // A timeout is a real overran turn, not a setup failure — not a fallback.
-        Err(_) => Ok(TurnOutcome {
-            result: format!(
-                "turn exceeded the {}-minute timeout and was killed (docs/adr/0023)",
-                TURN_TIMEOUT.as_secs() / 60
-            ),
-            harness_session: None,
-            failed: true,
-        }),
+            .unwrap_or("end_turn")
+            .to_string();
+        match next_loop_step(&stop, pumped.interrupted_with) {
+            LoopStep::Reprompt(message) => {
+                live.publish(
+                    session,
+                    LiveEvent::new("status", format!("steering: {message}")),
+                );
+                text = message;
+                answer.clear();
+                prompt_id += 1;
+                continue;
+            }
+            LoopStep::Done(end) => {
+                return Ok(TurnOutcome {
+                    result: if answer.trim().is_empty() {
+                        format!("(agent produced no message; stop reason: {stop})")
+                    } else {
+                        answer
+                    },
+                    harness_session: Some(session_id),
+                    end,
+                });
+            }
+        }
     }
 }
 
@@ -269,11 +321,91 @@ async fn write_message(stdin: &mut ChildStdin, message: &Value) -> Result<()> {
     Ok(())
 }
 
+/// How a finished prompt pump ended: the awaited `result`, plus the human
+/// control signal that interrupted it (if any).
+struct PumpEnd {
+    result: Value,
+    interrupted_with: Option<TurnControl>,
+}
+
+/// Classify how a prompt that drained to `stop_reason` ended. A human interrupt
+/// wins regardless of the adapter's reason. Pure — the wire I/O around it is
+/// covered by the Task-0 cancel probe + dogfood runs.
+fn classify_prompt_end(stop_reason: &str, interrupted: bool) -> TurnEnd {
+    if interrupted {
+        TurnEnd::Interrupted
+    } else if stop_reason == "end_turn" {
+        TurnEnd::Completed
+    } else {
+        TurnEnd::Failed
+    }
+}
+
+/// The next step of the steerable prompt loop after a prompt drained.
+enum LoopStep {
+    /// A steer arrived: re-prompt the same session in place with this text.
+    Reprompt(String),
+    /// The turn is over with this end-state.
+    Done(TurnEnd),
+}
+
+/// Decide the loop's next step from how the prompt ended. A steer re-prompts; a
+/// bare interrupt ends the turn; otherwise the adapter's stop reason decides.
+fn next_loop_step(stop_reason: &str, interrupted_with: Option<TurnControl>) -> LoopStep {
+    match interrupted_with {
+        Some(TurnControl::Steer(message)) => LoopStep::Reprompt(message),
+        Some(TurnControl::Interrupt) => LoopStep::Done(TurnEnd::Interrupted),
+        None => LoopStep::Done(classify_prompt_end(stop_reason, false)),
+    }
+}
+
+/// Process one parsed ACP message: publish `session/update`s into the live feed
+/// (accumulating agent text into `answer`) and auto-answer agent→client requests
+/// (permission prompts → allow — junto's gates are the outcome layer,
+/// `docs/adr/0023`). Returns `Some(result)` when the response for `awaited_id`
+/// arrives, `None` otherwise.
+async fn handle_acp_line(
+    message: &Value,
+    stdin: &mut ChildStdin,
+    awaited_id: i64,
+    live: &LiveSessions,
+    session: EntryId,
+    answer: &mut String,
+    state: &mut FeedState,
+) -> Result<Option<Value>> {
+    match message.get("method").and_then(|m| m.as_str()) {
+        // A response to one of our requests (responses carry no method).
+        None => {
+            if message.get("id").and_then(|v| v.as_i64()) == Some(awaited_id) {
+                if let Some(error) = message.get("error") {
+                    bail!("ACP error on request {awaited_id}: {error}");
+                }
+                return Ok(Some(message.get("result").cloned().unwrap_or(Value::Null)));
+            }
+        }
+        Some("session/update") => {
+            if let Some(update) = message.get("params").and_then(|p| p.get("update")) {
+                handle_update(update, live, session, answer, state);
+            }
+        }
+        // An agent→client request (has a non-null id) — answer it.
+        Some(other) => {
+            if let Some(id) = message.get("id").filter(|id| !id.is_null()) {
+                let result = answer_agent_request(other, message.get("params"));
+                write_message(
+                    stdin,
+                    &json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+                )
+                .await?;
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Read adapter output until the response for `awaited_id` arrives, returning
-/// its `result`. Meanwhile it publishes `session/update`s into the live feed
-/// (accumulating the agent's message text into `answer`) and auto-answers
-/// agent→client requests (permission prompts → allow — junto's gates are the
-/// outcome layer, `docs/adr/0023`).
+/// its `result`. Used for the fast handshake steps (initialize / session / mode);
+/// not cancellable — see [`pump_prompt`] for the interruptable prompt step.
 async fn pump_until(
     reader: &mut Lines<BufReader<ChildStdout>>,
     stdin: &mut ChildStdin,
@@ -282,7 +414,7 @@ async fn pump_until(
     session: EntryId,
     answer: &mut String,
 ) -> Result<Value> {
-    let mut pending = String::new();
+    let mut state = FeedState::default();
     while let Some(line) = reader.next_line().await.context("reading ACP output")? {
         let line = line.trim();
         if line.is_empty() {
@@ -291,92 +423,209 @@ async fn pump_until(
         let Ok(message) = serde_json::from_str::<Value>(line) else {
             continue; // tolerate any stray non-JSON line
         };
-        let method = message.get("method").and_then(|m| m.as_str());
-        match method {
-            // A response to one of our requests (responses carry no method).
-            None => {
-                if message.get("id").and_then(|v| v.as_i64()) == Some(awaited_id) {
-                    flush_pending(&mut pending, live, session);
-                    if let Some(error) = message.get("error") {
-                        bail!("ACP error on request {awaited_id}: {error}");
-                    }
-                    return Ok(message.get("result").cloned().unwrap_or(Value::Null));
-                }
-            }
-            Some("session/update") => {
-                if let Some(update) = message.get("params").and_then(|p| p.get("update")) {
-                    handle_update(update, live, session, answer, &mut pending);
-                }
-            }
-            // An agent→client request (has a non-null id) — answer it.
-            Some(other) => {
-                if let Some(id) = message.get("id").filter(|id| !id.is_null()) {
-                    let result = answer_agent_request(other, message.get("params"));
-                    write_message(
-                        stdin,
-                        &json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-                    )
-                    .await?;
-                }
-            }
+        if let Some(result) = handle_acp_line(
+            &message, stdin, awaited_id, live, session, answer, &mut state,
+        )
+        .await?
+        {
+            return Ok(result);
         }
     }
     bail!("ACP adapter closed before responding to request {awaited_id}")
 }
 
-/// Map one `session/update` into live-feed events; accumulate agent text into
-/// `answer` (the final memo) and flush readable lines via `pending`.
+/// Pump the prompt step, cancellable mid-flight: while draining the update
+/// stream it `select!`s on the human control channel. On the first signal it
+/// sends a graceful ACP `session/cancel` for `session_id` (the adapter tears
+/// down its own child tree — the cross-platform cancel path), then drains until
+/// the prompt resolves (`stopReason == "cancelled"`). A dropped control sender
+/// is treated as a bare interrupt.
+#[allow(clippy::too_many_arguments)]
+async fn pump_prompt(
+    reader: &mut Lines<BufReader<ChildStdout>>,
+    stdin: &mut ChildStdin,
+    awaited_id: i64,
+    session_id: &str,
+    live: &LiveSessions,
+    session: EntryId,
+    answer: &mut String,
+    control: &mut mpsc::Receiver<TurnControl>,
+    state: &mut FeedState,
+) -> Result<PumpEnd> {
+    let mut interrupted_with: Option<TurnControl> = None;
+    loop {
+        let line = tokio::select! {
+            // Once interrupted we stop watching control and just drain the reader.
+            signal = control.recv(), if interrupted_with.is_none() => {
+                write_message(stdin, &json!({
+                    "jsonrpc": "2.0", "method": "session/cancel",
+                    "params": { "sessionId": session_id }
+                })).await?;
+                interrupted_with = Some(signal.unwrap_or(TurnControl::Interrupt));
+                continue;
+            }
+            line = reader.next_line() => line.context("reading ACP output")?,
+        };
+        let Some(line) = line else {
+            bail!("ACP adapter closed before responding to request {awaited_id}");
+        };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(message) = serde_json::from_str::<Value>(line) else {
+            continue; // tolerate any stray non-JSON line
+        };
+        if let Some(result) =
+            handle_acp_line(&message, stdin, awaited_id, live, session, answer, state).await?
+        {
+            return Ok(PumpEnd {
+                result,
+                interrupted_with,
+            });
+        }
+    }
+}
+
+/// The active growing text segment of the live feed — assistant message or
+/// model reasoning — accumulated raw so it can be re-rendered as Markdown on
+/// every chunk.
+struct TextSegment {
+    /// `"assistant"` or `"thinking"`.
+    kind: &'static str,
+    /// The segment's stable feed id (same `seq` ⇒ the client replaces in place).
+    seq: u64,
+    /// The accumulated raw Markdown text so far.
+    text: String,
+}
+
+/// The live feed's segment bookkeeping across one turn (`docs/adr/0023`/`0032`):
+/// a monotonic segment id, the current text segment, and a map from ACP tool
+/// call ids to their feed `seq` so a `tool_call_update` replaces its block.
+/// Persisted across steer re-prompts so segment ids stay unique for the turn.
+#[derive(Default)]
+struct FeedState {
+    next_seq: u64,
+    segment: Option<TextSegment>,
+    tools: HashMap<String, u64>,
+}
+
+impl FeedState {
+    fn fresh_seq(&mut self) -> u64 {
+        self.next_seq += 1;
+        self.next_seq
+    }
+}
+
+/// Map one `session/update` into live-feed events (`docs/adr/0023`/`0032`):
+/// assistant/thinking chunks accumulate into a Markdown segment re-rendered as
+/// sanitized HTML on each frame; a tool call (and its later status update) is a
+/// discrete, richer block. Agent message text also accumulates into `answer`
+/// (the recorded memo); reasoning does **not** — thinking is transient.
 fn handle_update(
     update: &Value,
     live: &LiveSessions,
     session: EntryId,
     answer: &mut String,
-    pending: &mut String,
+    state: &mut FeedState,
 ) {
     match update.get("sessionUpdate").and_then(|v| v.as_str()) {
         Some("agent_message_chunk") => {
             if let Some(text) = update.pointer("/content/text").and_then(|v| v.as_str()) {
                 answer.push_str(text);
-                pending.push_str(text);
-                // Flush whole lines to the feed so it streams readably without a
-                // per-token <li> storm.
-                while let Some(newline) = pending.find('\n') {
-                    let line: String = pending.drain(..=newline).collect();
-                    let line = line.trim_end();
-                    if !line.is_empty() {
-                        live.publish(session, LiveEvent::new("assistant", line));
-                    }
-                }
+                stream_text(live, session, state, "assistant", text);
+            }
+        }
+        Some("agent_thought_chunk") => {
+            if let Some(text) = update.pointer("/content/text").and_then(|v| v.as_str()) {
+                stream_text(live, session, state, "thinking", text);
             }
         }
         Some("tool_call") => {
-            let label = update
-                .get("title")
-                .and_then(|v| v.as_str())
-                .or_else(|| update.pointer("/rawInput/command").and_then(|v| v.as_str()))
-                .unwrap_or("tool");
-            let label: String = label
-                .lines()
-                .next()
-                .unwrap_or(label)
-                .chars()
-                .take(80)
-                .collect();
-            live.publish(session, LiveEvent::new("tool", label));
+            // A tool interrupts the current text block: close it so the next
+            // assistant/thought chunk starts a fresh segment (chronology holds).
+            state.segment = None;
+            let seq = state.fresh_seq();
+            if let Some(id) = update.get("toolCallId").and_then(|v| v.as_str()) {
+                state.tools.insert(id.to_string(), seq);
+            }
+            live.publish(
+                session,
+                LiveEvent::line_seq("tool", tool_label(update), seq),
+            );
         }
-        // usage_update, plan, agent_thought_chunk, available_commands_update,
-        // tool_call_update: not surfaced in the v1 feed.
+        Some("tool_call_update") => {
+            // Replace the originating tool block in place (status / result),
+            // when we can match it back to its `tool_call`.
+            if let Some(seq) = update
+                .get("toolCallId")
+                .and_then(|v| v.as_str())
+                .and_then(|id| state.tools.get(id).copied())
+            {
+                live.publish(
+                    session,
+                    LiveEvent::line_seq("tool", tool_label(update), seq),
+                );
+            }
+        }
+        // usage_update, plan, available_commands_update: not surfaced.
         _ => {}
     }
 }
 
-/// Flush any buffered (newline-less) agent text as a final feed line.
-fn flush_pending(pending: &mut String, live: &LiveSessions, session: EntryId) {
-    let tail = pending.trim();
-    if !tail.is_empty() {
-        live.publish(session, LiveEvent::new("assistant", tail));
+/// Append `chunk` to the current text segment (starting a new one if the kind
+/// switched), then publish the whole segment re-rendered as sanitized Markdown
+/// HTML under its stable `seq`.
+fn stream_text(
+    live: &LiveSessions,
+    session: EntryId,
+    state: &mut FeedState,
+    kind: &'static str,
+    chunk: &str,
+) {
+    let mut segment = match state.segment.take() {
+        Some(seg) if seg.kind == kind => seg,
+        _ => TextSegment {
+            kind,
+            seq: state.fresh_seq(),
+            text: String::new(),
+        },
+    };
+    segment.text.push_str(chunk);
+    let html = crate::render::render_markdown(&segment.text);
+    live.publish(session, LiveEvent::segment(kind, html, segment.seq));
+    state.segment = Some(segment);
+}
+
+/// A richer one-line label for a tool call: `title: salient-input [status]`,
+/// e.g. `Bash: cargo test [completed]`. Still a glanceable summary, never the
+/// whole payload (terminal-less: an action, not scrollback).
+fn tool_label(update: &Value) -> String {
+    let title = update.get("title").and_then(|v| v.as_str());
+    let detail = update.get("rawInput").and_then(|input| {
+        ["command", "path", "file_path", "pattern", "url", "query"]
+            .iter()
+            .find_map(|key| input.get(key).and_then(|v| v.as_str()))
+    });
+    let base = match (title, detail) {
+        (Some(t), Some(d)) => format!("{t}: {d}"),
+        (Some(t), None) => t.to_string(),
+        (None, Some(d)) => d.to_string(),
+        (None, None) => "tool".to_string(),
+    };
+    let base: String = base
+        .lines()
+        .next()
+        .unwrap_or(&base)
+        .chars()
+        .take(160)
+        .collect();
+    match update.get("status").and_then(|v| v.as_str()) {
+        Some(status) if status != "in_progress" && status != "pending" => {
+            format!("{base} [{status}]")
+        }
+        _ => base,
     }
-    pending.clear();
 }
 
 /// The result for an agent→client request. Permission prompts are auto-allowed
@@ -411,6 +660,46 @@ fn answer_agent_request(method: &str, params: Option<&Value>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_prompt_end_distinguishes_interrupt_from_failure() {
+        assert_eq!(classify_prompt_end("end_turn", false), TurnEnd::Completed);
+        assert_eq!(classify_prompt_end("refusal", false), TurnEnd::Failed);
+        // A human interrupt wins regardless of the adapter's stop reason.
+        assert_eq!(classify_prompt_end("cancelled", true), TurnEnd::Interrupted);
+        assert_eq!(classify_prompt_end("end_turn", true), TurnEnd::Interrupted);
+    }
+
+    #[test]
+    fn steer_reprompts_other_signals_end_the_turn() {
+        match next_loop_step("cancelled", Some(TurnControl::Steer("do X instead".into()))) {
+            LoopStep::Reprompt(m) => assert_eq!(m, "do X instead"),
+            _ => panic!("steer should re-prompt"),
+        }
+        assert!(matches!(
+            next_loop_step("cancelled", Some(TurnControl::Interrupt)),
+            LoopStep::Done(TurnEnd::Interrupted)
+        ));
+        assert!(matches!(
+            next_loop_step("end_turn", None),
+            LoopStep::Done(TurnEnd::Completed)
+        ));
+    }
+
+    #[test]
+    fn tool_label_combines_title_input_and_status() {
+        let completed = json!({
+            "title": "Bash", "rawInput": { "command": "cargo test" }, "status": "completed"
+        });
+        assert_eq!(tool_label(&completed), "Bash: cargo test [completed]");
+        // in_progress is omitted; only the first line of the input is kept.
+        let running = json!({
+            "title": "Edit", "rawInput": { "file_path": "src/x.rs" }, "status": "in_progress"
+        });
+        assert_eq!(tool_label(&running), "Edit: src/x.rs");
+        // Bare fallback when there's nothing to say.
+        assert_eq!(tool_label(&json!({})), "tool");
+    }
 
     #[test]
     fn mcp_json_is_the_http_server_shape_the_adapter_expects() {

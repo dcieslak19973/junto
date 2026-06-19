@@ -25,7 +25,7 @@ use std::sync::{Mutex, OnceLock};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 use junto_kernel::{
     ChannelId, ContentDigest, EntryId, EntryPayload, LedgerEntry, Member, ProvenanceRef,
@@ -612,28 +612,82 @@ fn record_turn(
 /// One line in a session's live progress feed.
 #[derive(Clone, Debug, Serialize)]
 pub struct LiveEvent {
-    /// `status` (lifecycle), `assistant` (model text), `tool` (a named
-    /// action), `result` (final summary), or `error`.
+    /// `status` (lifecycle), `assistant` (model text), `thinking` (model
+    /// reasoning), `tool` (a named action), `result` (final summary), or
+    /// `error`.
     pub kind: String,
-    /// A human-readable line — assistant text, or a tool action like
-    /// `Bash: cargo test`.
+    /// The line's content. For `assistant`/`thinking` segments this is
+    /// **sanitized HTML** (`html == true`, rendered server-side from Markdown);
+    /// otherwise a plain string.
     pub text: String,
+    /// Segment id. `0` = a discrete line (always appended). A non-zero `seq`
+    /// marks a growing block: successive events with the same `seq` **replace**
+    /// the prior one (a Markdown segment re-rendered as it streams).
+    #[serde(default)]
+    pub seq: u64,
+    /// When true, `text` is sanitized HTML the client sets via `innerHTML`;
+    /// otherwise plain text set via `textContent`.
+    #[serde(default)]
+    pub html: bool,
 }
 
 impl LiveEvent {
+    /// A discrete plain-text line (status / result / error / tool).
     pub(crate) fn new(kind: &str, text: impl Into<String>) -> Self {
         Self {
             kind: kind.into(),
             text: text.into(),
+            seq: 0,
+            html: false,
+        }
+    }
+
+    /// A growing Markdown segment: `text` is sanitized HTML, keyed by `seq` so
+    /// the client replaces the block in place as it streams.
+    pub(crate) fn segment(kind: &str, html: impl Into<String>, seq: u64) -> Self {
+        Self {
+            kind: kind.into(),
+            text: html.into(),
+            seq,
+            html: true,
+        }
+    }
+
+    /// A discrete line carrying an explicit `seq` (a tool block that a later
+    /// `tool_call_update` can replace in place).
+    pub(crate) fn line_seq(kind: &str, text: impl Into<String>, seq: u64) -> Self {
+        Self {
+            kind: kind.into(),
+            text: text.into(),
+            seq,
+            html: false,
         }
     }
 }
 
+/// A human's mid-turn signal to a running turn — the reverse direction of the
+/// live feed (human → turn). Delivered over a per-session control channel and
+/// acted on by the turn driver's `select!` loop (`docs/adr/0032`).
+#[derive(Debug)]
+pub(crate) enum TurnControl {
+    /// Stop the current prompt and end the turn.
+    Interrupt,
+    /// Stop the current prompt and re-prompt in place with this text.
+    Steer(String),
+}
+
+/// No turn is currently live for the session, so control could not be
+/// delivered. The caller falls back to the between-turns resume path.
+#[derive(Debug)]
+pub(crate) struct NotLive;
+
 /// Per-session live feed: a bounded replay buffer (for a page that loads
-/// mid-turn) plus a broadcast sender for the live tail.
+/// mid-turn), a broadcast sender for the live tail (host → human), and a
+/// control sender for mid-turn signals (human → turn).
 struct LiveFeed {
     buffer: Vec<LiveEvent>,
     sender: broadcast::Sender<LiveEvent>,
+    control: mpsc::Sender<TurnControl>,
 }
 
 /// The host's in-memory registry of running sessions' live feeds. Ephemeral —
@@ -644,25 +698,49 @@ pub struct LiveSessions {
 }
 
 impl LiveSessions {
-    /// Open a fresh feed for a session about to run (replaces any stale one).
-    fn begin(&self, session: EntryId) {
+    /// Open a fresh feed for a session about to run (replaces any stale one),
+    /// returning the control receiver the running turn selects on (human →
+    /// turn).
+    pub(crate) fn begin(&self, session: EntryId) -> mpsc::Receiver<TurnControl> {
         let (sender, _rx) = broadcast::channel(256);
+        // Capacity 1: one human, one in-flight signal at a time.
+        let (control, control_rx) = mpsc::channel(1);
         let mut map = self.inner.lock().expect("live sessions registry lock");
         map.insert(
             session,
             LiveFeed {
                 buffer: Vec::new(),
                 sender,
+                control,
             },
         );
+        control_rx
+    }
+
+    /// Deliver a human's control signal to the running turn, or `Err(NotLive)`
+    /// if no turn is currently streaming for the session.
+    pub(crate) fn control(&self, session: EntryId, signal: TurnControl) -> Result<(), NotLive> {
+        let map = self.inner.lock().expect("live sessions registry lock");
+        let feed = map.get(&session).ok_or(NotLive)?;
+        feed.control.try_send(signal).map_err(|_| NotLive)
     }
 
     /// Append an event: into the replay buffer (bounded) and to live tails.
+    /// A non-zero `seq` marks a growing segment — successive same-`seq` events
+    /// **coalesce** in the replay buffer (the last one wins, so a late joiner
+    /// sees one rendered block, not every intermediate frame), which also keeps
+    /// a long Markdown stream from blowing the bound. Live subscribers still
+    /// receive every frame.
     pub(crate) fn publish(&self, session: EntryId, event: LiveEvent) {
         let mut map = self.inner.lock().expect("live sessions registry lock");
         if let Some(feed) = map.get_mut(&session) {
-            // Bound the replay buffer; live subscribers still get every event.
-            if feed.buffer.len() < 1000 {
+            let coalesce =
+                event.seq != 0 && feed.buffer.last().is_some_and(|last| last.seq == event.seq);
+            if coalesce {
+                if let Some(last) = feed.buffer.last_mut() {
+                    *last = event.clone();
+                }
+            } else if feed.buffer.len() < 1000 {
                 feed.buffer.push(event.clone());
             }
             // Err just means no one is watching right now — fine.
@@ -795,14 +873,47 @@ fn interpret_stream_line(line: &str) -> LineEffects {
 
 // ---- the turn itself: spawn → capture → record ----
 
+/// How a turn ended — folds the old `failed: bool` into the distinct cases that
+/// matter for the recorded session state (`docs/adr/0032`). An interrupt is a
+/// human choice, not an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TurnEnd {
+    /// The agent finished its turn normally (`stopReason == "end_turn"`).
+    Completed,
+    /// A human interrupted the turn mid-flight.
+    Interrupted,
+    /// The agent errored, exited non-zero, or produced unparseable output.
+    Failed,
+    /// The turn exceeded its timeout and was killed.
+    TimedOut,
+}
+
 /// What one finished harness turn yielded.
 pub(crate) struct TurnOutcome {
     /// The result text (the harness's final message, or the failure tail).
     pub(crate) result: String,
     /// The harness's session id, when the output carried one.
     pub(crate) harness_session: Option<String>,
-    /// Whether the turn failed (non-zero exit, timeout, unparseable output).
-    pub(crate) failed: bool,
+    /// How the turn ended.
+    pub(crate) end: TurnEnd,
+}
+
+/// Map a finished turn's end-state to the session state + note recorded for it.
+/// An interrupt lands the session `Done` (a human choice, not an error).
+fn outcome_state(end: TurnEnd, turn: u32, result: &str) -> (SessionState, String) {
+    let tail = snippet(result, 160);
+    match end {
+        TurnEnd::Completed => (SessionState::Done, format!("turn {turn} complete: {tail}")),
+        TurnEnd::Interrupted => (
+            SessionState::Done,
+            format!("turn {turn} interrupted: {tail}"),
+        ),
+        TurnEnd::Failed => (SessionState::Error, format!("turn {turn} failed: {tail}")),
+        TurnEnd::TimedOut => (
+            SessionState::Error,
+            format!("turn {turn} timed out: {tail}"),
+        ),
+    }
 }
 
 /// Run one harness turn in `workspace`: the launch turn when `resume` is
@@ -819,12 +930,13 @@ async fn run_turn(
     live: &LiveSessions,
     session: EntryId,
     agent: &crate::agent::Agent,
+    control: &mut mpsc::Receiver<TurnControl>,
 ) -> TurnOutcome {
     let harness = harness_by_id(&agent.harness);
     if let Some(adapter) = acp_adapter_command(harness) {
         let acp_agent = acp_config(agent, harness);
         match crate::acp::run_turn_acp(
-            &adapter, workspace, prompt, resume, live, session, &acp_agent,
+            &adapter, workspace, prompt, resume, live, session, &acp_agent, control,
         )
         .await
         {
@@ -840,14 +952,14 @@ async fn run_turn(
                     return TurnOutcome {
                         result: format!("{} could not start over ACP: {err:#}", harness.label),
                         harness_session: None,
-                        failed: true,
+                        end: TurnEnd::Failed,
                     };
                 }
             }
         }
     }
     if harness.has_cli_fallback() {
-        run_turn_cli(workspace, prompt, resume, live, session).await
+        run_turn_cli(workspace, prompt, resume, live, session, control).await
     } else {
         TurnOutcome {
             result: format!(
@@ -855,7 +967,7 @@ async fn run_turn(
                 harness.label
             ),
             harness_session: None,
-            failed: true,
+            end: TurnEnd::Failed,
         }
     }
 }
@@ -920,6 +1032,7 @@ async fn run_turn_cli(
     resume: Option<&str>,
     live: &LiveSessions,
     session: EntryId,
+    control: &mut mpsc::Receiver<TurnControl>,
 ) -> TurnOutcome {
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
@@ -954,7 +1067,7 @@ async fn run_turn_cli(
             return TurnOutcome {
                 result: format!("failed to spawn the harness: {err}"),
                 harness_session: None,
-                failed: true,
+                end: TurnEnd::Failed,
             };
         }
     };
@@ -968,7 +1081,7 @@ async fn run_turn_cli(
         return TurnOutcome {
             result: "harness produced no stdout pipe".into(),
             harness_session: None,
-            failed: true,
+            end: TurnEnd::Failed,
         };
     };
     // Drain stderr concurrently so a chatty harness can't fill the pipe and
@@ -1007,18 +1120,30 @@ async fn run_turn_cli(
         spawned.wait().await
     };
 
-    let status = match tokio::time::timeout(TURN_TIMEOUT, drive).await {
-        Ok(status) => status,
-        Err(_) => {
+    let status = tokio::select! {
+        // A human interrupt ends the CLI turn. Steer-in-place is ACP-only; a CLI
+        // re-prompt happens via the resume path (`launch::steer`). kill_on_drop
+        // reaps the child as the drive future drops.
+        _ = control.recv() => {
             return TurnOutcome {
-                result: format!(
-                    "turn exceeded the {}-minute timeout and was killed (docs/adr/0023)",
-                    TURN_TIMEOUT.as_secs() / 60
-                ),
-                harness_session,
-                failed: true,
+                result: "turn interrupted by the human".into(),
+                harness_session: None,
+                end: TurnEnd::Interrupted,
             };
         }
+        timed = tokio::time::timeout(TURN_TIMEOUT, drive) => match timed {
+            Ok(status) => status,
+            Err(_) => {
+                return TurnOutcome {
+                    result: format!(
+                        "turn exceeded the {}-minute timeout and was killed (docs/adr/0023)",
+                        TURN_TIMEOUT.as_secs() / 60
+                    ),
+                    harness_session,
+                    end: TurnEnd::TimedOut,
+                };
+            }
+        },
     };
 
     let exit_ok = matches!(status, Ok(s) if s.success());
@@ -1034,7 +1159,11 @@ async fn run_turn_cli(
     TurnOutcome {
         result,
         harness_session,
-        failed: is_error || !exit_ok,
+        end: if is_error || !exit_ok {
+            TurnEnd::Failed
+        } else {
+            TurnEnd::Completed
+        },
     }
 }
 
@@ -1313,9 +1442,35 @@ pub async fn steer(
     };
     // Steer the same agent (identity + config) that ran the session.
     let agent = resume_agent(&junto_home, &session)?;
+    record_steer_note(&host, &channel_ref, channel, session, steered_by, &message).await?;
+    spawn_turn(
+        host,
+        channel,
+        channel_ref,
+        workspace,
+        session,
+        message,
+        Some(harness_session),
+        agent,
+    );
+    Ok(())
+}
+
+/// Record a human's steer instruction as a `SessionUpdated` note (the record
+/// keeps who steered and what — docs/adr/0023), flipping the session to Working.
+/// Shared by the between-turns resume path ([`steer`]) and the in-session path
+/// ([`steer_live`]).
+async fn record_steer_note(
+    host: &Host,
+    channel_ref: &str,
+    channel: ChannelId,
+    session: EntryId,
+    steered_by: Member,
+    message: &str,
+) -> Result<()> {
     append(
-        &host,
-        &channel_ref,
+        host,
+        channel_ref,
         LedgerEntry {
             id: EntryId::new(),
             channel,
@@ -1328,17 +1483,31 @@ pub async fn steer(
             },
         },
     )
-    .await?;
-    spawn_turn(
-        host,
-        channel,
-        channel_ref,
-        workspace,
-        session,
-        message,
-        Some(harness_session),
-        agent,
-    );
+    .await
+}
+
+/// Steer a *running* turn in place (`docs/adr/0032`): deliver the message to the
+/// live turn over the control channel, then record the steer note. Returns
+/// `Err(NotLive)` when no turn is currently running for the session — the caller
+/// falls back to the between-turns resume path ([`steer`]).
+pub(crate) async fn steer_live(
+    host: std::sync::Arc<Host>,
+    channel: ChannelId,
+    channel_ref: String,
+    session: EntryId,
+    steered_by: Member,
+    message: String,
+) -> Result<(), NotLive> {
+    // Deliver first: if no turn is live we record nothing and the caller resumes.
+    host.live()
+        .control(session, TurnControl::Steer(message.clone()))?;
+    // The steer has landed in the running turn; recording the note is
+    // best-effort — a note failure must not undo the delivered steer.
+    if let Err(err) =
+        record_steer_note(&host, &channel_ref, channel, session, steered_by, &message).await
+    {
+        tracing::warn!("recording steer note for session {session} failed: {err:#}");
+    }
     Ok(())
 }
 
@@ -1372,7 +1541,7 @@ fn spawn_turn(
     agent: crate::agent::Agent,
 ) {
     tokio::spawn(async move {
-        host.live().begin(session);
+        let mut control_rx = host.live().begin(session);
         let outcome = run_turn(
             &workspace,
             &prompt,
@@ -1380,6 +1549,7 @@ fn spawn_turn(
             host.live(),
             session,
             &agent,
+            &mut control_rx,
         )
         .await;
         if let Err(err) = record_outcome(
@@ -1486,17 +1656,7 @@ async fn record_outcome(
         .await?;
     }
 
-    let (state, note) = if outcome.failed {
-        (
-            SessionState::Error,
-            format!("turn {turn} failed: {}", snippet(&outcome.result, 160)),
-        )
-    } else {
-        (
-            SessionState::Done,
-            format!("turn {turn} complete: {}", snippet(&outcome.result, 160)),
-        )
-    };
+    let (state, note) = outcome_state(outcome.end, turn, &outcome.result);
     append(
         host,
         channel_ref,
@@ -1577,7 +1737,7 @@ fn spawn_outcome_loop(
     agent: crate::agent::Agent,
 ) {
     tokio::spawn(async move {
-        host.live().begin(session);
+        let _control_rx = host.live().begin(session);
 
         // Prepare a PR branch the worker commits onto (the push-gate's
         // deliverable). Best-effort: without it, grading falls back to the
@@ -1683,6 +1843,9 @@ async fn run_worker_turn(
              the current git branch, then stop.\n\n{findings}"
         ),
     };
+    // The autonomous worker turn is not interruptible; an inert control channel
+    // (sender kept alive, so it never fires) satisfies run_turn's signature.
+    let (_inert_control, mut control) = mpsc::channel(1);
     let outcome = run_turn(
         workspace,
         &prompt,
@@ -1690,6 +1853,7 @@ async fn run_worker_turn(
         host.live(),
         session,
         agent,
+        &mut control,
     )
     .await;
     if outcome.harness_session.is_some() {
@@ -1747,7 +1911,18 @@ async fn verify_one(
         session,
         LiveEvent::new("status", "checks green — grading the diff"),
     );
-    let graded = run_turn(workspace, &prompt, None, host.live(), session, agent).await;
+    // The grader turn is autonomous, not interruptible — an inert control channel.
+    let (_inert_control, mut control) = mpsc::channel(1);
+    let graded = run_turn(
+        workspace,
+        &prompt,
+        None,
+        host.live(),
+        session,
+        agent,
+        &mut control,
+    )
+    .await;
 
     if let Err(err) =
         store_grader_report(host, channel_ref, channel, session, &graded.result, agent).await
@@ -2426,6 +2601,51 @@ mod tests {
         assert_eq!(before, after, "an ordinary approval triggers no PR-open");
     }
 
+    #[tokio::test]
+    async fn record_steer_note_appends_a_working_session_update() {
+        let repo = git_repo();
+        let member_home = tempfile::tempdir().unwrap();
+        let host = crate::host::Host::fixed_with_member_home(
+            vec![repo.path().to_path_buf()],
+            Some(member_home.path().to_path_buf()),
+        );
+        let dan = Member::human("Dan", "dan@example.com");
+        let channel = host
+            .open_channel(None, "c", dan.clone(), None)
+            .await
+            .unwrap()
+            .id;
+        let session = EntryId::new();
+
+        record_steer_note(
+            &host,
+            "c",
+            channel,
+            session,
+            dan.clone(),
+            "focus on the parser",
+        )
+        .await
+        .unwrap();
+
+        let ledger = host.ledger_for(repo.path()).await.unwrap();
+        let view = ledger.lock().await.project(&channel).await.unwrap();
+        let recorded = view
+            .entries
+            .iter()
+            .find_map(|e| match &e.payload {
+                EntryPayload::SessionUpdated {
+                    target,
+                    state,
+                    note,
+                } if *target == session => Some((*state, note.clone())),
+                _ => None,
+            })
+            .expect("a steer SessionUpdated was recorded");
+        assert_eq!(recorded.0, SessionState::Working);
+        assert!(recorded.1.contains("focus on the parser"));
+    }
+
     #[test]
     fn pr_branch_makes_committed_work_show_in_the_base_relative_diff() {
         let repo = git_repo_with_commit();
@@ -2607,7 +2827,7 @@ mod tests {
         // No feed yet → no subscription.
         assert!(live.subscribe(session).is_none());
 
-        live.begin(session);
+        let _ = live.begin(session);
         live.publish(session, LiveEvent::new("assistant", "first"));
         let (buffer, mut receiver) = live.subscribe(session).expect("feed is live");
         assert_eq!(buffer.len(), 1, "late joiner replays what already happened");
@@ -2625,6 +2845,70 @@ mod tests {
             receiver.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Closed)
         ));
+    }
+
+    #[test]
+    fn segment_events_coalesce_in_the_replay_buffer() {
+        let live = LiveSessions::default();
+        let session = EntryId::new();
+        let _rx = live.begin(session);
+        // Two frames of the same growing segment (seq 1) keep only the latest.
+        live.publish(session, LiveEvent::segment("assistant", "<p>hel</p>", 1));
+        live.publish(session, LiveEvent::segment("assistant", "<p>hello</p>", 1));
+        // A discrete line (seq 0) always appends.
+        live.publish(session, LiveEvent::new("tool", "Bash: ls"));
+        let (buffer, _rx2) = live.subscribe(session).expect("feed live");
+        assert_eq!(
+            buffer.len(),
+            2,
+            "same-seq frames coalesce; discrete line appends"
+        );
+        assert_eq!(buffer[0].text, "<p>hello</p>");
+        assert!(buffer[0].html);
+        assert_eq!(buffer[0].seq, 1);
+        assert_eq!(buffer[1].kind, "tool");
+    }
+
+    #[test]
+    fn outcome_state_maps_each_turn_end() {
+        use SessionState::*;
+        assert!(matches!(
+            outcome_state(TurnEnd::Completed, 1, "ok"),
+            (Done, _)
+        ));
+        assert!(matches!(
+            outcome_state(TurnEnd::Failed, 1, "boom"),
+            (Error, _)
+        ));
+        assert!(matches!(
+            outcome_state(TurnEnd::TimedOut, 1, "slow"),
+            (Error, _)
+        ));
+        // An interrupt is a human choice, not an error: the session lands Done.
+        let (state, note) = outcome_state(TurnEnd::Interrupted, 2, "stopped mid-edit");
+        assert_eq!(state, Done);
+        assert!(note.contains("interrupted"));
+    }
+
+    #[tokio::test]
+    async fn control_channel_delivers_to_live_turn_and_errors_when_idle() {
+        let live = LiveSessions::default();
+        let session = EntryId::new();
+
+        // No feed yet → control reports NotLive.
+        assert!(live.control(session, TurnControl::Interrupt).is_err());
+
+        let mut control_rx = live.begin(session);
+        live.control(session, TurnControl::Steer("focus on the parser".into()))
+            .expect("delivered to the live turn");
+        match control_rx.recv().await {
+            Some(TurnControl::Steer(msg)) => assert_eq!(msg, "focus on the parser"),
+            other => panic!("expected steer, got {other:?}"),
+        }
+
+        // After finish, control is NotLive again.
+        live.finish(session);
+        assert!(live.control(session, TurnControl::Interrupt).is_err());
     }
 
     #[test]

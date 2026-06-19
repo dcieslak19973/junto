@@ -17,6 +17,9 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
+# Hand external links (PR pages, docs) to the OS browser instead of navigating
+# the junto webview away from the host.
+open = "5"
 
 [workspace]
 # standalone — see the header comment

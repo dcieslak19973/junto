@@ -54,6 +54,10 @@ pub fn router(host: Arc<Host>) -> Router {
             post(steer_session),
         )
         .route(
+            "/channels/{channel}/sessions/{session}/interrupt",
+            post(interrupt_session),
+        )
+        .route(
             "/channels/{channel}/sessions/{session}/stream",
             get(stream_session),
         )
@@ -740,19 +744,81 @@ async fn steer_session(
         }
         Err(err) => return internal(format!("reading workspaces: {err}")),
     };
-    match crate::launch::steer(
+    // One steer box, routed on liveness: a running turn is steered in place over
+    // the control channel; a turn that has already landed is resumed (docs/adr/
+    // 0032).
+    match crate::launch::steer_live(
         host.clone(),
         id,
         channel.clone(),
-        workspace,
         session,
-        author,
-        message,
+        author.clone(),
+        message.clone(),
     )
     .await
     {
         Ok(()) => Redirect::to(&format!("/channels/{id}")).into_response(),
-        Err(err) => (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
+        Err(crate::launch::NotLive) => match crate::launch::steer(
+            host.clone(),
+            id,
+            channel.clone(),
+            workspace,
+            session,
+            author,
+            message,
+        )
+        .await
+        {
+            Ok(()) => Redirect::to(&format!("/channels/{id}")).into_response(),
+            Err(err) => (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
+        },
+    }
+}
+
+/// Interrupt a running session's current turn from its live card. Delivers a
+/// bare `Interrupt` over the control channel; the turn ends (interrupted) and
+/// the card reloads to the landed outcome. `Err(NotLive)` means no turn is
+/// currently running for the session.
+async fn interrupt_session(
+    State(host): State<Arc<Host>>,
+    Path((channel, session)): Path<(String, String)>,
+) -> Response {
+    let Ok(session) = session.parse::<EntryId>() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("'{session}' is not a session id"),
+        )
+            .into_response();
+    };
+    let (id, view, substrate) = match project(&host, &channel).await {
+        Ok(projected) => projected,
+        Err(response) => return response,
+    };
+    if view.session(&session).is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("{session} is not an agent session in this channel"),
+        )
+            .into_response();
+    }
+    // Membership checked like every human-surface act.
+    let author = match crate::host::git_user(&substrate) {
+        Ok(author) => author,
+        Err(err) => {
+            return internal(format!(
+                "no author identity: {err} (set git config user.name / user.email)"
+            ));
+        }
+    };
+    if let Err(err) = host.authorize_human_write(&view, &author) {
+        return (StatusCode::FORBIDDEN, format!("{err:#}")).into_response();
+    }
+    match host
+        .live()
+        .control(session, crate::launch::TurnControl::Interrupt)
+    {
+        Ok(()) => Redirect::to(&format!("/channels/{id}")).into_response(),
+        Err(_) => (StatusCode::BAD_REQUEST, "no running turn to interrupt").into_response(),
     }
 }
 
@@ -1568,6 +1634,35 @@ mod tests {
             requirement: ApprovalRequirement::Count(1),
             kind: None,
         }
+    }
+
+    fn session_started() -> EntryPayload {
+        EntryPayload::SessionStarted {
+            intent: "do the work".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupt_errors_when_idle_and_redirects_when_live() {
+        let fx = host_with_entry(session_started()).await;
+
+        // No live turn for the session → interrupting is a BAD_REQUEST.
+        let idle = interrupt_session(
+            State(fx.host.clone()),
+            Path(("web-test".into(), fx.target.to_string())),
+        )
+        .await;
+        assert_eq!(idle.status(), StatusCode::BAD_REQUEST);
+
+        // With a live feed (receiver kept alive), the interrupt is delivered
+        // and the card redirects.
+        let _rx = fx.host.live().begin(fx.target);
+        let live = interrupt_session(
+            State(fx.host.clone()),
+            Path(("web-test".into(), fx.target.to_string())),
+        )
+        .await;
+        assert_eq!(live.status(), StatusCode::SEE_OTHER);
     }
 
     async fn post_act(

@@ -83,10 +83,23 @@ fn main() {
 
     tauri::Builder::default()
         .setup(move |app| {
-            let external = url.parse().expect("JUNTO_HOST_URL is not a valid URL");
+            let external: tauri::Url = url.parse().expect("JUNTO_HOST_URL is not a valid URL");
+            // The window is a shell over the host: keep it on the host origin and
+            // hand external links (PR pages, docs) to the OS browser instead of
+            // navigating junto away from itself.
+            let host = external.host_str().map(str::to_string);
             tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::External(external))
                 .title("junto")
                 .inner_size(1100.0, 800.0)
+                .on_navigation(move |target| {
+                    let leaves_host = matches!(target.scheme(), "http" | "https")
+                        && target.host_str() != host.as_deref();
+                    if leaves_host {
+                        let _ = open::that(target.as_str());
+                        return false; // cancel the in-webview navigation
+                    }
+                    true
+                })
                 .build()?;
             Ok(())
         })
