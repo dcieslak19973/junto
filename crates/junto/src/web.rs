@@ -744,19 +744,34 @@ async fn steer_session(
         }
         Err(err) => return internal(format!("reading workspaces: {err}")),
     };
-    match crate::launch::steer(
+    // One steer box, routed on liveness: a running turn is steered in place over
+    // the control channel; a turn that has already landed is resumed (docs/adr/
+    // 0032).
+    match crate::launch::steer_live(
         host.clone(),
         id,
         channel.clone(),
-        workspace,
         session,
-        author,
-        message,
+        author.clone(),
+        message.clone(),
     )
     .await
     {
         Ok(()) => Redirect::to(&format!("/channels/{id}")).into_response(),
-        Err(err) => (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
+        Err(crate::launch::NotLive) => match crate::launch::steer(
+            host.clone(),
+            id,
+            channel.clone(),
+            workspace,
+            session,
+            author,
+            message,
+        )
+        .await
+        {
+            Ok(()) => Redirect::to(&format!("/channels/{id}")).into_response(),
+            Err(err) => (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
+        },
     }
 }
 

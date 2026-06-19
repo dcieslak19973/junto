@@ -2894,8 +2894,9 @@ fn sessions_section(view: &ChannelView, channel: &ChannelId) -> String {
             continue; // unrecognized author: the card stays in the ledger list
         };
         let state = session_state_label(session.state);
-        // Steering targets a finished turn (--resume runs a new one); a
-        // mid-turn session shows its liveness instead.
+        // The same steer box works mid-turn and between turns (docs/adr/0032):
+        // a finished turn is resumed; a running turn is steered in place and
+        // also offers interrupt. The post routes on liveness server-side.
         let steer = match session.state {
             SessionState::Done | SessionState::Error => format!(
                 "<form class=\"act\" method=\"post\" \
@@ -2910,6 +2911,11 @@ fn sessions_section(view: &ChannelView, channel: &ChannelId) -> String {
                 "<div class=\"live\" data-channel=\"{channel}\" data-session=\"{session_id}\">\
                  <p class=\"live-status\">running — live progress</p>\
                  <ul class=\"live-feed\"></ul></div>\
+                 <form class=\"act\" method=\"post\" \
+                 action=\"/channels/{channel}/sessions/{session_id}/steer\">\
+                 <input name=\"message\" placeholder=\"steer — redirect it now\" required>\
+                 <button class=\"primary\">steer</button>\
+                 </form>\
                  <form class=\"act\" method=\"post\" \
                  action=\"/channels/{channel}/sessions/{session_id}/interrupt\">\
                  <button>interrupt</button>\

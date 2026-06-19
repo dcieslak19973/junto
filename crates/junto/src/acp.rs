@@ -98,6 +98,10 @@ impl AcpAgent {
 /// feed. `Err` means ACP could not be set up — the caller falls back to the
 /// CLI; a turn that ran but the agent failed returns `Ok` with `end:
 /// TurnEnd::Failed`. A human interrupt resolves the prompt as `Interrupted`.
+// One ACP turn genuinely threads all of these (adapter, workspace, prompt,
+// resume, live feed, session, agent config, control channel); bundling them
+// into a struct would obscure more than it clarifies.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_turn_acp(
     adapter: &[String],
     workspace: &Path,

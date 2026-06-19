@@ -1396,9 +1396,35 @@ pub async fn steer(
     };
     // Steer the same agent (identity + config) that ran the session.
     let agent = resume_agent(&junto_home, &session)?;
+    record_steer_note(&host, &channel_ref, channel, session, steered_by, &message).await?;
+    spawn_turn(
+        host,
+        channel,
+        channel_ref,
+        workspace,
+        session,
+        message,
+        Some(harness_session),
+        agent,
+    );
+    Ok(())
+}
+
+/// Record a human's steer instruction as a `SessionUpdated` note (the record
+/// keeps who steered and what — docs/adr/0023), flipping the session to Working.
+/// Shared by the between-turns resume path ([`steer`]) and the in-session path
+/// ([`steer_live`]).
+async fn record_steer_note(
+    host: &Host,
+    channel_ref: &str,
+    channel: ChannelId,
+    session: EntryId,
+    steered_by: Member,
+    message: &str,
+) -> Result<()> {
     append(
-        &host,
-        &channel_ref,
+        host,
+        channel_ref,
         LedgerEntry {
             id: EntryId::new(),
             channel,
@@ -1411,17 +1437,31 @@ pub async fn steer(
             },
         },
     )
-    .await?;
-    spawn_turn(
-        host,
-        channel,
-        channel_ref,
-        workspace,
-        session,
-        message,
-        Some(harness_session),
-        agent,
-    );
+    .await
+}
+
+/// Steer a *running* turn in place (`docs/adr/0032`): deliver the message to the
+/// live turn over the control channel, then record the steer note. Returns
+/// `Err(NotLive)` when no turn is currently running for the session — the caller
+/// falls back to the between-turns resume path ([`steer`]).
+pub(crate) async fn steer_live(
+    host: std::sync::Arc<Host>,
+    channel: ChannelId,
+    channel_ref: String,
+    session: EntryId,
+    steered_by: Member,
+    message: String,
+) -> Result<(), NotLive> {
+    // Deliver first: if no turn is live we record nothing and the caller resumes.
+    host.live()
+        .control(session, TurnControl::Steer(message.clone()))?;
+    // The steer has landed in the running turn; recording the note is
+    // best-effort — a note failure must not undo the delivered steer.
+    if let Err(err) =
+        record_steer_note(&host, &channel_ref, channel, session, steered_by, &message).await
+    {
+        tracing::warn!("recording steer note for session {session} failed: {err:#}");
+    }
     Ok(())
 }
 
@@ -2513,6 +2553,51 @@ mod tests {
             .entries
             .len();
         assert_eq!(before, after, "an ordinary approval triggers no PR-open");
+    }
+
+    #[tokio::test]
+    async fn record_steer_note_appends_a_working_session_update() {
+        let repo = git_repo();
+        let member_home = tempfile::tempdir().unwrap();
+        let host = crate::host::Host::fixed_with_member_home(
+            vec![repo.path().to_path_buf()],
+            Some(member_home.path().to_path_buf()),
+        );
+        let dan = Member::human("Dan", "dan@example.com");
+        let channel = host
+            .open_channel(None, "c", dan.clone(), None)
+            .await
+            .unwrap()
+            .id;
+        let session = EntryId::new();
+
+        record_steer_note(
+            &host,
+            "c",
+            channel,
+            session,
+            dan.clone(),
+            "focus on the parser",
+        )
+        .await
+        .unwrap();
+
+        let ledger = host.ledger_for(repo.path()).await.unwrap();
+        let view = ledger.lock().await.project(&channel).await.unwrap();
+        let recorded = view
+            .entries
+            .iter()
+            .find_map(|e| match &e.payload {
+                EntryPayload::SessionUpdated {
+                    target,
+                    state,
+                    note,
+                } if *target == session => Some((*state, note.clone())),
+                _ => None,
+            })
+            .expect("a steer SessionUpdated was recorded");
+        assert_eq!(recorded.0, SessionState::Working);
+        assert!(recorded.1.contains("focus on the parser"));
     }
 
     #[test]
