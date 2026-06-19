@@ -225,6 +225,15 @@ pub enum EntryPayload {
         /// (`docs/adr/0019`). Omitted from the canonical bytes when absent.
         #[serde(skip_serializing_if = "Option::is_none", default)]
         frame: Option<DecisionFrame>,
+        /// An optional **playbook-supplied** tag identifying an actionable gate
+        /// (e.g. `"code-pr.open-pr"`) so an app-level executor can recognize
+        /// and run it on approval (`docs/adr/0029`). Like
+        /// [`ArtifactAttached::kind`](EntryPayload::ArtifactAttached) it is a
+        /// label the kernel **stores but never interprets** (`docs/adr/0020`) —
+        /// not a kernel enum. Omitted from the canonical bytes when absent, so
+        /// every pre-tag proposal's bytes are unchanged.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        kind: Option<String>,
     },
     /// Approves a [`Proposal`](EntryPayload::Proposal). Distinct from
     /// [`Ratification`](EntryPayload::Ratification): approve/reject pass-or-block

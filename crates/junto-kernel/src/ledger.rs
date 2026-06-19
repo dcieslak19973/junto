@@ -1257,6 +1257,7 @@ mod tests {
             rationale: "ready".into(),
             provenance: Vec::new(),
             frame: None,
+            kind: None,
             requirement,
         }
     }

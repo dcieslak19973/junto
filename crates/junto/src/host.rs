@@ -1316,6 +1316,7 @@ mod lineage_tests {
                     provenance: vec![],
                     requirement: ApprovalRequirement::Count(1),
                     frame: None,
+                    kind: None,
                 },
             })
             .await

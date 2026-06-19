@@ -3976,6 +3976,7 @@ mod tests {
                 provenance: vec![],
                 frame: None,
                 requirement: junto_kernel::ApprovalRequirement::Count(1),
+                kind: None,
             },
         };
         let acts = vec![
