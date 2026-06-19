@@ -10,6 +10,10 @@
 mod acp;
 mod agent;
 mod binding;
+// Wired into the push-gate's satisfied path by a later slice; the trait/impl
+// land first (ForgeAdapter PR-open, ledger ba64074b follow-up).
+#[allow(dead_code)]
+mod forge;
 mod grader;
 mod host;
 mod init;
