@@ -1651,30 +1651,13 @@ impl LineageModel {
             parent: s.parent,
             converged_into: s.converged_into,
         };
-        let dir = substrate
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned());
         if summaries.is_empty() {
             return LineageModel {
                 mainline: Track::empty(),
                 branches: Vec::new(),
             };
         }
-        // The main-line is an OPEN channel — the ambient one (name == repo dir)
-        // if it exists, else the busiest (most entries) — the de-facto trunk
-        // until real lineage edges name a true spine.
-        let main_id = summaries
-            .iter()
-            .filter(|s| !s.closed)
-            .find(|s| s.name == dir)
-            .or_else(|| {
-                summaries
-                    .iter()
-                    .filter(|s| !s.closed)
-                    .max_by_key(|s| s.entry_count)
-            })
-            .or_else(|| summaries.first())
-            .map(|s| s.id);
+        let main_id = main_line_id(summaries, substrate);
         let mainline = summaries
             .iter()
             .find(|s| Some(s.id) == main_id)
@@ -1688,6 +1671,32 @@ impl LineageModel {
         let branches = others.into_iter().map(track).collect();
         LineageModel { mainline, branches }
     }
+}
+
+/// The **main-line** (de-facto trunk) among one substrate's channels: the
+/// ambient channel whose name is the repo's directory, else the busiest open
+/// channel (most entries), else just the first — until real lineage edges name
+/// a true spine (`docs/adr/0027`). Shared by the strip and the channel page (so
+/// the trunk hides its close action consistently).
+pub fn main_line_id(
+    summaries: &[ChannelSummary],
+    substrate: &std::path::Path,
+) -> Option<ChannelId> {
+    let dir = substrate
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned());
+    summaries
+        .iter()
+        .filter(|s| !s.closed)
+        .find(|s| s.name == dir)
+        .or_else(|| {
+            summaries
+                .iter()
+                .filter(|s| !s.closed)
+                .max_by_key(|s| s.entry_count)
+        })
+        .or_else(|| summaries.first())
+        .map(|s| s.id)
 }
 
 /// Vertical spacing between tracks, in SVG units.
@@ -2301,13 +2310,15 @@ pub fn channel_html(
          </form></details>\n",
         name = escape_html(name),
     );
-    // The ambient channel is the substrate's trunk (its name is the repo's
-    // directory name — the de-facto main-line). Closing the trunk makes no
-    // sense, so it gets no close action.
-    let is_ambient = substrate
-        .file_name()
-        .map(|dir| dir.to_string_lossy() == name)
-        .unwrap_or(false);
+    // The ambient channel is this substrate's main-line (the de-facto trunk —
+    // dir-named or busiest, the same channel the strip pins as the main line).
+    // Closing the trunk makes no sense, so it gets no close action.
+    let scoped: Vec<ChannelSummary> = nav
+        .iter()
+        .filter(|summary| summary.substrate == substrate)
+        .cloned()
+        .collect();
+    let is_ambient = main_line_id(&scoped, substrate) == Some(*id);
     let lifecycle = if view.closed {
         format!(
             "<div class=\"closed-banner\">this channel is <strong>closed</strong> — the \
@@ -2394,11 +2405,6 @@ pub fn channel_html(
             workspaces.push(summary.substrate.clone());
         }
     }
-    let scoped: Vec<ChannelSummary> = nav
-        .iter()
-        .filter(|summary| summary.substrate == substrate)
-        .cloned()
-        .collect();
     let model = LineageModel::from_summaries(&scoped, substrate);
     let agents_working = view
         .sessions
@@ -3901,21 +3907,55 @@ mod tests {
 
     #[test]
     fn ambient_channel_hides_close() {
-        // The ambient channel's name is the substrate's directory name — the
-        // trunk, which gets no close action.
+        // The ambient channel is the substrate's main-line. Here the channel's
+        // name ("junto-dev") is NOT the repo dir ("junto-ledger"), but it is the
+        // busiest channel — so it's the de-facto trunk and hides close.
+        let repo = std::path::PathBuf::from("/repos/junto-ledger");
+        let channel = ChannelId::new();
+        let mut trunk = summary("junto-dev", &repo, 50, 0);
+        trunk.id = channel;
         let view = view_with(vec![]);
         let html = channel_html(
-            &[],
-            "junto-ledger",
-            &ChannelId::new(),
+            std::slice::from_ref(&trunk),
+            "junto-dev",
+            &channel,
             &view,
-            std::path::Path::new("/repos/junto-ledger"),
+            &repo,
             None,
         );
         assert!(!html.contains("close this channel"), "{html}");
         // …but rename and side-quests are still available.
         assert!(html.contains("rename this channel"), "{html}");
         assert!(html.contains("start a side-quest"), "{html}");
+    }
+
+    #[test]
+    fn non_main_line_channel_still_offers_close() {
+        // A second, quieter channel in the same substrate is a branch, not the
+        // trunk — it keeps its close action.
+        let repo = std::path::PathBuf::from("/repos/junto-ledger");
+        let trunk = {
+            let mut s = summary("junto-dev", &repo, 90, 0);
+            s.entry_count = 50;
+            s
+        };
+        let branch_id = ChannelId::new();
+        let branch = {
+            let mut s = summary("a-side-quest", &repo, 50, 0);
+            s.id = branch_id;
+            s.entry_count = 1;
+            s
+        };
+        let view = view_with(vec![]);
+        let html = channel_html(
+            &[trunk, branch],
+            "a-side-quest",
+            &branch_id,
+            &view,
+            &repo,
+            None,
+        );
+        assert!(html.contains("close this channel"), "{html}");
     }
 
     #[test]
