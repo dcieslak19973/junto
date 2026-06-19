@@ -617,12 +617,12 @@ impl Host {
         code: Option<&str>,
     ) -> Result<()> {
         let (_src_substrate, src_ledger, src_id) = self.resolve_for_write(source).await?;
-        let (_tgt_substrate, tgt_ledger, tgt_id) = self.resolve_for_write(target).await?;
+        let (tgt_id, tgt_ledger) = self.resolve_target(target).await?;
         if src_id == tgt_id {
             bail!("a channel cannot converge into itself");
         }
 
-        // The converger must be a member of both ends; the source must have no
+        // The converger must be a member of the source; the source must have no
         // dangling open gate.
         {
             let guard = src_ledger.lock().await;
@@ -640,7 +640,10 @@ impl Host {
                 );
             }
         }
-        {
+        // When the target is hosted here, check the converger's membership up
+        // front; when it isn't (a cross-machine id), membership is enforced by
+        // projection once the far side reconciles (docs/adr/0028).
+        if let Some(tgt_ledger) = &tgt_ledger {
             let guard = tgt_ledger.lock().await;
             let view = guard.project(&tgt_id).await?;
             self.authorize_write(&view, &converger, code)?;
@@ -670,20 +673,88 @@ impl Host {
                 })
                 .await?;
         }
-        // Target side: convergence received.
-        {
-            let mut guard = tgt_ledger.lock().await;
-            guard
-                .append(LedgerEntry {
-                    id: EntryId::new(),
-                    channel: tgt_id,
-                    author: converger,
-                    timestamp: Timestamp::now(),
-                    payload: EntryPayload::ConvergenceReceived { source: src_id },
-                })
-                .await?;
+        // Target side: convergence received. Try to write it now; on any
+        // failure — or when the target isn't hosted here — park it for the
+        // eventually-consistent reconciliation pass (docs/adr/0028).
+        let far = LedgerEntry {
+            id: EntryId::new(),
+            channel: tgt_id,
+            author: converger,
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::ConvergenceReceived { source: src_id },
+        };
+        let landed = match &tgt_ledger {
+            Some(ledger) => ledger.lock().await.append(far.clone()).await.is_ok(),
+            None => false,
+        };
+        if !landed {
+            crate::pending_lineage::enqueue(&self.member_home()?, &far)?;
         }
         Ok(())
+    }
+
+    /// Resolve a **target** channel reference for [`Host::converge`]: its id,
+    /// plus its local ledger if this host hosts it. A raw id that isn't hosted
+    /// here resolves to the id alone — the far side reconciles later
+    /// (`docs/adr/0028`); a *name* that doesn't resolve is an error, since we
+    /// cannot learn its id (converge never creates a channel, `docs/adr/0027`).
+    async fn resolve_target(&self, target: &str) -> Result<(ChannelId, Option<SharedLedger>)> {
+        match self.resolve(target).await? {
+            Resolution::Resolved { ledger, id, .. } => Ok((id, Some(ledger))),
+            Resolution::Ambiguous(substrates) => bail!(
+                "channel name '{target}' exists in several substrates ({substrates:?}); \
+                 address it by id"
+            ),
+            Resolution::NotFound => match target.parse::<ChannelId>() {
+                Ok(id) => Ok((id, None)),
+                Err(_) => bail!(
+                    "no channel '{target}' in any registered substrate, and it is not a channel \
+                     id — converge needs an existing target (docs/adr/0027)"
+                ),
+            },
+        }
+    }
+
+    /// Drain the pending-lineage queue (`docs/adr/0028`): for each parked
+    /// far-side entry, resolve its channel and append it (idempotent via
+    /// content-addressed dedup, `docs/adr/0010`). Entries that still can't be
+    /// written are kept for the next pass; those older than 30 days are dropped
+    /// with a warning (the near side stays "unresolved"). Run on host startup
+    /// and after sync — exactly when far channels become reachable.
+    pub async fn reconcile_lineage(&self) -> Result<()> {
+        const TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+        let home = self.member_home()?;
+        let queue = crate::pending_lineage::pending(&home)?;
+        if queue.is_empty() {
+            return Ok(());
+        }
+        let now = Timestamp::now().as_millis();
+        let mut keep = Vec::new();
+        for entry in queue {
+            if now - entry.timestamp.as_millis() > TTL_MS {
+                tracing::warn!(
+                    channel = %entry.channel,
+                    "dropping a pending lineage edge unreconciled after 30 days (docs/adr/0028)"
+                );
+                continue;
+            }
+            let landed = match self.ledger_for_channel(entry.channel).await? {
+                Some(ledger) => ledger.lock().await.append(entry.clone()).await.is_ok(),
+                None => false,
+            };
+            if !landed {
+                keep.push(entry);
+            }
+        }
+        crate::pending_lineage::rewrite(&home, &keep)
+    }
+
+    /// The local ledger hosting `channel`, if any registered substrate holds it.
+    async fn ledger_for_channel(&self, channel: ChannelId) -> Result<Option<SharedLedger>> {
+        match self.resolve(&channel.to_string()).await? {
+            Resolution::Resolved { ledger, .. } => Ok(Some(ledger)),
+            _ => Ok(None),
+        }
     }
 
     /// Resolve a channel reference for a write op, turning the not-found /
@@ -1044,7 +1115,9 @@ mod lineage_tests {
     #[tokio::test]
     async fn diverge_opens_child_and_records_both_edges() {
         let (dirs, host) = lineage_host(1);
-        host.open_channel(None, "parent", dan(), None).await.unwrap();
+        host.open_channel(None, "parent", dan(), None)
+            .await
+            .unwrap();
         let code = code_for(&dirs, &dan());
 
         let child = host
@@ -1054,24 +1127,27 @@ mod lineage_tests {
 
         let (parent_id, parent_view) = project(&host, "parent").await;
         assert!(
-            parent_view.lineage.iter().any(|e| e.relation == LineageRelation::Diverge
-                && e.direction == LineageDirection::Outgoing
-                && e.other == child.id),
+            parent_view
+                .lineage
+                .iter()
+                .any(|e| e.relation == LineageRelation::Diverge
+                    && e.direction == LineageDirection::Outgoing
+                    && e.other == child.id),
             "parent records the child diverged"
         );
 
-        let child_view = host
-            .resolve(&child.id.to_string())
-            .await
-            .unwrap();
+        let child_view = host.resolve(&child.id.to_string()).await.unwrap();
         let Resolution::Resolved { ledger, id, .. } = child_view else {
             panic!("child resolves");
         };
         let child_view = ledger.lock().await.project(&id).await.unwrap();
         assert!(
-            child_view.lineage.iter().any(|e| e.relation == LineageRelation::Diverge
-                && e.direction == LineageDirection::Incoming
-                && e.other == parent_id),
+            child_view
+                .lineage
+                .iter()
+                .any(|e| e.relation == LineageRelation::Diverge
+                    && e.direction == LineageDirection::Incoming
+                    && e.other == parent_id),
             "child records it diverged from the parent"
         );
         // The diverger founds the child (docs/adr/0027).
@@ -1084,7 +1160,9 @@ mod lineage_tests {
     #[tokio::test]
     async fn diverge_requires_parent_membership() {
         let (dirs, host) = lineage_host(1);
-        host.open_channel(None, "parent", dan(), None).await.unwrap();
+        host.open_channel(None, "parent", dan(), None)
+            .await
+            .unwrap();
         let stranger = Member::agent("Stranger", "stranger@example.com");
         let code = code_for(&dirs, &stranger);
         let err = host
@@ -1108,16 +1186,22 @@ mod lineage_tests {
         let (src_id, src_view) = project(&host, "src").await;
         assert!(src_view.closed, "the source closes on convergence");
         assert!(
-            src_view.lineage.iter().any(|e| e.relation == LineageRelation::Converge
-                && e.direction == LineageDirection::Outgoing),
+            src_view
+                .lineage
+                .iter()
+                .any(|e| e.relation == LineageRelation::Converge
+                    && e.direction == LineageDirection::Outgoing),
             "source records it converged into the target"
         );
 
         let (_tgt_id, tgt_view) = project(&host, "tgt").await;
         assert!(
-            tgt_view.lineage.iter().any(|e| e.relation == LineageRelation::Converge
-                && e.direction == LineageDirection::Incoming
-                && e.other == src_id),
+            tgt_view
+                .lineage
+                .iter()
+                .any(|e| e.relation == LineageRelation::Converge
+                    && e.direction == LineageDirection::Incoming
+                    && e.other == src_id),
             "target records it received the source"
         );
     }
@@ -1160,5 +1244,69 @@ mod lineage_tests {
         // And the source is NOT closed — the refusal left it untouched.
         let (_, src_view) = project(&host, "src").await;
         assert!(!src_view.closed);
+    }
+
+    #[tokio::test]
+    async fn reconcile_lands_a_pending_far_side_edge() {
+        let (dirs, host) = lineage_host(1);
+        host.open_channel(None, "tgt", dan(), None).await.unwrap();
+        let (tgt_id, _) = project(&host, "tgt").await;
+
+        // Park a far-side edge as if a source had converged into tgt.
+        let far = LedgerEntry {
+            id: EntryId::new(),
+            channel: tgt_id,
+            author: dan(),
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::ConvergenceReceived {
+                source: ChannelId::new(),
+            },
+        };
+        crate::pending_lineage::enqueue(member_home(&dirs), &far).unwrap();
+
+        host.reconcile_lineage().await.unwrap();
+
+        let (_, tgt_view) = project(&host, "tgt").await;
+        assert!(
+            tgt_view
+                .lineage
+                .iter()
+                .any(|e| e.relation == LineageRelation::Converge
+                    && e.direction == LineageDirection::Incoming),
+            "the parked edge landed in the target"
+        );
+        assert!(
+            crate::pending_lineage::pending(member_home(&dirs))
+                .unwrap()
+                .is_empty(),
+            "and was removed from the queue"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_drops_edges_older_than_30_days() {
+        let (dirs, host) = lineage_host(1);
+        let thirty_one_days = 31 * 24 * 60 * 60 * 1000;
+        let old = Timestamp::from_millis(Timestamp::now().as_millis() - thirty_one_days);
+        // Target not hosted here, so it could never land regardless.
+        let far = LedgerEntry {
+            id: EntryId::new(),
+            channel: ChannelId::new(),
+            author: dan(),
+            timestamp: old,
+            payload: EntryPayload::ConvergenceReceived {
+                source: ChannelId::new(),
+            },
+        };
+        crate::pending_lineage::enqueue(member_home(&dirs), &far).unwrap();
+
+        host.reconcile_lineage().await.unwrap();
+
+        assert!(
+            crate::pending_lineage::pending(member_home(&dirs))
+                .unwrap()
+                .is_empty(),
+            "the 30-day bound drops the unreconciled edge"
+        );
     }
 }

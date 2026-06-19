@@ -939,6 +939,9 @@ impl JuntoMcp {
             .sync(&remote, &channel)
             .await
             .map_err(internal)?;
+        // Sync is exactly when far channels and far-channel membership become
+        // reachable, so drain any pending lineage edges now (docs/adr/0028).
+        self.host.reconcile_lineage().await.map_err(internal)?;
         Ok(text(format!(
             "synced channel '{}' with remote '{remote}'",
             req.channel

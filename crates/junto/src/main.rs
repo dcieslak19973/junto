@@ -17,6 +17,7 @@ mod launch;
 mod mcp;
 mod members;
 mod outcome;
+mod pending_lineage;
 mod render;
 mod verify;
 mod web;
@@ -337,6 +338,12 @@ async fn serve(repo: Option<PathBuf>, port: u16) -> Result<()> {
             host::Host::from_registry(junto_home)
         }
     };
+
+    // Drain any pending lineage edges parked by a prior run (docs/adr/0028);
+    // best-effort — a reconciliation failure must not stop the host serving.
+    if let Err(err) = host.reconcile_lineage().await {
+        tracing::warn!("lineage reconciliation at startup failed: {err:#}");
+    }
 
     let handler = mcp::JuntoMcp::new(host.clone());
     let service = StreamableHttpService::new(
