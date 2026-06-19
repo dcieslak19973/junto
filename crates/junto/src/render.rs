@@ -494,6 +494,16 @@ fn recent_line(entry: &LedgerEntry) -> String {
         EntryPayload::Park { target, .. } => format!("parked `{}`", short(target)),
         EntryPayload::Approval { target, .. } => format!("approved `{}`", short(target)),
         EntryPayload::Rejection { target, .. } => format!("rejected `{}`", short(target)),
+        EntryPayload::GateExecuted {
+            target, success, ..
+        } => {
+            let verb = if *success {
+                "executed"
+            } else {
+                "failed to execute"
+            };
+            format!("{verb} gate `{}`", short(target))
+        }
         EntryPayload::SessionStarted { intent, .. } => {
             format!("started a session: {}", clamp(intent, TAIL_CLAMP))
         }
@@ -751,6 +761,18 @@ fn describe_markdown(entry: &LedgerEntry, view: &ChannelView) -> String {
         }
         EntryPayload::Approval { target, .. } => format!("approval of `{target}`"),
         EntryPayload::Rejection { target, .. } => format!("rejection of `{target}`"),
+        EntryPayload::GateExecuted {
+            target,
+            success,
+            note,
+        } => {
+            let verb = if *success {
+                "gate executed"
+            } else {
+                "gate execution failed"
+            };
+            format!("**{verb}** of `{target}` — {note}")
+        }
         EntryPayload::SessionStarted { intent } => {
             format!(
                 "**agent session** [{}] — {intent}",
@@ -2057,6 +2079,27 @@ fn attention_item(item: &crate::host::AttentionItem, channel: &ChannelId, back: 
     let entry = &item.entry;
     let waiting = wait_time(entry.timestamp.as_millis())
         .unwrap_or_else(|| format!("since {}", iso_utc(entry.timestamp.as_millis())));
+
+    // An approved gate whose action hasn't run (docs/adr/0030): a distinct,
+    // form-less card — it's already approved, so it needs to *run* (or be
+    // retried), not be voted on. Surfacing it is the whole point.
+    if item.kind == crate::host::AttentionKind::AwaitingExecution {
+        let action = match &entry.payload {
+            EntryPayload::Proposal { action, .. } => action.clone(),
+            _ => return String::new(),
+        };
+        return format!(
+            "<article class=\"card attn\">\
+             <header><span class=\"kind\">approved gate</span>\
+             <span class=\"badge stuck\">awaiting execution</span>\
+             <span class=\"spacer\"></span><span class=\"when\">{when}</span></header>\
+             <div class=\"blocking\">approved {waiting} but its action has not run — it may \
+             have failed, or the host that should run it isn't up (docs/adr/0030)</div>\
+             <div class=\"statement clamp\">{text}</div></article>",
+            when = escape_html(&iso_utc(entry.timestamp.as_millis())),
+            text = escape_html(&action),
+        );
+    }
     let (kind, badge, blocking, text, rationale, accept, decline) =
         match (&item.kind, &entry.payload) {
             (
@@ -2546,7 +2589,8 @@ fn entry_family(payload: &EntryPayload) -> &'static str {
         | EntryPayload::Park { .. }
         | EntryPayload::Correction { .. }
         | EntryPayload::Approval { .. }
-        | EntryPayload::Rejection { .. } => "fam-act",
+        | EntryPayload::Rejection { .. }
+        | EntryPayload::GateExecuted { .. } => "fam-act",
     }
 }
 
@@ -2654,6 +2698,22 @@ fn entry_card(entry: &LedgerEntry, view: &ChannelView, channel: &ChannelId) -> S
             None,
             None,
             Some(rationale.as_str()),
+            None,
+            Some(*target),
+        ),
+        EntryPayload::GateExecuted {
+            target,
+            success,
+            note,
+        } => (
+            if *success {
+                "gate executed"
+            } else {
+                "gate execution failed"
+            },
+            None,
+            Some(note.clone()),
+            None,
             None,
             Some(*target),
         ),
@@ -3699,6 +3759,7 @@ mod tests {
             unrecognized: std::collections::HashSet::new(),
             standings,
             gate_status,
+            gate_executions: HashMap::new(),
             sessions: HashMap::new(),
             closed: false,
             lineage: Vec::new(),
@@ -4128,6 +4189,7 @@ mod tests {
             unrecognized: Default::default(),
             standings,
             gate_status,
+            gate_executions: Default::default(),
             sessions: Default::default(),
             closed: false,
             lineage: Vec::new(),
@@ -4164,6 +4226,7 @@ mod tests {
             unrecognized: Default::default(),
             standings,
             gate_status: Default::default(),
+            gate_executions: Default::default(),
             sessions: Default::default(),
             closed: false,
             lineage: Vec::new(),

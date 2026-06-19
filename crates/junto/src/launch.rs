@@ -2166,6 +2166,24 @@ async fn try_execute_pr_gate(host: &Host, channel: ChannelId, proposal: EntryId)
                 },
             )
             .await?;
+            // Record the failure against the gate (docs/adr/0030) so the gate
+            // surfaces as failed-execution rather than silently approved.
+            append(
+                host,
+                &channel_ref,
+                LedgerEntry {
+                    id: EntryId::new(),
+                    channel,
+                    author,
+                    timestamp: Timestamp::now(),
+                    payload: EntryPayload::GateExecuted {
+                        target: proposal,
+                        success: false,
+                        note: format!("{err:#}"),
+                    },
+                },
+            )
+            .await?;
             return Err(err);
         }
     };
@@ -2197,12 +2215,29 @@ async fn try_execute_pr_gate(host: &Host, channel: ChannelId, proposal: EntryId)
         LedgerEntry {
             id: EntryId::new(),
             channel,
-            author,
+            author: author.clone(),
             timestamp: Timestamp::now(),
             payload: EntryPayload::SessionUpdated {
                 target: session,
                 state: SessionState::Done,
                 note: format!("opened pull request {url}"),
+            },
+        },
+    )
+    .await?;
+    // Record success against the gate (docs/adr/0030): the gate's action ran.
+    append(
+        host,
+        &channel_ref,
+        LedgerEntry {
+            id: EntryId::new(),
+            channel,
+            author,
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::GateExecuted {
+                target: proposal,
+                success: true,
+                note: url,
             },
         },
     )

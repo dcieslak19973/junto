@@ -200,6 +200,11 @@ pub enum MilestoneKind {
 pub enum AttentionKind {
     /// A pending proposal awaiting approve/reject; its author is blocked.
     Gate,
+    /// An **approved actionable gate whose action has not run** (`docs/adr/0030`):
+    /// approved + carries an executable `kind` + no successful `GateExecuted`.
+    /// Surfaced so a silently-stuck or failed execution is never mistaken for a
+    /// completed one.
+    AwaitingExecution,
     /// A provisional assertion awaiting ratify/park.
     Verification,
 }
@@ -972,6 +977,7 @@ pub struct OpenedChannel {
 /// the view in hand and must not re-project).
 pub fn attention_for_view(id: &ChannelId, view: &ChannelView) -> AttentionGroup {
     let mut gates = Vec::new();
+    let mut awaiting = Vec::new();
     let mut verifications = Vec::new();
     for entry in &view.entries {
         match &entry.payload {
@@ -980,6 +986,18 @@ pub fn attention_for_view(id: &ChannelId, view: &ChannelView) -> AttentionGroup 
             {
                 gates.push(AttentionItem {
                     kind: AttentionKind::Gate,
+                    entry: entry.clone(),
+                });
+            }
+            // An approved actionable gate whose action hasn't succeeded
+            // (docs/adr/0030): surfaced so a stuck/failed execution isn't
+            // mistaken for done.
+            EntryPayload::Proposal { kind: Some(_), .. }
+                if view.gate_status(&entry.id) == Some(GateStatus::Approved)
+                    && view.gate_executed(&entry.id) != Some(true) =>
+            {
+                awaiting.push(AttentionItem {
+                    kind: AttentionKind::AwaitingExecution,
                     entry: entry.clone(),
                 });
             }
@@ -994,9 +1012,12 @@ pub fn attention_for_view(id: &ChannelId, view: &ChannelView) -> AttentionGroup 
             _ => {}
         }
     }
-    // Oldest first within each kind: the longest-waiting item leads.
+    // Oldest first within each kind: the longest-waiting item leads. Gates
+    // (blocked proposer) first, then stuck executions, then verification debt.
     gates.sort_by_key(|item| item.entry.timestamp);
+    awaiting.sort_by_key(|item| item.entry.timestamp);
     verifications.sort_by_key(|item| item.entry.timestamp);
+    gates.extend(awaiting);
     gates.extend(verifications);
     AttentionGroup {
         channel: *id,
@@ -1121,6 +1142,14 @@ fn preview(entry: &LedgerEntry) -> String {
         EntryPayload::Proposal { action, .. } => ("proposal", action.clone()),
         EntryPayload::Approval { rationale, .. } => ("approval", rationale.clone()),
         EntryPayload::Rejection { rationale, .. } => ("rejection", rationale.clone()),
+        EntryPayload::GateExecuted { success, note, .. } => (
+            if *success {
+                "gate executed"
+            } else {
+                "gate execution failed"
+            },
+            note.clone(),
+        ),
         EntryPayload::SessionStarted { intent } => ("session started", intent.clone()),
         EntryPayload::SessionUpdated { note, .. } => ("session updated", note.clone()),
         EntryPayload::ArtifactAttached { description, .. } => ("artifact", description.clone()),
@@ -1377,6 +1406,91 @@ mod lineage_tests {
         // And the source is NOT closed — the refusal left it untouched.
         let (_, src_view) = project(&host, "src").await;
         assert!(!src_view.closed);
+    }
+
+    #[tokio::test]
+    async fn approved_actionable_gate_surfaces_until_executed() {
+        use junto_kernel::{ApprovalRequirement, EntryPayload};
+        let (dirs, host) = lineage_host(1);
+        host.open_channel(None, "c", dan(), None).await.unwrap();
+        let _ = &dirs;
+        let (id, _) = project(&host, "c").await;
+        let ledger = host
+            .ledger_for(host.substrate_paths().unwrap()[0].as_path())
+            .await
+            .unwrap();
+
+        // An approved, actionable (kind-tagged) gate.
+        let proposal = EntryId::new();
+        for payload in [
+            EntryPayload::Proposal {
+                action: "Open the PR".into(),
+                rationale: "verified".into(),
+                provenance: vec![],
+                requirement: ApprovalRequirement::Count(1),
+                frame: None,
+                kind: Some("code-pr.open-pr".into()),
+            },
+            EntryPayload::Approval {
+                target: proposal,
+                rationale: "go".into(),
+            },
+        ] {
+            let eid = if matches!(payload, EntryPayload::Proposal { .. }) {
+                proposal
+            } else {
+                EntryId::new()
+            };
+            ledger
+                .lock()
+                .await
+                .append(LedgerEntry {
+                    id: eid,
+                    channel: id,
+                    author: dan(),
+                    timestamp: Timestamp::now(),
+                    payload,
+                })
+                .await
+                .unwrap();
+        }
+
+        let view = ledger.lock().await.project(&id).await.unwrap();
+        let group = attention_for_view(&id, &view);
+        assert!(
+            group
+                .items
+                .iter()
+                .any(|i| i.kind == AttentionKind::AwaitingExecution),
+            "an approved actionable gate with no execution surfaces"
+        );
+
+        // A successful GateExecuted clears it.
+        ledger
+            .lock()
+            .await
+            .append(LedgerEntry {
+                id: EntryId::new(),
+                channel: id,
+                author: dan(),
+                timestamp: Timestamp::now(),
+                payload: EntryPayload::GateExecuted {
+                    target: proposal,
+                    success: true,
+                    note: "pr #1".into(),
+                },
+            })
+            .await
+            .unwrap();
+        let view = ledger.lock().await.project(&id).await.unwrap();
+        let group = attention_for_view(&id, &view);
+        assert!(
+            !group
+                .items
+                .iter()
+                .any(|i| i.kind == AttentionKind::AwaitingExecution),
+            "a successful execution clears the signal"
+        );
     }
 
     #[tokio::test]

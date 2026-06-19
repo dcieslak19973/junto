@@ -2498,6 +2498,7 @@ mod tests {
             name: Some("web-test".into()),
             standings: std::iter::once((entry.id, junto_kernel::Standing::Provisional)).collect(),
             gate_status: Default::default(),
+            gate_executions: Default::default(),
             entries: vec![entry.clone()],
             party: Vec::new(),
             unrecognized: Default::default(),

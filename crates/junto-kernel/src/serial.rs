@@ -180,6 +180,11 @@ mod tests {
                 requirement,
             }));
         }
+        assert_round_trips(&entry(EntryPayload::GateExecuted {
+            target,
+            success: true,
+            note: "https://github.com/x/y/pull/1".into(),
+        }));
         // A proposal carrying a playbook `kind` tag (docs/adr/0029).
         assert_round_trips(&entry(EntryPayload::Proposal {
             action: "Open a pull request".into(),
