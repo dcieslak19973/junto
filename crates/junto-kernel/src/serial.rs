@@ -176,9 +176,19 @@ mod tests {
                 rationale: "ready".into(),
                 provenance: vec![provenance_with_digest()],
                 frame: None,
+                kind: None,
                 requirement,
             }));
         }
+        // A proposal carrying a playbook `kind` tag (docs/adr/0029).
+        assert_round_trips(&entry(EntryPayload::Proposal {
+            action: "Open a pull request".into(),
+            rationale: "verified green".into(),
+            provenance: vec![],
+            frame: None,
+            kind: Some("code-pr.open-pr".into()),
+            requirement: ApprovalRequirement::Count(1),
+        }));
         assert_round_trips(&entry(EntryPayload::Approval {
             target,
             rationale: "looks good".into(),

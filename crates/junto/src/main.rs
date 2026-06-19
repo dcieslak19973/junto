@@ -10,6 +10,7 @@
 mod acp;
 mod agent;
 mod binding;
+mod forge;
 mod grader;
 mod host;
 mod init;

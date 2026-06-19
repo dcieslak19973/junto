@@ -1365,6 +1365,12 @@ async fn verify(
     }
     drop(guard);
 
+    // If this approval resolved a code-PR open-PR gate, open the PR now
+    // (docs/adr/0029) — best-effort, before the sync so the PR record rides it.
+    if act == "approve" {
+        crate::launch::execute_pr_gate_if_approved(&host, id, target).await;
+    }
+
     // Auto-sync, best-effort and non-blocking: the human write surface is
     // terminal-less, so the page is the human's *only* affordance — without
     // this their verification sits machine-local until some agent happens to
@@ -1560,6 +1566,7 @@ mod tests {
             provenance: vec![],
             frame: None,
             requirement: ApprovalRequirement::Count(1),
+            kind: None,
         }
     }
 

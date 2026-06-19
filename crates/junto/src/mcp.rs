@@ -828,6 +828,9 @@ impl JuntoMcp {
                 provenance,
                 frame,
                 requirement,
+                // The MCP propose tool authors ordinary gates — no executable
+                // kind (those are minted by playbooks, docs/adr/0029).
+                kind: None,
             },
         );
         self.append(&req.channel, ledger, entry).await
@@ -854,7 +857,11 @@ impl JuntoMcp {
                 rationale: req.rationale,
             },
         );
-        self.append(&req.channel, ledger, entry).await
+        let result = self.append(&req.channel, ledger, entry).await?;
+        // If this approval resolved a code-PR open-PR gate, open the PR now
+        // (docs/adr/0029) — best-effort, after the approval is durable.
+        crate::launch::execute_pr_gate_if_approved(&self.host, channel, target).await;
+        Ok(result)
     }
 
     #[tool(

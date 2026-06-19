@@ -1085,11 +1085,21 @@ fn workspace_diff(workspace: &Path) -> Option<String> {
         let out = command.output().ok()?;
         Some(String::from_utf8_lossy(&out.stdout).to_string())
     };
+    // On a junto PR branch the worker commits its work (ADR-pending push-gate),
+    // so `git diff HEAD` would be empty — diff against the recorded base commit
+    // instead, which shows everything since base whether committed or not.
+    let base = pr_branch_base(workspace);
     let status = run(&["status", "--porcelain"])?;
-    if status.trim().is_empty() {
+    if status.trim().is_empty() && base.is_none() {
         return None;
     }
-    let diff = run(&["diff", "HEAD"]).unwrap_or_default();
+    let diff = match &base {
+        Some(base_sha) => run(&["diff", base_sha]).unwrap_or_default(),
+        None => run(&["diff", "HEAD"]).unwrap_or_default(),
+    };
+    if diff.trim().is_empty() && status.trim().is_empty() {
+        return None;
+    }
     let untracked: Vec<&str> = status
         .lines()
         .filter(|line| line.starts_with("??"))
@@ -1103,6 +1113,130 @@ fn workspace_diff(workspace: &Path) -> Option<String> {
         }
     }
     Some(out)
+}
+
+/// The PR branch junto prepared for an Outcome session: a fresh `junto/<session>`
+/// off the current HEAD, with `base` (the branch it forked from) recorded so a
+/// later slice opens the PR `base ← branch`. The base **commit** is stored in
+/// git config (`branch.<branch>.juntoBaseSha`) so [`workspace_diff`] can show
+/// the committed work base-relative without any caller threading it through.
+#[derive(Debug, Clone)]
+pub(crate) struct BranchPlan {
+    pub branch: String,
+    pub base: String,
+}
+
+/// Create `junto/<session>` off the workspace's current HEAD and switch to it,
+/// recording the base for later. The worker commits onto this branch; a later
+/// slice pushes it and opens the PR. Best-effort: callers log and continue if
+/// the workspace isn't a usable git repo.
+pub(crate) fn prepare_pr_branch(workspace: &Path, session: EntryId) -> Result<BranchPlan> {
+    let git = |args: &[&str]| -> Result<std::process::Output> {
+        let mut command = std::process::Command::new("git");
+        command.arg("-C").arg(workspace).args(args);
+        no_console_window(&mut command);
+        command.output().context("running git")
+    };
+    let trimmed =
+        |out: &std::process::Output| String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+    let head = git(&["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let base = trimmed(&head);
+    let base = if base.is_empty() || base == "HEAD" {
+        "main".to_string()
+    } else {
+        base
+    };
+    let base_sha = trimmed(&git(&["rev-parse", "HEAD"])?);
+    let branch = format!("junto/{session}");
+
+    let created = git(&["checkout", "-b", &branch])?;
+    if !created.status.success() {
+        bail!(
+            "creating PR branch {branch}: {}",
+            String::from_utf8_lossy(&created.stderr).trim()
+        );
+    }
+    if !base_sha.is_empty() {
+        // The base commit drives workspace_diff; the base ref is the PR base
+        // (docs/adr/0029). Both recorded in config; non-fatal if they don't take.
+        let _ = git(&[
+            "config",
+            &format!("branch.{branch}.juntoBaseSha"),
+            &base_sha,
+        ]);
+        let _ = git(&["config", &format!("branch.{branch}.juntoBaseRef"), &base]);
+    }
+    Ok(BranchPlan { branch, base })
+}
+
+/// The base **branch** a junto PR branch targets (the PR base), from git config
+/// — `None` when not on a junto branch. Distinct from [`pr_branch_base`], which
+/// returns the base *commit* for diffing.
+fn pr_branch_base_ref(workspace: &Path) -> Option<String> {
+    let git = |args: &[&str]| -> Option<String> {
+        let mut command = std::process::Command::new("git");
+        command.arg("-C").arg(workspace).args(args);
+        no_console_window(&mut command);
+        let out = command.output().ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let branch = git(&["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let base = git(&["config", &format!("branch.{branch}.juntoBaseRef")])?;
+    (!base.is_empty()).then_some(base)
+}
+
+/// The workspace's current branch name (`None` if git can't say).
+fn current_branch(workspace: &Path) -> Option<String> {
+    let mut command = std::process::Command::new("git");
+    command
+        .arg("-C")
+        .arg(workspace)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"]);
+    no_console_window(&mut command);
+    let out = command.output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|b| !b.is_empty() && b != "HEAD")
+}
+
+/// Push `branch` to `origin` (setting upstream) — inherits the user's git auth,
+/// like the substrate's sync (constraint #1). Errors carry git's stderr.
+fn push_branch(workspace: &Path, branch: &str) -> Result<()> {
+    let mut command = std::process::Command::new("git");
+    command
+        .arg("-C")
+        .arg(workspace)
+        .args(["push", "-u", "origin", branch]);
+    no_console_window(&mut command);
+    let out = command.output().context("running git push")?;
+    if !out.status.success() {
+        bail!(
+            "git push of {branch} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// The base commit a junto PR branch was forked from, from git config — `None`
+/// when the workspace isn't on a junto branch (the ordinary working-tree diff).
+fn pr_branch_base(workspace: &Path) -> Option<String> {
+    let git = |args: &[&str]| -> Option<String> {
+        let mut command = std::process::Command::new("git");
+        command.arg("-C").arg(workspace).args(args);
+        no_console_window(&mut command);
+        let out = command.output().ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let branch = git(&["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let sha = git(&["config", &format!("branch.{branch}.juntoBaseSha")])?;
+    (!sha.is_empty()).then_some(sha)
 }
 
 /// First ~N chars of a result for artifact/note descriptions.
@@ -1386,6 +1520,11 @@ async fn record_outcome(
 /// The iteration budget for an Outcome loop before it escalates to a Gate.
 const MAX_OUTCOME_ITERATIONS: u32 = 3;
 
+/// The `Proposal.kind` tag marking the code-PR push-gate's "open the PR" gate
+/// (`docs/adr/0029`). The app-level executor matches this stable key on
+/// approval — never the human-readable action text.
+pub(crate) const PR_OPEN_GATE_KIND: &str = "code-pr.open-pr";
+
 /// Launch an **Outcome-driven** Agent Session — the code-PR push-gate. The
 /// worker does the work; junto verifies it (mechanical checks + the Grader);
 /// findings feed back until the Outcome is satisfied or the iteration budget
@@ -1440,6 +1579,27 @@ fn spawn_outcome_loop(
     tokio::spawn(async move {
         host.live().begin(session);
 
+        // Prepare a PR branch the worker commits onto (the push-gate's
+        // deliverable). Best-effort: without it, grading falls back to the
+        // working-tree diff. workspace_diff self-discovers the recorded base.
+        let branch_plan = match prepare_pr_branch(&workspace, session) {
+            Ok(plan) => {
+                tracing::info!(
+                    "outcome session {session}: committing onto {} (off {})",
+                    plan.branch,
+                    plan.base
+                );
+                Some(plan)
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "outcome session {session}: no PR branch ({err:#}); grading the \
+                     working-tree diff"
+                );
+                None
+            }
+        };
+
         // Each step owns its own clones so the spawned futures stay `Send`.
         let w_host = host.clone();
         let w_ref = channel_ref.clone();
@@ -1477,6 +1637,7 @@ fn spawn_outcome_loop(
             &workspace,
             &agent,
             &terminal,
+            branch_plan.as_ref(),
         )
         .await
         {
@@ -1513,10 +1674,13 @@ async fn run_worker_turn(
     let prompt = match feedback {
         None => format!(
             "{intent}\n\n(Launched from junto channel '{channel_ref}'; junto session \
-             {session}. Do the work in this repository.)"
+             {session}. Do the work in this repository. When the change is complete, \
+             commit it to the current git branch with a clear message — junto pushes that \
+             branch and opens the pull request.)"
         ),
         Some(findings) => format!(
-            "Verification found problems with your last change. Fix them, then stop.\n\n{findings}"
+            "Verification found problems with your last change. Fix them, commit the fix to \
+             the current git branch, then stop.\n\n{findings}"
         ),
     };
     let outcome = run_turn(
@@ -1720,9 +1884,13 @@ async fn store_grader_report(
     .await
 }
 
-/// Record the loop's terminal: `Done` when satisfied, or an escalation Gate (a
-/// `Proposal` for a human to accept the unfinished work, the session left
-/// `AwaitingApproval`) when the iteration budget ran out (docs/adr/0025).
+/// Record the loop's terminal. **Satisfied** → an "Open the PR" Gate (a
+/// `Proposal`, session left `AwaitingApproval`) when a PR branch is in hand —
+/// opening a PR is a consequential outward action junto gates (a later slice's
+/// executor opens it on approval); without a branch it falls back to `Done`.
+/// **MaxIterationsReached** → the escalation Gate (accept despite unmet
+/// verification). Symmetric — both terminals produce a gate (docs/adr/0025).
+#[allow(clippy::too_many_arguments)]
 async fn finish_outcome(
     host: &Host,
     channel_ref: &str,
@@ -1731,6 +1899,7 @@ async fn finish_outcome(
     workspace: &Path,
     agent: &crate::agent::Agent,
     terminal: &crate::outcome::LoopTerminal,
+    branch_plan: Option<&BranchPlan>,
 ) -> Result<()> {
     // The ACE-style outcome signal (gated) for the future self-improvement
     // Playbook to learn from — recorded for every terminal.
@@ -1741,6 +1910,75 @@ async fn finish_outcome(
     }
     match terminal {
         crate::outcome::LoopTerminal::Satisfied { iterations } => {
+            // Only gate a PR-open when a forge can honor it (docs/adr/0029):
+            // with a branch and an available forge, gate; otherwise the work is
+            // verified Done with nothing to open a PR from.
+            let plan = match branch_plan {
+                Some(plan) if crate::forge::GithubForge::is_available() => plan,
+                other => {
+                    let why = if other.is_some() {
+                        "no forge available"
+                    } else {
+                        "no PR branch"
+                    };
+                    return append(
+                        host,
+                        channel_ref,
+                        LedgerEntry {
+                            id: EntryId::new(),
+                            channel,
+                            author: agent.member(),
+                            timestamp: Timestamp::now(),
+                            payload: EntryPayload::SessionUpdated {
+                                target: session,
+                                state: SessionState::Done,
+                                note: format!(
+                                    "verified green after {iterations} iteration(s) ({why})"
+                                ),
+                            },
+                        },
+                    )
+                    .await;
+                }
+            };
+            // Gate the PR-open: opening a PR is a consequential outward action.
+            let junto_home = crate::host::junto_home()?;
+            let mut provenance = Vec::new();
+            if let Some(diff) = workspace_diff(workspace) {
+                provenance.push(store_artifact(
+                    &junto_home,
+                    &session,
+                    "deliverable-diff.patch",
+                    &diff,
+                )?);
+            }
+            append(
+                host,
+                channel_ref,
+                LedgerEntry {
+                    id: EntryId::new(),
+                    channel,
+                    author: agent.member(),
+                    timestamp: Timestamp::now(),
+                    payload: EntryPayload::Proposal {
+                        action: format!(
+                            "Open a pull request for this verified deliverable ({} → {})",
+                            plan.branch, plan.base
+                        ),
+                        rationale: format!(
+                            "The Outcome was verified green after {iterations} iteration(s). \
+                             Approve to push '{}' and open the pull request against '{}'.",
+                            plan.branch, plan.base
+                        ),
+                        provenance,
+                        requirement: junto_kernel::ApprovalRequirement::Count(1),
+                        frame: None,
+                        // The tag the executor matches on approval (docs/adr/0029).
+                        kind: Some(PR_OPEN_GATE_KIND.to_string()),
+                    },
+                },
+            )
+            .await?;
             append(
                 host,
                 channel_ref,
@@ -1751,8 +1989,11 @@ async fn finish_outcome(
                     timestamp: Timestamp::now(),
                     payload: EntryPayload::SessionUpdated {
                         target: session,
-                        state: SessionState::Done,
-                        note: format!("verified green after {iterations} iteration(s)"),
+                        state: SessionState::AwaitingApproval,
+                        note: format!(
+                            "verified green after {iterations} iteration(s); awaiting approval \
+                             to open the pull request"
+                        ),
                     },
                 },
             )
@@ -1789,6 +2030,7 @@ async fn finish_outcome(
                         provenance,
                         requirement: junto_kernel::ApprovalRequirement::Count(1),
                         frame: None,
+                        kind: None,
                     },
                 },
             )
@@ -1814,6 +2056,158 @@ async fn finish_outcome(
             .await
         }
     }
+}
+
+/// React to a just-recorded approval (`docs/adr/0029`): if it resolved a
+/// code-PR **"open the PR"** gate, push the `junto/<session>` branch and open
+/// the pull request, recording the PR URL as the deliverable. Best-effort and
+/// idempotent — a no-op for any other approval. Called from the web/MCP approve
+/// paths; fires only on the host that recorded the approval (no multi-host
+/// double-open).
+pub(crate) async fn execute_pr_gate_if_approved(
+    host: &Host,
+    channel: ChannelId,
+    proposal: EntryId,
+) {
+    if let Err(err) = try_execute_pr_gate(host, channel, proposal).await {
+        tracing::warn!("opening the PR for gate {proposal} failed: {err:#}");
+    }
+}
+
+async fn try_execute_pr_gate(host: &Host, channel: ChannelId, proposal: EntryId) -> Result<()> {
+    let crate::host::Resolution::Resolved { ledger, id, .. } =
+        host.resolve(&channel.to_string()).await?
+    else {
+        return Ok(());
+    };
+    let view = ledger.lock().await.project(&id).await?;
+
+    // Recognize a code-PR open-PR gate by its kind tag (docs/adr/0029), and only
+    // act once it is actually approved.
+    let is_open_pr_gate = view.entries.iter().any(|entry| {
+        entry.id == proposal
+            && matches!(
+                &entry.payload,
+                EntryPayload::Proposal { kind: Some(kind), .. } if kind == PR_OPEN_GATE_KIND
+            )
+    });
+    if !is_open_pr_gate || view.gate_status(&proposal) != Some(junto_kernel::GateStatus::Approved) {
+        return Ok(());
+    }
+
+    // Recover the workspace, branch, and session (the branch name carries it).
+    let home = crate::host::junto_home()?;
+    let Some(workspace) = workspace_for(&home, &channel)? else {
+        bail!("no workspace is mapped for channel {channel}");
+    };
+    let Some(branch) = current_branch(&workspace) else {
+        return Ok(());
+    };
+    let Some(session_str) = branch.strip_prefix("junto/") else {
+        return Ok(());
+    };
+    let session: EntryId = session_str
+        .parse()
+        .with_context(|| format!("branch {branch} has no session id"))?;
+
+    // Idempotent: a finished session has already opened (or settled) its PR.
+    if view
+        .session(&session)
+        .is_some_and(|s| s.state == SessionState::Done)
+    {
+        return Ok(());
+    }
+
+    let base = pr_branch_base_ref(&workspace).unwrap_or_else(|| "main".to_string());
+    let author = view
+        .entries
+        .iter()
+        .find(|entry| entry.id == session)
+        .map(|entry| entry.author.clone())
+        .unwrap_or_else(|| Member::agent("junto", "junto@local"));
+    let intent = view
+        .entries
+        .iter()
+        .find_map(|entry| match &entry.payload {
+            EntryPayload::SessionStarted { intent } if entry.id == session => Some(intent.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "junto deliverable".to_string());
+
+    // Push the branch, then open the PR.
+    push_branch(&workspace, &branch)?;
+    let spec = crate::forge::PullRequestSpec {
+        repo: workspace.clone(),
+        head: branch.clone(),
+        base,
+        title: snippet(&intent, 72),
+        body: format!(
+            "Opened by junto's code-PR push-gate (session {session}). Verified green.\n\n{intent}"
+        ),
+    };
+    let channel_ref = channel.to_string();
+    let url = match crate::forge::GithubForge.open_pull_request(&spec) {
+        Ok(url) => url,
+        Err(err) => {
+            // Surface the failure; leave the gate approved so a re-approve retries.
+            append(
+                host,
+                &channel_ref,
+                LedgerEntry {
+                    id: EntryId::new(),
+                    channel,
+                    author: author.clone(),
+                    timestamp: Timestamp::now(),
+                    payload: EntryPayload::SessionUpdated {
+                        target: session,
+                        state: SessionState::AwaitingApproval,
+                        note: format!("opening the PR failed: {err:#}"),
+                    },
+                },
+            )
+            .await?;
+            return Err(err);
+        }
+    };
+
+    // Record the PR as the deliverable, and finish the session.
+    let provenance = Uri::new(&url)
+        .map(|uri| vec![ProvenanceRef::new(uri)])
+        .unwrap_or_default();
+    append(
+        host,
+        &channel_ref,
+        LedgerEntry {
+            id: EntryId::new(),
+            channel,
+            author: author.clone(),
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::ArtifactAttached {
+                target: session,
+                kind: "pull-request".into(),
+                description: format!("pull request {url}"),
+                provenance,
+            },
+        },
+    )
+    .await?;
+    append(
+        host,
+        &channel_ref,
+        LedgerEntry {
+            id: EntryId::new(),
+            channel,
+            author,
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::SessionUpdated {
+                target: session,
+                state: SessionState::Done,
+                note: format!("opened pull request {url}"),
+            },
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 /// Store the loop's structured outcome signal (success/partial/failure-shaped,
@@ -1894,6 +2288,136 @@ mod tests {
                 .success()
         );
         dir
+    }
+
+    /// A repo with one commit on a `main` branch and a configured user.
+    fn git_repo_with_commit() -> tempfile::TempDir {
+        let dir = git_repo();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(dir.path())
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        std::fs::write(dir.path().join("README.md"), "x").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        git(&["branch", "-M", "main"]);
+        dir
+    }
+
+    #[tokio::test]
+    async fn pr_gate_executor_ignores_an_ordinary_approval() {
+        let repo = git_repo();
+        let member_home = tempfile::tempdir().unwrap();
+        let host = crate::host::Host::fixed_with_member_home(
+            vec![repo.path().to_path_buf()],
+            Some(member_home.path().to_path_buf()),
+        );
+        let dan = Member::human("Dan", "dan@example.com");
+        let channel = host
+            .open_channel(None, "c", dan.clone(), None)
+            .await
+            .unwrap()
+            .id;
+        let ledger = host.ledger_for(repo.path()).await.unwrap();
+        let proposal = EntryId::new();
+        // An ordinary gate (no kind tag), then its approval.
+        ledger
+            .lock()
+            .await
+            .append(LedgerEntry {
+                id: proposal,
+                channel,
+                author: dan.clone(),
+                timestamp: Timestamp::now(),
+                payload: EntryPayload::Proposal {
+                    action: "do a thing".into(),
+                    rationale: "because".into(),
+                    provenance: vec![],
+                    requirement: junto_kernel::ApprovalRequirement::Count(1),
+                    frame: None,
+                    kind: None,
+                },
+            })
+            .await
+            .unwrap();
+        ledger
+            .lock()
+            .await
+            .append(LedgerEntry {
+                id: EntryId::new(),
+                channel,
+                author: dan.clone(),
+                timestamp: Timestamp::now(),
+                payload: EntryPayload::Approval {
+                    target: proposal,
+                    rationale: "ok".into(),
+                },
+            })
+            .await
+            .unwrap();
+
+        let before = ledger
+            .lock()
+            .await
+            .project(&channel)
+            .await
+            .unwrap()
+            .entries
+            .len();
+        // No kind tag → a no-op: it must not push, open a PR, or append anything.
+        execute_pr_gate_if_approved(&host, channel, proposal).await;
+        let after = ledger
+            .lock()
+            .await
+            .project(&channel)
+            .await
+            .unwrap()
+            .entries
+            .len();
+        assert_eq!(before, after, "an ordinary approval triggers no PR-open");
+    }
+
+    #[test]
+    fn pr_branch_makes_committed_work_show_in_the_base_relative_diff() {
+        let repo = git_repo_with_commit();
+        let session = EntryId::new();
+
+        let plan = prepare_pr_branch(repo.path(), session).unwrap();
+        assert_eq!(plan.branch, format!("junto/{session}"));
+        assert_eq!(plan.base, "main");
+
+        // The worker edits AND commits to the junto branch.
+        std::fs::write(repo.path().join("feature.rs"), "fn added() {}\n").unwrap();
+        for args in [
+            &["add", "."][..],
+            &["commit", "-q", "-m", "add feature"][..],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(repo.path())
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+
+        // `git diff HEAD` is now empty (the work is committed), but the
+        // base-relative diff still shows it — so the Grader sees the change.
+        let diff = workspace_diff(repo.path()).expect("committed work shows base-relative");
+        assert!(diff.contains("feature.rs"), "{diff}");
+        assert!(diff.contains("fn added"), "{diff}");
     }
 
     #[test]
