@@ -122,6 +122,12 @@ pub struct ChannelView {
     pub standings: HashMap<EntryId, Standing>,
     /// Current gate status per proposal [`EntryId`].
     pub gate_status: HashMap<EntryId, GateStatus>,
+    /// Per actionable proposal, whether its authorized action has been carried
+    /// out — folded last-applicable-wins from [`EntryPayload::GateExecuted`]
+    /// entries (`docs/adr/0030`). `Some(true)` = done, `Some(false)` = failed,
+    /// absent = not executed (the gap an approved actionable gate must not sit
+    /// in silently).
+    pub gate_executions: HashMap<EntryId, bool>,
     /// Current view per Agent Session — keyed by the
     /// [`EntryPayload::SessionStarted`] entry's id, holding the folded
     /// [`SessionState`] and the session's attached artifacts.
@@ -150,6 +156,14 @@ impl ChannelView {
     #[must_use]
     pub fn gate_status(&self, id: &EntryId) -> Option<GateStatus> {
         self.gate_status.get(id).copied()
+    }
+
+    /// Whether an approved gate's authorized action has run (`docs/adr/0030`):
+    /// `Some(true)` carried out, `Some(false)` failed, `None` not (yet)
+    /// executed.
+    #[must_use]
+    pub fn gate_executed(&self, id: &EntryId) -> Option<bool> {
+        self.gate_executions.get(id).copied()
     }
 
     /// The view of a specific Agent Session, if present.
@@ -286,6 +300,7 @@ impl<S: SubstrateProvider> Ledger<S> {
 
         let standings = Self::project_standings(&recognized);
         let gate_status = Self::project_gates(&recognized);
+        let gate_executions = Self::project_gate_executions(&recognized);
         let sessions = Self::project_sessions(&recognized);
         let lineage = Self::project_lineage(&recognized);
         // The current name: the (canonically first) genesis binding, unless a
@@ -325,6 +340,7 @@ impl<S: SubstrateProvider> Ledger<S> {
             unrecognized,
             standings,
             gate_status,
+            gate_executions,
             sessions,
             closed,
             lineage,
@@ -433,6 +449,7 @@ impl<S: SubstrateProvider> Ledger<S> {
                 | EntryPayload::Proposal { .. }
                 | EntryPayload::Approval { .. }
                 | EntryPayload::Rejection { .. }
+                | EntryPayload::GateExecuted { .. }
                 | EntryPayload::SessionStarted { .. }
                 | EntryPayload::SessionUpdated { .. }
                 | EntryPayload::ArtifactAttached { .. } => continue,
@@ -450,6 +467,23 @@ impl<S: SubstrateProvider> Ledger<S> {
     /// Fold the proposal gate statuses out of an ordered list of *recognized*
     /// entries — so only members' approvals and rejections count
     /// (`docs/adr/0017`).
+    /// Fold per-proposal execution status out of `GateExecuted` entries
+    /// (`docs/adr/0030`), last-applicable-wins in canonical order — so a later
+    /// successful retry supersedes an earlier failure. Keyed by the target
+    /// proposal id; absent means never executed.
+    fn project_gate_executions(entries: &[&LedgerEntry]) -> HashMap<EntryId, bool> {
+        let mut executions = HashMap::new();
+        for entry in entries {
+            if let EntryPayload::GateExecuted {
+                target, success, ..
+            } = &entry.payload
+            {
+                executions.insert(*target, *success);
+            }
+        }
+        executions
+    }
+
     fn project_gates(entries: &[&LedgerEntry]) -> HashMap<EntryId, GateStatus> {
         // Per proposal: its requirement, the distinct emails that approved it,
         // and whether it has been rejected.
@@ -1064,6 +1098,67 @@ mod tests {
             .unwrap();
         let view = ledger.project(&channel).await.unwrap();
         assert!(!view.closed);
+    }
+
+    #[tokio::test]
+    async fn gate_execution_folds_last_applicable_wins() {
+        let dan = Member::human("Dan", "dan@example.com");
+        let (mut ledger, channel) = opened_channel(&dan).await;
+        let proposal = EntryId::new();
+        // A proposal with no GateExecuted yet: not executed.
+        ledger
+            .append(entry(
+                proposal,
+                channel,
+                dan.clone(),
+                1,
+                EntryPayload::Proposal {
+                    action: "open the PR".into(),
+                    rationale: "ready".into(),
+                    provenance: vec![],
+                    requirement: ApprovalRequirement::Count(1),
+                    frame: None,
+                    kind: Some("code-pr.open-pr".into()),
+                },
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            ledger
+                .project(&channel)
+                .await
+                .unwrap()
+                .gate_executed(&proposal),
+            None,
+            "no GateExecuted yet"
+        );
+
+        // A failure, then a successful retry — last-applicable wins.
+        for (ts, success, note) in [(2, false, "push denied"), (3, true, "pr #1")] {
+            ledger
+                .append(entry(
+                    EntryId::new(),
+                    channel,
+                    dan.clone(),
+                    ts,
+                    EntryPayload::GateExecuted {
+                        target: proposal,
+                        success,
+                        note: note.into(),
+                    },
+                ))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            ledger
+                .project(&channel)
+                .await
+                .unwrap()
+                .gate_executed(&proposal),
+            Some(true),
+            "the later successful execution supersedes the earlier failure"
+        );
     }
 
     #[tokio::test]

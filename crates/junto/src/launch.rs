@@ -2135,7 +2135,6 @@ async fn try_execute_pr_gate(host: &Host, channel: ChannelId, proposal: EntryId)
         .unwrap_or_else(|| "junto deliverable".to_string());
 
     // Push the branch, then open the PR.
-    push_branch(&workspace, &branch)?;
     let spec = crate::forge::PullRequestSpec {
         repo: workspace.clone(),
         head: branch.clone(),
@@ -2146,7 +2145,12 @@ async fn try_execute_pr_gate(host: &Host, channel: ChannelId, proposal: EntryId)
         ),
     };
     let channel_ref = channel.to_string();
-    let url = match crate::forge::GithubForge.open_pull_request(&spec) {
+    // Push then open — as one fallible step, so *any* failure (push or PR
+    // create) records GateExecuted(false), not just the PR-create step
+    // (docs/adr/0030; the push-only gap the first signal dogfood found).
+    let opened = push_branch(&workspace, &branch)
+        .and_then(|()| crate::forge::GithubForge.open_pull_request(&spec));
+    let url = match opened {
         Ok(url) => url,
         Err(err) => {
             // Surface the failure; leave the gate approved so a re-approve retries.
@@ -2162,6 +2166,24 @@ async fn try_execute_pr_gate(host: &Host, channel: ChannelId, proposal: EntryId)
                         target: session,
                         state: SessionState::AwaitingApproval,
                         note: format!("opening the PR failed: {err:#}"),
+                    },
+                },
+            )
+            .await?;
+            // Record the failure against the gate (docs/adr/0030) so the gate
+            // surfaces as failed-execution rather than silently approved.
+            append(
+                host,
+                &channel_ref,
+                LedgerEntry {
+                    id: EntryId::new(),
+                    channel,
+                    author,
+                    timestamp: Timestamp::now(),
+                    payload: EntryPayload::GateExecuted {
+                        target: proposal,
+                        success: false,
+                        note: format!("{err:#}"),
                     },
                 },
             )
@@ -2197,12 +2219,29 @@ async fn try_execute_pr_gate(host: &Host, channel: ChannelId, proposal: EntryId)
         LedgerEntry {
             id: EntryId::new(),
             channel,
-            author,
+            author: author.clone(),
             timestamp: Timestamp::now(),
             payload: EntryPayload::SessionUpdated {
                 target: session,
                 state: SessionState::Done,
                 note: format!("opened pull request {url}"),
+            },
+        },
+    )
+    .await?;
+    // Record success against the gate (docs/adr/0030): the gate's action ran.
+    append(
+        host,
+        &channel_ref,
+        LedgerEntry {
+            id: EntryId::new(),
+            channel,
+            author,
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::GateExecuted {
+                target: proposal,
+                success: true,
+                note: url,
             },
         },
     )

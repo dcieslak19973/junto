@@ -252,6 +252,22 @@ pub enum EntryPayload {
         /// Why it was rejected.
         rationale: String,
     },
+    /// Records that the action an approved Gate authorized was **carried out**
+    /// (or failed) — the outcome of an actionable [`Proposal`](EntryPayload::Proposal)
+    /// (`docs/adr/0030`). Targets the proposal. Approval and execution are
+    /// decoupled (`docs/adr/0029`), so without this an approved actionable gate
+    /// whose executor never ran is silently indistinguishable from one whose
+    /// action completed; folding these lets projection surface the gap. The
+    /// kernel stays generic — `note` is an opaque playbook string (e.g. a PR
+    /// URL, or a failure reason).
+    GateExecuted {
+        /// The proposal whose authorized action this reports on.
+        target: EntryId,
+        /// Whether the action succeeded.
+        success: bool,
+        /// What happened — the result (e.g. a PR URL) or the failure reason.
+        note: String,
+    },
     /// An agent began work in this channel — the genesis of one **Agent
     /// Session** (see [`crate::session`]). A *subject* entry: its id is the
     /// session's identity, the envelope's author is the agent, and the
@@ -340,6 +356,7 @@ impl EntryPayload {
             | EntryPayload::Correction { target, .. }
             | EntryPayload::Approval { target, .. }
             | EntryPayload::Rejection { target, .. }
+            | EntryPayload::GateExecuted { target, .. }
             | EntryPayload::SessionUpdated { target, .. }
             | EntryPayload::ArtifactAttached { target, .. } => Some(*target),
         }
