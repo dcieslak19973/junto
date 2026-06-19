@@ -332,6 +332,33 @@ pub struct SyncRequest {
     pub remote: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DivergeRequest {
+    /// The parent channel (name or id) to diverge from.
+    pub parent: String,
+    /// The new child channel's name — opened in the parent's home substrate.
+    pub child_name: String,
+    /// The parent entry this child split from (optional — defaults to "the
+    /// parent as it stands now"; docs/adr/0027).
+    pub at: Option<String>,
+    pub author: AuthorParam,
+    /// The diverger's member code — they must be a member of the parent.
+    pub code: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConvergeRequest {
+    /// The source channel (name or id) — it closes on convergence.
+    pub source: String,
+    /// The target channel (name or id) it converges into — must already exist.
+    pub target: String,
+    /// Why it converged.
+    pub rationale: String,
+    pub author: AuthorParam,
+    /// The converger's member code — they must be a member of both channels.
+    pub code: Option<String>,
+}
+
 /// The MCP handler: the singleton [`Host`] (`docs/adr/0015`), shared by every
 /// connected session and with the web read routes.
 #[derive(Clone)]
@@ -576,6 +603,61 @@ impl JuntoMcp {
         Ok(text(format!(
             "added {email} to channel '{}'. {code_note}",
             req.channel
+        )))
+    }
+
+    #[tool(
+        description = "Diverge a child channel from a parent (docs/adr/0027): open a new child channel in the parent's home substrate (you found it) and record the divergence edge in both ledgers — the common side-quest birth. You must be a member of the parent; pass your `code`. `at` optionally names the parent entry you split from (for recall + the lineage strip)."
+    )]
+    async fn diverge_channel(
+        &self,
+        Parameters(req): Parameters<DivergeRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let at = match req.at.as_deref() {
+            Some(raw) => Some(
+                raw.parse::<EntryId>()
+                    .map_err(|err| invalid(format!("invalid `at` entry id: {err}")))?,
+            ),
+            None => None,
+        };
+        let child = self
+            .host
+            .diverge(
+                &req.parent,
+                &req.child_name,
+                at,
+                req.author.into(),
+                req.code.as_deref(),
+            )
+            .await
+            .map_err(|err| invalid(err.to_string()))?;
+        Ok(text(format!(
+            "diverged '{}' from '{}' (child id {}); you are its founding member. \
+             Record into it, then sync_channel.",
+            req.child_name, req.parent, child.id
+        )))
+    }
+
+    #[tool(
+        description = "Converge a source channel into a target (docs/adr/0027): record the convergence edge in both ledgers and close the source. Refuses while the source has open gates — decide (approve/reject) or re-propose each into the target first. You must be a member of both channels; pass your `code`. The target must already exist (converge never creates a channel)."
+    )]
+    async fn converge_channel(
+        &self,
+        Parameters(req): Parameters<ConvergeRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        self.host
+            .converge(
+                &req.source,
+                &req.target,
+                &req.rationale,
+                req.author.into(),
+                req.code.as_deref(),
+            )
+            .await
+            .map_err(|err| invalid(err.to_string()))?;
+        Ok(text(format!(
+            "converged '{}' into '{}' — the source is now closed. sync_channel to publish.",
+            req.source, req.target
         )))
     }
 
@@ -1088,6 +1170,61 @@ mod tests {
             .nth(1)
             .expect("entry id in confirmation")
             .to_string()
+    }
+
+    #[tokio::test]
+    async fn diverge_channel_tool_opens_child_and_links() {
+        let (dirs, mcp) = init_repo();
+        open(&mcp, &dirs, "parent").await;
+
+        let result = mcp
+            .diverge_channel(Parameters(DivergeRequest {
+                parent: "parent".into(),
+                child_name: "side-quest".into(),
+                at: None,
+                author: dan(),
+                code: code_of(&dirs, dan()),
+            }))
+            .await
+            .unwrap();
+        assert!(
+            text_of(&result).contains("diverged"),
+            "{}",
+            text_of(&result)
+        );
+
+        // The child is now a real channel carrying the inherited-lineage block.
+        let brief = mcp
+            .view_channel(Parameters(ViewRequest {
+                channel: "side-quest".into(),
+                full: false,
+            }))
+            .await
+            .unwrap();
+        assert!(
+            text_of(&brief).contains("inherited context"),
+            "{}",
+            text_of(&brief)
+        );
+    }
+
+    #[tokio::test]
+    async fn converge_channel_tool_closes_the_source() {
+        let (dirs, mcp) = init_repo();
+        open(&mcp, &dirs, "src").await;
+        open(&mcp, &dirs, "tgt").await;
+
+        let result = mcp
+            .converge_channel(Parameters(ConvergeRequest {
+                source: "src".into(),
+                target: "tgt".into(),
+                rationale: "merged".into(),
+                author: dan(),
+                code: code_of(&dirs, dan()),
+            }))
+            .await
+            .unwrap();
+        assert!(text_of(&result).contains("closed"), "{}", text_of(&result));
     }
 
     #[tokio::test]
