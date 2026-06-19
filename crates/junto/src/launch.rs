@@ -1085,11 +1085,21 @@ fn workspace_diff(workspace: &Path) -> Option<String> {
         let out = command.output().ok()?;
         Some(String::from_utf8_lossy(&out.stdout).to_string())
     };
+    // On a junto PR branch the worker commits its work (ADR-pending push-gate),
+    // so `git diff HEAD` would be empty — diff against the recorded base commit
+    // instead, which shows everything since base whether committed or not.
+    let base = pr_branch_base(workspace);
     let status = run(&["status", "--porcelain"])?;
-    if status.trim().is_empty() {
+    if status.trim().is_empty() && base.is_none() {
         return None;
     }
-    let diff = run(&["diff", "HEAD"]).unwrap_or_default();
+    let diff = match &base {
+        Some(base_sha) => run(&["diff", base_sha]).unwrap_or_default(),
+        None => run(&["diff", "HEAD"]).unwrap_or_default(),
+    };
+    if diff.trim().is_empty() && status.trim().is_empty() {
+        return None;
+    }
     let untracked: Vec<&str> = status
         .lines()
         .filter(|line| line.starts_with("??"))
@@ -1103,6 +1113,76 @@ fn workspace_diff(workspace: &Path) -> Option<String> {
         }
     }
     Some(out)
+}
+
+/// The PR branch junto prepared for an Outcome session: a fresh `junto/<session>`
+/// off the current HEAD, with `base` (the branch it forked from) recorded so a
+/// later slice opens the PR `base ← branch`. The base **commit** is stored in
+/// git config (`branch.<branch>.juntoBaseSha`) so [`workspace_diff`] can show
+/// the committed work base-relative without any caller threading it through.
+#[derive(Debug, Clone)]
+pub(crate) struct BranchPlan {
+    pub branch: String,
+    pub base: String,
+}
+
+/// Create `junto/<session>` off the workspace's current HEAD and switch to it,
+/// recording the base for later. The worker commits onto this branch; a later
+/// slice pushes it and opens the PR. Best-effort: callers log and continue if
+/// the workspace isn't a usable git repo.
+pub(crate) fn prepare_pr_branch(workspace: &Path, session: EntryId) -> Result<BranchPlan> {
+    let git = |args: &[&str]| -> Result<std::process::Output> {
+        let mut command = std::process::Command::new("git");
+        command.arg("-C").arg(workspace).args(args);
+        no_console_window(&mut command);
+        command.output().context("running git")
+    };
+    let trimmed =
+        |out: &std::process::Output| String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+    let head = git(&["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let base = trimmed(&head);
+    let base = if base.is_empty() || base == "HEAD" {
+        "main".to_string()
+    } else {
+        base
+    };
+    let base_sha = trimmed(&git(&["rev-parse", "HEAD"])?);
+    let branch = format!("junto/{session}");
+
+    let created = git(&["checkout", "-b", &branch])?;
+    if !created.status.success() {
+        bail!(
+            "creating PR branch {branch}: {}",
+            String::from_utf8_lossy(&created.stderr).trim()
+        );
+    }
+    if !base_sha.is_empty() {
+        // Recorded for workspace_diff; non-fatal if it doesn't take.
+        let _ = git(&[
+            "config",
+            &format!("branch.{branch}.juntoBaseSha"),
+            &base_sha,
+        ]);
+    }
+    Ok(BranchPlan { branch, base })
+}
+
+/// The base commit a junto PR branch was forked from, from git config — `None`
+/// when the workspace isn't on a junto branch (the ordinary working-tree diff).
+fn pr_branch_base(workspace: &Path) -> Option<String> {
+    let git = |args: &[&str]| -> Option<String> {
+        let mut command = std::process::Command::new("git");
+        command.arg("-C").arg(workspace).args(args);
+        no_console_window(&mut command);
+        let out = command.output().ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let branch = git(&["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let sha = git(&["config", &format!("branch.{branch}.juntoBaseSha")])?;
+    (!sha.is_empty()).then_some(sha)
 }
 
 /// First ~N chars of a result for artifact/note descriptions.
@@ -1440,6 +1520,20 @@ fn spawn_outcome_loop(
     tokio::spawn(async move {
         host.live().begin(session);
 
+        // Prepare a PR branch the worker commits onto (the push-gate's
+        // deliverable). Best-effort: without it, grading falls back to the
+        // working-tree diff. workspace_diff self-discovers the recorded base.
+        match prepare_pr_branch(&workspace, session) {
+            Ok(plan) => tracing::info!(
+                "outcome session {session}: committing onto {} (off {})",
+                plan.branch,
+                plan.base
+            ),
+            Err(err) => tracing::warn!(
+                "outcome session {session}: no PR branch ({err:#}); grading the working-tree diff"
+            ),
+        }
+
         // Each step owns its own clones so the spawned futures stay `Send`.
         let w_host = host.clone();
         let w_ref = channel_ref.clone();
@@ -1513,10 +1607,13 @@ async fn run_worker_turn(
     let prompt = match feedback {
         None => format!(
             "{intent}\n\n(Launched from junto channel '{channel_ref}'; junto session \
-             {session}. Do the work in this repository.)"
+             {session}. Do the work in this repository. When the change is complete, \
+             commit it to the current git branch with a clear message — junto pushes that \
+             branch and opens the pull request.)"
         ),
         Some(findings) => format!(
-            "Verification found problems with your last change. Fix them, then stop.\n\n{findings}"
+            "Verification found problems with your last change. Fix them, commit the fix to \
+             the current git branch, then stop.\n\n{findings}"
         ),
     };
     let outcome = run_turn(
@@ -1894,6 +1991,63 @@ mod tests {
                 .success()
         );
         dir
+    }
+
+    /// A repo with one commit on a `main` branch and a configured user.
+    fn git_repo_with_commit() -> tempfile::TempDir {
+        let dir = git_repo();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(dir.path())
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        std::fs::write(dir.path().join("README.md"), "x").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        git(&["branch", "-M", "main"]);
+        dir
+    }
+
+    #[test]
+    fn pr_branch_makes_committed_work_show_in_the_base_relative_diff() {
+        let repo = git_repo_with_commit();
+        let session = EntryId::new();
+
+        let plan = prepare_pr_branch(repo.path(), session).unwrap();
+        assert_eq!(plan.branch, format!("junto/{session}"));
+        assert_eq!(plan.base, "main");
+
+        // The worker edits AND commits to the junto branch.
+        std::fs::write(repo.path().join("feature.rs"), "fn added() {}\n").unwrap();
+        for args in [
+            &["add", "."][..],
+            &["commit", "-q", "-m", "add feature"][..],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(repo.path())
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+
+        // `git diff HEAD` is now empty (the work is committed), but the
+        // base-relative diff still shows it — so the Grader sees the change.
+        let diff = workspace_diff(repo.path()).expect("committed work shows base-relative");
+        assert!(diff.contains("feature.rs"), "{diff}");
+        assert!(diff.contains("fn added"), "{diff}");
     }
 
     #[test]
