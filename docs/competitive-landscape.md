@@ -42,8 +42,58 @@ The product from Maggie Appleton's
 | Outcomes | `record_outcome` (`success` \| `partial` \| `failure` + traces) |
 
 Loop: *discover → load → apply → `record_outcome` → feeds evolution* ("ACE" =
-**Agentic Context Engineering**). Product-side it is **synchronous multiplayer**
-— shared workspaces, live cursors, co-editing, per-session microVMs.
+**Agentic Context Engineering**).
+
+### Update — re-assessed 2026-06-19
+
+Three substantive changes since the baseline above (recorded in the `junto-dev`
+side-quest channel *ACE - Update 20260619*, finding `0d93ed32`):
+
+1. **Strategic pivot: synchronous-multiplayer SaaS → OSS core + hosted cloud.**
+   Ace now splits into **ACE OSS** (open-source core, runs local with your own
+   model keys / storage / backups — *local single-user capability must remain
+   usable without ACE-operated services*) and **ACE Cloud** (Personal / Team /
+   Enterprise tiers selling sync, backups, managed job execution, team
+   governance, enterprise audit/compliance). The microVM / live-cursor
+   multiplayer framing has receded from the public docs.
+2. **The internal loop is now public and named:** **Generator** (produces
+   outputs from the playbook) → **Reflector** (analyzes outcomes into *delta
+   entries*) → **Curator** (periodically dedups, merges, removes contradictions).
+3. **The mechanism is documented** (ICLR 2026 paper, [`2510.04618`](https://arxiv.org/abs/2510.04618)):
+   context is a set of **itemized bullets carrying metadata**, updated by
+   **localized delta — never full rewrite** — with a **grow-and-refine** dedup
+   pass. The named failure modes it avoids are **brevity bias** (rewrites strip
+   domain detail for conciseness) and **context collapse** (iterative rewriting
+   erodes specificity until the context drifts generic). Reported +10.6% on
+   agents / +8.6% on finance, without labeled supervision.
+
+**Concepts to borrow (ranked).**
+
+- **★ Itemized-delta brief + grow-and-refine — strongest fit.** This lands
+  directly on junto's **recall bridge** (the scaled brief, [ADR 0013](adr/0013-recall-bridge-session-context-injection.md)).
+  junto already does "state, not history" — folds verification into targets,
+  decays resolved material — but has **no defense against its own context
+  collapse** as a channel ages and standing decisions accumulate. The borrow:
+  represent brief items as discrete units carrying metadata (last-touched,
+  supersession, still-load-bearing?), make the fold a **localized delta**, and
+  add an explicit periodic **curation pass** that dedups/merges standing
+  decisions. Concrete, low-cost improvement to a surface junto already ships.
+- **★ Strengthen junto's Curator step.** Generator/Reflector/Curator maps onto
+  junto's **record → ratify/park/correct → fold-into-brief**. junto's Curator
+  analog (the brief projection) is the weakest and least-deliberate of the
+  three; make brief-curation an explicit, inspectable step rather than an
+  emergent property of the projection.
+- **✗ Do *not* borrow automated evolution on a coarse signal.** Ace
+  auto-mutates context from `success | partial | failure`. junto's bet stays
+  **governed** (gated, human-ratified) evolution — now corroborated by
+  third-party assessment flagging Ace as *"production evidence thin… not for
+  critical systems,"* which is exactly junto's consequential-work niche. Borrow
+  the **representation** (itemized delta, grow-and-refine), keep the
+  **governance**.
+- **◆ Strategic validation.** Ace converging onto *local-core-must-work-standalone
+  + hosted-sync/governance* validates junto's existing shape (MIT core + local
+  host + sync over the user's own git remote) and gives a clean tiering template
+  for junto's eventual commercial story.
 
 **Three overlaps with junto — tradeoffs, not a scoreboard.**
 
@@ -184,10 +234,14 @@ the ACP-as-harness-protocol idea is wide open.
    long-poll is the reference design, on junto's async-versioned side.
 7. **Agent surface:** weigh AXI principles (compact output) for junto's MCP
    tools and brief regardless of the MCP-vs-AXI question.
+8. **Recall bridge:** borrow Ace's **itemized-delta + grow-and-refine** brief
+   representation (ADR 0013) — discrete metadata-carrying items, localized-delta
+   folds, an explicit curation pass — to defend the scaled brief against its own
+   *context collapse* as channels age. Keep junto's governed evolution.
 
 ## Sources
 
-- Ace: [MCP docs](https://docs.aceagent.io/docs/developer-guides/mcp-integration/overview) · [docs home](https://docs.aceagent.io) · [Zero Alignment essay](https://maggieappleton.com/zero-alignment/)
+- Ace: [MCP docs](https://docs.aceagent.io/docs/developer-guides/mcp-integration/overview) · [docs home](https://docs.aceagent.io) · [Zero Alignment essay](https://maggieappleton.com/zero-alignment/) · [ACE paper (ICLR 2026)](https://arxiv.org/abs/2510.04618) · [delta-update analysis (softmax)](https://softmaxdata.com/blog/the-biggest-lesson-from-ace-iclr-2026-the-power-of-agentic-engineering/) · [self-improvement-tools comparison (Ry Walker)](https://rywalker.com/research/agent-self-improvement)
 - Kun Chen: [GitHub](https://github.com/kunchenguid) · [lavish-axi](https://github.com/kunchenguid/lavish-axi) · [no-mistakes](https://github.com/kunchenguid/no-mistakes) · [treehouse](https://github.com/kunchenguid/treehouse) · [firstmate](https://github.com/kunchenguid/firstmate) · [gnhf](https://github.com/kunchenguid/gnhf) · [axi](https://github.com/kunchenguid/axi) · [superpowers-bench](https://github.com/kunchenguid/superpowers-bench) · [acp-mock](https://github.com/kunchenguid/acp-mock)
 - ACP: [Agent Client Protocol (Zed)](https://github.com/zed-industries/agent-client-protocol)
 - t3code: [pingdotgg/t3code](https://github.com/pingdotgg/t3code)
