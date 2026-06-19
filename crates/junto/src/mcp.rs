@@ -895,7 +895,8 @@ impl JuntoMcp {
         let rendered = if req.full {
             render::transcript_markdown(&name, &channel, &view)
         } else {
-            render::brief_markdown(&name, &channel, &view)
+            let lineage = self.host.lineage_context(&view).await.unwrap_or_default();
+            render::brief_markdown(&name, &channel, &view, &lineage)
         };
         Ok(text(rendered))
     }

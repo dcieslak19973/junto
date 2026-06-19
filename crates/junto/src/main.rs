@@ -281,7 +281,8 @@ async fn brief(dir: PathBuf) -> Result<()> {
                 match ledger.lock().await.project(&id).await {
                     Ok(view) => {
                         let name = view.name.clone().unwrap_or_else(|| channel.clone());
-                        println!("{}", render::brief_markdown(&name, &id, &view));
+                        let lineage = host.lineage_context(&view).await.unwrap_or_default();
+                        println!("{}", render::brief_markdown(&name, &id, &view, &lineage));
                     }
                     Err(err) => eprintln!("junto brief: projecting '{channel}': {err}"),
                 }

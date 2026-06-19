@@ -749,6 +749,73 @@ impl Host {
         crate::pending_lineage::rewrite(&home, &keep)
     }
 
+    /// Build a channel's **lineage context** for recall (`docs/adr/0027`): for
+    /// each incoming edge, resolve and summarize the ancestor's standing
+    /// decisions (as of the divergence point, for a diverge); for each outgoing
+    /// edge, resolve the dependent channel's name and closed state. One hop —
+    /// transitive recall is deferred. A dangling edge (the other end not yet
+    /// reconciled) is surfaced as unresolved rather than erroring.
+    pub async fn lineage_context(
+        &self,
+        view: &ChannelView,
+    ) -> Result<crate::render::LineageContext> {
+        /// How many of an ancestor's standing decisions to inherit.
+        const INHERIT_MAX: usize = 8;
+        let mut inherited = Vec::new();
+        let mut references = Vec::new();
+        for edge in &view.lineage {
+            let other = self.ledger_for_channel(edge.other).await?;
+            match edge.direction {
+                junto_kernel::LineageDirection::Incoming => {
+                    let mut entry = crate::render::InheritedLineage {
+                        relation: edge.relation,
+                        other: edge.other,
+                        name: None,
+                        decisions: Vec::new(),
+                        resolved: false,
+                    };
+                    if let Some(ledger) = other {
+                        let ancestor = ledger.lock().await.project(&edge.other).await?;
+                        // The cutoff: the divergence point's timestamp, so the
+                        // child inherits the parent *as of* the split.
+                        let cutoff = edge.point.and_then(|point| {
+                            ancestor
+                                .entries
+                                .iter()
+                                .find(|e| e.id == point)
+                                .map(|e| e.timestamp.as_millis())
+                        });
+                        entry.name = ancestor.name.clone();
+                        entry.decisions =
+                            crate::render::standing_decision_lines(&ancestor, cutoff, INHERIT_MAX);
+                        entry.resolved = true;
+                    }
+                    inherited.push(entry);
+                }
+                junto_kernel::LineageDirection::Outgoing => {
+                    let mut reference = crate::render::LineageRef {
+                        relation: edge.relation,
+                        other: edge.other,
+                        name: None,
+                        closed: false,
+                        resolved: false,
+                    };
+                    if let Some(ledger) = other {
+                        let dependent = ledger.lock().await.project(&edge.other).await?;
+                        reference.name = dependent.name.clone();
+                        reference.closed = dependent.closed;
+                        reference.resolved = true;
+                    }
+                    references.push(reference);
+                }
+            }
+        }
+        Ok(crate::render::LineageContext {
+            inherited,
+            references,
+        })
+    }
+
     /// The local ledger hosting `channel`, if any registered substrate holds it.
     async fn ledger_for_channel(&self, channel: ChannelId) -> Result<Option<SharedLedger>> {
         match self.resolve(&channel.to_string()).await? {
@@ -1244,6 +1311,72 @@ mod lineage_tests {
         // And the source is NOT closed — the refusal left it untouched.
         let (_, src_view) = project(&host, "src").await;
         assert!(!src_view.closed);
+    }
+
+    #[tokio::test]
+    async fn child_brief_inherits_parent_standing_decisions() {
+        let (dirs, host) = lineage_host(1);
+        host.open_channel(None, "parent", dan(), None)
+            .await
+            .unwrap();
+        let code = code_for(&dirs, &dan());
+
+        // A ratified decision in the parent.
+        let (parent_id, _) = project(&host, "parent").await;
+        let ledger = host.ledger_for(dirs[0].path()).await.unwrap();
+        let decision = EntryId::new();
+        ledger
+            .lock()
+            .await
+            .append(LedgerEntry {
+                id: decision,
+                channel: parent_id,
+                author: dan(),
+                timestamp: Timestamp::now(),
+                payload: EntryPayload::Assertion {
+                    statement: "use NDJSON for the pending queue".into(),
+                    rationale: "matches the substrate".into(),
+                    provenance: vec![],
+                    frame: None,
+                },
+            })
+            .await
+            .unwrap();
+        ledger
+            .lock()
+            .await
+            .append(LedgerEntry {
+                id: EntryId::new(),
+                channel: parent_id,
+                author: dan(),
+                timestamp: Timestamp::now(),
+                payload: EntryPayload::Ratification {
+                    target: decision,
+                    rationale: "agreed".into(),
+                },
+            })
+            .await
+            .unwrap();
+
+        let child = host
+            .diverge("parent", "sq", None, dan(), Some(&code))
+            .await
+            .unwrap();
+        let child_view = {
+            let Resolution::Resolved { ledger, id, .. } =
+                host.resolve(&child.id.to_string()).await.unwrap()
+            else {
+                panic!("child resolves");
+            };
+            ledger.lock().await.project(&id).await.unwrap()
+        };
+        let ctx = host.lineage_context(&child_view).await.unwrap();
+        let brief = crate::render::brief_markdown("sq", &child.id, &child_view, &ctx);
+        assert!(brief.contains("inherited context"), "{brief}");
+        assert!(
+            brief.contains("use NDJSON for the pending queue"),
+            "the child's brief inherits the parent's ratified decision: {brief}"
+        );
     }
 
     #[tokio::test]

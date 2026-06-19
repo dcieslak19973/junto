@@ -16,8 +16,8 @@
 //!   as such.
 
 use junto_kernel::{
-    ChannelId, ChannelView, EntryId, EntryPayload, GateStatus, LedgerEntry, Member, MemberKind,
-    ProvenanceRef, SessionState, Standing,
+    ChannelId, ChannelView, EntryId, EntryPayload, GateStatus, LedgerEntry, LineageRelation,
+    Member, MemberKind, ProvenanceRef, SessionState, Standing,
 };
 use std::fmt::Write as _;
 
@@ -178,7 +178,145 @@ fn brief_shape(view: &ChannelView) -> BriefShape<'_> {
 /// ratified decisions tier down; sanctioned (approved) actions decay
 /// fastest — a delivered action is a completion record, embodied in the
 /// work itself.
-pub fn brief_markdown(name: &str, id: &ChannelId, view: &ChannelView) -> String {
+/// A channel's lineage context for recall (`docs/adr/0027`): summaries of the
+/// ancestors it inherits from (incoming edges) and references to channels that
+/// depend on it (outgoing edges). Built by the host (it needs to project other
+/// channels); rendered into the brief. Default is empty — no lineage.
+#[derive(Debug, Default)]
+pub struct LineageContext {
+    /// Ancestors this channel inherits context from: its parent (diverge) and
+    /// any convergence predecessors.
+    pub inherited: Vec<InheritedLineage>,
+    /// Channels depending on this one: its diverged children, and what it
+    /// converged into.
+    pub references: Vec<LineageRef>,
+}
+
+/// One ancestor whose settled decisions this channel inherits (`docs/adr/0027`).
+#[derive(Debug)]
+pub struct InheritedLineage {
+    /// Diverge (a parent) or Converge (a predecessor).
+    pub relation: LineageRelation,
+    /// The ancestor's id (shown when it can't be resolved).
+    pub other: ChannelId,
+    /// The ancestor's name, if it resolved.
+    pub name: Option<String>,
+    /// A summary of the ancestor's standing decisions (as of the divergence
+    /// point, for a diverge), clamped.
+    pub decisions: Vec<String>,
+    /// Whether the ancestor channel resolved (a dangling edge is `false`).
+    pub resolved: bool,
+}
+
+/// One channel depending on this one — an outgoing lineage edge reference.
+#[derive(Debug)]
+pub struct LineageRef {
+    /// Diverge (a child) or Converge (what this channel converged into).
+    pub relation: LineageRelation,
+    /// The other channel's id.
+    pub other: ChannelId,
+    /// Its name, if it resolved.
+    pub name: Option<String>,
+    /// Whether it is closed (a converged/closed child).
+    pub closed: bool,
+    /// Whether it resolved (a dangling edge is `false`).
+    pub resolved: bool,
+}
+
+/// This channel's standing decisions (ratified assertions and live
+/// corrections), newest first, clamped, up to `max` — optionally only those
+/// recorded at or before `cutoff` epoch-millis (the divergence point, so a
+/// child inherits the parent *as of* the split). The summarizer the brief's
+/// inherited-context block (`docs/adr/0027`) reuses.
+pub fn standing_decision_lines(view: &ChannelView, cutoff: Option<i64>, max: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for entry in brief_shape(view).ratified.iter().rev() {
+        if let Some(cutoff) = cutoff
+            && entry.timestamp.as_millis() > cutoff
+        {
+            continue;
+        }
+        let text = match &entry.payload {
+            EntryPayload::Assertion { statement, .. }
+            | EntryPayload::Correction { statement, .. } => statement.as_str(),
+            _ => continue,
+        };
+        lines.push(clamp(text, BRIEF_CLAMP));
+        if lines.len() >= max {
+            break;
+        }
+    }
+    lines
+}
+
+/// The inherited-context + lineage-references block (`docs/adr/0027`): a
+/// read-only header an agent reads before acting in a diverged/converged
+/// channel. Empty string when there is no lineage.
+fn lineage_block(ctx: &LineageContext) -> String {
+    if ctx.inherited.is_empty() && ctx.references.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    if !ctx.inherited.is_empty() {
+        out.push_str(
+            "## inherited context (read-only — settled territory you branched from, \
+             docs/adr/0027)\n\n",
+        );
+        for inh in &ctx.inherited {
+            let verb = match inh.relation {
+                LineageRelation::Diverge => "diverged from parent",
+                LineageRelation::Converge => "converged from",
+            };
+            if !inh.resolved {
+                let _ = writeln!(
+                    out,
+                    "- {verb} `{}` — unresolved (pending reconciliation; docs/adr/0028)",
+                    inh.other
+                );
+                continue;
+            }
+            let who = inh
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("channel {}", inh.other));
+            let _ = writeln!(out, "- {verb} **{who}**:");
+            if inh.decisions.is_empty() {
+                let _ = writeln!(out, "  - (no standing decisions to inherit)");
+            }
+            for decision in &inh.decisions {
+                let _ = writeln!(out, "  - {decision}");
+            }
+        }
+        out.push('\n');
+    }
+    if !ctx.references.is_empty() {
+        out.push_str("## lineage (channels branching from this one)\n\n");
+        for r in &ctx.references {
+            let who = r
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("channel {}", r.other));
+            match r.relation {
+                LineageRelation::Diverge => {
+                    let state = if r.closed { "closed" } else { "open" };
+                    let _ = writeln!(out, "- side-quest: {who} ({state})");
+                }
+                LineageRelation::Converge => {
+                    let _ = writeln!(out, "- converged into {who}");
+                }
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+pub fn brief_markdown(
+    name: &str,
+    id: &ChannelId,
+    view: &ChannelView,
+    lineage: &LineageContext,
+) -> String {
     let mut out = format!("# channel '{name}' ({id}) — brief\n\n");
     if !view.party.is_empty() {
         let roster: Vec<String> = view.party.iter().map(member_label).collect();
@@ -203,6 +341,8 @@ pub fn brief_markdown(name: &str, id: &ChannelId, view: &ChannelView) -> String 
          resolved material decays out. The full transcript is one call away \
          (`view_channel` with `full: true`).\n\n",
     );
+
+    out.push_str(&lineage_block(lineage));
 
     let notes = act_notes(view);
     let BriefShape {
@@ -3777,7 +3917,7 @@ mod tests {
             closed: false,
             lineage: Vec::new(),
         };
-        let brief = brief_markdown("t", &ChannelId::new(), &view);
+        let brief = brief_markdown("t", &ChannelId::new(), &view, &Default::default());
 
         // Acts fold into their targets instead of renting lines.
         assert!(brief.contains("ratified by Dan"), "{brief}");
@@ -3813,7 +3953,7 @@ mod tests {
             closed: false,
             lineage: Vec::new(),
         };
-        let brief = brief_markdown("t", &ChannelId::new(), &view);
+        let brief = brief_markdown("t", &ChannelId::new(), &view, &Default::default());
 
         assert!(brief.contains("extra body 29"), "newest in full: {brief}");
         assert!(
@@ -3905,7 +4045,7 @@ mod tests {
         let entry = assertion("claim");
         let id = entry.id.to_string();
         let view = view_with(vec![entry]);
-        let brief = brief_markdown("test", &ChannelId::new(), &view);
+        let brief = brief_markdown("test", &ChannelId::new(), &view, &Default::default());
         assert!(brief.contains(&id));
         assert!(brief.contains("[provisional]"));
     }
@@ -3914,7 +4054,7 @@ mod tests {
     fn empty_channel_renders_in_both_styles() {
         let view = view_with(vec![]);
         let id = ChannelId::new();
-        assert!(brief_markdown("empty", &id, &view).contains("(no entries)"));
+        assert!(brief_markdown("empty", &id, &view, &Default::default()).contains("(no entries)"));
         assert!(
             channel_html(
                 &[],
