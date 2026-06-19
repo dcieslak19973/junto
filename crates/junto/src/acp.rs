@@ -12,6 +12,7 @@
 //! `session/prompt`) and the `session/update` notification stream. The typed
 //! `agent-client-protocol` crate is the upgrade path if this grows.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
 
@@ -227,6 +228,9 @@ pub(crate) async fn run_turn_acp(
     let mut text = prompt.to_string();
     let mut answer = String::new();
     let mut prompt_id = 4_i64;
+    // One feed state for the whole turn so segment ids stay unique across steer
+    // re-prompts (a fresh state per prompt would reuse seq 1 and clobber blocks).
+    let mut feed = FeedState::default();
     loop {
         request(
             &mut stdin,
@@ -249,6 +253,7 @@ pub(crate) async fn run_turn_acp(
                 session,
                 &mut answer,
                 control,
+                &mut feed,
             ),
         )
         .await
@@ -366,13 +371,12 @@ async fn handle_acp_line(
     live: &LiveSessions,
     session: EntryId,
     answer: &mut String,
-    pending: &mut String,
+    state: &mut FeedState,
 ) -> Result<Option<Value>> {
     match message.get("method").and_then(|m| m.as_str()) {
         // A response to one of our requests (responses carry no method).
         None => {
             if message.get("id").and_then(|v| v.as_i64()) == Some(awaited_id) {
-                flush_pending(pending, live, session);
                 if let Some(error) = message.get("error") {
                     bail!("ACP error on request {awaited_id}: {error}");
                 }
@@ -381,7 +385,7 @@ async fn handle_acp_line(
         }
         Some("session/update") => {
             if let Some(update) = message.get("params").and_then(|p| p.get("update")) {
-                handle_update(update, live, session, answer, pending);
+                handle_update(update, live, session, answer, state);
             }
         }
         // An agent→client request (has a non-null id) — answer it.
@@ -410,7 +414,7 @@ async fn pump_until(
     session: EntryId,
     answer: &mut String,
 ) -> Result<Value> {
-    let mut pending = String::new();
+    let mut state = FeedState::default();
     while let Some(line) = reader.next_line().await.context("reading ACP output")? {
         let line = line.trim();
         if line.is_empty() {
@@ -419,16 +423,8 @@ async fn pump_until(
         let Ok(message) = serde_json::from_str::<Value>(line) else {
             continue; // tolerate any stray non-JSON line
         };
-        if let Some(result) = handle_acp_line(
-            &message,
-            stdin,
-            awaited_id,
-            live,
-            session,
-            answer,
-            &mut pending,
-        )
-        .await?
+        if let Some(result) =
+            handle_acp_line(&message, stdin, awaited_id, live, session, answer, &mut state).await?
         {
             return Ok(result);
         }
@@ -452,8 +448,8 @@ async fn pump_prompt(
     session: EntryId,
     answer: &mut String,
     control: &mut mpsc::Receiver<TurnControl>,
+    state: &mut FeedState,
 ) -> Result<PumpEnd> {
-    let mut pending = String::new();
     let mut interrupted_with: Option<TurnControl> = None;
     loop {
         let line = tokio::select! {
@@ -478,16 +474,8 @@ async fn pump_prompt(
         let Ok(message) = serde_json::from_str::<Value>(line) else {
             continue; // tolerate any stray non-JSON line
         };
-        if let Some(result) = handle_acp_line(
-            &message,
-            stdin,
-            awaited_id,
-            live,
-            session,
-            answer,
-            &mut pending,
-        )
-        .await?
+        if let Some(result) =
+            handle_acp_line(&message, stdin, awaited_id, live, session, answer, state).await?
         {
             return Ok(PumpEnd {
                 result,
@@ -497,59 +485,133 @@ async fn pump_prompt(
     }
 }
 
-/// Map one `session/update` into live-feed events; accumulate agent text into
-/// `answer` (the final memo) and flush readable lines via `pending`.
+/// The active growing text segment of the live feed — assistant message or
+/// model reasoning — accumulated raw so it can be re-rendered as Markdown on
+/// every chunk.
+struct TextSegment {
+    /// `"assistant"` or `"thinking"`.
+    kind: &'static str,
+    /// The segment's stable feed id (same `seq` ⇒ the client replaces in place).
+    seq: u64,
+    /// The accumulated raw Markdown text so far.
+    text: String,
+}
+
+/// The live feed's segment bookkeeping across one turn (`docs/adr/0023`/`0032`):
+/// a monotonic segment id, the current text segment, and a map from ACP tool
+/// call ids to their feed `seq` so a `tool_call_update` replaces its block.
+/// Persisted across steer re-prompts so segment ids stay unique for the turn.
+#[derive(Default)]
+struct FeedState {
+    next_seq: u64,
+    segment: Option<TextSegment>,
+    tools: HashMap<String, u64>,
+}
+
+impl FeedState {
+    fn fresh_seq(&mut self) -> u64 {
+        self.next_seq += 1;
+        self.next_seq
+    }
+}
+
+/// Map one `session/update` into live-feed events (`docs/adr/0023`/`0032`):
+/// assistant/thinking chunks accumulate into a Markdown segment re-rendered as
+/// sanitized HTML on each frame; a tool call (and its later status update) is a
+/// discrete, richer block. Agent message text also accumulates into `answer`
+/// (the recorded memo); reasoning does **not** — thinking is transient.
 fn handle_update(
     update: &Value,
     live: &LiveSessions,
     session: EntryId,
     answer: &mut String,
-    pending: &mut String,
+    state: &mut FeedState,
 ) {
     match update.get("sessionUpdate").and_then(|v| v.as_str()) {
         Some("agent_message_chunk") => {
             if let Some(text) = update.pointer("/content/text").and_then(|v| v.as_str()) {
                 answer.push_str(text);
-                pending.push_str(text);
-                // Flush whole lines to the feed so it streams readably without a
-                // per-token <li> storm.
-                while let Some(newline) = pending.find('\n') {
-                    let line: String = pending.drain(..=newline).collect();
-                    let line = line.trim_end();
-                    if !line.is_empty() {
-                        live.publish(session, LiveEvent::new("assistant", line));
-                    }
-                }
+                stream_text(live, session, state, "assistant", text);
+            }
+        }
+        Some("agent_thought_chunk") => {
+            if let Some(text) = update.pointer("/content/text").and_then(|v| v.as_str()) {
+                stream_text(live, session, state, "thinking", text);
             }
         }
         Some("tool_call") => {
-            let label = update
-                .get("title")
-                .and_then(|v| v.as_str())
-                .or_else(|| update.pointer("/rawInput/command").and_then(|v| v.as_str()))
-                .unwrap_or("tool");
-            let label: String = label
-                .lines()
-                .next()
-                .unwrap_or(label)
-                .chars()
-                .take(80)
-                .collect();
-            live.publish(session, LiveEvent::new("tool", label));
+            // A tool interrupts the current text block: close it so the next
+            // assistant/thought chunk starts a fresh segment (chronology holds).
+            state.segment = None;
+            let seq = state.fresh_seq();
+            if let Some(id) = update.get("toolCallId").and_then(|v| v.as_str()) {
+                state.tools.insert(id.to_string(), seq);
+            }
+            live.publish(session, LiveEvent::line_seq("tool", tool_label(update), seq));
         }
-        // usage_update, plan, agent_thought_chunk, available_commands_update,
-        // tool_call_update: not surfaced in the v1 feed.
+        Some("tool_call_update") => {
+            // Replace the originating tool block in place (status / result),
+            // when we can match it back to its `tool_call`.
+            if let Some(seq) = update
+                .get("toolCallId")
+                .and_then(|v| v.as_str())
+                .and_then(|id| state.tools.get(id).copied())
+            {
+                live.publish(session, LiveEvent::line_seq("tool", tool_label(update), seq));
+            }
+        }
+        // usage_update, plan, available_commands_update: not surfaced.
         _ => {}
     }
 }
 
-/// Flush any buffered (newline-less) agent text as a final feed line.
-fn flush_pending(pending: &mut String, live: &LiveSessions, session: EntryId) {
-    let tail = pending.trim();
-    if !tail.is_empty() {
-        live.publish(session, LiveEvent::new("assistant", tail));
+/// Append `chunk` to the current text segment (starting a new one if the kind
+/// switched), then publish the whole segment re-rendered as sanitized Markdown
+/// HTML under its stable `seq`.
+fn stream_text(
+    live: &LiveSessions,
+    session: EntryId,
+    state: &mut FeedState,
+    kind: &'static str,
+    chunk: &str,
+) {
+    let mut segment = match state.segment.take() {
+        Some(seg) if seg.kind == kind => seg,
+        _ => TextSegment {
+            kind,
+            seq: state.fresh_seq(),
+            text: String::new(),
+        },
+    };
+    segment.text.push_str(chunk);
+    let html = crate::render::render_markdown(&segment.text);
+    live.publish(session, LiveEvent::segment(kind, html, segment.seq));
+    state.segment = Some(segment);
+}
+
+/// A richer one-line label for a tool call: `title: salient-input [status]`,
+/// e.g. `Bash: cargo test [completed]`. Still a glanceable summary, never the
+/// whole payload (terminal-less: an action, not scrollback).
+fn tool_label(update: &Value) -> String {
+    let title = update.get("title").and_then(|v| v.as_str());
+    let detail = update.get("rawInput").and_then(|input| {
+        ["command", "path", "file_path", "pattern", "url", "query"]
+            .iter()
+            .find_map(|key| input.get(key).and_then(|v| v.as_str()))
+    });
+    let base = match (title, detail) {
+        (Some(t), Some(d)) => format!("{t}: {d}"),
+        (Some(t), None) => t.to_string(),
+        (None, Some(d)) => d.to_string(),
+        (None, None) => "tool".to_string(),
+    };
+    let base: String = base.lines().next().unwrap_or(&base).chars().take(160).collect();
+    match update.get("status").and_then(|v| v.as_str()) {
+        Some(status) if status != "in_progress" && status != "pending" => {
+            format!("{base} [{status}]")
+        }
+        _ => base,
     }
-    pending.clear();
 }
 
 /// The result for an agent→client request. Permission prompts are auto-allowed
