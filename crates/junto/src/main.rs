@@ -17,6 +17,7 @@ mod launch;
 mod mcp;
 mod members;
 mod outcome;
+mod pending_lineage;
 mod render;
 mod verify;
 mod web;
@@ -25,7 +26,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use junto_kernel::{ChannelId, Member};
+use junto_kernel::{ChannelId, EntryId, Member};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
@@ -139,6 +140,32 @@ enum Command {
         #[arg(long)]
         checkout: Option<PathBuf>,
     },
+    /// Diverge a child channel from a parent (docs/adr/0027): open the child in
+    /// the parent's home substrate (you found it) and record the divergence
+    /// edge in both ledgers — the side-quest birth.
+    Diverge {
+        /// The new child channel's name.
+        child_name: String,
+        /// The parent channel (name or id) to diverge from.
+        #[arg(long)]
+        from: String,
+        /// The parent entry this child split from (optional).
+        #[arg(long)]
+        at: Option<String>,
+    },
+    /// Converge a source channel into a target (docs/adr/0027): record the
+    /// convergence edge in both ledgers and close the source. Refuses while the
+    /// source has open gates. The target must already exist.
+    Converge {
+        /// The source channel (name or id) — it closes on convergence.
+        source: String,
+        /// The target channel (name or id) it converges into.
+        #[arg(long)]
+        into: String,
+        /// Why it converged.
+        #[arg(long, default_value = "converged")]
+        rationale: String,
+    },
 }
 
 #[tokio::main]
@@ -192,6 +219,16 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Command::Diverge {
+            child_name,
+            from,
+            at,
+        } => diverge(from, child_name, at).await,
+        Command::Converge {
+            source,
+            into,
+            rationale,
+        } => converge(source, into, rationale).await,
     }
 }
 
@@ -253,6 +290,63 @@ async fn add_member(
     Ok(())
 }
 
+/// This identity's machine-local member code, if one was minted here
+/// (`docs/adr/0017`). The CLI looks it up so it can author through the host's
+/// code-checked write surface — whoever can run commands on this machine can
+/// read the store anyway.
+fn member_code_for(email: &str) -> Result<Option<String>> {
+    Ok(members::minted_members(&host::junto_home()?)?
+        .into_iter()
+        .find(|record| record.member.email == email)
+        .map(|record| record.code))
+}
+
+/// `junto diverge` — open a child channel off a parent and record the
+/// divergence edge (`docs/adr/0027`). The diverger is this machine's git user
+/// (taken from the parent's home substrate, like `junto open`).
+async fn diverge(from: String, child_name: String, at: Option<String>) -> Result<()> {
+    let host = host::Host::from_registry(host::junto_home()?);
+    let substrate = match host.resolve(&from).await? {
+        host::Resolution::Resolved { substrate, .. } => substrate,
+        host::Resolution::NotFound => bail!("no channel '{from}' in any registered substrate"),
+        host::Resolution::Ambiguous(substrates) => bail!(
+            "channel name '{from}' exists in several substrates ({substrates:?}); address it by id"
+        ),
+    };
+    let author = host::git_user(&substrate)?;
+    let code = member_code_for(&author.email)?;
+    let at = at.map(|raw| raw.parse::<EntryId>()).transpose()?;
+    let child = host
+        .diverge(&from, &child_name, at, author, code.as_deref())
+        .await?;
+    println!(
+        "diverged '{child_name}' from '{from}' (child id {})",
+        child.id
+    );
+    Ok(())
+}
+
+/// `junto converge` — record a convergence edge and close the source
+/// (`docs/adr/0027`). The converger is this machine's git user (from the
+/// source's home substrate).
+async fn converge(source: String, into: String, rationale: String) -> Result<()> {
+    let host = host::Host::from_registry(host::junto_home()?);
+    let substrate = match host.resolve(&source).await? {
+        host::Resolution::Resolved { substrate, .. } => substrate,
+        host::Resolution::NotFound => bail!("no channel '{source}' in any registered substrate"),
+        host::Resolution::Ambiguous(substrates) => bail!(
+            "channel name '{source}' exists in several substrates ({substrates:?}); \
+             address it by id"
+        ),
+    };
+    let author = host::git_user(&substrate)?;
+    let code = member_code_for(&author.email)?;
+    host.converge(&source, &into, &rationale, author, code.as_deref())
+        .await?;
+    println!("converged '{source}' into '{into}' — the source is now closed");
+    Ok(())
+}
+
 /// Print the briefs of every channel this checkout is bound to. Best-effort by
 /// design — a SessionStart hook must never break session start, so failures
 /// are notes on stderr and the exit is always success.
@@ -280,7 +374,8 @@ async fn brief(dir: PathBuf) -> Result<()> {
                 match ledger.lock().await.project(&id).await {
                     Ok(view) => {
                         let name = view.name.clone().unwrap_or_else(|| channel.clone());
-                        println!("{}", render::brief_markdown(&name, &id, &view));
+                        let lineage = host.lineage_context(&view).await.unwrap_or_default();
+                        println!("{}", render::brief_markdown(&name, &id, &view, &lineage));
                     }
                     Err(err) => eprintln!("junto brief: projecting '{channel}': {err}"),
                 }
@@ -337,6 +432,12 @@ async fn serve(repo: Option<PathBuf>, port: u16) -> Result<()> {
             host::Host::from_registry(junto_home)
         }
     };
+
+    // Drain any pending lineage edges parked by a prior run (docs/adr/0028);
+    // best-effort — a reconciliation failure must not stop the host serving.
+    if let Err(err) = host.reconcile_lineage().await {
+        tracing::warn!("lineage reconciliation at startup failed: {err:#}");
+    }
 
     let handler = mcp::JuntoMcp::new(host.clone());
     let service = StreamableHttpService::new(

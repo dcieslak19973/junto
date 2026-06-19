@@ -93,6 +93,25 @@ mod tests {
         assert_round_trips(&entry(EntryPayload::ChannelReopened {
             rationale: "it resumed".into(),
         }));
+        // Lineage edges (docs/adr/0027) — four kinds, two per edge.
+        assert_round_trips(&entry(EntryPayload::DivergedFrom {
+            parent: ChannelId::new(),
+            at: Some(target),
+        }));
+        // DivergedFrom with no anchor point (exercises the omitted field).
+        assert_round_trips(&entry(EntryPayload::DivergedFrom {
+            parent: ChannelId::new(),
+            at: None,
+        }));
+        assert_round_trips(&entry(EntryPayload::ChildDiverged {
+            child: ChannelId::new(),
+        }));
+        assert_round_trips(&entry(EntryPayload::ConvergedInto {
+            target: ChannelId::new(),
+        }));
+        assert_round_trips(&entry(EntryPayload::ConvergenceReceived {
+            source: ChannelId::new(),
+        }));
         // Assertion with a digest-bearing provenance ref.
         assert_round_trips(&entry(EntryPayload::Assertion {
             statement: "the sky is blue".into(),

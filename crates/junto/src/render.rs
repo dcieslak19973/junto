@@ -16,8 +16,8 @@
 //!   as such.
 
 use junto_kernel::{
-    ChannelId, ChannelView, EntryId, EntryPayload, GateStatus, LedgerEntry, Member, MemberKind,
-    ProvenanceRef, SessionState, Standing,
+    ChannelId, ChannelView, EntryId, EntryPayload, GateStatus, LedgerEntry, LineageRelation,
+    Member, MemberKind, ProvenanceRef, SessionState, Standing,
 };
 use std::fmt::Write as _;
 
@@ -178,7 +178,145 @@ fn brief_shape(view: &ChannelView) -> BriefShape<'_> {
 /// ratified decisions tier down; sanctioned (approved) actions decay
 /// fastest — a delivered action is a completion record, embodied in the
 /// work itself.
-pub fn brief_markdown(name: &str, id: &ChannelId, view: &ChannelView) -> String {
+/// A channel's lineage context for recall (`docs/adr/0027`): summaries of the
+/// ancestors it inherits from (incoming edges) and references to channels that
+/// depend on it (outgoing edges). Built by the host (it needs to project other
+/// channels); rendered into the brief. Default is empty — no lineage.
+#[derive(Debug, Default)]
+pub struct LineageContext {
+    /// Ancestors this channel inherits context from: its parent (diverge) and
+    /// any convergence predecessors.
+    pub inherited: Vec<InheritedLineage>,
+    /// Channels depending on this one: its diverged children, and what it
+    /// converged into.
+    pub references: Vec<LineageRef>,
+}
+
+/// One ancestor whose settled decisions this channel inherits (`docs/adr/0027`).
+#[derive(Debug)]
+pub struct InheritedLineage {
+    /// Diverge (a parent) or Converge (a predecessor).
+    pub relation: LineageRelation,
+    /// The ancestor's id (shown when it can't be resolved).
+    pub other: ChannelId,
+    /// The ancestor's name, if it resolved.
+    pub name: Option<String>,
+    /// A summary of the ancestor's standing decisions (as of the divergence
+    /// point, for a diverge), clamped.
+    pub decisions: Vec<String>,
+    /// Whether the ancestor channel resolved (a dangling edge is `false`).
+    pub resolved: bool,
+}
+
+/// One channel depending on this one — an outgoing lineage edge reference.
+#[derive(Debug)]
+pub struct LineageRef {
+    /// Diverge (a child) or Converge (what this channel converged into).
+    pub relation: LineageRelation,
+    /// The other channel's id.
+    pub other: ChannelId,
+    /// Its name, if it resolved.
+    pub name: Option<String>,
+    /// Whether it is closed (a converged/closed child).
+    pub closed: bool,
+    /// Whether it resolved (a dangling edge is `false`).
+    pub resolved: bool,
+}
+
+/// This channel's standing decisions (ratified assertions and live
+/// corrections), newest first, clamped, up to `max` — optionally only those
+/// recorded at or before `cutoff` epoch-millis (the divergence point, so a
+/// child inherits the parent *as of* the split). The summarizer the brief's
+/// inherited-context block (`docs/adr/0027`) reuses.
+pub fn standing_decision_lines(view: &ChannelView, cutoff: Option<i64>, max: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for entry in brief_shape(view).ratified.iter().rev() {
+        if let Some(cutoff) = cutoff
+            && entry.timestamp.as_millis() > cutoff
+        {
+            continue;
+        }
+        let text = match &entry.payload {
+            EntryPayload::Assertion { statement, .. }
+            | EntryPayload::Correction { statement, .. } => statement.as_str(),
+            _ => continue,
+        };
+        lines.push(clamp(text, BRIEF_CLAMP));
+        if lines.len() >= max {
+            break;
+        }
+    }
+    lines
+}
+
+/// The inherited-context + lineage-references block (`docs/adr/0027`): a
+/// read-only header an agent reads before acting in a diverged/converged
+/// channel. Empty string when there is no lineage.
+fn lineage_block(ctx: &LineageContext) -> String {
+    if ctx.inherited.is_empty() && ctx.references.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    if !ctx.inherited.is_empty() {
+        out.push_str(
+            "## inherited context (read-only — settled territory you branched from, \
+             docs/adr/0027)\n\n",
+        );
+        for inh in &ctx.inherited {
+            let verb = match inh.relation {
+                LineageRelation::Diverge => "diverged from parent",
+                LineageRelation::Converge => "converged from",
+            };
+            if !inh.resolved {
+                let _ = writeln!(
+                    out,
+                    "- {verb} `{}` — unresolved (pending reconciliation; docs/adr/0028)",
+                    inh.other
+                );
+                continue;
+            }
+            let who = inh
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("channel {}", inh.other));
+            let _ = writeln!(out, "- {verb} **{who}**:");
+            if inh.decisions.is_empty() {
+                let _ = writeln!(out, "  - (no standing decisions to inherit)");
+            }
+            for decision in &inh.decisions {
+                let _ = writeln!(out, "  - {decision}");
+            }
+        }
+        out.push('\n');
+    }
+    if !ctx.references.is_empty() {
+        out.push_str("## lineage (channels branching from this one)\n\n");
+        for r in &ctx.references {
+            let who = r
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("channel {}", r.other));
+            match r.relation {
+                LineageRelation::Diverge => {
+                    let state = if r.closed { "closed" } else { "open" };
+                    let _ = writeln!(out, "- side-quest: {who} ({state})");
+                }
+                LineageRelation::Converge => {
+                    let _ = writeln!(out, "- converged into {who}");
+                }
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+pub fn brief_markdown(
+    name: &str,
+    id: &ChannelId,
+    view: &ChannelView,
+    lineage: &LineageContext,
+) -> String {
     let mut out = format!("# channel '{name}' ({id}) — brief\n\n");
     if !view.party.is_empty() {
         let roster: Vec<String> = view.party.iter().map(member_label).collect();
@@ -203,6 +341,8 @@ pub fn brief_markdown(name: &str, id: &ChannelId, view: &ChannelView) -> String 
          resolved material decays out. The full transcript is one call away \
          (`view_channel` with `full: true`).\n\n",
     );
+
+    out.push_str(&lineage_block(lineage));
 
     let notes = act_notes(view);
     let BriefShape {
@@ -369,6 +509,10 @@ fn recent_line(entry: &LedgerEntry) -> String {
         EntryPayload::ChannelReopened { rationale } => {
             format!("reopened the channel: {}", clamp(rationale, TAIL_CLAMP))
         }
+        EntryPayload::DivergedFrom { .. } => "diverged from a parent channel".to_string(),
+        EntryPayload::ChildDiverged { .. } => "a side-quest diverged from here".to_string(),
+        EntryPayload::ConvergedInto { .. } => "converged into another channel".to_string(),
+        EntryPayload::ConvergenceReceived { .. } => "received a converging channel".to_string(),
     }
 }
 
@@ -636,6 +780,18 @@ fn describe_markdown(entry: &LedgerEntry, view: &ChannelView) -> String {
         }
         EntryPayload::ChannelReopened { rationale } => {
             format!("**channel reopened** — {rationale}")
+        }
+        EntryPayload::DivergedFrom { parent, .. } => {
+            format!("**diverged from** parent channel `{parent}`")
+        }
+        EntryPayload::ChildDiverged { child } => {
+            format!("**child diverged** — side-quest `{child}`")
+        }
+        EntryPayload::ConvergedInto { target } => {
+            format!("**converged into** channel `{target}`")
+        }
+        EntryPayload::ConvergenceReceived { source } => {
+            format!("**convergence received** — from channel `{source}`")
         }
     }
 }
@@ -1441,10 +1597,17 @@ pub struct Track {
     /// quiet channel ends earlier; only recent work reaches "now"). For a
     /// converged channel this is also where it merges back.
     pub last_activity: Option<junto_kernel::Timestamp>,
-    /// The channel is closed — drawn converging back to the baseline.
+    /// The channel is closed — drawn converging back to its target (or the
+    /// baseline if that target isn't shown).
     pub converged: bool,
     /// Milestone events plotted as nodes along the track (recent-most last).
     pub milestones: Vec<Milestone>,
+    /// The channel this one diverged from (`docs/adr/0027`) — the branch
+    /// attaches to this track's row instead of the baseline.
+    pub parent: Option<ChannelId>,
+    /// The channel this one converged into (`docs/adr/0027`) — the merge-back
+    /// lands on this track's row instead of the baseline.
+    pub converged_into: Option<ChannelId>,
 }
 
 impl Track {
@@ -1458,6 +1621,8 @@ impl Track {
             last_activity: None,
             converged: false,
             milestones: Vec::new(),
+            parent: None,
+            converged_into: None,
         }
     }
 }
@@ -1483,6 +1648,8 @@ impl LineageModel {
             last_activity: s.last_activity,
             converged: s.closed,
             milestones: s.milestones.clone(),
+            parent: s.parent,
+            converged_into: s.converged_into,
         };
         let dir = substrate
             .file_name()
@@ -1618,6 +1785,19 @@ pub fn lineage_strip(model: &LineageModel, selected: Option<&ChannelId>) -> Stri
     let now_x = 1140;
     // Newest branch (index 0) sits at the top; the oldest nearest the baseline.
     let y_of = |i: i32| spine_y - (rows_above - i) * STRIP_ROW;
+    // The row a channel's track sits on — the baseline for the main-line, else
+    // a branch's stacked row. `None` when the channel isn't shown here (a root,
+    // or a dangling edge whose other end is in another workspace), so the
+    // caller falls back to the baseline (docs/adr/0027).
+    let row_y = |id: &ChannelId| -> Option<i32> {
+        if *id == model.mainline.id {
+            return Some(spine_y);
+        }
+        shown
+            .iter()
+            .position(|b| b.id == *id)
+            .map(|i| y_of(i as i32))
+    };
 
     let mut s = format!("<svg viewBox=\"0 0 1200 {height}\" role=\"img\">");
 
@@ -1667,29 +1847,38 @@ pub fn lineage_strip(model: &LineageModel, selected: Option<&ChannelId>) -> Stri
         // span up to the end (a one-entry channel still shows a short branch).
         let dx = strip_time_x(b.first_activity).clamp(left_x, end_x - 70);
         let sw = if b.needs_you { 3 } else { 2 };
+        // Attach the branch to its real parent's row, and merge it back into
+        // its real convergence target's row — falling back to the baseline for
+        // roots and dangling edges (docs/adr/0027).
+        let origin_y = b.parent.as_ref().and_then(&row_y).unwrap_or(spine_y);
+        let dest_y = b
+            .converged_into
+            .as_ref()
+            .and_then(&row_y)
+            .unwrap_or(spine_y);
         let (path, end_marker) = if b.converged {
-            // up off the baseline, flat, then back down to the baseline (merge).
+            // up off the parent's row, flat, then back down to the target's row.
             let mx = (end_x - 46).max(dx + 50);
             (
                 format!(
-                    "M{dx},{spine_y} C{},{spine_y} {},{ty} {},{ty} L{mx},{ty} \
-                     C{},{ty} {},{spine_y} {end_x},{spine_y}",
+                    "M{dx},{origin_y} C{},{origin_y} {},{ty} {},{ty} L{mx},{ty} \
+                     C{},{ty} {},{dest_y} {end_x},{dest_y}",
                     dx + 24,
                     dx + 14,
                     dx + 46,
                     mx + 14,
                     end_x - 24,
                 ),
-                // a green merge node on the baseline
+                // a green merge node on the target's row
                 format!(
-                    "<circle cx=\"{end_x}\" cy=\"{spine_y}\" r=\"4.5\" fill=\"#0e1217\" \
+                    "<circle cx=\"{end_x}\" cy=\"{dest_y}\" r=\"4.5\" fill=\"#0e1217\" \
                      stroke=\"#5fd3a6\" stroke-width=\"2\"/>"
                 ),
             )
         } else {
             (
                 format!(
-                    "M{dx},{spine_y} C{},{spine_y} {},{ty} {},{ty} L{end_x},{ty}",
+                    "M{dx},{origin_y} C{},{origin_y} {},{ty} {},{ty} L{end_x},{ty}",
                     dx + 24,
                     dx + 14,
                     dx + 46,
@@ -2291,6 +2480,10 @@ fn entry_family(payload: &EntryPayload) -> &'static str {
         | EntryPayload::MemberAdded { .. }
         | EntryPayload::ChannelClosed { .. }
         | EntryPayload::ChannelReopened { .. }
+        | EntryPayload::DivergedFrom { .. }
+        | EntryPayload::ChildDiverged { .. }
+        | EntryPayload::ConvergedInto { .. }
+        | EntryPayload::ConvergenceReceived { .. }
         | EntryPayload::Ratification { .. }
         | EntryPayload::Park { .. }
         | EntryPayload::Correction { .. }
@@ -2438,6 +2631,38 @@ fn entry_card(entry: &LedgerEntry, view: &ChannelView, channel: &ChannelId) -> S
             None,
             Some(provenance.as_slice()),
             Some(*target),
+        ),
+        EntryPayload::DivergedFrom { parent, .. } => (
+            "diverged from",
+            None,
+            Some(format!("diverged from parent channel {parent}")),
+            None,
+            None,
+            None,
+        ),
+        EntryPayload::ChildDiverged { child } => (
+            "child diverged",
+            None,
+            Some(format!("side-quest {child} diverged from here")),
+            None,
+            None,
+            None,
+        ),
+        EntryPayload::ConvergedInto { target } => (
+            "converged into",
+            None,
+            Some(format!("converged into channel {target}")),
+            None,
+            None,
+            None,
+        ),
+        EntryPayload::ConvergenceReceived { source } => (
+            "convergence received",
+            None,
+            Some(format!("channel {source} converged into here")),
+            None,
+            None,
+            None,
         ),
     };
 
@@ -3222,6 +3447,8 @@ mod tests {
             latest: None,
             closed: false,
             milestones: Vec::new(),
+            parent: None,
+            converged_into: None,
         }
     }
 
@@ -3295,6 +3522,66 @@ mod tests {
     }
 
     #[test]
+    fn strip_attaches_a_branch_to_its_parents_row() {
+        fn track(name: &str, parent: Option<ChannelId>) -> Track {
+            Track {
+                id: ChannelId::new(),
+                name: Some(name.into()),
+                needs_you: false,
+                first_activity: Some(Timestamp::from_millis(10_000)),
+                last_activity: Some(Timestamp::from_millis(90_000)),
+                converged: false,
+                milestones: Vec::new(),
+                parent,
+                converged_into: None,
+            }
+        }
+        let mainline = track("main", None);
+        let feat = track("feat", None);
+        let side_quest = track("side-quest", Some(feat.id));
+        // Newest first: the side-quest (index 0) sits above its parent feat
+        // (index 1). With two branches the baseline is y=86 and feat's row is
+        // y=56, so the side-quest's branch must originate at ",56 C" — not the
+        // baseline.
+        let model = LineageModel {
+            mainline,
+            branches: vec![side_quest, feat],
+        };
+        let html = lineage_strip(&model, None);
+        assert!(
+            html.contains(",56 C"),
+            "the side-quest attaches to its parent's row, not the baseline: {html}"
+        );
+
+        // Control: with no parent edge, nothing originates at row 56.
+        let mainline = track("main", None);
+        let feat = track("feat", None);
+        let orphan = track("orphan", None);
+        let model = LineageModel {
+            mainline,
+            branches: vec![orphan, feat],
+        };
+        assert!(
+            !lineage_strip(&model, None).contains(",56 C"),
+            "a rootless branch falls back to the baseline"
+        );
+    }
+
+    #[test]
+    fn from_summaries_threads_lineage_edges_into_tracks() {
+        let repo = std::path::PathBuf::from("/x/junto-ledger");
+        let parent = ChannelId::new();
+        let target = ChannelId::new();
+        let mut child = summary("child", &repo, 50, 0);
+        child.parent = Some(parent);
+        child.converged_into = Some(target);
+        let model = LineageModel::from_summaries(std::slice::from_ref(&child), &repo);
+        // The single channel becomes the main-line; its edges are carried.
+        assert_eq!(model.mainline.parent, Some(parent));
+        assert_eq!(model.mainline.converged_into, Some(target));
+    }
+
+    #[test]
     fn top_bar_shows_workspace_live_status_and_identity() {
         let workspaces = vec![
             std::path::PathBuf::from("/x/junto-ledger"),
@@ -3356,6 +3643,7 @@ mod tests {
             gate_status,
             sessions: HashMap::new(),
             closed: false,
+            lineage: Vec::new(),
         }
     }
 
@@ -3722,8 +4010,9 @@ mod tests {
             gate_status,
             sessions: Default::default(),
             closed: false,
+            lineage: Vec::new(),
         };
-        let brief = brief_markdown("t", &ChannelId::new(), &view);
+        let brief = brief_markdown("t", &ChannelId::new(), &view, &Default::default());
 
         // Acts fold into their targets instead of renting lines.
         assert!(brief.contains("ratified by Dan"), "{brief}");
@@ -3757,8 +4046,9 @@ mod tests {
             gate_status: Default::default(),
             sessions: Default::default(),
             closed: false,
+            lineage: Vec::new(),
         };
-        let brief = brief_markdown("t", &ChannelId::new(), &view);
+        let brief = brief_markdown("t", &ChannelId::new(), &view, &Default::default());
 
         assert!(brief.contains("extra body 29"), "newest in full: {brief}");
         assert!(
@@ -3850,7 +4140,7 @@ mod tests {
         let entry = assertion("claim");
         let id = entry.id.to_string();
         let view = view_with(vec![entry]);
-        let brief = brief_markdown("test", &ChannelId::new(), &view);
+        let brief = brief_markdown("test", &ChannelId::new(), &view, &Default::default());
         assert!(brief.contains(&id));
         assert!(brief.contains("[provisional]"));
     }
@@ -3859,7 +4149,7 @@ mod tests {
     fn empty_channel_renders_in_both_styles() {
         let view = view_with(vec![]);
         let id = ChannelId::new();
-        assert!(brief_markdown("empty", &id, &view).contains("(no entries)"));
+        assert!(brief_markdown("empty", &id, &view, &Default::default()).contains("(no entries)"));
         assert!(
             channel_html(
                 &[],

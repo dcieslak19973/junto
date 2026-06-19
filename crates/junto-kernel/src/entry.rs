@@ -119,6 +119,46 @@ pub enum EntryPayload {
         /// Why it reopened.
         rationale: String,
     },
+    /// **Child side** of a divergence edge (`docs/adr/0027`): this channel was
+    /// born by *diverging* from `parent` (the common case: a side-quest). One
+    /// of the channel-lineage family — each edge is a pair of entries, one in
+    /// each endpoint's ledger. The parent's matching entry is
+    /// [`ChildDiverged`](EntryPayload::ChildDiverged).
+    DivergedFrom {
+        /// The channel this one diverged from.
+        parent: ChannelId,
+        /// The entry **in the parent** this channel split from — the recall
+        /// cutoff and the strip's attach point. Optional ("diverged from the
+        /// parent as it stands now") and **unvalidated** (the parent may be in
+        /// another substrate or arrive later by sync; a non-resolving id
+        /// degrades to this entry's timestamp).
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        at: Option<EntryId>,
+    },
+    /// **Parent side** of a divergence edge (`docs/adr/0027`): a `child`
+    /// channel diverged from this one. The announcement; the parent flows on.
+    /// Pairs with the child's [`DivergedFrom`](EntryPayload::DivergedFrom).
+    ChildDiverged {
+        /// The channel that diverged from this one.
+        child: ChannelId,
+    },
+    /// **Source side** of a convergence edge (`docs/adr/0027`): this channel
+    /// *converged into* `target` — recorded as it closes (convergence implies
+    /// closing the source). Pairs with the target's
+    /// [`ConvergenceReceived`](EntryPayload::ConvergenceReceived).
+    ConvergedInto {
+        /// The channel this one converged into (its parent, or a new
+        /// continuation).
+        target: ChannelId,
+    },
+    /// **Target side** of a convergence edge (`docs/adr/0027`): a `source`
+    /// channel converged into this one. The two-into-a-new-continuation case
+    /// is simply *two* of these naming both predecessors. Pairs with the
+    /// source's [`ConvergedInto`](EntryPayload::ConvergedInto).
+    ConvergenceReceived {
+        /// The channel that converged into this one.
+        source: ChannelId,
+    },
     /// An original claim, decision, or finding. Alternatives considered live in
     /// `rationale` — or, structurally, in the optional `frame` (`docs/adr/0019`).
     Assertion {
@@ -277,6 +317,12 @@ impl EntryPayload {
             | EntryPayload::MemberAdded { .. }
             | EntryPayload::ChannelClosed { .. }
             | EntryPayload::ChannelReopened { .. }
+            // Lineage edges reference *other channels* (docs/adr/0027), never a
+            // within-channel entry — `DivergedFrom::at` points into the parent.
+            | EntryPayload::DivergedFrom { .. }
+            | EntryPayload::ChildDiverged { .. }
+            | EntryPayload::ConvergedInto { .. }
+            | EntryPayload::ConvergenceReceived { .. }
             | EntryPayload::Assertion { .. }
             | EntryPayload::Proposal { .. }
             | EntryPayload::SessionStarted { .. } => None,

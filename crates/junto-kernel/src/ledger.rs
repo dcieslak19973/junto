@@ -47,6 +47,50 @@ pub enum Standing {
     Superseded,
 }
 
+/// Whether a [`LineageEdge`] is a divergence or a convergence (`docs/adr/0027`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineageRelation {
+    /// A child channel departed from a parent (the side-quest birth).
+    Diverge,
+    /// Channels merged by a recorded act (a child back into its parent, or
+    /// predecessors into a continuation).
+    Converge,
+}
+
+/// The way context flows across a [`LineageEdge`], **from this channel's own
+/// ledger's point of view** (`docs/adr/0027`). Orthogonal to
+/// [`LineageRelation`]: the four entry kinds normalize onto the
+/// `(relation, direction)` pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineageDirection {
+    /// Context flows **in**: this channel inherits from `other` — its parent on
+    /// a `Diverge` (`DivergedFrom`), a predecessor on a `Converge`
+    /// (`ConvergenceReceived`).
+    Incoming,
+    /// Context flows **out**: `other` depends on this channel — a child on a
+    /// `Diverge` (`ChildDiverged`), the continuation this channel fed on a
+    /// `Converge` (`ConvergedInto`).
+    Outgoing,
+}
+
+/// One lineage edge as the projection presents it (`docs/adr/0027`): the four
+/// distinct entry kinds normalized into a single shape that recall and the
+/// lineage strip both consume. Purely **local** — built from this channel's own
+/// entries; whether the reciprocal entry exists in `other`'s ledger (a dangling
+/// edge) is a cross-channel question the host answers, not this projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineageEdge {
+    /// Divergence or convergence.
+    pub relation: LineageRelation,
+    /// Which way context flows, from this channel's view.
+    pub direction: LineageDirection,
+    /// The channel at the other end of the edge.
+    pub other: ChannelId,
+    /// The divergence point — an entry **in the parent** — when this channel is
+    /// the child side of a divergence (`DivergedFrom::at`); `None` otherwise.
+    pub point: Option<EntryId>,
+}
+
 /// A point-in-time projection of a Channel's Ledger: the entries in canonical
 /// order, plus the derived [`Standing`] of each assertion and
 /// [`GateStatus`] of each proposal.
@@ -87,6 +131,12 @@ pub struct ChannelView {
     /// wins, in canonical order, members only. The record outlives the
     /// inquiry — closed only means "out of the working set".
     pub closed: bool,
+    /// This channel's **lineage edges** (`docs/adr/0027`), normalized from its
+    /// `DivergedFrom` / `ChildDiverged` / `ConvergedInto` /
+    /// `ConvergenceReceived` entries (members only), in canonical order. Local
+    /// to this channel — the reciprocal entry in `other`'s ledger is the host's
+    /// concern, not the projection's.
+    pub lineage: Vec<LineageEdge>,
 }
 
 impl ChannelView {
@@ -237,6 +287,7 @@ impl<S: SubstrateProvider> Ledger<S> {
         let standings = Self::project_standings(&recognized);
         let gate_status = Self::project_gates(&recognized);
         let sessions = Self::project_sessions(&recognized);
+        let lineage = Self::project_lineage(&recognized);
         // The current name: the (canonically first) genesis binding, unless a
         // later Correction targeting the genesis superseded it — rename is a
         // corrective entry, not mutable metadata (docs/adr/0014/0016).
@@ -276,6 +327,7 @@ impl<S: SubstrateProvider> Ledger<S> {
             gate_status,
             sessions,
             closed,
+            lineage,
         };
         if let Ok(mut cache) = self.cache.lock() {
             cache.insert(*channel, (std::time::Instant::now(), view.clone()));
@@ -310,6 +362,44 @@ impl<S: SubstrateProvider> Ledger<S> {
         party
     }
 
+    /// Fold this channel's **lineage edges** out of an ordered list of
+    /// *recognized* entries (`docs/adr/0027`): the four edge kinds normalize
+    /// onto `(relation, direction, other, point)`. Local only — each entry is
+    /// one end of an edge; the reciprocal in `other`'s ledger is the host's
+    /// concern. Order follows canonical entry order.
+    fn project_lineage(entries: &[&LedgerEntry]) -> Vec<LineageEdge> {
+        entries
+            .iter()
+            .filter_map(|entry| match &entry.payload {
+                EntryPayload::DivergedFrom { parent, at } => Some(LineageEdge {
+                    relation: LineageRelation::Diverge,
+                    direction: LineageDirection::Incoming,
+                    other: *parent,
+                    point: *at,
+                }),
+                EntryPayload::ChildDiverged { child } => Some(LineageEdge {
+                    relation: LineageRelation::Diverge,
+                    direction: LineageDirection::Outgoing,
+                    other: *child,
+                    point: None,
+                }),
+                EntryPayload::ConvergedInto { target } => Some(LineageEdge {
+                    relation: LineageRelation::Converge,
+                    direction: LineageDirection::Outgoing,
+                    other: *target,
+                    point: None,
+                }),
+                EntryPayload::ConvergenceReceived { source } => Some(LineageEdge {
+                    relation: LineageRelation::Converge,
+                    direction: LineageDirection::Incoming,
+                    other: *source,
+                    point: None,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Fold the assertion standings out of an ordered list of *recognized*
     /// entries (refs, because projection filters the canonical list by
     /// membership without cloning).
@@ -335,6 +425,10 @@ impl<S: SubstrateProvider> Ledger<S> {
                 | EntryPayload::MemberAdded { .. }
                 | EntryPayload::ChannelClosed { .. }
                 | EntryPayload::ChannelReopened { .. }
+                | EntryPayload::DivergedFrom { .. }
+                | EntryPayload::ChildDiverged { .. }
+                | EntryPayload::ConvergedInto { .. }
+                | EntryPayload::ConvergenceReceived { .. }
                 | EntryPayload::Assertion { .. }
                 | EntryPayload::Proposal { .. }
                 | EntryPayload::Approval { .. }
@@ -448,7 +542,8 @@ impl<S: SubstrateProvider> Ledger<S> {
 mod tests {
     use crate::{
         ApprovalRequirement, EntryId, EntryPayload, GateStatus, InMemorySubstrate, Ledger,
-        LedgerEntry, Member, SessionState, Standing, Timestamp, ids::ChannelId,
+        LedgerEntry, LineageDirection, LineageEdge, LineageRelation, Member, SessionState,
+        Standing, Timestamp, ids::ChannelId,
     };
 
     /// Build an entry with explicit id/timestamp/author for deterministic tests.
@@ -969,6 +1064,94 @@ mod tests {
             .unwrap();
         let view = ledger.project(&channel).await.unwrap();
         assert!(!view.closed);
+    }
+
+    #[tokio::test]
+    async fn lineage_edges_project_normalized_by_relation_and_direction() {
+        let dan = Member::human("Dan", "dan@example.com");
+        let (mut ledger, channel) = opened_channel(&dan).await;
+        let parent = ChannelId::new();
+        let child = ChannelId::new();
+        let target = ChannelId::new();
+        let source = ChannelId::new();
+        let split_point = EntryId::new();
+
+        for (ts, payload) in [
+            (
+                1,
+                EntryPayload::DivergedFrom {
+                    parent,
+                    at: Some(split_point),
+                },
+            ),
+            (2, EntryPayload::ChildDiverged { child }),
+            (3, EntryPayload::ConvergedInto { target }),
+            (4, EntryPayload::ConvergenceReceived { source }),
+        ] {
+            ledger
+                .append(entry(EntryId::new(), channel, dan.clone(), ts, payload))
+                .await
+                .unwrap();
+        }
+
+        let view = ledger.project(&channel).await.unwrap();
+        let edges = &view.lineage;
+        assert_eq!(edges.len(), 4);
+
+        // Child side of a divergence: inherits from the parent, carries the point.
+        assert!(edges.contains(&LineageEdge {
+            relation: LineageRelation::Diverge,
+            direction: LineageDirection::Incoming,
+            other: parent,
+            point: Some(split_point),
+        }));
+        // Parent side: a child depends on us; no point.
+        assert!(edges.contains(&LineageEdge {
+            relation: LineageRelation::Diverge,
+            direction: LineageDirection::Outgoing,
+            other: child,
+            point: None,
+        }));
+        // Source side of a convergence: we feed the target.
+        assert!(edges.contains(&LineageEdge {
+            relation: LineageRelation::Converge,
+            direction: LineageDirection::Outgoing,
+            other: target,
+            point: None,
+        }));
+        // Target side: a predecessor's context flows into us.
+        assert!(edges.contains(&LineageEdge {
+            relation: LineageRelation::Converge,
+            direction: LineageDirection::Incoming,
+            other: source,
+            point: None,
+        }));
+    }
+
+    #[tokio::test]
+    async fn lineage_edges_from_non_members_do_not_project() {
+        let dan = Member::human("Dan", "dan@example.com");
+        let stranger = Member::agent("Stranger", "stranger@example.com");
+        let (mut ledger, channel) = opened_channel(&dan).await;
+
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                stranger,
+                1,
+                EntryPayload::ChildDiverged {
+                    child: ChannelId::new(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert!(
+            view.lineage.is_empty(),
+            "a non-member's lineage edge is unrecognized and does not project"
+        );
     }
 
     #[tokio::test]
