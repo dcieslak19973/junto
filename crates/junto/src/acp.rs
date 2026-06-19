@@ -19,11 +19,12 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines};
 use tokio::process::{ChildStdin, ChildStdout};
+use tokio::sync::mpsc;
 
 use junto_kernel::EntryId;
 
 use crate::agent::McpServer;
-use crate::launch::{LiveEvent, LiveSessions, TURN_TIMEOUT, TurnEnd, TurnOutcome};
+use crate::launch::{LiveEvent, LiveSessions, TURN_TIMEOUT, TurnControl, TurnEnd, TurnOutcome};
 
 /// A agent's config as it crosses into one ACP turn
 /// (`docs/superpowers/specs/2026-06-13-agent-personas-design.md`). `mcp_servers`
@@ -95,7 +96,8 @@ impl AcpAgent {
 /// Run one ACP turn: spawn the adapter, handshake, start (`session/new`) or
 /// resume (`session/load`) a session, prompt, and stream updates into the live
 /// feed. `Err` means ACP could not be set up — the caller falls back to the
-/// CLI; a turn that ran but the agent failed returns `Ok` with `failed: true`.
+/// CLI; a turn that ran but the agent failed returns `Ok` with `end:
+/// TurnEnd::Failed`. A human interrupt resolves the prompt as `Interrupted`.
 pub(crate) async fn run_turn_acp(
     adapter: &[String],
     workspace: &Path,
@@ -104,6 +106,7 @@ pub(crate) async fn run_turn_acp(
     live: &LiveSessions,
     session: EntryId,
     agent: &AcpAgent,
+    control: &mut mpsc::Receiver<TurnControl>,
 ) -> Result<TurnOutcome> {
     let (program, args) = adapter.split_first().context("empty ACP adapter command")?;
     let mut command = tokio::process::Command::new(program);
@@ -216,11 +219,21 @@ pub(crate) async fn run_turn_acp(
         )
         .await?;
         let mut answer = String::new();
-        let result = pump_until(&mut reader, &mut stdin, 4, live, session, &mut answer)
-            .await
-            .context("ACP session/prompt")?;
+        let pumped = pump_prompt(
+            &mut reader,
+            &mut stdin,
+            4,
+            &session_id,
+            live,
+            session,
+            &mut answer,
+            control,
+        )
+        .await
+        .context("ACP session/prompt")?;
 
-        let stop = result
+        let stop = pumped
+            .result
             .get("stopReason")
             .and_then(|v| v.as_str())
             .unwrap_or("end_turn");
@@ -231,11 +244,7 @@ pub(crate) async fn run_turn_acp(
                 answer
             },
             harness_session: Some(session_id),
-            end: if stop != "end_turn" {
-                TurnEnd::Failed
-            } else {
-                TurnEnd::Completed
-            },
+            end: classify_prompt_end(stop, pumped.interrupted_with.is_some()),
         })
     };
 
@@ -273,11 +282,74 @@ async fn write_message(stdin: &mut ChildStdin, message: &Value) -> Result<()> {
     Ok(())
 }
 
+/// How a finished prompt pump ended: the awaited `result`, plus the human
+/// control signal that interrupted it (if any).
+struct PumpEnd {
+    result: Value,
+    interrupted_with: Option<TurnControl>,
+}
+
+/// Classify how a prompt that drained to `stop_reason` ended. A human interrupt
+/// wins regardless of the adapter's reason. Pure — the wire I/O around it is
+/// covered by the Task-0 cancel probe + dogfood runs.
+fn classify_prompt_end(stop_reason: &str, interrupted: bool) -> TurnEnd {
+    if interrupted {
+        TurnEnd::Interrupted
+    } else if stop_reason == "end_turn" {
+        TurnEnd::Completed
+    } else {
+        TurnEnd::Failed
+    }
+}
+
+/// Process one parsed ACP message: publish `session/update`s into the live feed
+/// (accumulating agent text into `answer`) and auto-answer agent→client requests
+/// (permission prompts → allow — junto's gates are the outcome layer,
+/// `docs/adr/0023`). Returns `Some(result)` when the response for `awaited_id`
+/// arrives, `None` otherwise.
+async fn handle_acp_line(
+    message: &Value,
+    stdin: &mut ChildStdin,
+    awaited_id: i64,
+    live: &LiveSessions,
+    session: EntryId,
+    answer: &mut String,
+    pending: &mut String,
+) -> Result<Option<Value>> {
+    match message.get("method").and_then(|m| m.as_str()) {
+        // A response to one of our requests (responses carry no method).
+        None => {
+            if message.get("id").and_then(|v| v.as_i64()) == Some(awaited_id) {
+                flush_pending(pending, live, session);
+                if let Some(error) = message.get("error") {
+                    bail!("ACP error on request {awaited_id}: {error}");
+                }
+                return Ok(Some(message.get("result").cloned().unwrap_or(Value::Null)));
+            }
+        }
+        Some("session/update") => {
+            if let Some(update) = message.get("params").and_then(|p| p.get("update")) {
+                handle_update(update, live, session, answer, pending);
+            }
+        }
+        // An agent→client request (has a non-null id) — answer it.
+        Some(other) => {
+            if let Some(id) = message.get("id").filter(|id| !id.is_null()) {
+                let result = answer_agent_request(other, message.get("params"));
+                write_message(
+                    stdin,
+                    &json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+                )
+                .await?;
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Read adapter output until the response for `awaited_id` arrives, returning
-/// its `result`. Meanwhile it publishes `session/update`s into the live feed
-/// (accumulating the agent's message text into `answer`) and auto-answers
-/// agent→client requests (permission prompts → allow — junto's gates are the
-/// outcome layer, `docs/adr/0023`).
+/// its `result`. Used for the fast handshake steps (initialize / session / mode);
+/// not cancellable — see [`pump_prompt`] for the interruptable prompt step.
 async fn pump_until(
     reader: &mut Lines<BufReader<ChildStdout>>,
     stdin: &mut ChildStdin,
@@ -295,37 +367,82 @@ async fn pump_until(
         let Ok(message) = serde_json::from_str::<Value>(line) else {
             continue; // tolerate any stray non-JSON line
         };
-        let method = message.get("method").and_then(|m| m.as_str());
-        match method {
-            // A response to one of our requests (responses carry no method).
-            None => {
-                if message.get("id").and_then(|v| v.as_i64()) == Some(awaited_id) {
-                    flush_pending(&mut pending, live, session);
-                    if let Some(error) = message.get("error") {
-                        bail!("ACP error on request {awaited_id}: {error}");
-                    }
-                    return Ok(message.get("result").cloned().unwrap_or(Value::Null));
-                }
-            }
-            Some("session/update") => {
-                if let Some(update) = message.get("params").and_then(|p| p.get("update")) {
-                    handle_update(update, live, session, answer, &mut pending);
-                }
-            }
-            // An agent→client request (has a non-null id) — answer it.
-            Some(other) => {
-                if let Some(id) = message.get("id").filter(|id| !id.is_null()) {
-                    let result = answer_agent_request(other, message.get("params"));
-                    write_message(
-                        stdin,
-                        &json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-                    )
-                    .await?;
-                }
-            }
+        if let Some(result) = handle_acp_line(
+            &message,
+            stdin,
+            awaited_id,
+            live,
+            session,
+            answer,
+            &mut pending,
+        )
+        .await?
+        {
+            return Ok(result);
         }
     }
     bail!("ACP adapter closed before responding to request {awaited_id}")
+}
+
+/// Pump the prompt step, cancellable mid-flight: while draining the update
+/// stream it `select!`s on the human control channel. On the first signal it
+/// sends a graceful ACP `session/cancel` for `session_id` (the adapter tears
+/// down its own child tree — the cross-platform cancel path), then drains until
+/// the prompt resolves (`stopReason == "cancelled"`). A dropped control sender
+/// is treated as a bare interrupt.
+#[allow(clippy::too_many_arguments)]
+async fn pump_prompt(
+    reader: &mut Lines<BufReader<ChildStdout>>,
+    stdin: &mut ChildStdin,
+    awaited_id: i64,
+    session_id: &str,
+    live: &LiveSessions,
+    session: EntryId,
+    answer: &mut String,
+    control: &mut mpsc::Receiver<TurnControl>,
+) -> Result<PumpEnd> {
+    let mut pending = String::new();
+    let mut interrupted_with: Option<TurnControl> = None;
+    loop {
+        let line = tokio::select! {
+            // Once interrupted we stop watching control and just drain the reader.
+            signal = control.recv(), if interrupted_with.is_none() => {
+                write_message(stdin, &json!({
+                    "jsonrpc": "2.0", "method": "session/cancel",
+                    "params": { "sessionId": session_id }
+                })).await?;
+                interrupted_with = Some(signal.unwrap_or(TurnControl::Interrupt));
+                continue;
+            }
+            line = reader.next_line() => line.context("reading ACP output")?,
+        };
+        let Some(line) = line else {
+            bail!("ACP adapter closed before responding to request {awaited_id}");
+        };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(message) = serde_json::from_str::<Value>(line) else {
+            continue; // tolerate any stray non-JSON line
+        };
+        if let Some(result) = handle_acp_line(
+            &message,
+            stdin,
+            awaited_id,
+            live,
+            session,
+            answer,
+            &mut pending,
+        )
+        .await?
+        {
+            return Ok(PumpEnd {
+                result,
+                interrupted_with,
+            });
+        }
+    }
 }
 
 /// Map one `session/update` into live-feed events; accumulate agent text into
@@ -415,6 +532,15 @@ fn answer_agent_request(method: &str, params: Option<&Value>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_prompt_end_distinguishes_interrupt_from_failure() {
+        assert_eq!(classify_prompt_end("end_turn", false), TurnEnd::Completed);
+        assert_eq!(classify_prompt_end("refusal", false), TurnEnd::Failed);
+        // A human interrupt wins regardless of the adapter's stop reason.
+        assert_eq!(classify_prompt_end("cancelled", true), TurnEnd::Interrupted);
+        assert_eq!(classify_prompt_end("end_turn", true), TurnEnd::Interrupted);
+    }
 
     #[test]
     fn mcp_json_is_the_http_server_shape_the_adapter_expects() {

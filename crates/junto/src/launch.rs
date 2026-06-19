@@ -884,12 +884,13 @@ async fn run_turn(
     live: &LiveSessions,
     session: EntryId,
     agent: &crate::agent::Agent,
+    control: &mut mpsc::Receiver<TurnControl>,
 ) -> TurnOutcome {
     let harness = harness_by_id(&agent.harness);
     if let Some(adapter) = acp_adapter_command(harness) {
         let acp_agent = acp_config(agent, harness);
         match crate::acp::run_turn_acp(
-            &adapter, workspace, prompt, resume, live, session, &acp_agent,
+            &adapter, workspace, prompt, resume, live, session, &acp_agent, control,
         )
         .await
         {
@@ -912,7 +913,7 @@ async fn run_turn(
         }
     }
     if harness.has_cli_fallback() {
-        run_turn_cli(workspace, prompt, resume, live, session).await
+        run_turn_cli(workspace, prompt, resume, live, session, control).await
     } else {
         TurnOutcome {
             result: format!(
@@ -985,6 +986,7 @@ async fn run_turn_cli(
     resume: Option<&str>,
     live: &LiveSessions,
     session: EntryId,
+    control: &mut mpsc::Receiver<TurnControl>,
 ) -> TurnOutcome {
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
@@ -1072,18 +1074,30 @@ async fn run_turn_cli(
         spawned.wait().await
     };
 
-    let status = match tokio::time::timeout(TURN_TIMEOUT, drive).await {
-        Ok(status) => status,
-        Err(_) => {
+    let status = tokio::select! {
+        // A human interrupt ends the CLI turn. Steer-in-place is ACP-only; a CLI
+        // re-prompt happens via the resume path (`launch::steer`). kill_on_drop
+        // reaps the child as the drive future drops.
+        _ = control.recv() => {
             return TurnOutcome {
-                result: format!(
-                    "turn exceeded the {}-minute timeout and was killed (docs/adr/0023)",
-                    TURN_TIMEOUT.as_secs() / 60
-                ),
-                harness_session,
-                end: TurnEnd::TimedOut,
+                result: "turn interrupted by the human".into(),
+                harness_session: None,
+                end: TurnEnd::Interrupted,
             };
         }
+        timed = tokio::time::timeout(TURN_TIMEOUT, drive) => match timed {
+            Ok(status) => status,
+            Err(_) => {
+                return TurnOutcome {
+                    result: format!(
+                        "turn exceeded the {}-minute timeout and was killed (docs/adr/0023)",
+                        TURN_TIMEOUT.as_secs() / 60
+                    ),
+                    harness_session,
+                    end: TurnEnd::TimedOut,
+                };
+            }
+        },
     };
 
     let exit_ok = matches!(status, Ok(s) if s.success());
@@ -1441,7 +1455,7 @@ fn spawn_turn(
     agent: crate::agent::Agent,
 ) {
     tokio::spawn(async move {
-        let _control_rx = host.live().begin(session);
+        let mut control_rx = host.live().begin(session);
         let outcome = run_turn(
             &workspace,
             &prompt,
@@ -1449,6 +1463,7 @@ fn spawn_turn(
             host.live(),
             session,
             &agent,
+            &mut control_rx,
         )
         .await;
         if let Err(err) = record_outcome(
@@ -1742,6 +1757,9 @@ async fn run_worker_turn(
              the current git branch, then stop.\n\n{findings}"
         ),
     };
+    // The autonomous worker turn is not interruptible; an inert control channel
+    // (sender kept alive, so it never fires) satisfies run_turn's signature.
+    let (_inert_control, mut control) = mpsc::channel(1);
     let outcome = run_turn(
         workspace,
         &prompt,
@@ -1749,6 +1767,7 @@ async fn run_worker_turn(
         host.live(),
         session,
         agent,
+        &mut control,
     )
     .await;
     if outcome.harness_session.is_some() {
@@ -1806,7 +1825,18 @@ async fn verify_one(
         session,
         LiveEvent::new("status", "checks green — grading the diff"),
     );
-    let graded = run_turn(workspace, &prompt, None, host.live(), session, agent).await;
+    // The grader turn is autonomous, not interruptible — an inert control channel.
+    let (_inert_control, mut control) = mpsc::channel(1);
+    let graded = run_turn(
+        workspace,
+        &prompt,
+        None,
+        host.live(),
+        session,
+        agent,
+        &mut control,
+    )
+    .await;
 
     if let Err(err) =
         store_grader_report(host, channel_ref, channel, session, &graded.result, agent).await
