@@ -627,7 +627,7 @@ impl JuntoMcp {
                 &req.child_name,
                 at,
                 req.author.into(),
-                req.code.as_deref(),
+                crate::host::WriteAuth::Agent(req.code.as_deref()),
             )
             .await
             .map_err(|err| invalid(err.to_string()))?;
@@ -651,7 +651,7 @@ impl JuntoMcp {
                 &req.target,
                 &req.rationale,
                 req.author.into(),
-                req.code.as_deref(),
+                crate::host::WriteAuth::Agent(req.code.as_deref()),
             )
             .await
             .map_err(|err| invalid(err.to_string()))?;

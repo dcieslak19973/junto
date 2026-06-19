@@ -2322,10 +2322,53 @@ pub fn channel_html(
              </form></details>\n"
         )
     };
+    // Lineage acts (docs/adr/0027): start a side-quest (diverge), or converge
+    // into another open channel in this substrate. A closed channel offers
+    // neither — it is out of the working set.
+    let lineage_actions = if view.closed {
+        String::new()
+    } else {
+        let mut options = String::new();
+        for summary in nav {
+            if summary.id == *id || summary.closed || summary.substrate != substrate {
+                continue;
+            }
+            let label = summary
+                .name
+                .clone()
+                .unwrap_or_else(|| summary.id.to_string());
+            let _ = write!(
+                options,
+                "<option value=\"{}\">{}</option>",
+                summary.id,
+                escape_html(&label)
+            );
+        }
+        let converge = if options.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "<details class=\"rename\"><summary>converge into another channel</summary>\
+                 <form class=\"act\" method=\"post\" action=\"/channels/{id}/converge\">\
+                 <select name=\"target\" required>{options}</select>\
+                 <input name=\"rationale\" placeholder=\"why it converges — the disposal \
+                 reason\" required>\
+                 <button class=\"primary\">converge &amp; close</button>\
+                 </form></details>\n"
+            )
+        };
+        format!(
+            "<details class=\"rename\"><summary>start a side-quest (diverge)</summary>\
+             <form class=\"act\" method=\"post\" action=\"/channels/{id}/diverge\">\
+             <input name=\"child_name\" placeholder=\"the side-quest's name\" required>\
+             <button class=\"primary\">start side-quest</button>\
+             </form></details>\n{converge}"
+        )
+    };
     let content = format!(
         "<h1>{name}</h1>\n\
          <p class=\"meta\">{count} entries</p>\n\
-         {rename}{lifecycle}{party}{strip}{start_work}{sessions}{standing}{recently}{footer}\
+         {rename}{lifecycle}{lineage_actions}{party}{strip}{start_work}{sessions}{standing}{recently}{footer}\
          <details class=\"ledger\"><summary class=\"board-head\">channel history \
          · {count} entries</summary>\n{body}</details>\n{open_here}",
         name = escape_html(name),
@@ -3837,6 +3880,12 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("value=\"old-name\""), "{html}");
+        // An open channel offers the lineage acts (docs/adr/0027).
+        assert!(html.contains("start a side-quest"), "{html}");
+        assert!(
+            html.contains(&format!("/channels/{channel}/diverge")),
+            "{html}"
+        );
     }
 
     #[test]

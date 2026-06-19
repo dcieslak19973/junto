@@ -29,6 +29,18 @@ use tokio::sync::Mutex;
 /// serializes appends (read-modify-write on the underlying git ref).
 pub type SharedLedger = Arc<Mutex<Ledger<GitRefsSubstrate>>>;
 
+/// How a write is authorized — the two surfaces differ (`docs/adr/0021`): the
+/// agent surface (MCP/CLI) requires the author's machine-local member code; the
+/// human surface (web pages the desktop shell wraps) checks membership only,
+/// deriving the author from git config. Threaded into the lineage ops so
+/// `diverge`/`converge` serve both.
+pub enum WriteAuth<'a> {
+    /// Agent surface: the claimed author's member code (`docs/adr/0017`).
+    Agent(Option<&'a str>),
+    /// Human surface: membership only, no code (`docs/adr/0021`).
+    Human,
+}
+
 /// The user's junto directory: `$JUNTO_HOME` if set (tests, unusual setups),
 /// else `~/.junto`.
 pub fn junto_home() -> Result<PathBuf> {
@@ -560,14 +572,14 @@ impl Host {
         child_name: &str,
         at: Option<EntryId>,
         diverger: Member,
-        code: Option<&str>,
+        auth: WriteAuth<'_>,
     ) -> Result<OpenedChannel> {
         let (parent_substrate, parent_ledger, parent_id) = self.resolve_for_write(parent).await?;
         // The diverger must be a member of the parent to author its side.
         {
             let guard = parent_ledger.lock().await;
             let view = guard.project(&parent_id).await?;
-            self.authorize_write(&view, &diverger, code)?;
+            self.check_write_auth(&view, &diverger, &auth)?;
         }
 
         // Open the child beside its parent; the diverger is its founder.
@@ -621,7 +633,7 @@ impl Host {
         target: &str,
         rationale: &str,
         converger: Member,
-        code: Option<&str>,
+        auth: WriteAuth<'_>,
     ) -> Result<()> {
         let (_src_substrate, src_ledger, src_id) = self.resolve_for_write(source).await?;
         let (tgt_id, tgt_ledger) = self.resolve_target(target).await?;
@@ -634,7 +646,7 @@ impl Host {
         {
             let guard = src_ledger.lock().await;
             let view = guard.project(&src_id).await?;
-            self.authorize_write(&view, &converger, code)?;
+            self.check_write_auth(&view, &converger, &auth)?;
             let open = view
                 .gate_status
                 .values()
@@ -653,7 +665,7 @@ impl Host {
         if let Some(tgt_ledger) = &tgt_ledger {
             let guard = tgt_ledger.lock().await;
             let view = guard.project(&tgt_id).await?;
-            self.authorize_write(&view, &converger, code)?;
+            self.check_write_auth(&view, &converger, &auth)?;
         }
 
         // Source side: converged-into, then closed (convergence closes it).
@@ -845,6 +857,22 @@ impl Host {
                 "channel name '{channel}' exists in several substrates ({substrates:?}); \
                  address it by id"
             ),
+        }
+    }
+
+    /// Authorize a write under whichever surface's rules apply (`docs/adr/0021`)
+    /// — the agent surface checks the member code, the human surface checks
+    /// membership only. The lineage ops ([`Host::diverge`]/[`Host::converge`])
+    /// dispatch through here so they serve both surfaces.
+    fn check_write_auth(
+        &self,
+        view: &ChannelView,
+        author: &Member,
+        auth: &WriteAuth<'_>,
+    ) -> Result<()> {
+        match auth {
+            WriteAuth::Agent(code) => self.authorize_write(view, author, *code),
+            WriteAuth::Human => self.authorize_human_write(view, author),
         }
     }
 
@@ -1207,7 +1235,13 @@ mod lineage_tests {
         let code = code_for(&dirs, &dan());
 
         let child = host
-            .diverge("parent", "side-quest", None, dan(), Some(&code))
+            .diverge(
+                "parent",
+                "side-quest",
+                None,
+                dan(),
+                WriteAuth::Agent(Some(&code)),
+            )
             .await
             .unwrap();
 
@@ -1252,7 +1286,13 @@ mod lineage_tests {
         let stranger = Member::agent("Stranger", "stranger@example.com");
         let code = code_for(&dirs, &stranger);
         let err = host
-            .diverge("parent", "sq", None, stranger, Some(&code))
+            .diverge(
+                "parent",
+                "sq",
+                None,
+                stranger,
+                WriteAuth::Agent(Some(&code)),
+            )
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not a member"), "{err}");
@@ -1265,9 +1305,15 @@ mod lineage_tests {
         host.open_channel(None, "tgt", dan(), None).await.unwrap();
         let code = code_for(&dirs, &dan());
 
-        host.converge("src", "tgt", "merged the side-quest", dan(), Some(&code))
-            .await
-            .unwrap();
+        host.converge(
+            "src",
+            "tgt",
+            "merged the side-quest",
+            dan(),
+            WriteAuth::Agent(Some(&code)),
+        )
+        .await
+        .unwrap();
 
         let (src_id, src_view) = project(&host, "src").await;
         assert!(src_view.closed, "the source closes on convergence");
@@ -1322,7 +1368,7 @@ mod lineage_tests {
             .unwrap();
 
         let err = host
-            .converge("src", "tgt", "merge", dan(), Some(&code))
+            .converge("src", "tgt", "merge", dan(), WriteAuth::Agent(Some(&code)))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("open gate"), "{err}");
@@ -1378,7 +1424,7 @@ mod lineage_tests {
             .unwrap();
 
         let child = host
-            .diverge("parent", "sq", None, dan(), Some(&code))
+            .diverge("parent", "sq", None, dan(), WriteAuth::Agent(Some(&code)))
             .await
             .unwrap();
         let child_view = {

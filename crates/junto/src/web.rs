@@ -64,6 +64,8 @@ pub fn router(host: Arc<Host>) -> Router {
         .route("/channels/{channel}/rename", post(rename_channel))
         .route("/channels/{channel}/close", post(close_channel))
         .route("/channels/{channel}/reopen", post(reopen_channel))
+        .route("/channels/{channel}/diverge", post(diverge_channel))
+        .route("/channels/{channel}/converge", post(converge_channel))
         .route("/channels/{channel}/brief", get(channel_brief))
         .route("/channels/{channel}/entries/{entry}/{act}", post(verify))
         .with_state(host)
@@ -1089,6 +1091,136 @@ async fn lifecycle_act(host: &Host, channel: &str, form: LifecycleForm, close: b
         }
     });
     Redirect::to(&format!("/channels/{id}")).into_response()
+}
+
+/// Spawn a best-effort background sync of one channel after a write — so the
+/// durable record leaves this machine without blocking the redirect.
+fn spawn_channel_sync(substrate: std::path::PathBuf, id: ChannelId) {
+    tokio::spawn(async move {
+        let mut fresh = junto_substrate_git::GitRefsSubstrate::open(substrate);
+        if let Err(err) = fresh.sync("origin", &id).await {
+            tracing::warn!("auto-sync of channel {id} after a lineage act failed: {err:#}");
+        }
+    });
+}
+
+/// Map a lineage-op error to a styled response: a membership refusal is a
+/// FORBIDDEN ("you can't do that here"), everything else (name taken, open
+/// gates, no such target) is a correctable BAD_REQUEST.
+fn lineage_error(err: anyhow::Error) -> Response {
+    let message = format!("{err:#}");
+    let status = if message.contains("member") {
+        StatusCode::FORBIDDEN
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    (status, message).into_response()
+}
+
+/// Start a side-quest from the channel page (`docs/adr/0027`): open a child
+/// channel off this one and record the divergence edge. Author from git config,
+/// membership-checked (no member code on the human surface, `docs/adr/0021`).
+async fn diverge_channel(
+    State(host): State<Arc<Host>>,
+    Path(channel): Path<String>,
+    Form(form): Form<DivergeForm>,
+) -> Response {
+    let child_name = form.child_name.trim().to_string();
+    if child_name.is_empty() {
+        return (StatusCode::BAD_REQUEST, "a side-quest needs a name").into_response();
+    }
+    let (parent_id, _view, substrate) = match project(&host, &channel).await {
+        Ok(projected) => projected,
+        Err(response) => return response,
+    };
+    let author = match crate::host::git_user(&substrate) {
+        Ok(author) => author,
+        Err(err) => {
+            return internal(format!(
+                "no author identity: {err} (set git config user.name / user.email)"
+            ));
+        }
+    };
+    match host
+        .diverge(
+            &channel,
+            &child_name,
+            None,
+            author,
+            crate::host::WriteAuth::Human,
+        )
+        .await
+    {
+        Ok(child) => {
+            spawn_channel_sync(substrate.clone(), parent_id);
+            spawn_channel_sync(substrate, child.id);
+            Redirect::to(&format!("/channels/{}", child.id)).into_response()
+        }
+        Err(err) => lineage_error(err),
+    }
+}
+
+/// Converge this channel into another from the channel page (`docs/adr/0027`):
+/// record the convergence edge and close the source. Membership-checked.
+async fn converge_channel(
+    State(host): State<Arc<Host>>,
+    Path(channel): Path<String>,
+    Form(form): Form<ConvergeForm>,
+) -> Response {
+    let target = form.target.trim().to_string();
+    let rationale = form.rationale.trim().to_string();
+    if target.is_empty() || rationale.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "converge needs a target channel and a rationale",
+        )
+            .into_response();
+    }
+    let (source_id, _view, substrate) = match project(&host, &channel).await {
+        Ok(projected) => projected,
+        Err(response) => return response,
+    };
+    let author = match crate::host::git_user(&substrate) {
+        Ok(author) => author,
+        Err(err) => {
+            return internal(format!(
+                "no author identity: {err} (set git config user.name / user.email)"
+            ));
+        }
+    };
+    match host
+        .converge(
+            &channel,
+            &target,
+            &rationale,
+            author,
+            crate::host::WriteAuth::Human,
+        )
+        .await
+    {
+        Ok(()) => {
+            spawn_channel_sync(substrate.clone(), source_id);
+            if let Ok(target_id) = target.parse::<ChannelId>() {
+                spawn_channel_sync(substrate, target_id);
+            }
+            Redirect::to(&format!("/channels/{target}")).into_response()
+        }
+        Err(err) => lineage_error(err),
+    }
+}
+
+/// The form body for starting a side-quest (`docs/adr/0027`).
+#[derive(Debug, Deserialize)]
+struct DivergeForm {
+    child_name: String,
+}
+
+/// The form body for converging into another channel (`docs/adr/0027`).
+#[derive(Debug, Deserialize)]
+struct ConvergeForm {
+    /// The target channel's id (the dropdown's option value).
+    target: String,
+    rationale: String,
 }
 
 /// The form body of a verification act: just the rationale — the act and
@@ -2198,6 +2330,76 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CONFLICT);
         let page = body_text(response).await;
         assert!(page.contains("web-test"), "{page}");
+    }
+
+    #[tokio::test]
+    async fn diverge_form_opens_a_linked_child() {
+        let fx = host_with_entry(assertion()).await;
+        let response = diverge_channel(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(DivergeForm {
+                child_name: "ui-side-quest".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .expect("redirect target")
+            .to_string();
+        assert!(location.starts_with("/channels/"), "{location}");
+
+        // The child resolves, founded by the git user, with a DivergedFrom
+        // edge back to the parent.
+        let Resolution::Resolved { ledger, id, .. } =
+            fx.host.resolve("ui-side-quest").await.unwrap()
+        else {
+            panic!("the side-quest resolves by name");
+        };
+        let view = ledger.lock().await.project(&id).await.unwrap();
+        assert_eq!(view.party[0].email, "web@example.com");
+        assert!(
+            view.lineage.iter().any(
+                |edge| edge.relation == junto_kernel::LineageRelation::Diverge
+                    && edge.direction == junto_kernel::LineageDirection::Incoming
+                    && edge.other == fx.channel
+            ),
+            "the child records it diverged from the parent"
+        );
+    }
+
+    #[tokio::test]
+    async fn converge_form_closes_the_source() {
+        let fx = host_with_entry(assertion()).await;
+        // A second open channel in the same substrate, founded by the same git
+        // user so the human write is a member write.
+        let founder = Member::human("Web User", "web@example.com");
+        let target = fx
+            .host
+            .open_channel(None, "target", founder, None)
+            .await
+            .unwrap()
+            .id;
+        let response = converge_channel(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(ConvergeForm {
+                target: target.to_string(),
+                rationale: "merged the side-quest".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let Resolution::Resolved { ledger, id, .. } = fx.host.resolve("web-test").await.unwrap()
+        else {
+            panic!("the source resolves");
+        };
+        let view = ledger.lock().await.project(&id).await.unwrap();
+        assert!(view.closed, "convergence closed the source");
     }
 
     #[tokio::test]
