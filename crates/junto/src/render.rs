@@ -369,6 +369,10 @@ fn recent_line(entry: &LedgerEntry) -> String {
         EntryPayload::ChannelReopened { rationale } => {
             format!("reopened the channel: {}", clamp(rationale, TAIL_CLAMP))
         }
+        EntryPayload::DivergedFrom { .. } => "diverged from a parent channel".to_string(),
+        EntryPayload::ChildDiverged { .. } => "a side-quest diverged from here".to_string(),
+        EntryPayload::ConvergedInto { .. } => "converged into another channel".to_string(),
+        EntryPayload::ConvergenceReceived { .. } => "received a converging channel".to_string(),
     }
 }
 
@@ -636,6 +640,18 @@ fn describe_markdown(entry: &LedgerEntry, view: &ChannelView) -> String {
         }
         EntryPayload::ChannelReopened { rationale } => {
             format!("**channel reopened** — {rationale}")
+        }
+        EntryPayload::DivergedFrom { parent, .. } => {
+            format!("**diverged from** parent channel `{parent}`")
+        }
+        EntryPayload::ChildDiverged { child } => {
+            format!("**child diverged** — side-quest `{child}`")
+        }
+        EntryPayload::ConvergedInto { target } => {
+            format!("**converged into** channel `{target}`")
+        }
+        EntryPayload::ConvergenceReceived { source } => {
+            format!("**convergence received** — from channel `{source}`")
         }
     }
 }
@@ -2291,6 +2307,10 @@ fn entry_family(payload: &EntryPayload) -> &'static str {
         | EntryPayload::MemberAdded { .. }
         | EntryPayload::ChannelClosed { .. }
         | EntryPayload::ChannelReopened { .. }
+        | EntryPayload::DivergedFrom { .. }
+        | EntryPayload::ChildDiverged { .. }
+        | EntryPayload::ConvergedInto { .. }
+        | EntryPayload::ConvergenceReceived { .. }
         | EntryPayload::Ratification { .. }
         | EntryPayload::Park { .. }
         | EntryPayload::Correction { .. }
@@ -2438,6 +2458,38 @@ fn entry_card(entry: &LedgerEntry, view: &ChannelView, channel: &ChannelId) -> S
             None,
             Some(provenance.as_slice()),
             Some(*target),
+        ),
+        EntryPayload::DivergedFrom { parent, .. } => (
+            "diverged from",
+            None,
+            Some(format!("diverged from parent channel {parent}")),
+            None,
+            None,
+            None,
+        ),
+        EntryPayload::ChildDiverged { child } => (
+            "child diverged",
+            None,
+            Some(format!("side-quest {child} diverged from here")),
+            None,
+            None,
+            None,
+        ),
+        EntryPayload::ConvergedInto { target } => (
+            "converged into",
+            None,
+            Some(format!("converged into channel {target}")),
+            None,
+            None,
+            None,
+        ),
+        EntryPayload::ConvergenceReceived { source } => (
+            "convergence received",
+            None,
+            Some(format!("channel {source} converged into here")),
+            None,
+            None,
+            None,
         ),
     };
 
@@ -3356,6 +3408,7 @@ mod tests {
             gate_status,
             sessions: HashMap::new(),
             closed: false,
+            lineage: Vec::new(),
         }
     }
 
@@ -3722,6 +3775,7 @@ mod tests {
             gate_status,
             sessions: Default::default(),
             closed: false,
+            lineage: Vec::new(),
         };
         let brief = brief_markdown("t", &ChannelId::new(), &view);
 
@@ -3757,6 +3811,7 @@ mod tests {
             gate_status: Default::default(),
             sessions: Default::default(),
             closed: false,
+            lineage: Vec::new(),
         };
         let brief = brief_markdown("t", &ChannelId::new(), &view);
 

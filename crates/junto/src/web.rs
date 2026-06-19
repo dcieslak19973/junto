@@ -2293,6 +2293,7 @@ mod tests {
             unrecognized: Default::default(),
             sessions: Default::default(),
             closed: false,
+            lineage: Vec::new(),
         };
         let html = crate::render::channel_html(
             &[],

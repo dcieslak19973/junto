@@ -758,6 +758,12 @@ fn preview(entry: &LedgerEntry) -> String {
         EntryPayload::MemberAdded { member } => ("member added", member.display_name.clone()),
         EntryPayload::ChannelClosed { rationale } => ("closed", rationale.clone()),
         EntryPayload::ChannelReopened { rationale } => ("reopened", rationale.clone()),
+        EntryPayload::DivergedFrom { parent, .. } => ("diverged from", parent.to_string()),
+        EntryPayload::ChildDiverged { child } => ("child diverged", child.to_string()),
+        EntryPayload::ConvergedInto { target } => ("converged into", target.to_string()),
+        EntryPayload::ConvergenceReceived { source } => {
+            ("convergence received", source.to_string())
+        }
         EntryPayload::Assertion { statement, .. } => ("assertion", statement.clone()),
         EntryPayload::Ratification { rationale, .. } => ("ratification", rationale.clone()),
         EntryPayload::Park { rationale, .. } => ("park", rationale.clone()),
