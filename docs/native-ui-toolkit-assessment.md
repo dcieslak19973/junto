@@ -36,6 +36,17 @@ The contamination is reportedly **unintentional and trivially fixable upstream**
 
 Suggested cadence: re-check whenever the native-surface question is picked back up, or every few months.
 
+## Refined framing — read-only mobile splits the surface into two jobs
+
+Dan's call (2026-06-19): **full work happens on desktop; on mobile he only wants to *check in*** — read the focus board, ratify/approve/park, glance at a running session. That split resolves most of the replace-vs-coexist tension:
+
+- **Mobile + remote check-in = the served web surface.** Reading the focus board and acting on it from a phone browser is *exactly* what the host's server-rendered HTML already does (and the [focus board](attention.md) with inline acts *is* that surface, once built). So mobile is a reason to **keep** the webview/served surface, not abandon it. egui/Iced are poor mobile fits anyway (both desktop-first; mobile is experimental/DIY on either — see [iced #302](https://github.com/iced-rs/iced/issues/302)).
+- **Desktop power-work = an optional native app.** Tmux panes, steering, the daily-driver "real app" feel — where a native toolkit would earn its keep, *if* the feel proves worth a second codebase.
+
+**The reframe:** because the web surface stays (covering mobile + remote), a native desktop app **no longer forfeits browser/remote access** — those live on the web surface. So native becomes *additive* (a power-surface for two genuinely different jobs), not a lossy *replacement* of ADR 0018. The cost flips from "lose capabilities" to "maintain a second surface."
+
+**The cheap de-risking step (independent of any native decision):** make the served surface **responsive** and **build the focus board**. That ships the mobile check-in Dan wants now, with zero native commitment — and lets him live on the web surface daily to find out whether the "I want native" itch justifies the second codebase. Build the native desktop app later (if at all), knowing exactly what it's for.
+
 ## Where this leaves the (deferred) decision
 
 If junto ever goes native: **egui or Iced are the safe-by-construction choices** (both permissive, both genuinely cross-platform). **egui** is the right tool to *prototype* and decide empirically — the sharpest spike is the **tmux-pane workspace** (the thing the webview does worst). **GPUI** is the "watch this space" option, gated on the licensing fix above. None of this is committed: the replace-vs-coexist crux (whether junto gives up browser/remote access) is the gate on the whole thing.
