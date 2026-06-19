@@ -148,6 +148,13 @@ pub struct ChannelSummary {
     /// channel's track on the lineage strip. Curated (not every entry) so a
     /// busy channel's line stays legible.
     pub milestones: Vec<Milestone>,
+    /// The channel this one diverged from (`docs/adr/0027`), if any — the
+    /// lineage strip attaches its branch to the parent's track here, instead
+    /// of the baseline.
+    pub parent: Option<ChannelId>,
+    /// The channel this one converged into (`docs/adr/0027`), if any — the
+    /// strip draws the merge-back into that target's track.
+    pub converged_into: Option<ChannelId>,
 }
 
 /// One notable event on a channel's track — a settled decision, an attached
@@ -1050,6 +1057,18 @@ fn summarize(id: &ChannelId, view: &ChannelView, substrate: &Path) -> ChannelSum
         latest: view.entries.last().map(preview),
         closed: view.closed,
         milestones: channel_milestones(view),
+        // The first parent / convergence-target edge drives the strip's
+        // attachment points (docs/adr/0027).
+        parent: view.lineage.iter().find_map(|edge| {
+            (edge.relation == junto_kernel::LineageRelation::Diverge
+                && edge.direction == junto_kernel::LineageDirection::Incoming)
+                .then_some(edge.other)
+        }),
+        converged_into: view.lineage.iter().find_map(|edge| {
+            (edge.relation == junto_kernel::LineageRelation::Converge
+                && edge.direction == junto_kernel::LineageDirection::Outgoing)
+                .then_some(edge.other)
+        }),
     }
 }
 
