@@ -423,8 +423,10 @@ async fn pump_until(
         let Ok(message) = serde_json::from_str::<Value>(line) else {
             continue; // tolerate any stray non-JSON line
         };
-        if let Some(result) =
-            handle_acp_line(&message, stdin, awaited_id, live, session, answer, &mut state).await?
+        if let Some(result) = handle_acp_line(
+            &message, stdin, awaited_id, live, session, answer, &mut state,
+        )
+        .await?
         {
             return Ok(result);
         }
@@ -547,7 +549,10 @@ fn handle_update(
             if let Some(id) = update.get("toolCallId").and_then(|v| v.as_str()) {
                 state.tools.insert(id.to_string(), seq);
             }
-            live.publish(session, LiveEvent::line_seq("tool", tool_label(update), seq));
+            live.publish(
+                session,
+                LiveEvent::line_seq("tool", tool_label(update), seq),
+            );
         }
         Some("tool_call_update") => {
             // Replace the originating tool block in place (status / result),
@@ -557,7 +562,10 @@ fn handle_update(
                 .and_then(|v| v.as_str())
                 .and_then(|id| state.tools.get(id).copied())
             {
-                live.publish(session, LiveEvent::line_seq("tool", tool_label(update), seq));
+                live.publish(
+                    session,
+                    LiveEvent::line_seq("tool", tool_label(update), seq),
+                );
             }
         }
         // usage_update, plan, available_commands_update: not surfaced.
@@ -605,7 +613,13 @@ fn tool_label(update: &Value) -> String {
         (None, Some(d)) => d.to_string(),
         (None, None) => "tool".to_string(),
     };
-    let base: String = base.lines().next().unwrap_or(&base).chars().take(160).collect();
+    let base: String = base
+        .lines()
+        .next()
+        .unwrap_or(&base)
+        .chars()
+        .take(160)
+        .collect();
     match update.get("status").and_then(|v| v.as_str()) {
         Some(status) if status != "in_progress" && status != "pending" => {
             format!("{base} [{status}]")
@@ -670,6 +684,21 @@ mod tests {
             next_loop_step("end_turn", None),
             LoopStep::Done(TurnEnd::Completed)
         ));
+    }
+
+    #[test]
+    fn tool_label_combines_title_input_and_status() {
+        let completed = json!({
+            "title": "Bash", "rawInput": { "command": "cargo test" }, "status": "completed"
+        });
+        assert_eq!(tool_label(&completed), "Bash: cargo test [completed]");
+        // in_progress is omitted; only the first line of the input is kept.
+        let running = json!({
+            "title": "Edit", "rawInput": { "file_path": "src/x.rs" }, "status": "in_progress"
+        });
+        assert_eq!(tool_label(&running), "Edit: src/x.rs");
+        // Bare fallback when there's nothing to say.
+        assert_eq!(tool_label(&json!({})), "tool");
     }
 
     #[test]

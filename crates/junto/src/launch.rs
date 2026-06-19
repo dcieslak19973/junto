@@ -734,8 +734,8 @@ impl LiveSessions {
     pub(crate) fn publish(&self, session: EntryId, event: LiveEvent) {
         let mut map = self.inner.lock().expect("live sessions registry lock");
         if let Some(feed) = map.get_mut(&session) {
-            let coalesce = event.seq != 0
-                && feed.buffer.last().is_some_and(|last| last.seq == event.seq);
+            let coalesce =
+                event.seq != 0 && feed.buffer.last().is_some_and(|last| last.seq == event.seq);
             if coalesce {
                 if let Some(last) = feed.buffer.last_mut() {
                     *last = event.clone();
@@ -2845,6 +2845,28 @@ mod tests {
             receiver.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Closed)
         ));
+    }
+
+    #[test]
+    fn segment_events_coalesce_in_the_replay_buffer() {
+        let live = LiveSessions::default();
+        let session = EntryId::new();
+        let _rx = live.begin(session);
+        // Two frames of the same growing segment (seq 1) keep only the latest.
+        live.publish(session, LiveEvent::segment("assistant", "<p>hel</p>", 1));
+        live.publish(session, LiveEvent::segment("assistant", "<p>hello</p>", 1));
+        // A discrete line (seq 0) always appends.
+        live.publish(session, LiveEvent::new("tool", "Bash: ls"));
+        let (buffer, _rx2) = live.subscribe(session).expect("feed live");
+        assert_eq!(
+            buffer.len(),
+            2,
+            "same-seq frames coalesce; discrete line appends"
+        );
+        assert_eq!(buffer[0].text, "<p>hello</p>");
+        assert!(buffer[0].html);
+        assert_eq!(buffer[0].seq, 1);
+        assert_eq!(buffer[1].kind, "tool");
     }
 
     #[test]

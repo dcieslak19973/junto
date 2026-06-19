@@ -2843,8 +2843,11 @@ fn entry_card(entry: &LedgerEntry, view: &ChannelView, channel: &ChannelId) -> S
 ///   memo/diff) from the artifact endpoint the first time it's open, so the
 ///   agent's output reads inline as a stream instead of a snippet + link.
 ///
-/// All text is set via `textContent`, so agent output can never inject markup
-/// (a feed/stream, not scrollback).
+/// Discrete lines are set via `textContent` (never markup). `assistant` and
+/// `thinking` segments carry server-sanitized Markdown HTML (`ev.html`) set via
+/// `innerHTML` — safe because `render_markdown` escapes any raw HTML the agent
+/// emitted. A non-zero `ev.seq` is a growing block: the client replaces the
+/// element with that `data-seq` in place as it streams, instead of appending.
 const SESSIONS_SCRIPT: &str = r#"<script>
 (function(){
   document.querySelectorAll('.live').forEach(function(box){
@@ -2855,10 +2858,16 @@ const SESSIONS_SCRIPT: &str = r#"<script>
     var marks={tool:'⚙ ',status:'· ',result:'✓ ',error:'✗ '};
     es.addEventListener('live',function(e){
       var ev; try{ev=JSON.parse(e.data);}catch(_){return;}
-      var li=document.createElement('li');
+      var seq=ev.seq||0;
+      var li=seq>0 ? feed.querySelector('li[data-seq="'+seq+'"]') : null;
+      if(!li){
+        li=document.createElement('li');
+        if(seq>0) li.dataset.seq=seq;
+        feed.appendChild(li);
+      }
       li.className='le le-'+(ev.kind||'status');
-      li.textContent=(marks[ev.kind]||'')+(ev.text||'');
-      feed.appendChild(li);
+      if(ev.html){ li.innerHTML=ev.text||''; }
+      else { li.textContent=(marks[ev.kind]||'')+(ev.text||''); }
       feed.scrollTop=feed.scrollHeight;
     });
     es.addEventListener('end',function(){ es.close(); location.reload(); });
@@ -3427,6 +3436,15 @@ max-height:18rem;overflow-y:auto;border-left:2px solid var(--border);padding-lef
 .le-status{color:var(--muted);font-size:.8rem}\
 .le-result{color:var(--green)}\
 .le-error{color:var(--red)}\
+.le-thinking{color:var(--muted);font-style:italic}\
+.le-assistant,.le-thinking{white-space:normal}\
+.le-assistant>:first-child,.le-thinking>:first-child{margin-top:0}\
+.le-assistant>:last-child,.le-thinking>:last-child{margin-bottom:0}\
+.le-assistant p,.le-thinking p{margin:.3rem 0}\
+.le-assistant ul,.le-assistant ol,.le-thinking ul,.le-thinking ol{margin:.3rem 0;padding-left:1.2rem}\
+.le-assistant code,.le-thinking code{font-family:ui-monospace,'Cascadia Mono',Consolas,monospace;font-size:.82em}\
+.le-assistant pre,.le-thinking pre{white-space:pre-wrap;background:rgba(127,127,127,.12);\
+padding:.4rem .55rem;border-radius:4px;overflow-x:auto}\
 .meta-line{color:var(--muted);font-size:.8rem;margin-top:.45rem}\
 .hint{color:var(--yellow);background:rgba(249,226,175,.07);border:1px solid rgba(249,226,175,.22);\
 border-radius:.5rem;padding:.5rem .7rem;margin-top:.6rem}\
