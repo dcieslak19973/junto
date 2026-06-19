@@ -612,19 +612,55 @@ fn record_turn(
 /// One line in a session's live progress feed.
 #[derive(Clone, Debug, Serialize)]
 pub struct LiveEvent {
-    /// `status` (lifecycle), `assistant` (model text), `tool` (a named
-    /// action), `result` (final summary), or `error`.
+    /// `status` (lifecycle), `assistant` (model text), `thinking` (model
+    /// reasoning), `tool` (a named action), `result` (final summary), or
+    /// `error`.
     pub kind: String,
-    /// A human-readable line — assistant text, or a tool action like
-    /// `Bash: cargo test`.
+    /// The line's content. For `assistant`/`thinking` segments this is
+    /// **sanitized HTML** (`html == true`, rendered server-side from Markdown);
+    /// otherwise a plain string.
     pub text: String,
+    /// Segment id. `0` = a discrete line (always appended). A non-zero `seq`
+    /// marks a growing block: successive events with the same `seq` **replace**
+    /// the prior one (a Markdown segment re-rendered as it streams).
+    #[serde(default)]
+    pub seq: u64,
+    /// When true, `text` is sanitized HTML the client sets via `innerHTML`;
+    /// otherwise plain text set via `textContent`.
+    #[serde(default)]
+    pub html: bool,
 }
 
 impl LiveEvent {
+    /// A discrete plain-text line (status / result / error / tool).
     pub(crate) fn new(kind: &str, text: impl Into<String>) -> Self {
         Self {
             kind: kind.into(),
             text: text.into(),
+            seq: 0,
+            html: false,
+        }
+    }
+
+    /// A growing Markdown segment: `text` is sanitized HTML, keyed by `seq` so
+    /// the client replaces the block in place as it streams.
+    pub(crate) fn segment(kind: &str, html: impl Into<String>, seq: u64) -> Self {
+        Self {
+            kind: kind.into(),
+            text: html.into(),
+            seq,
+            html: true,
+        }
+    }
+
+    /// A discrete line carrying an explicit `seq` (a tool block that a later
+    /// `tool_call_update` can replace in place).
+    pub(crate) fn line_seq(kind: &str, text: impl Into<String>, seq: u64) -> Self {
+        Self {
+            kind: kind.into(),
+            text: text.into(),
+            seq,
+            html: false,
         }
     }
 }
@@ -690,11 +726,21 @@ impl LiveSessions {
     }
 
     /// Append an event: into the replay buffer (bounded) and to live tails.
+    /// A non-zero `seq` marks a growing segment — successive same-`seq` events
+    /// **coalesce** in the replay buffer (the last one wins, so a late joiner
+    /// sees one rendered block, not every intermediate frame), which also keeps
+    /// a long Markdown stream from blowing the bound. Live subscribers still
+    /// receive every frame.
     pub(crate) fn publish(&self, session: EntryId, event: LiveEvent) {
         let mut map = self.inner.lock().expect("live sessions registry lock");
         if let Some(feed) = map.get_mut(&session) {
-            // Bound the replay buffer; live subscribers still get every event.
-            if feed.buffer.len() < 1000 {
+            let coalesce = event.seq != 0
+                && feed.buffer.last().is_some_and(|last| last.seq == event.seq);
+            if coalesce {
+                if let Some(last) = feed.buffer.last_mut() {
+                    *last = event.clone();
+                }
+            } else if feed.buffer.len() < 1000 {
                 feed.buffer.push(event.clone());
             }
             // Err just means no one is watching right now — fine.
