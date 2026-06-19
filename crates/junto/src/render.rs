@@ -2301,6 +2301,13 @@ pub fn channel_html(
          </form></details>\n",
         name = escape_html(name),
     );
+    // The ambient channel is the substrate's trunk (its name is the repo's
+    // directory name — the de-facto main-line). Closing the trunk makes no
+    // sense, so it gets no close action.
+    let is_ambient = substrate
+        .file_name()
+        .map(|dir| dir.to_string_lossy() == name)
+        .unwrap_or(false);
     let lifecycle = if view.closed {
         format!(
             "<div class=\"closed-banner\">this channel is <strong>closed</strong> — the \
@@ -2312,6 +2319,8 @@ pub fn channel_html(
              <button class=\"primary\">reopen</button>\
              </form></details>\n"
         )
+    } else if is_ambient {
+        String::new()
     } else {
         format!(
             "<details class=\"rename\"><summary>close this channel</summary>\
@@ -3886,6 +3895,27 @@ mod tests {
             html.contains(&format!("/channels/{channel}/diverge")),
             "{html}"
         );
+        // A non-ambient channel offers close.
+        assert!(html.contains("close this channel"), "{html}");
+    }
+
+    #[test]
+    fn ambient_channel_hides_close() {
+        // The ambient channel's name is the substrate's directory name — the
+        // trunk, which gets no close action.
+        let view = view_with(vec![]);
+        let html = channel_html(
+            &[],
+            "junto-ledger",
+            &ChannelId::new(),
+            &view,
+            std::path::Path::new("/repos/junto-ledger"),
+            None,
+        );
+        assert!(!html.contains("close this channel"), "{html}");
+        // …but rename and side-quests are still available.
+        assert!(html.contains("rename this channel"), "{html}");
+        assert!(html.contains("start a side-quest"), "{html}");
     }
 
     #[test]
