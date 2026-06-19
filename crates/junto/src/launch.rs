@@ -2135,7 +2135,6 @@ async fn try_execute_pr_gate(host: &Host, channel: ChannelId, proposal: EntryId)
         .unwrap_or_else(|| "junto deliverable".to_string());
 
     // Push the branch, then open the PR.
-    push_branch(&workspace, &branch)?;
     let spec = crate::forge::PullRequestSpec {
         repo: workspace.clone(),
         head: branch.clone(),
@@ -2146,7 +2145,12 @@ async fn try_execute_pr_gate(host: &Host, channel: ChannelId, proposal: EntryId)
         ),
     };
     let channel_ref = channel.to_string();
-    let url = match crate::forge::GithubForge.open_pull_request(&spec) {
+    // Push then open — as one fallible step, so *any* failure (push or PR
+    // create) records GateExecuted(false), not just the PR-create step
+    // (docs/adr/0030; the push-only gap the first signal dogfood found).
+    let opened = push_branch(&workspace, &branch)
+        .and_then(|()| crate::forge::GithubForge.open_pull_request(&spec));
+    let url = match opened {
         Ok(url) => url,
         Err(err) => {
             // Surface the failure; leave the gate approved so a re-approve retries.
