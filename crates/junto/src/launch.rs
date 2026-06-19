@@ -827,14 +827,47 @@ fn interpret_stream_line(line: &str) -> LineEffects {
 
 // ---- the turn itself: spawn → capture → record ----
 
+/// How a turn ended — folds the old `failed: bool` into the distinct cases that
+/// matter for the recorded session state (`docs/adr/0032`). An interrupt is a
+/// human choice, not an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TurnEnd {
+    /// The agent finished its turn normally (`stopReason == "end_turn"`).
+    Completed,
+    /// A human interrupted the turn mid-flight.
+    Interrupted,
+    /// The agent errored, exited non-zero, or produced unparseable output.
+    Failed,
+    /// The turn exceeded its timeout and was killed.
+    TimedOut,
+}
+
 /// What one finished harness turn yielded.
 pub(crate) struct TurnOutcome {
     /// The result text (the harness's final message, or the failure tail).
     pub(crate) result: String,
     /// The harness's session id, when the output carried one.
     pub(crate) harness_session: Option<String>,
-    /// Whether the turn failed (non-zero exit, timeout, unparseable output).
-    pub(crate) failed: bool,
+    /// How the turn ended.
+    pub(crate) end: TurnEnd,
+}
+
+/// Map a finished turn's end-state to the session state + note recorded for it.
+/// An interrupt lands the session `Done` (a human choice, not an error).
+fn outcome_state(end: TurnEnd, turn: u32, result: &str) -> (SessionState, String) {
+    let tail = snippet(result, 160);
+    match end {
+        TurnEnd::Completed => (SessionState::Done, format!("turn {turn} complete: {tail}")),
+        TurnEnd::Interrupted => (
+            SessionState::Done,
+            format!("turn {turn} interrupted: {tail}"),
+        ),
+        TurnEnd::Failed => (SessionState::Error, format!("turn {turn} failed: {tail}")),
+        TurnEnd::TimedOut => (
+            SessionState::Error,
+            format!("turn {turn} timed out: {tail}"),
+        ),
+    }
 }
 
 /// Run one harness turn in `workspace`: the launch turn when `resume` is
@@ -872,7 +905,7 @@ async fn run_turn(
                     return TurnOutcome {
                         result: format!("{} could not start over ACP: {err:#}", harness.label),
                         harness_session: None,
-                        failed: true,
+                        end: TurnEnd::Failed,
                     };
                 }
             }
@@ -887,7 +920,7 @@ async fn run_turn(
                 harness.label
             ),
             harness_session: None,
-            failed: true,
+            end: TurnEnd::Failed,
         }
     }
 }
@@ -986,7 +1019,7 @@ async fn run_turn_cli(
             return TurnOutcome {
                 result: format!("failed to spawn the harness: {err}"),
                 harness_session: None,
-                failed: true,
+                end: TurnEnd::Failed,
             };
         }
     };
@@ -1000,7 +1033,7 @@ async fn run_turn_cli(
         return TurnOutcome {
             result: "harness produced no stdout pipe".into(),
             harness_session: None,
-            failed: true,
+            end: TurnEnd::Failed,
         };
     };
     // Drain stderr concurrently so a chatty harness can't fill the pipe and
@@ -1048,7 +1081,7 @@ async fn run_turn_cli(
                     TURN_TIMEOUT.as_secs() / 60
                 ),
                 harness_session,
-                failed: true,
+                end: TurnEnd::TimedOut,
             };
         }
     };
@@ -1066,7 +1099,11 @@ async fn run_turn_cli(
     TurnOutcome {
         result,
         harness_session,
-        failed: is_error || !exit_ok,
+        end: if is_error || !exit_ok {
+            TurnEnd::Failed
+        } else {
+            TurnEnd::Completed
+        },
     }
 }
 
@@ -1518,17 +1555,7 @@ async fn record_outcome(
         .await?;
     }
 
-    let (state, note) = if outcome.failed {
-        (
-            SessionState::Error,
-            format!("turn {turn} failed: {}", snippet(&outcome.result, 160)),
-        )
-    } else {
-        (
-            SessionState::Done,
-            format!("turn {turn} complete: {}", snippet(&outcome.result, 160)),
-        )
-    };
+    let (state, note) = outcome_state(outcome.end, turn, &outcome.result);
     append(
         host,
         channel_ref,
@@ -2657,6 +2684,27 @@ mod tests {
             receiver.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Closed)
         ));
+    }
+
+    #[test]
+    fn outcome_state_maps_each_turn_end() {
+        use SessionState::*;
+        assert!(matches!(
+            outcome_state(TurnEnd::Completed, 1, "ok"),
+            (Done, _)
+        ));
+        assert!(matches!(
+            outcome_state(TurnEnd::Failed, 1, "boom"),
+            (Error, _)
+        ));
+        assert!(matches!(
+            outcome_state(TurnEnd::TimedOut, 1, "slow"),
+            (Error, _)
+        ));
+        // An interrupt is a human choice, not an error: the session lands Done.
+        let (state, note) = outcome_state(TurnEnd::Interrupted, 2, "stopped mid-edit");
+        assert_eq!(state, Done);
+        assert!(note.contains("interrupted"));
     }
 
     #[tokio::test]

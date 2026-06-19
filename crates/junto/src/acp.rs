@@ -23,7 +23,7 @@ use tokio::process::{ChildStdin, ChildStdout};
 use junto_kernel::EntryId;
 
 use crate::agent::McpServer;
-use crate::launch::{LiveEvent, LiveSessions, TURN_TIMEOUT, TurnOutcome};
+use crate::launch::{LiveEvent, LiveSessions, TURN_TIMEOUT, TurnEnd, TurnOutcome};
 
 /// A agent's config as it crosses into one ACP turn
 /// (`docs/superpowers/specs/2026-06-13-agent-personas-design.md`). `mcp_servers`
@@ -231,7 +231,11 @@ pub(crate) async fn run_turn_acp(
                 answer
             },
             harness_session: Some(session_id),
-            failed: stop != "end_turn",
+            end: if stop != "end_turn" {
+                TurnEnd::Failed
+            } else {
+                TurnEnd::Completed
+            },
         })
     };
 
@@ -246,7 +250,7 @@ pub(crate) async fn run_turn_acp(
                 TURN_TIMEOUT.as_secs() / 60
             ),
             harness_session: None,
-            failed: true,
+            end: TurnEnd::TimedOut,
         }),
     }
 }
