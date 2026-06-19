@@ -665,7 +665,7 @@ impl LiveSessions {
     /// Open a fresh feed for a session about to run (replaces any stale one),
     /// returning the control receiver the running turn selects on (human →
     /// turn).
-    fn begin(&self, session: EntryId) -> mpsc::Receiver<TurnControl> {
+    pub(crate) fn begin(&self, session: EntryId) -> mpsc::Receiver<TurnControl> {
         let (sender, _rx) = broadcast::channel(256);
         // Capacity 1: one human, one in-flight signal at a time.
         let (control, control_rx) = mpsc::channel(1);

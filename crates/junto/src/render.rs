@@ -2909,7 +2909,11 @@ fn sessions_section(view: &ChannelView, channel: &ChannelId) -> String {
             SessionState::Working => format!(
                 "<div class=\"live\" data-channel=\"{channel}\" data-session=\"{session_id}\">\
                  <p class=\"live-status\">running — live progress</p>\
-                 <ul class=\"live-feed\"></ul></div>",
+                 <ul class=\"live-feed\"></ul></div>\
+                 <form class=\"act\" method=\"post\" \
+                 action=\"/channels/{channel}/sessions/{session_id}/interrupt\">\
+                 <button>interrupt</button>\
+                 </form>",
                 session_id = entry.id,
             ),
             _ => String::new(),
