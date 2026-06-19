@@ -1651,30 +1651,13 @@ impl LineageModel {
             parent: s.parent,
             converged_into: s.converged_into,
         };
-        let dir = substrate
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned());
         if summaries.is_empty() {
             return LineageModel {
                 mainline: Track::empty(),
                 branches: Vec::new(),
             };
         }
-        // The main-line is an OPEN channel — the ambient one (name == repo dir)
-        // if it exists, else the busiest (most entries) — the de-facto trunk
-        // until real lineage edges name a true spine.
-        let main_id = summaries
-            .iter()
-            .filter(|s| !s.closed)
-            .find(|s| s.name == dir)
-            .or_else(|| {
-                summaries
-                    .iter()
-                    .filter(|s| !s.closed)
-                    .max_by_key(|s| s.entry_count)
-            })
-            .or_else(|| summaries.first())
-            .map(|s| s.id);
+        let main_id = main_line_id(summaries, substrate);
         let mainline = summaries
             .iter()
             .find(|s| Some(s.id) == main_id)
@@ -1688,6 +1671,32 @@ impl LineageModel {
         let branches = others.into_iter().map(track).collect();
         LineageModel { mainline, branches }
     }
+}
+
+/// The **main-line** (de-facto trunk) among one substrate's channels: the
+/// ambient channel whose name is the repo's directory, else the busiest open
+/// channel (most entries), else just the first — until real lineage edges name
+/// a true spine (`docs/adr/0027`). Shared by the strip and the channel page (so
+/// the trunk hides its close action consistently).
+pub fn main_line_id(
+    summaries: &[ChannelSummary],
+    substrate: &std::path::Path,
+) -> Option<ChannelId> {
+    let dir = substrate
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned());
+    summaries
+        .iter()
+        .filter(|s| !s.closed)
+        .find(|s| s.name == dir)
+        .or_else(|| {
+            summaries
+                .iter()
+                .filter(|s| !s.closed)
+                .max_by_key(|s| s.entry_count)
+        })
+        .or_else(|| summaries.first())
+        .map(|s| s.id)
 }
 
 /// Vertical spacing between tracks, in SVG units.
@@ -2301,6 +2310,15 @@ pub fn channel_html(
          </form></details>\n",
         name = escape_html(name),
     );
+    // The ambient channel is this substrate's main-line (the de-facto trunk —
+    // dir-named or busiest, the same channel the strip pins as the main line).
+    // Closing the trunk makes no sense, so it gets no close action.
+    let scoped: Vec<ChannelSummary> = nav
+        .iter()
+        .filter(|summary| summary.substrate == substrate)
+        .cloned()
+        .collect();
+    let is_ambient = main_line_id(&scoped, substrate) == Some(*id);
     let lifecycle = if view.closed {
         format!(
             "<div class=\"closed-banner\">this channel is <strong>closed</strong> — the \
@@ -2312,6 +2330,8 @@ pub fn channel_html(
              <button class=\"primary\">reopen</button>\
              </form></details>\n"
         )
+    } else if is_ambient {
+        String::new()
     } else {
         format!(
             "<details class=\"rename\"><summary>close this channel</summary>\
@@ -2322,10 +2342,53 @@ pub fn channel_html(
              </form></details>\n"
         )
     };
+    // Lineage acts (docs/adr/0027): start a side-quest (diverge), or converge
+    // into another open channel in this substrate. A closed channel offers
+    // neither — it is out of the working set.
+    let lineage_actions = if view.closed {
+        String::new()
+    } else {
+        let mut options = String::new();
+        for summary in nav {
+            if summary.id == *id || summary.closed || summary.substrate != substrate {
+                continue;
+            }
+            let label = summary
+                .name
+                .clone()
+                .unwrap_or_else(|| summary.id.to_string());
+            let _ = write!(
+                options,
+                "<option value=\"{}\">{}</option>",
+                summary.id,
+                escape_html(&label)
+            );
+        }
+        let converge = if options.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "<details class=\"rename\"><summary>converge into another channel</summary>\
+                 <form class=\"act\" method=\"post\" action=\"/channels/{id}/converge\">\
+                 <select name=\"target\" required>{options}</select>\
+                 <input name=\"rationale\" placeholder=\"why it converges — the disposal \
+                 reason\" required>\
+                 <button class=\"primary\">converge &amp; close</button>\
+                 </form></details>\n"
+            )
+        };
+        format!(
+            "<details class=\"rename\"><summary>start a side-quest (diverge)</summary>\
+             <form class=\"act\" method=\"post\" action=\"/channels/{id}/diverge\">\
+             <input name=\"child_name\" placeholder=\"the side-quest's name\" required>\
+             <button class=\"primary\">start side-quest</button>\
+             </form></details>\n{converge}"
+        )
+    };
     let content = format!(
         "<h1>{name}</h1>\n\
          <p class=\"meta\">{count} entries</p>\n\
-         {rename}{lifecycle}{party}{strip}{start_work}{sessions}{standing}{recently}{footer}\
+         {rename}{lifecycle}{lineage_actions}{party}{strip}{start_work}{sessions}{standing}{recently}{footer}\
          <details class=\"ledger\"><summary class=\"board-head\">channel history \
          · {count} entries</summary>\n{body}</details>\n{open_here}",
         name = escape_html(name),
@@ -2342,11 +2405,6 @@ pub fn channel_html(
             workspaces.push(summary.substrate.clone());
         }
     }
-    let scoped: Vec<ChannelSummary> = nav
-        .iter()
-        .filter(|summary| summary.substrate == substrate)
-        .cloned()
-        .collect();
     let model = LineageModel::from_summaries(&scoped, substrate);
     let agents_working = view
         .sessions
@@ -3837,6 +3895,67 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("value=\"old-name\""), "{html}");
+        // An open channel offers the lineage acts (docs/adr/0027).
+        assert!(html.contains("start a side-quest"), "{html}");
+        assert!(
+            html.contains(&format!("/channels/{channel}/diverge")),
+            "{html}"
+        );
+        // A non-ambient channel offers close.
+        assert!(html.contains("close this channel"), "{html}");
+    }
+
+    #[test]
+    fn ambient_channel_hides_close() {
+        // The ambient channel is the substrate's main-line. Here the channel's
+        // name ("junto-dev") is NOT the repo dir ("junto-ledger"), but it is the
+        // busiest channel — so it's the de-facto trunk and hides close.
+        let repo = std::path::PathBuf::from("/repos/junto-ledger");
+        let channel = ChannelId::new();
+        let mut trunk = summary("junto-dev", &repo, 50, 0);
+        trunk.id = channel;
+        let view = view_with(vec![]);
+        let html = channel_html(
+            std::slice::from_ref(&trunk),
+            "junto-dev",
+            &channel,
+            &view,
+            &repo,
+            None,
+        );
+        assert!(!html.contains("close this channel"), "{html}");
+        // …but rename and side-quests are still available.
+        assert!(html.contains("rename this channel"), "{html}");
+        assert!(html.contains("start a side-quest"), "{html}");
+    }
+
+    #[test]
+    fn non_main_line_channel_still_offers_close() {
+        // A second, quieter channel in the same substrate is a branch, not the
+        // trunk — it keeps its close action.
+        let repo = std::path::PathBuf::from("/repos/junto-ledger");
+        let trunk = {
+            let mut s = summary("junto-dev", &repo, 90, 0);
+            s.entry_count = 50;
+            s
+        };
+        let branch_id = ChannelId::new();
+        let branch = {
+            let mut s = summary("a-side-quest", &repo, 50, 0);
+            s.id = branch_id;
+            s.entry_count = 1;
+            s
+        };
+        let view = view_with(vec![]);
+        let html = channel_html(
+            &[trunk, branch],
+            "a-side-quest",
+            &branch_id,
+            &view,
+            &repo,
+            None,
+        );
+        assert!(html.contains("close this channel"), "{html}");
     }
 
     #[test]

@@ -317,7 +317,13 @@ async fn diverge(from: String, child_name: String, at: Option<String>) -> Result
     let code = member_code_for(&author.email)?;
     let at = at.map(|raw| raw.parse::<EntryId>()).transpose()?;
     let child = host
-        .diverge(&from, &child_name, at, author, code.as_deref())
+        .diverge(
+            &from,
+            &child_name,
+            at,
+            author,
+            host::WriteAuth::Agent(code.as_deref()),
+        )
         .await?;
     println!(
         "diverged '{child_name}' from '{from}' (child id {})",
@@ -341,8 +347,14 @@ async fn converge(source: String, into: String, rationale: String) -> Result<()>
     };
     let author = host::git_user(&substrate)?;
     let code = member_code_for(&author.email)?;
-    host.converge(&source, &into, &rationale, author, code.as_deref())
-        .await?;
+    host.converge(
+        &source,
+        &into,
+        &rationale,
+        author,
+        host::WriteAuth::Agent(code.as_deref()),
+    )
+    .await?;
     println!("converged '{source}' into '{into}' — the source is now closed");
     Ok(())
 }
