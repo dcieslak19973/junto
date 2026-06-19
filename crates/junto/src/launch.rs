@@ -1523,16 +1523,23 @@ fn spawn_outcome_loop(
         // Prepare a PR branch the worker commits onto (the push-gate's
         // deliverable). Best-effort: without it, grading falls back to the
         // working-tree diff. workspace_diff self-discovers the recorded base.
-        match prepare_pr_branch(&workspace, session) {
-            Ok(plan) => tracing::info!(
-                "outcome session {session}: committing onto {} (off {})",
-                plan.branch,
-                plan.base
-            ),
-            Err(err) => tracing::warn!(
-                "outcome session {session}: no PR branch ({err:#}); grading the working-tree diff"
-            ),
-        }
+        let branch_plan = match prepare_pr_branch(&workspace, session) {
+            Ok(plan) => {
+                tracing::info!(
+                    "outcome session {session}: committing onto {} (off {})",
+                    plan.branch,
+                    plan.base
+                );
+                Some(plan)
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "outcome session {session}: no PR branch ({err:#}); grading the \
+                     working-tree diff"
+                );
+                None
+            }
+        };
 
         // Each step owns its own clones so the spawned futures stay `Send`.
         let w_host = host.clone();
@@ -1571,6 +1578,7 @@ fn spawn_outcome_loop(
             &workspace,
             &agent,
             &terminal,
+            branch_plan.as_ref(),
         )
         .await
         {
@@ -1817,9 +1825,13 @@ async fn store_grader_report(
     .await
 }
 
-/// Record the loop's terminal: `Done` when satisfied, or an escalation Gate (a
-/// `Proposal` for a human to accept the unfinished work, the session left
-/// `AwaitingApproval`) when the iteration budget ran out (docs/adr/0025).
+/// Record the loop's terminal. **Satisfied** → an "Open the PR" Gate (a
+/// `Proposal`, session left `AwaitingApproval`) when a PR branch is in hand —
+/// opening a PR is a consequential outward action junto gates (a later slice's
+/// executor opens it on approval); without a branch it falls back to `Done`.
+/// **MaxIterationsReached** → the escalation Gate (accept despite unmet
+/// verification). Symmetric — both terminals produce a gate (docs/adr/0025).
+#[allow(clippy::too_many_arguments)]
 async fn finish_outcome(
     host: &Host,
     channel_ref: &str,
@@ -1828,6 +1840,7 @@ async fn finish_outcome(
     workspace: &Path,
     agent: &crate::agent::Agent,
     terminal: &crate::outcome::LoopTerminal,
+    branch_plan: Option<&BranchPlan>,
 ) -> Result<()> {
     // The ACE-style outcome signal (gated) for the future self-improvement
     // Playbook to learn from — recorded for every terminal.
@@ -1838,6 +1851,64 @@ async fn finish_outcome(
     }
     match terminal {
         crate::outcome::LoopTerminal::Satisfied { iterations } => {
+            let Some(plan) = branch_plan else {
+                // No PR branch (the workspace wasn't a clean git repo): the work
+                // is verified but there's nothing to open a PR from.
+                return append(
+                    host,
+                    channel_ref,
+                    LedgerEntry {
+                        id: EntryId::new(),
+                        channel,
+                        author: agent.member(),
+                        timestamp: Timestamp::now(),
+                        payload: EntryPayload::SessionUpdated {
+                            target: session,
+                            state: SessionState::Done,
+                            note: format!(
+                                "verified green after {iterations} iteration(s) (no PR branch)"
+                            ),
+                        },
+                    },
+                )
+                .await;
+            };
+            // Gate the PR-open: opening a PR is a consequential outward action.
+            let junto_home = crate::host::junto_home()?;
+            let mut provenance = Vec::new();
+            if let Some(diff) = workspace_diff(workspace) {
+                provenance.push(store_artifact(
+                    &junto_home,
+                    &session,
+                    "deliverable-diff.patch",
+                    &diff,
+                )?);
+            }
+            append(
+                host,
+                channel_ref,
+                LedgerEntry {
+                    id: EntryId::new(),
+                    channel,
+                    author: agent.member(),
+                    timestamp: Timestamp::now(),
+                    payload: EntryPayload::Proposal {
+                        action: format!(
+                            "Open a pull request for this verified deliverable ({} → {})",
+                            plan.branch, plan.base
+                        ),
+                        rationale: format!(
+                            "The Outcome was verified green after {iterations} iteration(s). \
+                             Approve to push '{}' and open the pull request against '{}'.",
+                            plan.branch, plan.base
+                        ),
+                        provenance,
+                        requirement: junto_kernel::ApprovalRequirement::Count(1),
+                        frame: None,
+                    },
+                },
+            )
+            .await?;
             append(
                 host,
                 channel_ref,
@@ -1848,8 +1919,11 @@ async fn finish_outcome(
                     timestamp: Timestamp::now(),
                     payload: EntryPayload::SessionUpdated {
                         target: session,
-                        state: SessionState::Done,
-                        note: format!("verified green after {iterations} iteration(s)"),
+                        state: SessionState::AwaitingApproval,
+                        note: format!(
+                            "verified green after {iterations} iteration(s); awaiting approval \
+                             to open the pull request"
+                        ),
                     },
                 },
             )
