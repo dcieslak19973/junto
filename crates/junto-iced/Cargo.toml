@@ -13,6 +13,8 @@ description = "Spike: a native (Iced) multi-channel pane workspace over the junt
 [dependencies]
 iced = { version = "0.13", features = ["tokio", "markdown"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# Open markdown links (PR/doc pages) in the OS browser, like the Tauri shell does.
+open = "5"
 
 [workspace]
 # standalone — see the header comment
