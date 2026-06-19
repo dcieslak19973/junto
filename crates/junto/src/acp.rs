@@ -129,9 +129,10 @@ pub(crate) async fn run_turn_acp(
     let mut reader = BufReader::new(stdout).lines();
     let cwd = workspace.display().to_string();
 
-    // The whole exchange runs under the turn timeout; on timeout the future
-    // drops and kill_on_drop reaps the adapter (and its Claude Code child).
-    let exchange = async {
+    // Handshake (initialize → session → set_mode) under a setup-timeout budget;
+    // a setup failure or timeout bubbles as `Err` so the caller can fall back to
+    // the CLI (`docs/adr/0024`). On drop, kill_on_drop reaps the adapter.
+    let setup = async {
         // 1. initialize
         request(
             &mut stdin,
@@ -206,61 +207,90 @@ pub(crate) async fn run_turn_acp(
         pump_until(&mut reader, &mut stdin, 3, live, session, &mut sink)
             .await
             .context("ACP session/set_mode")?;
+        Ok::<String, anyhow::Error>(session_id)
+    };
+    let session_id = match tokio::time::timeout(TURN_TIMEOUT, setup).await {
+        Ok(Ok(session_id)) => session_id,
+        // A setup/handshake error → bubble up so the caller can fall back.
+        Ok(Err(err)) => return Err(err),
+        Err(_) => bail!("ACP setup exceeded the timeout"),
+    };
 
-        // 4. prompt — updates stream into `answer` while we await the response.
+    // 4. steerable prompt loop. Each prompt gets a fresh timeout budget (a steer
+    // is a new instruction). The adapter process + ACP session stay alive across
+    // a cancel → re-prompt, so a steer continues with full context in place
+    // (`docs/adr/0032`).
+    let mut text = prompt.to_string();
+    let mut answer = String::new();
+    let mut prompt_id = 4_i64;
+    loop {
         request(
             &mut stdin,
-            4,
+            prompt_id,
             "session/prompt",
             json!({
                 "sessionId": session_id,
-                "prompt": [{ "type": "text", "text": prompt }]
+                "prompt": [{ "type": "text", "text": text }]
             }),
         )
         .await?;
-        let mut answer = String::new();
-        let pumped = pump_prompt(
-            &mut reader,
-            &mut stdin,
-            4,
-            &session_id,
-            live,
-            session,
-            &mut answer,
-            control,
+        let pumped = match tokio::time::timeout(
+            TURN_TIMEOUT,
+            pump_prompt(
+                &mut reader,
+                &mut stdin,
+                prompt_id,
+                &session_id,
+                live,
+                session,
+                &mut answer,
+                control,
+            ),
         )
         .await
-        .context("ACP session/prompt")?;
-
+        {
+            Ok(Ok(pumped)) => pumped,
+            Ok(Err(err)) => return Err(err.context("ACP session/prompt")),
+            Err(_) => {
+                return Ok(TurnOutcome {
+                    result: format!(
+                        "turn exceeded the {}-minute timeout and was killed (docs/adr/0023)",
+                        TURN_TIMEOUT.as_secs() / 60
+                    ),
+                    harness_session: Some(session_id),
+                    end: TurnEnd::TimedOut,
+                });
+            }
+        };
         let stop = pumped
             .result
             .get("stopReason")
             .and_then(|v| v.as_str())
-            .unwrap_or("end_turn");
-        Ok::<TurnOutcome, anyhow::Error>(TurnOutcome {
-            result: if answer.trim().is_empty() {
-                format!("(agent produced no message; stop reason: {stop})")
-            } else {
-                answer
-            },
-            harness_session: Some(session_id),
-            end: classify_prompt_end(stop, pumped.interrupted_with.is_some()),
-        })
-    };
-
-    match tokio::time::timeout(TURN_TIMEOUT, exchange).await {
-        Ok(Ok(outcome)) => Ok(outcome),
-        // A setup/handshake error → bubble up so the caller can fall back.
-        Ok(Err(err)) => Err(err),
-        // A timeout is a real overran turn, not a setup failure — not a fallback.
-        Err(_) => Ok(TurnOutcome {
-            result: format!(
-                "turn exceeded the {}-minute timeout and was killed (docs/adr/0023)",
-                TURN_TIMEOUT.as_secs() / 60
-            ),
-            harness_session: None,
-            end: TurnEnd::TimedOut,
-        }),
+            .unwrap_or("end_turn")
+            .to_string();
+        match next_loop_step(&stop, pumped.interrupted_with) {
+            LoopStep::Reprompt(message) => {
+                live.publish(
+                    session,
+                    LiveEvent::new("status", format!("steering: {message}")),
+                );
+                text = message;
+                answer.clear();
+                prompt_id += 1;
+                continue;
+            }
+            LoopStep::Done(end) => {
+                return Ok(TurnOutcome {
+                    result: if answer.trim().is_empty() {
+                        format!("(agent produced no message; stop reason: {stop})")
+                    } else {
+                        answer
+                    },
+                    harness_session: Some(session_id),
+                    end,
+                });
+            }
+        }
     }
 }
 
@@ -299,6 +329,24 @@ fn classify_prompt_end(stop_reason: &str, interrupted: bool) -> TurnEnd {
         TurnEnd::Completed
     } else {
         TurnEnd::Failed
+    }
+}
+
+/// The next step of the steerable prompt loop after a prompt drained.
+enum LoopStep {
+    /// A steer arrived: re-prompt the same session in place with this text.
+    Reprompt(String),
+    /// The turn is over with this end-state.
+    Done(TurnEnd),
+}
+
+/// Decide the loop's next step from how the prompt ended. A steer re-prompts; a
+/// bare interrupt ends the turn; otherwise the adapter's stop reason decides.
+fn next_loop_step(stop_reason: &str, interrupted_with: Option<TurnControl>) -> LoopStep {
+    match interrupted_with {
+        Some(TurnControl::Steer(message)) => LoopStep::Reprompt(message),
+        Some(TurnControl::Interrupt) => LoopStep::Done(TurnEnd::Interrupted),
+        None => LoopStep::Done(classify_prompt_end(stop_reason, false)),
     }
 }
 
@@ -540,6 +588,22 @@ mod tests {
         // A human interrupt wins regardless of the adapter's stop reason.
         assert_eq!(classify_prompt_end("cancelled", true), TurnEnd::Interrupted);
         assert_eq!(classify_prompt_end("end_turn", true), TurnEnd::Interrupted);
+    }
+
+    #[test]
+    fn steer_reprompts_other_signals_end_the_turn() {
+        match next_loop_step("cancelled", Some(TurnControl::Steer("do X instead".into()))) {
+            LoopStep::Reprompt(m) => assert_eq!(m, "do X instead"),
+            _ => panic!("steer should re-prompt"),
+        }
+        assert!(matches!(
+            next_loop_step("cancelled", Some(TurnControl::Interrupt)),
+            LoopStep::Done(TurnEnd::Interrupted)
+        ));
+        assert!(matches!(
+            next_loop_step("end_turn", None),
+            LoopStep::Done(TurnEnd::Completed)
+        ));
     }
 
     #[test]
