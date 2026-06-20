@@ -100,6 +100,8 @@ struct Pane {
     /// Entry ids with a verification act in flight — drives the "recording…"
     /// feedback and disables the buttons until the host responds.
     act_pending: HashSet<String>,
+    /// The timeline scrollable's id, so we can snap it to the newest entry.
+    scroll_id: scrollable::Id,
 }
 
 enum Content {
@@ -395,13 +397,23 @@ impl App {
                 }
             },
             Message::Fetched(pane, result) => {
-                if let Some(state) = self.panes.get_mut(pane) {
-                    state.content = match result {
-                        Ok(dto) => Content::Loaded(dto),
-                        Err(err) => Content::Error(err),
-                    };
+                let Some(state) = self.panes.get_mut(pane) else {
+                    return Task::none();
+                };
+                match result {
+                    Ok(dto) => {
+                        state.content = Content::Loaded(dto);
+                        // Jump to the newest entry (bottom) by default.
+                        scrollable::snap_to(
+                            state.scroll_id.clone(),
+                            scrollable::RelativeOffset::END,
+                        )
+                    }
+                    Err(err) => {
+                        state.content = Content::Error(err);
+                        Task::none()
+                    }
                 }
-                Task::none()
             }
             Message::Refresh(pane) => {
                 if let Some(state) = self.panes.get_mut(pane) {
@@ -911,11 +923,12 @@ fn pane_body<'a>(
                 pending_for(entry),
             ));
         }
+        let scroll = scrollable(timeline)
+            .id(pane.scroll_id.clone())
+            .height(Fill);
         match pinned {
-            Some(pinned) => column![pinned, scrollable(timeline).height(Fill)]
-                .spacing(8)
-                .into(),
-            None => scrollable(timeline).height(Fill).into(),
+            Some(pinned) => column![pinned, scroll].spacing(8).into(),
+            None => scroll.into(),
         }
     };
 
@@ -1227,6 +1240,7 @@ impl Pane {
             act_drafts: HashMap::new(),
             act_errors: HashMap::new(),
             act_pending: HashSet::new(),
+            scroll_id: scrollable::Id::unique(),
         }
     }
 }
