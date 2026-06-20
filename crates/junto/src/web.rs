@@ -81,6 +81,7 @@ pub fn router(host: Arc<Host>) -> Router {
         .route("/focus.json", get(focus_json))
         .route("/agents.json", get(agents_json))
         .route("/workspaces.json", get(workspaces_json))
+        .route("/substrates.json", get(substrates_json))
         .route("/channels/{channel}/entries/{entry}/{act}", post(verify))
         .with_state(host)
         // Wrap any plain-text error response in a styled page (so a refused
@@ -1590,6 +1591,18 @@ async fn focus_json(State(host): State<Arc<Host>>) -> Response {
         }
     }
     axum::Json(items).into_response()
+}
+
+/// The registered **home substrates** (repo paths) — for the native new-channel
+/// form to pick which substrate a channel opens in (when more than one).
+async fn substrates_json(State(host): State<Arc<Host>>) -> Response {
+    let paths: Vec<String> = host
+        .substrate_paths()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    axum::Json(paths).into_response()
 }
 
 /// Distinct **workspace repos**, most-recently-used first — the launch form's

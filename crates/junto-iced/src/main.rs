@@ -70,6 +70,14 @@ struct App {
     agents: Vec<AgentDto>,
     /// Distinct workspace repos, most-recent first — the inferred launch default.
     recent_workspaces: Vec<String>,
+    /// The name typed into the "new channel" box.
+    new_channel: String,
+    /// The last create-channel error, if any.
+    new_channel_error: Option<String>,
+    /// Registered home substrates; a new channel opens in the chosen one.
+    substrates: Vec<String>,
+    /// The substrate selected for the next new channel.
+    new_channel_repo: Option<String>,
 }
 
 struct Pane {
@@ -129,6 +137,16 @@ struct Pane {
     /// and Iced actually restarts it for a new turn (a finished subscription
     /// with an unchanged id is never restarted — the Iced footgun).
     stream_nonce: u64,
+    /// The channel lifecycle form currently open in this pane, if any.
+    lifecycle: Option<LifecycleKind>,
+    /// The lifecycle form's text input (a rationale or a side-quest name).
+    lifecycle_text: String,
+    /// The converge target channel name.
+    lifecycle_target: String,
+    /// A lifecycle act is in flight.
+    lifecycle_pending: bool,
+    /// The last lifecycle act's error, if it failed.
+    lifecycle_error: Option<String>,
 }
 
 enum Content {
@@ -282,6 +300,26 @@ struct FrameOptionDto {
     rationale: String,
 }
 
+/// A channel lifecycle act the pane can perform (`docs/adr/0022`/`0027`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LifecycleKind {
+    Close,
+    Reopen,
+    Diverge,
+    Converge,
+}
+
+impl LifecycleKind {
+    fn label(self) -> &'static str {
+        match self {
+            LifecycleKind::Close => "close channel",
+            LifecycleKind::Reopen => "reopen channel",
+            LifecycleKind::Diverge => "diverge (side-quest)",
+            LifecycleKind::Converge => "converge into…",
+        }
+    }
+}
+
 /// The fetch state of an artifact's inline content (`/artifacts/{id}/content.json`).
 enum ArtifactContent {
     Loading,
@@ -355,6 +393,26 @@ enum Message {
     ToggleLaunchOptions(pane_grid::Pane),
     /// Show all entries vs. the recent brief.
     ToggleHistory(pane_grid::Pane),
+    // Channel lifecycle acts.
+    /// Open (or toggle off) a lifecycle form in a pane.
+    LifecycleSelect(pane_grid::Pane, LifecycleKind),
+    /// Cancel the open lifecycle form.
+    LifecycleCancel(pane_grid::Pane),
+    LifecycleTextChanged(pane_grid::Pane, String),
+    LifecycleTargetChanged(pane_grid::Pane, String),
+    /// Submit the open lifecycle act.
+    LifecycleSubmit(pane_grid::Pane),
+    /// A lifecycle act finished: Ok(Some(name)) opens that channel; Ok(None)
+    /// just refreshes; Err carries the message.
+    LifecycleDone(pane_grid::Pane, Result<Option<String>, String>),
+    SubstratesLoaded(Vec<String>),
+    NewChannelRepoChanged(String),
+    /// The "new channel" name box.
+    NewChannelChanged(String),
+    /// Create a channel from the new-channel box.
+    CreateChannel,
+    /// A channel was created (Ok = its name to open) or failed.
+    ChannelCreated(Result<String, String>),
     /// A clicked Markdown link in the live feed — currently ignored.
     NoOp,
 }
@@ -371,6 +429,10 @@ impl App {
             focus_items: Vec::new(),
             agents: Vec::new(),
             recent_workspaces: Vec::new(),
+            new_channel: String::new(),
+            new_channel_error: None,
+            substrates: Vec::new(),
+            new_channel_repo: None,
         };
         (
             app,
@@ -381,6 +443,7 @@ impl App {
                 fetch_focus(),
                 fetch_agents(),
                 fetch_workspaces(),
+                fetch_substrates(),
             ]),
         )
     }
@@ -814,6 +877,122 @@ impl App {
                 }
                 Task::none()
             }
+            Message::LifecycleSelect(pane, kind) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    // Toggle off if the same form is already open.
+                    state.lifecycle = (state.lifecycle != Some(kind)).then_some(kind);
+                    state.lifecycle_text.clear();
+                    state.lifecycle_target.clear();
+                    state.lifecycle_error = None;
+                }
+                Task::none()
+            }
+            Message::LifecycleCancel(pane) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    state.lifecycle = None;
+                    state.lifecycle_error = None;
+                }
+                Task::none()
+            }
+            Message::LifecycleTextChanged(pane, value) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    state.lifecycle_text = value;
+                }
+                Task::none()
+            }
+            Message::LifecycleTargetChanged(pane, value) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    state.lifecycle_target = value;
+                }
+                Task::none()
+            }
+            Message::LifecycleSubmit(pane) => {
+                let Some(state) = self.panes.get_mut(pane) else {
+                    return Task::none();
+                };
+                let Some(kind) = state.lifecycle else {
+                    return Task::none();
+                };
+                let text = state.lifecycle_text.trim().to_string();
+                let target = state.lifecycle_target.trim().to_string();
+                // Validate the inputs each act needs.
+                let valid = match kind {
+                    LifecycleKind::Close | LifecycleKind::Reopen | LifecycleKind::Diverge => {
+                        !text.is_empty()
+                    }
+                    LifecycleKind::Converge => !text.is_empty() && !target.is_empty(),
+                };
+                if !valid {
+                    return Task::none();
+                }
+                state.lifecycle_pending = true;
+                state.lifecycle_error = None;
+                post_lifecycle(pane, state.channel.clone(), kind, text, target)
+            }
+            Message::LifecycleDone(pane, result) => {
+                let Some(state) = self.panes.get_mut(pane) else {
+                    return Task::none();
+                };
+                state.lifecycle_pending = false;
+                match result {
+                    Ok(open_name) => {
+                        state.lifecycle = None;
+                        state.lifecycle_error = None;
+                        let channel = state.channel.clone();
+                        let mut tasks =
+                            vec![fetch(pane, &channel), fetch_lineage_graph(), fetch_channels()];
+                        // Diverge yields a child to open in its own pane.
+                        if let Some(name) = open_name {
+                            let (_, task) = self.open_or_focus(&name);
+                            tasks.push(task);
+                        }
+                        Task::batch(tasks)
+                    }
+                    Err(err) => {
+                        state.lifecycle_error = Some(err);
+                        Task::none()
+                    }
+                }
+            }
+            Message::SubstratesLoaded(paths) => {
+                // Default the new-channel substrate to the first registered one.
+                self.new_channel_repo = paths.first().cloned();
+                self.substrates = paths;
+                Task::none()
+            }
+            Message::NewChannelRepoChanged(repo) => {
+                self.new_channel_repo = Some(repo);
+                Task::none()
+            }
+            Message::NewChannelChanged(value) => {
+                self.new_channel = value;
+                Task::none()
+            }
+            Message::CreateChannel => {
+                let name = self.new_channel.trim().to_string();
+                if name.is_empty() {
+                    return Task::none();
+                }
+                self.new_channel_error = None;
+                // Pass the chosen substrate only when more than one is registered
+                // (the host requires it then; with one it infers it).
+                let repo = (self.substrates.len() > 1)
+                    .then(|| self.new_channel_repo.clone())
+                    .flatten();
+                post_create_channel(name, repo)
+            }
+            Message::ChannelCreated(result) => match result {
+                Ok(name) => {
+                    self.new_channel.clear();
+                    self.new_channel_error = None;
+                    let (_, open) = self.open_or_focus(&name);
+                    Task::batch([open, fetch_channels(), fetch_lineage_graph()])
+                }
+                Err(err) => {
+                    self.new_channel_error = Some(err);
+                    Task::none()
+                }
+            },
             Message::NoOp => Task::none(),
         }
     }
@@ -841,18 +1020,45 @@ impl App {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        let adder = row![
-            text("open a channel ▸").size(13).color(MUTED),
+        let adder_row = row![
+            text("open ▸").size(13).color(MUTED),
             combo_box(
                 &self.channels,
                 "type to search channels…",
                 None,
                 Message::ChannelPicked,
             )
-            .width(320),
+            .width(260),
+            text("· new ▸").size(13).color(MUTED),
+            text_input("new channel name…", &self.new_channel)
+                .on_input(Message::NewChannelChanged)
+                .on_submit(Message::CreateChannel)
+                .width(200)
+                .padding(6),
         ]
         .spacing(8)
         .align_y(Center);
+        // When several substrates are registered, the host needs to know which.
+        let adder_row = if self.substrates.len() > 1 {
+            adder_row.push(
+                pick_list(
+                    self.substrates.clone(),
+                    self.new_channel_repo.clone(),
+                    Message::NewChannelRepoChanged,
+                )
+                .text_size(12)
+                .padding(6),
+            )
+        } else {
+            adder_row
+        };
+        let adder_row = adder_row.push(button("create").on_press(Message::CreateChannel).padding(6));
+        let adder: Element<Message> = match &self.new_channel_error {
+            Some(err) => column![adder_row, text(format!("⚠ {err}")).size(11).color(RED)]
+                .spacing(4)
+                .into(),
+            None => adder_row.into(),
+        };
 
         // The always-visible branch graph: the *whole* lineage DAG (every
         // channel, every diverge/converge), with currently-open channels
@@ -1004,6 +1210,89 @@ fn column_pane<'a>(
         .into()
 }
 
+/// The inline form for a channel lifecycle act: the inputs it needs, a
+/// confirm/cancel row, and any error.
+fn lifecycle_form(
+    id: pane_grid::Pane,
+    pane: &Pane,
+    kind: LifecycleKind,
+) -> Element<'_, Message> {
+    let mut col = column![].spacing(6);
+    match kind {
+        LifecycleKind::Diverge => {
+            col = col.push(
+                text_input("side-quest name…", &pane.lifecycle_text)
+                    .on_input(move |v| Message::LifecycleTextChanged(id, v))
+                    .on_submit(Message::LifecycleSubmit(id))
+                    .size(12)
+                    .padding(6),
+            );
+        }
+        LifecycleKind::Converge => {
+            col = col
+                .push(
+                    text_input("target channel name…", &pane.lifecycle_target)
+                        .on_input(move |v| Message::LifecycleTargetChanged(id, v))
+                        .size(12)
+                        .padding(6),
+                )
+                .push(
+                    text_input("rationale (required)…", &pane.lifecycle_text)
+                        .on_input(move |v| Message::LifecycleTextChanged(id, v))
+                        .on_submit(Message::LifecycleSubmit(id))
+                        .size(12)
+                        .padding(6),
+                );
+        }
+        LifecycleKind::Close | LifecycleKind::Reopen => {
+            col = col.push(
+                text_input("rationale (required)…", &pane.lifecycle_text)
+                    .on_input(move |v| Message::LifecycleTextChanged(id, v))
+                    .on_submit(Message::LifecycleSubmit(id))
+                    .size(12)
+                    .padding(6),
+            );
+        }
+    }
+    let confirm_label = if pane.lifecycle_pending {
+        "working…"
+    } else {
+        kind.label()
+    };
+    let mut confirm = button(text(confirm_label).size(11))
+        .padding([3, 10])
+        .style(|_t, _s| chip_style(GREEN, true));
+    if !pane.lifecycle_pending {
+        confirm = confirm.on_press(Message::LifecycleSubmit(id));
+    }
+    col = col.push(
+        row![
+            confirm,
+            button(text("cancel").size(11))
+                .on_press(Message::LifecycleCancel(id))
+                .padding([3, 10])
+                .style(|_t, _s| chip_style(MUTED, false)),
+        ]
+        .spacing(6),
+    );
+    if let Some(err) = &pane.lifecycle_error {
+        col = col.push(text(format!("⚠ {err}")).size(11).color(RED));
+    }
+    container(col)
+        .padding(8)
+        .width(Fill)
+        .style(|_theme| container::Style {
+            background: Some(Background::Color(Color { a: 0.4, ..SURFACE })),
+            border: Border {
+                color: BORDER,
+                width: 1.0,
+                radius: 4.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
 fn pane_body<'a>(
     id: pane_grid::Pane,
     pane: &'a Pane,
@@ -1026,15 +1315,46 @@ fn pane_body<'a>(
     // Parsed Markdown for a session memo entry's summary, if any.
     let summary_md_for = |entry: &EntryDto| pane.entry_md.get(&entry.id).map(Vec::as_slice);
 
-    // The channel's own header: just the party now (lineage lives in the top
-    // window-wide branch graph, so the per-pane strip is gone).
-    let mut header = column![].spacing(8);
+    // The channel's own header: the party, a closed badge, and the lifecycle
+    // acts (lineage lives in the top window-wide branch graph).
+    let mut header = column![].spacing(6);
+    let mut party_row = row![].spacing(8).align_y(Center);
     if !dto.party.is_empty() {
-        header = header.push(
+        party_row = party_row.push(
             text(format!("party: {}", dto.party.join(", ")))
                 .size(12)
                 .color(MUTED),
         );
+    }
+    if dto.closed {
+        party_row = party_row.push(badge("closed", RED));
+    }
+    header = header.push(party_row);
+    // Lifecycle act buttons; a closed channel only offers reopen.
+    let acts: &[LifecycleKind] = if dto.closed {
+        &[LifecycleKind::Reopen]
+    } else {
+        &[
+            LifecycleKind::Diverge,
+            LifecycleKind::Converge,
+            LifecycleKind::Close,
+        ]
+    };
+    let mut bar = row![text("channel ▸").size(11).color(MUTED)]
+        .spacing(6)
+        .align_y(Center);
+    for &k in acts {
+        let active = pane.lifecycle == Some(k);
+        bar = bar.push(
+            button(text(k.label()).size(11))
+                .on_press(Message::LifecycleSelect(id, k))
+                .padding([2, 8])
+                .style(move |_t, _s| chip_style(MUTED, active)),
+        );
+    }
+    header = header.push(bar);
+    if let Some(kind) = pane.lifecycle {
+        header = header.push(lifecycle_form(id, pane, kind));
     }
 
     // Launch a session: intent + agent picker + mode toggle + workspace.
@@ -1762,6 +2082,11 @@ impl Pane {
             entry_md: HashMap::new(),
             watch_newest: false,
             stream_nonce: 0,
+            lifecycle: None,
+            lifecycle_text: String::new(),
+            lifecycle_target: String::new(),
+            lifecycle_pending: false,
+            lifecycle_error: None,
         }
     }
 }
@@ -2134,6 +2459,20 @@ fn fetch_artifact(pane: pane_grid::Pane, channel: String, artifact: String) -> T
     )
 }
 
+/// Fetch the registered home substrates for the new-channel picker.
+fn fetch_substrates() -> Task<Message> {
+    let url = format!("{HOST}/substrates.json");
+    Task::perform(
+        async move {
+            match reqwest::get(&url).await {
+                Ok(response) => response.json::<Vec<String>>().await.unwrap_or_default(),
+                Err(_) => Vec::new(),
+            }
+        },
+        Message::SubstratesLoaded,
+    )
+}
+
 /// Fetch the recent workspace repos for the launch default/suggestions.
 fn fetch_workspaces() -> Task<Message> {
     let url = format!("{HOST}/workspaces.json");
@@ -2313,6 +2652,84 @@ fn post_act(
             let _ = request.send().await;
         },
         move |()| Message::Posted(pane),
+    )
+}
+
+/// POST a channel lifecycle act (close / reopen / diverge / converge) and
+/// report the result. Diverge returns the child's name to open.
+fn post_lifecycle(
+    pane: pane_grid::Pane,
+    channel: String,
+    kind: LifecycleKind,
+    text: String,
+    target: String,
+) -> Task<Message> {
+    let (path, form, open_name) = match kind {
+        LifecycleKind::Close => ("close", vec![("rationale", text)], None),
+        LifecycleKind::Reopen => ("reopen", vec![("rationale", text)], None),
+        LifecycleKind::Diverge => (
+            "diverge",
+            vec![("child_name", text.clone())],
+            Some(text), // open the new side-quest by name
+        ),
+        LifecycleKind::Converge => (
+            "converge",
+            vec![("target", target), ("rationale", text)],
+            None,
+        ),
+    };
+    let url = format!("{HOST}/channels/{channel}/{path}");
+    Task::perform(
+        async move {
+            match reqwest::Client::new().post(&url).form(&form).send().await {
+                Ok(resp) if resp.status().is_success() => Ok(open_name),
+                Ok(resp) => {
+                    let code = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    let body = body.trim();
+                    Err(if body.is_empty() {
+                        format!("{path} failed ({code})")
+                    } else {
+                        format!("{code}: {body}")
+                    })
+                }
+                Err(err) => Err(format!("request failed: {err}")),
+            }
+        },
+        move |result| Message::LifecycleDone(pane, result),
+    )
+}
+
+/// POST a new channel (open) and report the result (the name to open on success).
+fn post_create_channel(name: String, repo: Option<String>) -> Task<Message> {
+    let url = format!("{HOST}/channels");
+    Task::perform(
+        async move {
+            let mut form = vec![("name", name.clone())];
+            if let Some(repo) = repo {
+                form.push(("repo", repo));
+            }
+            match reqwest::Client::new()
+                .post(&url)
+                .form(&form)
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => Ok(name),
+                Ok(resp) => {
+                    let code = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    let body = body.trim();
+                    Err(if body.is_empty() {
+                        format!("create failed ({code})")
+                    } else {
+                        format!("{code}: {body}")
+                    })
+                }
+                Err(err) => Err(format!("request failed: {err}")),
+            }
+        },
+        Message::ChannelCreated,
     )
 }
 
