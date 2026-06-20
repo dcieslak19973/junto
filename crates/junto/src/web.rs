@@ -1686,7 +1686,12 @@ async fn workspaces_json(State(host): State<Arc<Host>>) -> Response {
         .await
         .unwrap_or_default()
         .into_iter()
-        .map(|s| (s.id.to_string(), s.last_activity.map(|t| t.as_millis()).unwrap_or(0)))
+        .map(|s| {
+            (
+                s.id.to_string(),
+                s.last_activity.map(|t| t.as_millis()).unwrap_or(0),
+            )
+        })
         .collect();
     // Newest channel's repo first; dedup repos keeping their best (latest) rank.
     let mut ranked: Vec<(i64, String)> = mappings
@@ -1848,10 +1853,7 @@ async fn lineage_json(State(host): State<Arc<Host>>) -> Response {
 /// assessment.md`) renders into its own widgets. Mirrors what the HTML channel
 /// page shows: party, lineage edges (the split history), and the entry timeline
 /// with each entry's derived status. Read-only; acts stay POST routes.
-async fn channel_view_json(
-    State(host): State<Arc<Host>>,
-    Path(channel): Path<String>,
-) -> Response {
+async fn channel_view_json(State(host): State<Arc<Host>>, Path(channel): Path<String>) -> Response {
     match project(&host, &channel).await {
         Ok((id, view, _substrate)) => {
             // Resolve lineage edges' other-channel ids to names for the strip.
@@ -1998,7 +2000,9 @@ impl EntryDto {
             EntryPayload::MemberAdded { member } => {
                 ("member", format!("added {}", member.display_name))
             }
-            EntryPayload::ChannelClosed { rationale } => ("channel", format!("closed — {rationale}")),
+            EntryPayload::ChannelClosed { rationale } => {
+                ("channel", format!("closed — {rationale}"))
+            }
             EntryPayload::ChannelReopened { rationale } => {
                 ("channel", format!("reopened — {rationale}"))
             }
@@ -2013,7 +2017,9 @@ impl EntryDto {
                 ("lineage", "received a convergence".to_string())
             }
             EntryPayload::Assertion { statement, .. } => ("assertion", statement.clone()),
-            EntryPayload::Ratification { rationale, .. } => ("act", format!("ratified — {rationale}")),
+            EntryPayload::Ratification { rationale, .. } => {
+                ("act", format!("ratified — {rationale}"))
+            }
             EntryPayload::Park { rationale, .. } => ("act", format!("parked — {rationale}")),
             EntryPayload::Correction { statement, .. } => {
                 ("act", format!("corrected — {statement}"))

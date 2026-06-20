@@ -453,7 +453,13 @@ pub fn all_workspaces(junto_home: &Path) -> Result<Vec<(ChannelId, PathBuf)>> {
     Ok(file
         .workspaces
         .into_iter()
-        .filter_map(|record| record.repos.into_iter().next().map(|repo| (record.channel, repo)))
+        .filter_map(|record| {
+            record
+                .repos
+                .into_iter()
+                .next()
+                .map(|repo| (record.channel, repo))
+        })
         .collect())
 }
 
@@ -2888,8 +2894,11 @@ mod tests {
         let session = EntryId::new();
         let _rx = live.begin(session);
         // Two frames of the same growing segment (seq 1) keep only the latest.
-        live.publish(session, LiveEvent::segment("assistant", "<p>hel</p>", 1));
-        live.publish(session, LiveEvent::segment("assistant", "<p>hello</p>", 1));
+        live.publish(session, LiveEvent::segment("assistant", "hel", "<p>hel</p>", 1));
+        live.publish(
+            session,
+            LiveEvent::segment("assistant", "hello", "<p>hello</p>", 1),
+        );
         // A discrete line (seq 0) always appends.
         live.publish(session, LiveEvent::new("tool", "Bash: ls"));
         let (buffer, _rx2) = live.subscribe(session).expect("feed live");

@@ -12,8 +12,8 @@ use std::collections::{HashMap, HashSet};
 use iced::widget::canvas::{self, Canvas, Frame, Geometry, Path, Stroke};
 use iced::widget::pane_grid;
 use iced::widget::{
-    button, checkbox, column, combo_box, container, markdown, pick_list, row, scrollable, text,
-    text_input, Space,
+    Space, button, checkbox, column, combo_box, container, markdown, pick_list, row, scrollable,
+    text, text_input,
 };
 use iced::{
     Background, Border, Center, Color, Element, Fill, Length, Point, Rectangle, Renderer, Size,
@@ -900,7 +900,11 @@ impl App {
                 }
                 let channel = state.channel.clone();
                 let agent = state.launch_agent.as_ref().map(|a| a.slug.clone());
-                let mode = if state.launch_outcome { "outcome" } else { "single" };
+                let mode = if state.launch_outcome {
+                    "outcome"
+                } else {
+                    "single"
+                };
                 let workspace = state.launch_workspace.trim().to_string();
                 // Keep the intent until the launch succeeds, so a failed launch
                 // doesn't lose what was typed.
@@ -968,7 +972,8 @@ impl App {
                 let Some(state) = self.panes.get_mut(pane) else {
                     return Task::none();
                 };
-                let (Some(session), text) = (state.watched.clone(), state.steer_text.trim().to_string())
+                let (Some(session), text) =
+                    (state.watched.clone(), state.steer_text.trim().to_string())
                 else {
                     return Task::none();
                 };
@@ -1115,8 +1120,11 @@ impl App {
                             state.channel = new_name.clone();
                         }
                         let channel = state.channel.clone();
-                        let mut tasks =
-                            vec![fetch(pane, &channel), fetch_lineage_graph(), fetch_channels()];
+                        let mut tasks = vec![
+                            fetch(pane, &channel),
+                            fetch_lineage_graph(),
+                            fetch_channels(),
+                        ];
                         // Diverge yields a child to open in its own pane.
                         if let LifecycleResult::OpenChild(name) = outcome {
                             let (_, task) = self.open_or_focus(&name);
@@ -1391,7 +1399,11 @@ impl App {
                     .agent_harness
                     .as_ref()
                     .map(|h| h.id.clone())
-                    .or_else(|| self.settings.as_ref().and_then(|s| s.harnesses.first().map(|h| h.id.clone())))
+                    .or_else(|| {
+                        self.settings
+                            .as_ref()
+                            .and_then(|s| s.harnesses.first().map(|h| h.id.clone()))
+                    })
                     .unwrap_or_else(|| "claude".into());
                 self.agent_msg = None;
                 post_save_agent(
@@ -1455,7 +1467,8 @@ impl App {
             .collect();
         // A slow ambient refresh so the focus board / lineage stay live as
         // agents work and sync pulls entries (panes are left alone).
-        let tick = iced::time::every(std::time::Duration::from_secs(20)).map(|_| Message::AutoRefresh);
+        let tick =
+            iced::time::every(std::time::Duration::from_secs(20)).map(|_| Message::AutoRefresh);
         iced::Subscription::batch(streams.into_iter().chain([tick]))
     }
 
@@ -1492,7 +1505,8 @@ impl App {
         } else {
             adder_row
         };
-        let adder_row = adder_row.push(button("create").on_press(Message::CreateChannel).padding(6));
+        let adder_row =
+            adder_row.push(button("create").on_press(Message::CreateChannel).padding(6));
         let adder: Element<Message> = match &self.new_channel_error {
             Some(err) => column![adder_row, text(format!("⚠ {err}")).size(11).color(RED)]
                 .spacing(4)
@@ -1533,7 +1547,9 @@ impl App {
                     .width(Fill)
                     .height(Length::Fixed(48.0));
                 let scroll = scrollable(
-                    Canvas::new(canvas).width(Fill).height(Length::Fixed(content_h)),
+                    Canvas::new(canvas)
+                        .width(Fill)
+                        .height(Length::Fixed(content_h)),
                 )
                 .height(Fill);
                 container(column![pinned, scroll])
@@ -1581,9 +1597,9 @@ impl App {
                     item.author,
                     truncate(&item.summary, 40)
                 );
-                let mut chip = button(text(label).size(11)).padding([3, 9]).style(
-                    move |_t, _s| chip_style(color, false),
-                );
+                let mut chip = button(text(label).size(11))
+                    .padding([3, 9])
+                    .style(move |_t, _s| chip_style(color, false));
                 if let Some(name) = &item.channel_name {
                     chip = chip.on_press(Message::FocusChipPicked(
                         name.clone(),
@@ -1625,10 +1641,16 @@ impl App {
             }
         }
 
-        column![admin_toolbar(self.admin), focus_board, adder, ribbon, body.height(Fill)]
-            .spacing(10)
-            .padding(10)
-            .into()
+        column![
+            admin_toolbar(self.admin),
+            focus_board,
+            adder,
+            ribbon,
+            body.height(Fill)
+        ]
+        .spacing(10)
+        .padding(10)
+        .into()
     }
 }
 
@@ -1735,7 +1757,12 @@ fn settings_panel(app: &App) -> Element<'_, Message> {
     }
 
     // Register a repo as a home substrate — the GUI `junto init`.
-    let mut repo = column![text("register a repo (home substrate)").size(13).color(TEAL)].spacing(6);
+    let mut repo = column![
+        text("register a repo (home substrate)")
+            .size(13)
+            .color(TEAL)
+    ]
+    .spacing(6);
     repo = repo.push(
         row![
             text_input("git repo path…", &app.repo_path)
@@ -1821,10 +1848,14 @@ fn agents_panel(app: &App) -> Element<'_, Message> {
     );
     if !harnesses.is_empty() {
         form = form.push(
-            pick_list(harnesses, app.agent_harness.clone(), Message::AgentHarnessPicked)
-                .placeholder("harness")
-                .text_size(12)
-                .padding(6),
+            pick_list(
+                harnesses,
+                app.agent_harness.clone(),
+                Message::AgentHarnessPicked,
+            )
+            .placeholder("harness")
+            .text_size(12)
+            .padding(6),
         );
     }
     form = form.push(
@@ -1996,11 +2027,7 @@ fn brief_panel<'a>(items: &'a [markdown::Item], raw: &str) -> Element<'a, Messag
 
 /// The inline form for a channel lifecycle act: the inputs it needs, a
 /// confirm/cancel row, and any error.
-fn lifecycle_form(
-    id: pane_grid::Pane,
-    pane: &Pane,
-    kind: LifecycleKind,
-) -> Element<'_, Message> {
+fn lifecycle_form(id: pane_grid::Pane, pane: &Pane, kind: LifecycleKind) -> Element<'_, Message> {
     let mut col = column![].spacing(6);
     match kind {
         LifecycleKind::Diverge => {
@@ -2157,8 +2184,12 @@ fn pane_body<'a>(
     } else {
         intent_input.on_submit(Message::Launch(id))
     };
-    let mut launch_btn = button(text(if pane.launching { "launching…" } else { "launch" }))
-        .padding(6);
+    let mut launch_btn = button(text(if pane.launching {
+        "launching…"
+    } else {
+        "launch"
+    }))
+    .padding(6);
     if !pane.launching {
         launch_btn = launch_btn.on_press(Message::Launch(id));
     }
@@ -2397,9 +2428,7 @@ fn pane_body<'a>(
                 summary_md_for(entry),
             ));
         }
-        let scroll = scrollable(timeline)
-            .id(pane.scroll_id.clone())
-            .height(Fill);
+        let scroll = scrollable(timeline).id(pane.scroll_id.clone()).height(Fill);
         match pinned {
             Some(pinned) => column![pinned, scroll].spacing(8).into(),
             None => scroll.into(),
@@ -2417,18 +2446,22 @@ fn pane_body<'a>(
 fn feed_line(item: &FeedItem) -> Element<'_, Message> {
     // Your own steer messages, echoed as a chat-style "you ›" line.
     if item.event.kind == "you" {
-        return container(text(format!("you › {}", item.event.text)).size(13).color(BLUE))
-            .padding([3, 8])
-            .width(Fill)
-            .style(|_theme| container::Style {
-                background: Some(Background::Color(Color { a: 0.12, ..BLUE })),
-                border: Border {
-                    radius: 4.0.into(),
-                    ..Border::default()
-                },
-                ..container::Style::default()
-            })
-            .into();
+        return container(
+            text(format!("you › {}", item.event.text))
+                .size(13)
+                .color(BLUE),
+        )
+        .padding([3, 8])
+        .width(Fill)
+        .style(|_theme| container::Style {
+            background: Some(Background::Color(Color { a: 0.12, ..BLUE })),
+            border: Border {
+                radius: 4.0.into(),
+                ..Border::default()
+            },
+            ..container::Style::default()
+        })
+        .into();
     }
     // Model prose renders as Markdown; status/tool/error lines stay plain.
     if let Some(md) = &item.md {
@@ -2478,10 +2511,11 @@ fn is_id_noise(token: &str) -> bool {
         return false;
     }
     // A `@1781910552547`-style epoch token.
-    if let Some(digits) = core.strip_prefix('@') {
-        if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
-            return true;
-        }
+    if let Some(digits) = core.strip_prefix('@')
+        && !digits.is_empty()
+        && digits.chars().all(|c| c.is_ascii_digit())
+    {
+        return true;
     }
     // A content digest, e.g. `sha256:abcd…`.
     if core.contains(':') && core.split(':').next().is_some_and(|a| a == "sha256") {
@@ -2556,6 +2590,7 @@ fn chip_style(color: Color, active: bool) -> button::Style {
 /// One history entry: a node on a left rail (git-log style) beside its card.
 /// The rail line fills the row height; with zero column spacing the nodes link
 /// into a continuous history.
+#[allow(clippy::too_many_arguments)]
 fn timeline_entry<'a>(
     id: pane_grid::Pane,
     entry: &'a EntryDto,
@@ -2568,7 +2603,16 @@ fn timeline_entry<'a>(
 ) -> Element<'a, Message> {
     row![
         rail(kind_color(&entry.kind)),
-        entry_card(id, entry, highlighted, draft, error, pending, artifact, summary_md)
+        entry_card(
+            id,
+            entry,
+            highlighted,
+            draft,
+            error,
+            pending,
+            artifact,
+            summary_md
+        )
     ]
     .spacing(10)
     .into()
@@ -2613,6 +2657,7 @@ fn dot(color: Color) -> Element<'static, Message> {
 
 /// One timeline entry as a card: a colour-coded kind badge + author + status,
 /// over the summary text.
+#[allow(clippy::too_many_arguments)]
 fn entry_card<'a>(
     id: pane_grid::Pane,
     entry: &'a EntryDto,
@@ -2624,8 +2669,11 @@ fn entry_card<'a>(
     summary_md: Option<&'a [markdown::Item]>,
 ) -> Element<'a, Message> {
     let accent = kind_color(&entry.kind);
-    let mut head = row![badge(&entry.kind, accent), text(entry.author.clone()).size(11).color(MUTED)]
-        .spacing(8);
+    let mut head = row![
+        badge(&entry.kind, accent),
+        text(entry.author.clone()).size(11).color(MUTED)
+    ]
+    .spacing(8);
     if let Some(status) = &entry.status {
         head = head.push(badge(status, status_color(status)));
     }
@@ -2729,7 +2777,11 @@ fn entry_card<'a>(
                 .align_y(Center),
         );
         if pending {
-            acts = acts.push(text("recording… (writing to the ledger)").size(11).color(YELLOW));
+            acts = acts.push(
+                text("recording… (writing to the ledger)")
+                    .size(11)
+                    .color(YELLOW),
+            );
         } else if let Some(err) = error {
             acts = acts.push(text(format!("⚠ {err}")).size(11).color(RED));
         }
@@ -2758,9 +2810,8 @@ fn entry_card<'a>(
                 card = card.push(text(format!("⚠ {err}")).size(11).color(RED));
             }
             Some(ArtifactContent::Loaded { format, body, md }) => {
-                card = card.push(
-                    row![Space::with_width(Fill), copy_button(body.clone())].align_y(Center),
-                );
+                card = card
+                    .push(row![Space::with_width(Fill), copy_button(body.clone())].align_y(Center));
                 card = card.push(artifact_body(format, body, md.as_deref()));
             }
             None => {}
@@ -2896,17 +2947,21 @@ fn copy_button(text_to_copy: String) -> Element<'static, Message> {
 }
 
 fn badge(label: &str, color: Color) -> Element<'static, Message> {
-    container(text(label.to_string()).size(11).color(Color::from_rgb(0.12, 0.12, 0.18)))
-        .padding([2, 7])
-        .style(move |_theme| container::Style {
-            background: Some(Background::Color(color)),
-            border: Border {
-                radius: 10.0.into(),
-                ..Border::default()
-            },
-            ..container::Style::default()
-        })
-        .into()
+    container(
+        text(label.to_string())
+            .size(11)
+            .color(Color::from_rgb(0.12, 0.12, 0.18)),
+    )
+    .padding([2, 7])
+    .style(move |_theme| container::Style {
+        background: Some(Background::Color(color)),
+        border: Border {
+            radius: 10.0.into(),
+            ..Border::default()
+        },
+        ..container::Style::default()
+    })
+    .into()
 }
 
 fn kind_color(kind: &str) -> Color {
@@ -3215,7 +3270,10 @@ impl canvas::Program<Message> for LineageCanvas {
                     .with_color(color)
                     .with_width(if track.open { 3.0 } else { 2.0 }),
             );
-            frame.fill(&Path::circle(Point::new(x1, y), if track.open { 5.0 } else { 4.0 }), color);
+            frame.fill(
+                &Path::circle(Point::new(x1, y), if track.open { 5.0 } else { 4.0 }),
+                color,
+            );
 
             // Milestone points along the track (clamped onto the drawn span).
             for (ms, label) in &track.milestones {
@@ -3518,7 +3576,6 @@ fn fetch_channels() -> Task<Message> {
     )
 }
 
-
 /// A long-lived SSE subscription streaming a session's live feed from the host
 /// (`/channels/{channel}/sessions/{session}/stream`) into `Message::Live`.
 fn session_stream(channel: String, session: String) -> impl iced::futures::Stream<Item = Message> {
@@ -3540,10 +3597,10 @@ fn session_stream(channel: String, session: String) -> impl iced::futures::Strea
                     let _ = output.send(Message::LiveEnded(session.clone())).await;
                     return;
                 }
-                if let Some(data) = frame.lines().find_map(|l| l.strip_prefix("data:")) {
-                    if let Ok(event) = serde_json::from_str::<LiveEvent>(data.trim()) {
-                        let _ = output.send(Message::Live(session.clone(), event)).await;
-                    }
+                if let Some(data) = frame.lines().find_map(|l| l.strip_prefix("data:"))
+                    && let Ok(event) = serde_json::from_str::<LiveEvent>(data.trim())
+                {
+                    let _ = output.send(Message::Live(session.clone(), event)).await;
                 }
             }
         }
@@ -3709,12 +3766,7 @@ fn post_create_channel(name: String, repo: Option<String>) -> Task<Message> {
             if let Some(repo) = repo {
                 form.push(("repo", repo));
             }
-            match reqwest::Client::new()
-                .post(&url)
-                .form(&form)
-                .send()
-                .await
-            {
+            match reqwest::Client::new().post(&url).form(&form).send().await {
                 Ok(resp) if resp.status().is_success() => Ok(name),
                 Ok(resp) => {
                     let code = resp.status();
