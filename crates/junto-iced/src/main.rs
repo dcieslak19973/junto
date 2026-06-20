@@ -150,6 +150,8 @@ struct Pane {
     /// The channel's curated brief (recall bridge) as parsed Markdown — shown at
     /// the top of the pane; the full entry history is a click away.
     brief_md: Option<Vec<markdown::Item>>,
+    /// The humanized brief text, kept so it can be copied to the clipboard.
+    brief_text: Option<String>,
 }
 
 enum Content {
@@ -420,6 +422,8 @@ enum Message {
     BriefLoaded(pane_grid::Pane, Option<String>),
     /// Open a clicked Markdown link in the OS browser.
     OpenUrl(String),
+    /// Copy text to the system clipboard.
+    Copy(String),
 }
 
 impl App {
@@ -1007,9 +1011,11 @@ impl App {
                     // The brief is the agent-facing recall text; strip the id
                     // noise (UUIDs, @timestamps, digests) the human doesn't care
                     // about before rendering.
-                    state.brief_md = md
+                    let humanized = md
                         .filter(|s| !s.trim().is_empty())
-                        .map(|s| markdown::parse(&humanize_brief(&s)).collect());
+                        .map(|s| humanize_brief(&s));
+                    state.brief_md = humanized.as_deref().map(|s| markdown::parse(s).collect());
+                    state.brief_text = humanized;
                 }
                 Task::none()
             }
@@ -1017,6 +1023,7 @@ impl App {
                 let _ = open::that(url);
                 Task::none()
             }
+            Message::Copy(text) => iced::clipboard::write(text),
         }
     }
 
@@ -1235,14 +1242,20 @@ fn column_pane<'a>(
 
 /// The curated brief (recall bridge) rendered as Markdown in a card at the top
 /// of a pane — standing decisions + what needs attention.
-fn brief_panel(items: &[markdown::Item]) -> Element<'_, Message> {
+fn brief_panel<'a>(items: &'a [markdown::Item], raw: &str) -> Element<'a, Message> {
     let body = markdown::view(
         items,
         markdown::Settings::default(),
         markdown::Style::from_palette(Theme::CatppuccinMocha.palette()),
     )
     .map(|url| Message::OpenUrl(url.to_string()));
-    container(column![text("brief").size(11).color(TEAL), body].spacing(6))
+    let head = row![
+        text("brief").size(11).color(TEAL),
+        Space::with_width(Fill),
+        copy_button(raw.to_string()),
+    ]
+    .align_y(Center);
+    container(column![head, body].spacing(6))
         .padding(10)
         .width(Fill)
         .style(|_theme| container::Style {
@@ -1611,7 +1624,8 @@ fn pane_body<'a>(
         // decisions + what needs attention. The full entry history is a click
         // away — when there's no brief, fall back to the most recent entries.
         if let Some(items) = &pane.brief_md {
-            timeline = timeline.push(brief_panel(items));
+            let raw = pane.brief_text.as_deref().unwrap_or("");
+            timeline = timeline.push(brief_panel(items, raw));
         }
         // History disclosure. Collapsed default: the brief alone (or, without a
         // brief, the recent entries). Expanded: the full timeline.
@@ -1888,6 +1902,8 @@ fn entry_card<'a>(
     if entry.unrecognized {
         head = head.push(badge("unrecognized", MUTED));
     }
+    head = head.push(Space::with_width(Fill));
+    head = head.push(copy_button(entry.summary.clone()));
 
     // The body: a session memo renders as Markdown; everything else is plain.
     let body: Element<Message> = if let Some(items) = summary_md {
@@ -2012,6 +2028,9 @@ fn entry_card<'a>(
                 card = card.push(text(format!("⚠ {err}")).size(11).color(RED));
             }
             Some(ArtifactContent::Loaded { format, body, md }) => {
+                card = card.push(
+                    row![Space::with_width(Fill), copy_button(body.clone())].align_y(Center),
+                );
                 card = card.push(artifact_body(format, body, md.as_deref()));
             }
             None => {}
@@ -2136,6 +2155,16 @@ fn diff_line_color(line: &str) -> Color {
     }
 }
 
+/// A small "copy" button that writes `text` to the clipboard (Iced static text
+/// isn't mouse-selectable, so copy buttons are how you grab content).
+fn copy_button(text_to_copy: String) -> Element<'static, Message> {
+    button(text("copy").size(10))
+        .on_press(Message::Copy(text_to_copy))
+        .padding([1, 6])
+        .style(|_t, _s| chip_style(MUTED, false))
+        .into()
+}
+
 fn badge(label: &str, color: Color) -> Element<'static, Message> {
     container(text(label.to_string()).size(11).color(Color::from_rgb(0.12, 0.12, 0.18)))
         .padding([2, 7])
@@ -2202,6 +2231,7 @@ impl Pane {
             lifecycle_pending: false,
             lifecycle_error: None,
             brief_md: None,
+            brief_text: None,
         }
     }
 }
