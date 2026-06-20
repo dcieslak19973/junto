@@ -88,6 +88,8 @@ struct Pane {
     /// An entry to surface at the top of the timeline — set when a focus-board
     /// chip jumps here so the card needing attention is immediately visible.
     highlight_entry: Option<String>,
+    /// Per-entry rationale drafts for inline verification acts, keyed by entry id.
+    act_drafts: HashMap<String, String>,
 }
 
 enum Content {
@@ -209,6 +211,10 @@ enum Message {
     FocusChipPicked(String, String),
     /// Dismiss the pinned attention card in a pane.
     ClearHighlight(pane_grid::Pane),
+    /// Edit the rationale draft for an inline verification act (pane, entry, text).
+    ActRationaleChanged(pane_grid::Pane, String, String),
+    /// Submit a verification act on an entry (pane, entry, act keyword).
+    Act(pane_grid::Pane, String, &'static str),
     LineageGraphLoaded(Option<LineageGraphDto>),
     FocusLoaded(Vec<FocusItem>),
     AgentsLoaded(Vec<AgentDto>),
@@ -319,6 +325,28 @@ impl App {
                     state.highlight_entry = None;
                 }
                 Task::none()
+            }
+            Message::ActRationaleChanged(pane, entry_id, value) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    state.act_drafts.insert(entry_id, value);
+                }
+                Task::none()
+            }
+            Message::Act(pane, entry_id, act) => {
+                let Some(state) = self.panes.get_mut(pane) else {
+                    return Task::none();
+                };
+                let rationale = state
+                    .act_drafts
+                    .get(&entry_id)
+                    .map(|r| r.trim().to_string())
+                    .unwrap_or_default();
+                if rationale.is_empty() {
+                    return Task::none();
+                }
+                let channel = state.channel.clone();
+                state.act_drafts.remove(&entry_id);
+                post_verify(pane, channel, entry_id, act, rationale)
             }
             Message::Fetched(pane, result) => {
                 if let Some(state) = self.panes.get_mut(pane) {
@@ -740,6 +768,12 @@ fn pane_body<'a>(
         let highlight = pane.highlight_entry.as_deref();
         // A focus-board jump pins the attention entry above the scroll so it's
         // immediately visible; it's lifted out of the scrolled list below.
+        let draft_for = |entry: &EntryDto| {
+            pane.act_drafts
+                .get(&entry.id)
+                .map(String::as_str)
+                .unwrap_or("")
+        };
         let pinned: Option<Element<Message>> = highlight.and_then(|hid| {
             dto.entries.iter().find(|e| e.id == hid).map(|entry| {
                 let header = row![
@@ -751,7 +785,7 @@ fn pane_body<'a>(
                         .style(|_t, _s| chip_style(MUTED, false)),
                 ]
                 .align_y(Center);
-                column![header, timeline_entry(entry, true)]
+                column![header, timeline_entry(id, entry, true, draft_for(entry))]
                     .spacing(4)
                     .into()
             })
@@ -761,7 +795,7 @@ fn pane_body<'a>(
             if highlight == Some(entry.id.as_str()) {
                 continue; // pinned above
             }
-            timeline = timeline.push(timeline_entry(entry, false));
+            timeline = timeline.push(timeline_entry(id, entry, false, draft_for(entry)));
         }
         match pinned {
             Some(pinned) => column![pinned, scrollable(timeline).height(Fill)]
@@ -842,10 +876,29 @@ fn chip_style(color: Color, active: bool) -> button::Style {
 /// One history entry: a node on a left rail (git-log style) beside its card.
 /// The rail line fills the row height; with zero column spacing the nodes link
 /// into a continuous history.
-fn timeline_entry(entry: &EntryDto, highlighted: bool) -> Element<'_, Message> {
-    row![rail(kind_color(&entry.kind)), entry_card(entry, highlighted)]
-        .spacing(10)
-        .into()
+fn timeline_entry<'a>(
+    id: pane_grid::Pane,
+    entry: &'a EntryDto,
+    highlighted: bool,
+    draft: &'a str,
+) -> Element<'a, Message> {
+    row![
+        rail(kind_color(&entry.kind)),
+        entry_card(id, entry, highlighted, draft)
+    ]
+    .spacing(10)
+    .into()
+}
+
+/// The (affirm, decline) verification acts available on an entry, if it's still
+/// open: a provisional assertion → ratify/park; a pending proposal →
+/// approve/reject. Resolved entries return `None` (no buttons).
+fn entry_acts(entry: &EntryDto) -> Option<(&'static str, &'static str)> {
+    match (entry.kind.as_str(), entry.status.as_deref()) {
+        ("assertion", Some("provisional")) => Some(("ratify", "park")),
+        ("proposal", Some("pending")) => Some(("approve", "reject")),
+        _ => None,
+    }
 }
 
 /// The left rail for one entry: a coloured node dot at the card's top. (A
@@ -876,7 +929,12 @@ fn dot(color: Color) -> Element<'static, Message> {
 
 /// One timeline entry as a card: a colour-coded kind badge + author + status,
 /// over the summary text.
-fn entry_card(entry: &EntryDto, highlighted: bool) -> Element<'_, Message> {
+fn entry_card<'a>(
+    id: pane_grid::Pane,
+    entry: &'a EntryDto,
+    highlighted: bool,
+    draft: &'a str,
+) -> Element<'a, Message> {
     let accent = kind_color(&entry.kind);
     let mut head = row![badge(&entry.kind, accent), text(entry.author.clone()).size(11).color(MUTED)]
         .spacing(8);
@@ -887,7 +945,38 @@ fn entry_card(entry: &EntryDto, highlighted: bool) -> Element<'_, Message> {
         head = head.push(badge("unrecognized", MUTED));
     }
 
-    let card = column![head, text(entry.summary.clone()).size(13).color(TEXT)].spacing(6);
+    let mut card = column![head, text(entry.summary.clone()).size(13).color(TEXT)].spacing(6);
+
+    // Inline verification acts: open assertions/proposals get a rationale box
+    // and affirm/decline buttons (disabled until a rationale is typed — the
+    // host requires one). Acting refetches the pane, so the buttons clear once
+    // the entry resolves.
+    if let Some((affirm, decline)) = entry_acts(entry) {
+        let entry_id = entry.id.clone();
+        let has_rationale = !draft.trim().is_empty();
+        let rationale = text_input("rationale (required)…", draft)
+            .on_input({
+                let entry_id = entry_id.clone();
+                move |v| Message::ActRationaleChanged(id, entry_id.clone(), v)
+            })
+            .size(12)
+            .padding(6);
+        let mut affirm_btn = button(text(affirm).size(11))
+            .padding([3, 10])
+            .style(|_t, _s| chip_style(GREEN, true));
+        let mut decline_btn = button(text(decline).size(11))
+            .padding([3, 10])
+            .style(|_t, _s| chip_style(RED, false));
+        if has_rationale {
+            affirm_btn = affirm_btn.on_press(Message::Act(id, entry_id.clone(), affirm));
+            decline_btn = decline_btn.on_press(Message::Act(id, entry_id.clone(), decline));
+        }
+        card = card.push(
+            row![rationale, affirm_btn, decline_btn]
+                .spacing(6)
+                .align_y(Center),
+        );
+    }
 
     let (border_color, border_width) = if highlighted {
         (YELLOW, 2.0)
@@ -958,6 +1047,7 @@ impl Pane {
             launch_outcome: false,
             launch_workspace: String::new(),
             highlight_entry: None,
+            act_drafts: HashMap::new(),
         }
     }
 }
@@ -1403,6 +1493,28 @@ fn post_launch(
                 form.push(("agent", agent));
             }
             let _ = reqwest::Client::new().post(&url).form(&form).send().await;
+        },
+        move |()| Message::Posted(pane),
+    )
+}
+
+/// POST a verification act on an entry — ratify/park (assertions) or
+/// approve/reject (proposals), with the required rationale.
+fn post_verify(
+    pane: pane_grid::Pane,
+    channel: String,
+    entry: String,
+    act: &'static str,
+    rationale: String,
+) -> Task<Message> {
+    let url = format!("{HOST}/channels/{channel}/entries/{entry}/{act}");
+    Task::perform(
+        async move {
+            let _ = reqwest::Client::new()
+                .post(&url)
+                .form(&[("rationale", rationale)])
+                .send()
+                .await;
         },
         move |()| Message::Posted(pane),
     )
