@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 
 use iced::widget::canvas::{self, Canvas, Frame, Geometry, Path, Stroke};
-use iced::widget::pane_grid::{self, PaneGrid};
+use iced::widget::pane_grid;
 use iced::widget::{
     button, column, combo_box, container, row, scrollable, text, text_input, Space,
 };
@@ -50,22 +50,13 @@ fn main() -> iced::Result {
         .run_with(App::new)
 }
 
-/// Two layout prototypes to compare: the custom columns with an exactly-aligned
-/// top lineage ribbon, vs. the pane_grid with an approximate ribbon.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LayoutMode {
-    /// Custom shared-width columns; ribbon segments line up exactly above panes.
-    Columns,
-    /// pane_grid (drag-resize) with the ribbon approximated over even columns.
-    Grid,
-}
-
 struct App {
+    /// pane_grid::State is used purely as a keyed store of panes; rendering is
+    /// the custom shared-width Columns layout, not a PaneGrid.
     panes: pane_grid::State<Pane>,
     focus: Option<pane_grid::Pane>,
     /// Left-to-right pane order (pane_grid's own iteration isn't ordered).
     order: Vec<pane_grid::Pane>,
-    layout: LayoutMode,
     /// Available channel names for the type-ahead picker.
     channels: combo_box::State<String>,
 }
@@ -168,13 +159,9 @@ struct EntryDto {
 enum Message {
     ChannelsLoaded(Vec<String>),
     ChannelPicked(String),
-    SetLayout(LayoutMode),
     OpenLineage,
     LineageFetched(pane_grid::Pane, Result<LineageGraphDto, String>),
     Fetched(pane_grid::Pane, Result<ChannelDto, String>),
-    Clicked(pane_grid::Pane),
-    Dragged(pane_grid::DragEvent),
-    Resized(pane_grid::ResizeEvent),
     Refresh(pane_grid::Pane),
     Close(pane_grid::Pane),
     // Live session pane.
@@ -196,7 +183,6 @@ impl App {
             panes,
             focus: Some(first),
             order: vec![first],
-            layout: LayoutMode::Columns,
             channels: combo_box::State::new(Vec::new()),
         };
         (app, Task::batch([fetch(first, "junto-dev"), fetch_channels()]))
@@ -221,10 +207,6 @@ impl App {
                     self.focus = Some(new_pane);
                     return fetch(new_pane, &name);
                 }
-                Task::none()
-            }
-            Message::SetLayout(mode) => {
-                self.layout = mode;
                 Task::none()
             }
             Message::OpenLineage => {
@@ -259,19 +241,6 @@ impl App {
                         Err(err) => Content::Error(err),
                     };
                 }
-                Task::none()
-            }
-            Message::Clicked(pane) => {
-                self.focus = Some(pane);
-                Task::none()
-            }
-            Message::Dragged(pane_grid::DragEvent::Dropped { pane, target }) => {
-                self.panes.drop(pane, target);
-                Task::none()
-            }
-            Message::Dragged(_) => Task::none(),
-            Message::Resized(pane_grid::ResizeEvent { split, ratio }) => {
-                self.panes.resize(split, ratio);
                 Task::none()
             }
             Message::Refresh(pane) => {
@@ -409,9 +378,6 @@ impl App {
                 Message::ChannelPicked,
             )
             .width(320),
-            Space::with_width(Fill),
-            layout_button("columns", LayoutMode::Columns, self.layout),
-            layout_button("grid", LayoutMode::Grid, self.layout),
         ]
         .spacing(8)
         .align_y(Center);
@@ -430,29 +396,16 @@ impl App {
                 ..container::Style::default()
             });
 
-        let body: Element<Message> = match self.layout {
-            LayoutMode::Columns => {
-                // Shared-width columns: ribbon segments above line up exactly.
-                let mut cols = row![].spacing(6);
-                for id in &self.order {
-                    if let Some(pane) = self.panes.get(*id) {
-                        cols = cols.push(column_pane(*id, pane));
-                    }
-                }
-                cols.height(Fill).into()
+        // Shared-width columns: the ribbon segments above line up exactly, and
+        // open/close reflows both together.
+        let mut body = row![].spacing(6);
+        for id in &self.order {
+            if let Some(pane) = self.panes.get(*id) {
+                body = body.push(column_pane(*id, pane));
             }
-            LayoutMode::Grid => PaneGrid::new(&self.panes, |id, pane, _is_maximized| {
-                pane_grid::Content::new(pane_body(id, pane))
-                    .title_bar(pane_grid::TitleBar::new(title_row(id, pane)).padding(8))
-            })
-            .spacing(6)
-            .on_click(Message::Clicked)
-            .on_drag(Message::Dragged)
-            .on_resize(8, Message::Resized)
-            .into(),
-        };
+        }
 
-        column![adder, ribbon, body]
+        column![adder, ribbon, body.height(Fill)]
             .spacing(10)
             .padding(10)
             .into()
@@ -483,34 +436,7 @@ impl App {
     }
 }
 
-/// A layout-mode toggle button, highlighted when active.
-fn layout_button(label: &str, mode: LayoutMode, current: LayoutMode) -> Element<'static, Message> {
-    let active = mode == current;
-    button(text(label.to_string()).size(12))
-        .on_press(Message::SetLayout(mode))
-        .padding([4, 10])
-        .style(move |_theme, _status| button::Style {
-            background: Some(Background::Color(if active {
-                TEAL
-            } else {
-                Color { a: 0.15, ..TEAL }
-            })),
-            text_color: if active {
-                Color::from_rgb(0.12, 0.12, 0.18)
-            } else {
-                TEXT
-            },
-            border: Border {
-                color: TEAL,
-                width: 1.0,
-                radius: 6.0.into(),
-            },
-            ..button::Style::default()
-        })
-        .into()
-}
-
-/// A pane's title bar (channel name + refresh/close), shared by both layouts.
+/// A pane's title bar (channel name + refresh/close).
 fn title_row(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
     row![
         text(pane.channel.clone()).size(15),
