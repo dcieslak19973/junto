@@ -769,6 +769,11 @@ impl LineageCanvas {
             .iter()
             .map(|n| (n.id.as_str(), n.first_ms.unwrap_or(min_ms)))
             .collect();
+        let last_of: HashMap<&str, i64> = graph
+            .nodes
+            .iter()
+            .map(|n| (n.id.as_str(), n.last_ms.unwrap_or(now_ms)))
+            .collect();
 
         let links = graph
             .edges
@@ -776,8 +781,15 @@ impl LineageCanvas {
             .filter_map(|e| {
                 let parent = *row_of.get(e.from.as_str())?;
                 let child = *row_of.get(e.to.as_str())?;
-                let at = *first_of.get(e.to.as_str())?;
-                Some((parent, child, at, e.relation == "diverge"))
+                let diverge = e.relation == "diverge";
+                // Diverge happens at the child's start; convergence happens at the
+                // source's end (when the side-quest merged back).
+                let at = if diverge {
+                    *first_of.get(e.to.as_str())?
+                } else {
+                    *last_of.get(e.from.as_str())?
+                };
+                Some((parent, child, at, diverge))
             })
             .collect();
 
