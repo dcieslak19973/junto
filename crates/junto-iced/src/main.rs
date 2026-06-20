@@ -90,6 +90,8 @@ struct Pane {
     highlight_entry: Option<String>,
     /// Per-entry rationale drafts for inline verification acts, keyed by entry id.
     act_drafts: HashMap<String, String>,
+    /// Per-entry error messages from a failed act, keyed by entry id.
+    act_errors: HashMap<String, String>,
 }
 
 enum Content {
@@ -228,6 +230,8 @@ enum Message {
     /// Frame options pass their pre-baked rationale; the free-text form passes
     /// the typed draft.
     Act(pane_grid::Pane, String, String, String),
+    /// The result of a verification act (pane, entry, Ok or an error message).
+    Acted(pane_grid::Pane, String, Result<(), String>),
     LineageGraphLoaded(Option<LineageGraphDto>),
     FocusLoaded(Vec<FocusItem>),
     AgentsLoaded(Vec<AgentDto>),
@@ -355,8 +359,24 @@ impl App {
                 };
                 let channel = state.channel.clone();
                 state.act_drafts.remove(&entry_id);
+                state.act_errors.remove(&entry_id); // clear any stale error
                 post_verify(pane, channel, entry_id, act, rationale)
             }
+            Message::Acted(pane, entry_id, result) => match result {
+                Ok(()) => {
+                    let channel = self.panes.get_mut(pane).map(|state| {
+                        state.act_errors.remove(&entry_id);
+                        state.channel.clone()
+                    });
+                    channel.map_or_else(Task::none, |c| fetch(pane, &c))
+                }
+                Err(err) => {
+                    if let Some(state) = self.panes.get_mut(pane) {
+                        state.act_errors.insert(entry_id, err);
+                    }
+                    Task::none()
+                }
+            },
             Message::Fetched(pane, result) => {
                 if let Some(state) = self.panes.get_mut(pane) {
                     state.content = match result {
@@ -783,6 +803,7 @@ fn pane_body<'a>(
                 .map(String::as_str)
                 .unwrap_or("")
         };
+        let error_for = |entry: &EntryDto| pane.act_errors.get(&entry.id).map(String::as_str);
         let pinned: Option<Element<Message>> = highlight.and_then(|hid| {
             dto.entries.iter().find(|e| e.id == hid).map(|entry| {
                 let header = row![
@@ -794,9 +815,12 @@ fn pane_body<'a>(
                         .style(|_t, _s| chip_style(MUTED, false)),
                 ]
                 .align_y(Center);
-                column![header, timeline_entry(id, entry, true, draft_for(entry))]
-                    .spacing(4)
-                    .into()
+                column![
+                    header,
+                    timeline_entry(id, entry, true, draft_for(entry), error_for(entry))
+                ]
+                .spacing(4)
+                .into()
             })
         });
         let mut timeline = column![].spacing(8);
@@ -804,7 +828,8 @@ fn pane_body<'a>(
             if highlight == Some(entry.id.as_str()) {
                 continue; // pinned above
             }
-            timeline = timeline.push(timeline_entry(id, entry, false, draft_for(entry)));
+            timeline =
+                timeline.push(timeline_entry(id, entry, false, draft_for(entry), error_for(entry)));
         }
         match pinned {
             Some(pinned) => column![pinned, scrollable(timeline).height(Fill)]
@@ -890,10 +915,11 @@ fn timeline_entry<'a>(
     entry: &'a EntryDto,
     highlighted: bool,
     draft: &'a str,
+    error: Option<&'a str>,
 ) -> Element<'a, Message> {
     row![
         rail(kind_color(&entry.kind)),
-        entry_card(id, entry, highlighted, draft)
+        entry_card(id, entry, highlighted, draft, error)
     ]
     .spacing(10)
     .into()
@@ -943,6 +969,7 @@ fn entry_card<'a>(
     entry: &'a EntryDto,
     highlighted: bool,
     draft: &'a str,
+    error: Option<&'a str>,
 ) -> Element<'a, Message> {
     let accent = kind_color(&entry.kind);
     let mut head = row![badge(&entry.kind, accent), text(entry.author.clone()).size(11).color(MUTED)]
@@ -1035,6 +1062,9 @@ fn entry_card<'a>(
                 .spacing(6)
                 .align_y(Center),
         );
+        if let Some(err) = error {
+            acts = acts.push(text(format!("⚠ {err}")).size(11).color(RED));
+        }
         card = card.push(acts);
     }
 
@@ -1108,6 +1138,7 @@ impl Pane {
             launch_workspace: String::new(),
             highlight_entry: None,
             act_drafts: HashMap::new(),
+            act_errors: HashMap::new(),
         }
     }
 }
@@ -1568,15 +1599,30 @@ fn post_verify(
     rationale: String,
 ) -> Task<Message> {
     let url = format!("{HOST}/channels/{channel}/entries/{entry}/{act}");
+    let entry_id = entry.clone();
     Task::perform(
         async move {
-            let _ = reqwest::Client::new()
+            match reqwest::Client::new()
                 .post(&url)
                 .form(&[("rationale", rationale)])
                 .send()
-                .await;
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => Ok(()),
+                Ok(resp) => {
+                    let code = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    let body = body.trim();
+                    Err(if body.is_empty() {
+                        format!("act failed ({code})")
+                    } else {
+                        format!("{code}: {body}")
+                    })
+                }
+                Err(err) => Err(format!("request failed: {err}")),
+            }
         },
-        move |()| Message::Posted(pane),
+        move |result| Message::Acted(pane, entry_id.clone(), result),
     )
 }
 
