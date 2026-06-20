@@ -698,6 +698,9 @@ impl Pane {
 const ROWH: f32 = 24.0;
 const TOP: f32 = 12.0;
 const LABEL_W: f32 = 150.0;
+/// Minimum drawn track length, so a short side-quest's diverge (at its start)
+/// and converge (at its end) keep a visible horizontal gap.
+const MIN_TRACK: f32 = 56.0;
 
 struct Track {
     name: String,
@@ -832,11 +835,23 @@ impl canvas::Program<Message> for LineageCanvas {
         let hover = cursor.position_in(bounds);
         let mut tooltip: Option<(Point, String)> = None;
 
+        // Per-track x-range with a minimum length so diverge/converge keep a gap.
+        let mut ranges = vec![(0.0_f32, 0.0_f32); self.tracks.len()];
+        for t in &self.tracks {
+            let x0 = self.x_of(t.first_ms, left, right);
+            let x1 = self.x_of(t.last_ms, left, right).max(x0 + MIN_TRACK);
+            ranges[t.row] = (x0, x1);
+        }
+
         // Diverge/converge connectors: straight vertical links, distinguished by
-        // style so they read even when a short side-quest's diverge and converge
-        // land close — diverge solid (mauve), converge dashed (green).
-        for (parent_row, child_row, at_ms, diverge) in &self.links {
-            let x = self.x_of(*at_ms, left, right);
+        // style so they read even when close — diverge solid (mauve) anchored at
+        // the child's start, converge dashed (green) anchored at the source's end.
+        for (parent_row, child_row, _at_ms, diverge) in &self.links {
+            let x = if *diverge {
+                ranges[*child_row].0
+            } else {
+                ranges[*parent_row].1
+            };
             let y0 = Self::y_of(*parent_row);
             let y1 = Self::y_of(*child_row);
             let color = if *diverge { MAUVE } else { GREEN };
@@ -859,8 +874,7 @@ impl canvas::Program<Message> for LineageCanvas {
         // plus a labelled dot per milestone (label shown on hover).
         for track in &self.tracks {
             let y = Self::y_of(track.row);
-            let x0 = self.x_of(track.first_ms, left, right);
-            let x1 = self.x_of(track.last_ms, left, right).max(x0 + 2.0);
+            let (x0, x1) = ranges[track.row];
             let base = if track.root { TEAL } else { MAUVE };
             let color = if track.open {
                 base
@@ -875,9 +889,9 @@ impl canvas::Program<Message> for LineageCanvas {
             );
             frame.fill(&Path::circle(Point::new(x1, y), if track.open { 5.0 } else { 4.0 }), color);
 
-            // Milestone points along the track.
+            // Milestone points along the track (clamped onto the drawn span).
             for (ms, label) in &track.milestones {
-                let mx = self.x_of(*ms, left, right);
+                let mx = self.x_of(*ms, left, right).clamp(x0, x1);
                 let dot = Point::new(mx, y);
                 frame.fill(
                     &Path::circle(dot, 2.5),
