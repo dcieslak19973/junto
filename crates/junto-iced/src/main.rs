@@ -400,17 +400,19 @@ impl App {
                 // scrollable graph of the whole lineage.
                 let canvas = LineageCanvas::layout(graph, &open);
                 let content_h = canvas.height.max(60.0);
-                let scroll_h = content_h.min(300.0);
+                // Shorter history scroll; a roomier pinned-ambient strip. Both
+                // shrink the band overall so the channel columns get more room.
+                let scroll_h = content_h.min(150.0);
                 let pinned = Canvas::new(canvas.pinned())
                     .width(Fill)
-                    .height(Length::Fixed(28.0));
+                    .height(Length::Fixed(48.0));
                 let scroll = scrollable(
                     Canvas::new(canvas).width(Fill).height(Length::Fixed(content_h)),
                 )
                 .height(Fill);
                 container(column![pinned, scroll])
                     .width(Fill)
-                    .height(Length::Fixed(scroll_h + 34.0))
+                    .height(Length::Fixed(scroll_h + 56.0))
                     .padding(6)
                     .style(|_theme| container::Style {
                         background: Some(Background::Color(Color { a: 0.4, ..SURFACE })),
