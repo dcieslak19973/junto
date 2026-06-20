@@ -843,6 +843,12 @@ impl LineageCanvas {
 
         let mut ordered: Vec<&GNode> = graph.nodes.iter().collect();
         ordered.sort_by_key(|n| n.first_ms.unwrap_or(min_ms));
+        // The oldest root is the mainline spine — keep it at row 0 (the sticky
+        // pinned ambient). Show the remaining tracks newest-first, so the most
+        // recent channels appear at the top of the timeline.
+        if ordered.len() > 1 {
+            ordered[1..].reverse();
+        }
 
         let mut row_of: HashMap<&str, usize> = HashMap::new();
         let mut tracks = Vec::new();
