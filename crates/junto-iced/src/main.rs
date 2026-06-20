@@ -459,15 +459,20 @@ impl App {
                 }
                 items = items.push(chip);
             }
-            scrollable(items)
+            // Fixed height taller than the chips so the chips align to the top
+            // and the horizontal scrollbar gets its own band below them
+            // (otherwise it overlays the chips).
+            scrollable(items.padding([6, 0]))
                 .direction(scrollable::Direction::Horizontal(
                     scrollable::Scrollbar::default(),
                 ))
+                .width(Fill)
+                .height(Length::Fixed(44.0))
                 .into()
         };
         let focus_board = container(focus_inner)
             .width(Fill)
-            .center_y(Length::Fixed(44.0))
+            .center_y(Length::Fixed(56.0))
             .padding([0, 12])
             .style(|_theme| container::Style {
                 background: Some(Background::Color(SURFACE)),
