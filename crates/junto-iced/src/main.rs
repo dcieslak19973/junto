@@ -265,10 +265,14 @@ struct FrameOptionDto {
 }
 
 /// The fetch state of an artifact's inline content (`/artifacts/{id}/content.json`).
-#[derive(Debug, Clone)]
 enum ArtifactContent {
     Loading,
-    Loaded { format: String, body: String },
+    Loaded {
+        format: String,
+        body: String,
+        /// Parsed Markdown, for memo-format artifacts (parsed once on load).
+        md: Option<Vec<markdown::Item>>,
+    },
     Error(String),
 }
 
@@ -662,10 +666,15 @@ impl App {
             Message::ArtifactLoaded(pane, artifact_id, result) => {
                 if let Some(state) = self.panes.get_mut(pane) {
                     let content = match result {
-                        Ok(dto) => ArtifactContent::Loaded {
-                            format: dto.format,
-                            body: dto.content,
-                        },
+                        Ok(dto) => {
+                            let md = (dto.format == "markdown")
+                                .then(|| markdown::parse(&dto.content).collect::<Vec<_>>());
+                            ArtifactContent::Loaded {
+                                format: dto.format,
+                                body: dto.content,
+                                md,
+                            }
+                        }
                         Err(err) => ArtifactContent::Error(err),
                     };
                     state.artifacts.insert(artifact_id, content);
@@ -1392,8 +1401,8 @@ fn entry_card<'a>(
             Some(ArtifactContent::Error(err)) => {
                 card = card.push(text(format!("⚠ {err}")).size(11).color(RED));
             }
-            Some(ArtifactContent::Loaded { format, body }) => {
-                card = card.push(artifact_body(format, body));
+            Some(ArtifactContent::Loaded { format, body, md }) => {
+                card = card.push(artifact_body(format, body, md.as_deref()));
             }
             None => {}
         }
@@ -1424,7 +1433,37 @@ fn entry_card<'a>(
 /// Render an artifact's content inline: a diff gets per-line add/remove/hunk
 /// colour; anything else is shown verbatim. Monospace; long artifacts are
 /// truncated (the web view holds the full text).
-fn artifact_body(format: &str, body: &str) -> Element<'static, Message> {
+fn artifact_body<'a>(
+    format: &str,
+    body: &'a str,
+    md: Option<&'a [markdown::Item]>,
+) -> Element<'a, Message> {
+    // A memo renders as formatted Markdown.
+    if let Some(items) = md {
+        return container(
+            markdown::view(
+                items,
+                markdown::Settings::default(),
+                markdown::Style::from_palette(Theme::CatppuccinMocha.palette()),
+            )
+            .map(|_url| Message::NoOp),
+        )
+        .padding(8)
+        .width(Fill)
+        .style(|_theme| container::Style {
+            background: Some(Background::Color(Color {
+                a: 0.6,
+                ..Color::from_rgb(0.067, 0.067, 0.106)
+            })),
+            border: Border {
+                color: BORDER,
+                width: 1.0,
+                radius: 4.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into();
+    }
     const MAX_LINES: usize = 500;
     let lines: Vec<&str> = body.lines().collect();
     let is_diff = format == "diff";
