@@ -1743,7 +1743,7 @@ fn is_id_noise(token: &str) -> bool {
     if core.contains(':') && core.split(':').next().is_some_and(|a| a == "sha256") {
         return true;
     }
-    is_uuid(core) || is_long_hex(core)
+    is_uuid(core) || is_hex_id(core)
 }
 
 /// A canonical 8-4-4-4-12 hex UUID.
@@ -1756,9 +1756,13 @@ fn is_uuid(s: &str) -> bool {
             .all(|(n, p)| p.len() == *n && p.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
-/// A bare hex run long enough to be an id rather than a word (≥12 chars).
-fn is_long_hex(s: &str) -> bool {
-    s.len() >= 12 && s.chars().all(|c| c.is_ascii_hexdigit())
+/// A bare hex run that's an id rather than a word: ≥6 hex chars **with at least
+/// one digit** — catches short shas / entry-id prefixes (e.g. `943677b5`) while
+/// sparing all-letter hex words like "facade", "decade", "defaced".
+fn is_hex_id(s: &str) -> bool {
+    s.len() >= 6
+        && s.chars().all(|c| c.is_ascii_hexdigit())
+        && s.chars().any(|c| c.is_ascii_digit())
 }
 
 /// Crude tag-stripper for the host's sanitized-HTML feed segments.
