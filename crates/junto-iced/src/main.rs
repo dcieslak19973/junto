@@ -12,8 +12,8 @@ use std::collections::{HashMap, HashSet};
 use iced::widget::canvas::{self, Canvas, Frame, Geometry, Path, Stroke};
 use iced::widget::pane_grid;
 use iced::widget::{
-    button, checkbox, column, combo_box, container, pick_list, row, scrollable, text, text_input,
-    Space,
+    button, checkbox, column, combo_box, container, markdown, pick_list, row, scrollable, text,
+    text_input, Space,
 };
 use iced::{
     Background, Border, Center, Color, Element, Fill, Length, Point, Rectangle, Renderer, Size,
@@ -79,8 +79,8 @@ struct Pane {
     /// turn. Distinct from `watched`: a landed session stays selected (so its
     /// record + steer box show) but is not streaming.
     streaming: bool,
-    /// Accumulated live events for the watched session's current turn.
-    feed: Vec<LiveEvent>,
+    /// Accumulated live events (with parsed Markdown) for the current turn.
+    feed: Vec<FeedItem>,
     launch_intent: String,
     steer_text: String,
     /// Which configured Agent runs the next launch (None → host default).
@@ -177,6 +177,29 @@ struct LiveEvent {
     seq: u64,
     #[serde(default)]
     html: bool,
+    /// Raw Markdown behind a rendered segment, when the host supplies it.
+    #[serde(default)]
+    markdown: Option<String>,
+}
+
+/// A live-feed entry plus its parsed Markdown (parsed once on arrival so the
+/// `markdown` widget can render it without re-parsing each frame).
+struct FeedItem {
+    event: LiveEvent,
+    md: Option<Vec<markdown::Item>>,
+}
+
+/// The raw Markdown to render for an event, if any: the host's `markdown`
+/// field, or model prose that arrived as plain text (assistant/thinking/result).
+fn feed_markdown(event: &LiveEvent) -> Option<Vec<markdown::Item>> {
+    let raw = event.markdown.as_deref().or_else(|| {
+        (!event.html && matches!(event.kind.as_str(), "assistant" | "thinking" | "result"))
+            .then_some(event.text.as_str())
+    })?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    Some(markdown::parse(raw).collect())
 }
 
 // --- the host's view.json shape ---
@@ -304,6 +327,8 @@ enum Message {
     Steer(pane_grid::Pane),
     Interrupt(pane_grid::Pane),
     Posted(pane_grid::Pane),
+    /// A clicked Markdown link in the live feed — currently ignored.
+    NoOp,
 }
 
 impl App {
@@ -503,10 +528,18 @@ impl App {
                 let mut scroll = None;
                 for (_, state) in self.panes.iter_mut() {
                     if state.watched.as_deref() == Some(session.as_str()) {
+                        let item = FeedItem {
+                            md: feed_markdown(&event),
+                            event,
+                        };
                         // Coalesce streaming Markdown segments by seq.
                         match state.feed.last_mut() {
-                            Some(last) if event.seq != 0 && last.seq == event.seq => *last = event,
-                            _ => state.feed.push(event),
+                            Some(last)
+                                if item.event.seq != 0 && last.event.seq == item.event.seq =>
+                            {
+                                *last = item;
+                            }
+                            _ => state.feed.push(item),
                         }
                         scroll = Some(state.scroll_id.clone());
                         break;
@@ -674,6 +707,7 @@ impl App {
                 let channel = self.panes.get(pane).map(|p| p.channel.clone());
                 channel.map_or_else(Task::none, |c| fetch(pane, &c))
             }
+            Message::NoOp => Task::none(),
         }
     }
 
@@ -994,9 +1028,9 @@ fn pane_body<'a>(
         // The current turn's live output, while streaming.
         if pane.streaming {
             record = record.push(text("— live turn —").size(11).color(MUTED));
-            let mut feed = column![].spacing(4);
-            for event in &pane.feed {
-                feed = feed.push(feed_line(event));
+            let mut feed = column![].spacing(6);
+            for item in &pane.feed {
+                feed = feed.push(feed_line(item));
             }
             record = record.push(feed);
         }
@@ -1099,7 +1133,17 @@ fn pane_body<'a>(
 
 /// One live-feed line — kind-coloured, with any HTML the host rendered stripped
 /// back to plain text (native can't paint HTML).
-fn feed_line(event: &LiveEvent) -> Element<'static, Message> {
+fn feed_line(item: &FeedItem) -> Element<'_, Message> {
+    // Model prose renders as Markdown; status/tool/error lines stay plain.
+    if let Some(md) = &item.md {
+        return markdown::view(
+            md,
+            markdown::Settings::default(),
+            markdown::Style::from_palette(Theme::CatppuccinMocha.palette()),
+        )
+        .map(|_url| Message::NoOp);
+    }
+    let event = &item.event;
     let body = if event.html {
         strip_html(&event.text)
     } else {

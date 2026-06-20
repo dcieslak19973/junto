@@ -593,7 +593,10 @@ fn stream_text(
     };
     segment.text.push_str(chunk);
     let html = crate::render::render_markdown(&segment.text);
-    live.publish(session, LiveEvent::segment(kind, html, segment.seq));
+    live.publish(
+        session,
+        LiveEvent::segment(kind, segment.text.clone(), html, segment.seq),
+    );
     state.segment = Some(segment);
 }
 

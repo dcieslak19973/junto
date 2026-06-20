@@ -647,6 +647,11 @@ pub struct LiveEvent {
     /// otherwise plain text set via `textContent`.
     #[serde(default)]
     pub html: bool,
+    /// The raw Markdown behind a rendered segment, for clients that render
+    /// Markdown themselves (the native app) instead of consuming `text`'s HTML.
+    /// `None` for plain lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub markdown: Option<String>,
 }
 
 impl LiveEvent {
@@ -657,17 +662,25 @@ impl LiveEvent {
             text: text.into(),
             seq: 0,
             html: false,
+            markdown: None,
         }
     }
 
-    /// A growing Markdown segment: `text` is sanitized HTML, keyed by `seq` so
-    /// the client replaces the block in place as it streams.
-    pub(crate) fn segment(kind: &str, html: impl Into<String>, seq: u64) -> Self {
+    /// A growing Markdown segment: `text` is sanitized HTML and `markdown` the
+    /// raw source, keyed by `seq` so the client replaces the block in place as
+    /// it streams.
+    pub(crate) fn segment(
+        kind: &str,
+        markdown: impl Into<String>,
+        html: impl Into<String>,
+        seq: u64,
+    ) -> Self {
         Self {
             kind: kind.into(),
             text: html.into(),
             seq,
             html: true,
+            markdown: Some(markdown.into()),
         }
     }
 
@@ -679,6 +692,7 @@ impl LiveEvent {
             text: text.into(),
             seq,
             html: false,
+            markdown: None,
         }
     }
 }
