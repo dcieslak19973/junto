@@ -396,22 +396,27 @@ impl App {
             .collect();
         let ribbon: Element<Message> = match &self.lineage {
             Some(graph) => {
-                // Render the ENTIRE timeline, always visible — no internal scroll.
+                // A short, vertically-scrollable band — the whole graph is
+                // reachable by scrolling without it dominating the window.
                 let canvas = LineageCanvas::layout(graph, &open);
-                let h = canvas.height.max(60.0);
-                container(Canvas::new(canvas).width(Fill).height(Length::Fixed(h)))
-                    .width(Fill)
-                    .height(Length::Fixed(h))
-                    .padding(6)
-                    .style(|_theme| container::Style {
-                        background: Some(Background::Color(Color { a: 0.4, ..SURFACE })),
-                        border: Border {
-                            radius: 6.0.into(),
-                            ..Border::default()
-                        },
-                        ..container::Style::default()
-                    })
-                    .into()
+                let content_h = canvas.height.max(60.0);
+                let view_h = content_h.min(190.0);
+                container(
+                    scrollable(Canvas::new(canvas).width(Fill).height(Length::Fixed(content_h)))
+                        .height(Fill),
+                )
+                .width(Fill)
+                .height(Length::Fixed(view_h))
+                .padding(6)
+                .style(|_theme| container::Style {
+                    background: Some(Background::Color(Color { a: 0.4, ..SURFACE })),
+                    border: Border {
+                        radius: 6.0.into(),
+                        ..Border::default()
+                    },
+                    ..container::Style::default()
+                })
+                .into()
             }
             None => container(text("loading lineage…").size(12).color(MUTED))
                 .width(Fill)
@@ -420,16 +425,14 @@ impl App {
                 .into(),
         };
 
-        // The focus board: cross-channel "needs you" items. Click one to open
-        // its channel pane (acting on it is the next parity step).
-        let focus_board: Element<Message> = if self.focus_items.is_empty() {
-            container(text("focus · all clear").size(12).color(GREEN))
-                .padding([4, 8])
-                .into()
+        // The focus board: a visible top banner of cross-channel "needs you"
+        // items. Click one to open its channel pane (acting inline is next).
+        let focus_inner: Element<Message> = if self.focus_items.is_empty() {
+            text("focus · all clear").size(13).color(GREEN).into()
         } else {
             let mut items = row![
                 text(format!("needs you ({}) ▸", self.focus_items.len()))
-                    .size(12)
+                    .size(13)
                     .color(YELLOW)
             ]
             .spacing(8)
@@ -450,15 +453,25 @@ impl App {
                 }
                 items = items.push(chip);
             }
-            container(
-                scrollable(items).direction(scrollable::Direction::Horizontal(
+            scrollable(items)
+                .direction(scrollable::Direction::Horizontal(
                     scrollable::Scrollbar::default(),
-                )),
-            )
-            .width(Fill)
-            .padding([4, 4])
-            .into()
+                ))
+                .into()
         };
+        let focus_board = container(focus_inner)
+            .width(Fill)
+            .center_y(Length::Fixed(44.0))
+            .padding([0, 12])
+            .style(|_theme| container::Style {
+                background: Some(Background::Color(SURFACE)),
+                border: Border {
+                    color: BORDER,
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                ..container::Style::default()
+            });
 
         // Shared-width columns, reflowing as channels open/close.
         let mut body = row![].spacing(6);
