@@ -965,8 +965,10 @@ fn entry_card<'a>(
         let entry_id = entry.id.clone();
         let mut acts = column![].spacing(6);
 
-        // Pre-baked frame options coherent with this entry's two acts.
-        let mut options = row![].spacing(6);
+        // Pre-baked frame options coherent with this entry's two acts. Stacked
+        // full-width so they stay readable in a narrow pane (no horizontal
+        // overflow); the act is tagged on the right of each row.
+        let mut options = column![].spacing(4);
         let mut has_options = false;
         for opt in &entry.frame {
             if opt.act != affirm && opt.act != decline {
@@ -975,23 +977,28 @@ fn entry_card<'a>(
             has_options = true;
             let affirmative = opt.act == affirm;
             let color = if affirmative { GREEN } else { RED };
-            let label = format!("{}  ({})", opt.label, opt.act);
+            let inner = row![
+                text(opt.label.clone()).size(11),
+                Space::with_width(Fill),
+                text(opt.act.clone()).size(10),
+            ]
+            .spacing(8)
+            .align_y(Center);
             options = options.push(
-                button(text(label).size(11))
+                button(inner)
+                    .width(Fill)
                     .on_press(Message::Act(
                         id,
                         entry_id.clone(),
                         opt.act.clone(),
                         opt.rationale.clone(),
                     ))
-                    .padding([3, 10])
+                    .padding([4, 10])
                     .style(move |_t, _s| chip_style(color, affirmative)),
             );
         }
         if has_options {
-            acts = acts.push(scrollable(options).direction(
-                scrollable::Direction::Horizontal(scrollable::Scrollbar::default().width(4).scroller_width(4)),
-            ));
+            acts = acts.push(options);
         }
 
         // Free-text fallback: type a custom rationale, then affirm/decline.
