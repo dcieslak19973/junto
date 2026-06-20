@@ -73,6 +73,7 @@ pub fn router(host: Arc<Host>) -> Router {
         .route("/channels/{channel}/brief", get(channel_brief))
         .route("/channels/{channel}/view.json", get(channel_view_json))
         .route("/channels.json", get(channels_json))
+        .route("/lineage.json", get(lineage_json))
         .route("/channels/{channel}/entries/{entry}/{act}", post(verify))
         .with_state(host)
         // Wrap any plain-text error response in a styled page (so a refused
@@ -1500,6 +1501,51 @@ async fn channels_json(State(host): State<Arc<Host>>) -> Response {
         })
         .collect();
     axum::Json(items).into_response()
+}
+
+/// The whole **lineage DAG** across channels (nodes + diverge/converge edges) —
+/// the data a native surface draws as a git-style branch graph. Read-only.
+async fn lineage_json(State(host): State<Arc<Host>>) -> Response {
+    #[derive(Serialize)]
+    struct Node {
+        id: String,
+        name: String,
+    }
+    #[derive(Serialize)]
+    struct Edge {
+        from: String,
+        to: String,
+        relation: String,
+    }
+    #[derive(Serialize)]
+    struct Graph {
+        nodes: Vec<Node>,
+        edges: Vec<Edge>,
+    }
+
+    let inventory = host.inventory().await.unwrap_or_default();
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    for summary in &inventory {
+        let Some(name) = &summary.name else { continue };
+        nodes.push(Node {
+            id: summary.id.to_string(),
+            name: name.clone(),
+        });
+        // Use each channel's *outgoing* edges so each edge is counted once.
+        if let Ok((id, view, _)) = project(&host, &summary.id.to_string()).await {
+            for edge in &view.lineage {
+                if edge.direction == junto_kernel::LineageDirection::Outgoing {
+                    edges.push(Edge {
+                        from: id.to_string(),
+                        to: edge.other.to_string(),
+                        relation: format!("{:?}", edge.relation).to_lowercase(),
+                    });
+                }
+            }
+        }
+    }
+    axum::Json(Graph { nodes, edges }).into_response()
 }
 
 /// A structured **read-only** projection of a channel as JSON — the data a

@@ -11,7 +11,7 @@ license = "MIT"
 description = "Spike: a native (Iced) multi-channel pane workspace over the junto host"
 
 [dependencies]
-iced = { version = "0.13", features = ["tokio", "image"] }
+iced = { version = "0.13", features = ["tokio", "image", "canvas"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
