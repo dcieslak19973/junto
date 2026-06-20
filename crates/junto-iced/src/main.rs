@@ -85,6 +85,9 @@ struct Pane {
     /// The workspace repo for the launch; empty falls back to the channel's
     /// remembered mapping on the host.
     launch_workspace: String,
+    /// An entry to surface at the top of the timeline — set when a focus-board
+    /// chip jumps here so the card needing attention is immediately visible.
+    highlight_entry: Option<String>,
 }
 
 enum Content {
@@ -190,6 +193,7 @@ struct FocusItem {
 
 #[derive(Debug, Clone, Deserialize)]
 struct EntryDto {
+    id: String,
     author: String,
     kind: String,
     summary: String,
@@ -201,6 +205,10 @@ struct EntryDto {
 enum Message {
     ChannelsLoaded(Vec<String>),
     ChannelPicked(String),
+    /// A focus-board chip: open/focus the channel and jump to the entry.
+    FocusChipPicked(String, String),
+    /// Dismiss the pinned attention card in a pane.
+    ClearHighlight(pane_grid::Pane),
     LineageGraphLoaded(Option<LineageGraphDto>),
     FocusLoaded(Vec<FocusItem>),
     AgentsLoaded(Vec<AgentDto>),
@@ -246,6 +254,32 @@ impl App {
         )
     }
 
+    /// Focus the existing pane for `name`, or split a new one. Returns the pane
+    /// (when resolved) and the fetch task for a freshly-opened pane.
+    fn open_or_focus(&mut self, name: &str) -> (Option<pane_grid::Pane>, Task<Message>) {
+        if let Some(existing) = self
+            .order
+            .iter()
+            .copied()
+            .find(|p| self.panes.get(*p).is_some_and(|s| s.channel == name))
+        {
+            self.focus = Some(existing);
+            return (Some(existing), Task::none());
+        }
+        let Some(target) = self.focus.or_else(|| self.order.last().copied()) else {
+            return (None, Task::none());
+        };
+        if let Some((new_pane, _)) =
+            self.panes
+                .split(pane_grid::Axis::Vertical, target, Pane::loading(name))
+        {
+            self.order.push(new_pane);
+            self.focus = Some(new_pane);
+            return (Some(new_pane), fetch(new_pane, name));
+        }
+        (None, Task::none())
+    }
+
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::ChannelsLoaded(names) => {
@@ -265,28 +299,24 @@ impl App {
                 Task::none()
             }
             Message::ChannelPicked(name) => {
-                // If this channel already has an open pane, focus it rather than
-                // opening a duplicate (the focus-board chips route through here too).
-                if let Some(existing) = self
-                    .order
-                    .iter()
-                    .copied()
-                    .find(|p| self.panes.get(*p).is_some_and(|s| s.channel == name))
+                let (_, task) = self.open_or_focus(&name);
+                task
+            }
+            Message::FocusChipPicked(name, entry_id) => {
+                let (pane, task) = self.open_or_focus(&name);
+                if let Some(pane) = pane
+                    && let Some(state) = self.panes.get_mut(pane)
                 {
-                    self.focus = Some(existing);
-                    return Task::none();
+                    // Show the timeline (not a live feed) so the card is visible,
+                    // and pin the attention entry to the top.
+                    state.watched = None;
+                    state.highlight_entry = Some(entry_id);
                 }
-                let Some(target) = self.focus.or_else(|| self.order.last().copied())
-                else {
-                    return Task::none();
-                };
-                if let Some((new_pane, _)) =
-                    self.panes
-                        .split(pane_grid::Axis::Vertical, target, Pane::loading(&name))
-                {
-                    self.order.push(new_pane);
-                    self.focus = Some(new_pane);
-                    return fetch(new_pane, &name);
+                task
+            }
+            Message::ClearHighlight(pane) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    state.highlight_entry = None;
                 }
                 Task::none()
             }
@@ -528,7 +558,10 @@ impl App {
                     move |_t, _s| chip_style(color, false),
                 );
                 if let Some(name) = &item.channel_name {
-                    chip = chip.on_press(Message::ChannelPicked(name.clone()));
+                    chip = chip.on_press(Message::FocusChipPicked(
+                        name.clone(),
+                        item.entry_id.clone(),
+                    ));
                 }
                 items = items.push(chip);
             }
@@ -704,11 +737,38 @@ fn pane_body<'a>(
         .spacing(6);
         column![scrollable(feed).height(Fill), steer].spacing(8).into()
     } else {
+        let highlight = pane.highlight_entry.as_deref();
+        // A focus-board jump pins the attention entry above the scroll so it's
+        // immediately visible; it's lifted out of the scrolled list below.
+        let pinned: Option<Element<Message>> = highlight.and_then(|hid| {
+            dto.entries.iter().find(|e| e.id == hid).map(|entry| {
+                let header = row![
+                    text("▾ needs you").size(11).color(YELLOW),
+                    Space::with_width(Fill),
+                    button(text("dismiss").size(11).color(MUTED))
+                        .on_press(Message::ClearHighlight(id))
+                        .padding([2, 8])
+                        .style(|_t, _s| chip_style(MUTED, false)),
+                ]
+                .align_y(Center);
+                column![header, timeline_entry(entry, true)]
+                    .spacing(4)
+                    .into()
+            })
+        });
         let mut timeline = column![].spacing(8);
         for entry in &dto.entries {
-            timeline = timeline.push(timeline_entry(entry));
+            if highlight == Some(entry.id.as_str()) {
+                continue; // pinned above
+            }
+            timeline = timeline.push(timeline_entry(entry, false));
         }
-        scrollable(timeline).height(Fill).into()
+        match pinned {
+            Some(pinned) => column![pinned, scrollable(timeline).height(Fill)]
+                .spacing(8)
+                .into(),
+            None => scrollable(timeline).height(Fill).into(),
+        }
     };
 
     column![header, launch, chips, main]
@@ -782,8 +842,8 @@ fn chip_style(color: Color, active: bool) -> button::Style {
 /// One history entry: a node on a left rail (git-log style) beside its card.
 /// The rail line fills the row height; with zero column spacing the nodes link
 /// into a continuous history.
-fn timeline_entry(entry: &EntryDto) -> Element<'_, Message> {
-    row![rail(kind_color(&entry.kind)), entry_card(entry)]
+fn timeline_entry(entry: &EntryDto, highlighted: bool) -> Element<'_, Message> {
+    row![rail(kind_color(&entry.kind)), entry_card(entry, highlighted)]
         .spacing(10)
         .into()
 }
@@ -816,7 +876,7 @@ fn dot(color: Color) -> Element<'static, Message> {
 
 /// One timeline entry as a card: a colour-coded kind badge + author + status,
 /// over the summary text.
-fn entry_card(entry: &EntryDto) -> Element<'_, Message> {
+fn entry_card(entry: &EntryDto, highlighted: bool) -> Element<'_, Message> {
     let accent = kind_color(&entry.kind);
     let mut head = row![badge(&entry.kind, accent), text(entry.author.clone()).size(11).color(MUTED)]
         .spacing(8);
@@ -829,14 +889,19 @@ fn entry_card(entry: &EntryDto) -> Element<'_, Message> {
 
     let card = column![head, text(entry.summary.clone()).size(13).color(TEXT)].spacing(6);
 
+    let (border_color, border_width) = if highlighted {
+        (YELLOW, 2.0)
+    } else {
+        (BORDER, 1.0)
+    };
     container(card)
         .padding(10)
         .width(Fill)
         .style(move |_theme| container::Style {
             background: Some(Background::Color(SURFACE)),
             border: Border {
-                color: BORDER,
-                width: 1.0,
+                color: border_color,
+                width: border_width,
                 radius: 6.0.into(),
             },
             text_color: Some(TEXT),
@@ -892,6 +957,7 @@ impl Pane {
             launch_agent: None,
             launch_outcome: false,
             launch_workspace: String::new(),
+            highlight_entry: None,
         }
     }
 }
