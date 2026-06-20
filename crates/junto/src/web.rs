@@ -32,7 +32,7 @@ use axum::{
     routing::{get, post},
 };
 use junto_kernel::{ChannelId, ChannelView, EntryId, EntryPayload, LedgerEntry, Timestamp};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::host::{Host, Resolution};
 use crate::render;
@@ -65,12 +65,24 @@ pub fn router(host: Arc<Host>) -> Router {
             "/channels/{channel}/artifacts/{artifact}",
             get(view_artifact),
         )
+        .route(
+            "/channels/{channel}/artifacts/{artifact}/content.json",
+            get(artifact_content_json),
+        )
         .route("/channels/{channel}/rename", post(rename_channel))
         .route("/channels/{channel}/close", post(close_channel))
         .route("/channels/{channel}/reopen", post(reopen_channel))
         .route("/channels/{channel}/diverge", post(diverge_channel))
         .route("/channels/{channel}/converge", post(converge_channel))
         .route("/channels/{channel}/brief", get(channel_brief))
+        .route("/channels/{channel}/view.json", get(channel_view_json))
+        .route("/channels.json", get(channels_json))
+        .route("/lineage.json", get(lineage_json))
+        .route("/focus.json", get(focus_json))
+        .route("/agents.json", get(agents_json))
+        .route("/workspaces.json", get(workspaces_json))
+        .route("/substrates.json", get(substrates_json))
+        .route("/settings.json", get(settings_json))
         .route("/channels/{channel}/entries/{entry}/{act}", post(verify))
         .with_state(host)
         // Wrap any plain-text error response in a styled page (so a refused
@@ -883,61 +895,16 @@ async fn view_artifact(
     State(host): State<Arc<Host>>,
     Path((channel, artifact)): Path<(String, String)>,
 ) -> Response {
-    let Ok(artifact_id) = artifact.parse::<EntryId>() else {
-        return (StatusCode::BAD_REQUEST, "not an artifact id").into_response();
-    };
-    let (_id, view, _substrate) = match project(&host, &channel).await {
-        Ok(projected) => projected,
+    let (content, format) = match resolve_artifact_content(&host, &channel, &artifact).await {
+        Ok(resolved) => resolved,
         Err(response) => return response,
-    };
-    let Some(entry) = view.entries.iter().find(|e| e.id == artifact_id) else {
-        return (StatusCode::NOT_FOUND, "no such artifact in this channel").into_response();
-    };
-    let EntryPayload::ArtifactAttached {
-        kind, provenance, ..
-    } = &entry.payload
-    else {
-        return (StatusCode::BAD_REQUEST, "that entry is not an artifact").into_response();
-    };
-    let Some(file) = provenance.first() else {
-        return (StatusCode::NOT_FOUND, "artifact has no stored content").into_response();
-    };
-    let Some(path) = file_uri_to_path(file.uri.as_str()) else {
-        return (StatusCode::BAD_REQUEST, "artifact is not a local file").into_response();
-    };
-    // Defense in depth: only ever read under this machine's artifacts root.
-    let artifacts_root = match crate::host::junto_home() {
-        Ok(home) => home.join("artifacts"),
-        Err(err) => return internal(format!("no junto home: {err}")),
-    };
-    let (canon_path, canon_root) = match (
-        dunce::canonicalize(&path),
-        dunce::canonicalize(&artifacts_root),
-    ) {
-        (Ok(p), Ok(root)) => (p, root),
-        _ => {
-            return (
-                StatusCode::NOT_FOUND,
-                "artifact content is not on this machine",
-            )
-                .into_response();
-        }
-    };
-    if !canon_path.starts_with(&canon_root) {
-        return (StatusCode::FORBIDDEN, "artifact path is outside the store").into_response();
-    }
-    let content = match std::fs::read_to_string(&canon_path) {
-        Ok(content) => content,
-        Err(err) => {
-            return (StatusCode::NOT_FOUND, format!("reading artifact: {err}")).into_response();
-        }
     };
     // The card's `<details>` lazy-loads this inline. A memo is the agent's
     // prose (rendered as sanitized CommonMark); a diff gets per-line colour;
     // everything else stays verbatim as text.
     let html =
         |body: String| ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], body).into_response();
-    match render::artifact_format(kind) {
+    match format {
         render::ArtifactFormat::Markdown => html(render::render_markdown(&content)),
         render::ArtifactFormat::Diff => html(render::render_diff(&content)),
         render::ArtifactFormat::Raw => (
@@ -946,6 +913,88 @@ async fn view_artifact(
         )
             .into_response(),
     }
+}
+
+/// An artifact's **raw content + format** as JSON — for a non-HTML surface (the
+/// native Iced app) to render itself (diff colouring, etc.). Same content and
+/// security checks as [`view_artifact`], just not pre-rendered to HTML.
+async fn artifact_content_json(
+    State(host): State<Arc<Host>>,
+    Path((channel, artifact)): Path<(String, String)>,
+) -> Response {
+    let (content, format) = match resolve_artifact_content(&host, &channel, &artifact).await {
+        Ok(resolved) => resolved,
+        Err(response) => return response,
+    };
+    #[derive(Serialize)]
+    struct Out {
+        format: &'static str,
+        content: String,
+    }
+    let format = match format {
+        render::ArtifactFormat::Markdown => "markdown",
+        render::ArtifactFormat::Diff => "diff",
+        render::ArtifactFormat::Raw => "raw",
+    };
+    axum::Json(Out { format, content }).into_response()
+}
+
+/// Resolve an artifact entry to its stored content + presentation format,
+/// enforcing that the file sits under this machine's artifacts root (an entry
+/// can arrive by sync carrying any path, so the resolved file is not trusted
+/// until checked). Shared by the HTML and JSON artifact endpoints.
+async fn resolve_artifact_content(
+    host: &Arc<Host>,
+    channel: &str,
+    artifact: &str,
+) -> Result<(String, render::ArtifactFormat), Response> {
+    let Ok(artifact_id) = artifact.parse::<EntryId>() else {
+        return Err((StatusCode::BAD_REQUEST, "not an artifact id").into_response());
+    };
+    let (_id, view, _substrate) = project(host, channel).await?;
+    let Some(entry) = view.entries.iter().find(|e| e.id == artifact_id) else {
+        return Err((StatusCode::NOT_FOUND, "no such artifact in this channel").into_response());
+    };
+    let EntryPayload::ArtifactAttached {
+        kind, provenance, ..
+    } = &entry.payload
+    else {
+        return Err((StatusCode::BAD_REQUEST, "that entry is not an artifact").into_response());
+    };
+    let Some(file) = provenance.first() else {
+        return Err((StatusCode::NOT_FOUND, "artifact has no stored content").into_response());
+    };
+    let Some(path) = file_uri_to_path(file.uri.as_str()) else {
+        return Err((StatusCode::BAD_REQUEST, "artifact is not a local file").into_response());
+    };
+    // Defense in depth: only ever read under this machine's artifacts root.
+    let artifacts_root = match crate::host::junto_home() {
+        Ok(home) => home.join("artifacts"),
+        Err(err) => return Err(internal(format!("no junto home: {err}"))),
+    };
+    let (canon_path, canon_root) = match (
+        dunce::canonicalize(&path),
+        dunce::canonicalize(&artifacts_root),
+    ) {
+        (Ok(p), Ok(root)) => (p, root),
+        _ => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                "artifact content is not on this machine",
+            )
+                .into_response());
+        }
+    };
+    if !canon_path.starts_with(&canon_root) {
+        return Err((StatusCode::FORBIDDEN, "artifact path is outside the store").into_response());
+    }
+    let content = match std::fs::read_to_string(&canon_path) {
+        Ok(content) => content,
+        Err(err) => {
+            return Err((StatusCode::NOT_FOUND, format!("reading artifact: {err}")).into_response());
+        }
+    };
+    Ok((content, render::artifact_format(kind)))
 }
 
 /// Turn a `file://` URI (as `store_artifact` writes it) back into a path.
@@ -1474,6 +1523,569 @@ async fn channel_brief(State(host): State<Arc<Host>>, Path(channel): Path<String
                 .into_response()
         }
         Err(response) => response,
+    }
+}
+
+/// The list of open channels (name + id) — feeds a native surface's channel
+/// picker / type-ahead. Read-only.
+async fn channels_json(State(host): State<Arc<Host>>) -> Response {
+    #[derive(Serialize)]
+    struct Item {
+        id: String,
+        name: String,
+    }
+    let items: Vec<Item> = host
+        .inventory()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|s| {
+            s.name.map(|name| Item {
+                id: s.id.to_string(),
+                name,
+            })
+        })
+        .collect();
+    axum::Json(items).into_response()
+}
+
+/// The **focus board** across channels — the cross-channel "needs you" items
+/// (pending gates, approved-but-unexecuted actionable gates, provisional
+/// assertions awaiting verification). The native attention home renders this.
+async fn focus_json(State(host): State<Arc<Host>>) -> Response {
+    #[derive(Serialize)]
+    struct Item {
+        kind: String,
+        entry_id: String,
+        channel: String,
+        channel_name: Option<String>,
+        author: String,
+        summary: String,
+    }
+    let clip = |s: &str| s.chars().take(140).collect::<String>();
+    let inventory = host.inventory().await.unwrap_or_default();
+    let mut items = Vec::new();
+    for summary in &inventory {
+        let Ok((id, view, _)) = project(&host, &summary.id.to_string()).await else {
+            continue;
+        };
+        let group = crate::host::attention_for_view(&id, &view);
+        for item in &group.items {
+            let kind = match item.kind {
+                crate::host::AttentionKind::Gate => "gate",
+                crate::host::AttentionKind::AwaitingExecution => "awaiting-execution",
+                crate::host::AttentionKind::Verification => "verification",
+            };
+            let text = match &item.entry.payload {
+                EntryPayload::Assertion { statement, .. } => clip(statement),
+                EntryPayload::Proposal { action, .. } => clip(action),
+                _ => "—".into(),
+            };
+            items.push(Item {
+                kind: kind.into(),
+                entry_id: item.entry.id.to_string(),
+                channel: id.to_string(),
+                channel_name: group.name.clone(),
+                author: item.entry.author.display_name.clone(),
+                summary: text,
+            });
+        }
+    }
+    axum::Json(items).into_response()
+}
+
+/// Machine settings for the native settings view: harness status, the
+/// harnesses available to the agent form, registered substrates, the identity
+/// human acts author as, and the host version. Read-only.
+async fn settings_json(State(host): State<Arc<Host>>) -> Response {
+    #[derive(Serialize)]
+    struct HarnessOut {
+        protocol: &'static str,
+        detail: String,
+        backend: &'static str,
+        auth: &'static str,
+        hint: Option<&'static str>,
+    }
+    #[derive(Serialize)]
+    struct HarnessRef {
+        id: &'static str,
+        label: &'static str,
+    }
+    #[derive(Serialize)]
+    struct IdentityOut {
+        name: String,
+        email: String,
+    }
+    #[derive(Serialize)]
+    struct Out {
+        harness: HarnessOut,
+        harnesses: Vec<HarnessRef>,
+        substrates: Vec<String>,
+        identity: Option<IdentityOut>,
+        version: &'static str,
+    }
+    let status = crate::launch::harness_status();
+    let substrates = host.substrate_paths().unwrap_or_default();
+    let identity = substrates
+        .first()
+        .and_then(|repo| crate::host::git_user(repo).ok())
+        .map(|m| IdentityOut {
+            name: m.display_name,
+            email: m.email,
+        });
+    let out = Out {
+        harness: HarnessOut {
+            protocol: status.protocol,
+            detail: status.detail,
+            backend: status.backend,
+            auth: status.auth,
+            hint: status.hint,
+        },
+        harnesses: crate::launch::all_harnesses()
+            .iter()
+            .map(|h| HarnessRef {
+                id: h.id,
+                label: h.label,
+            })
+            .collect(),
+        substrates: substrates.iter().map(|p| p.display().to_string()).collect(),
+        identity,
+        version: env!("CARGO_PKG_VERSION"),
+    };
+    axum::Json(out).into_response()
+}
+
+/// The registered **home substrates** (repo paths) — for the native new-channel
+/// form to pick which substrate a channel opens in (when more than one).
+async fn substrates_json(State(host): State<Arc<Host>>) -> Response {
+    let paths: Vec<String> = host
+        .substrate_paths()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    axum::Json(paths).into_response()
+}
+
+/// Distinct **workspace repos**, most-recently-used first — the launch form's
+/// inferred default + suggestions for a fresh channel (so the user rarely has
+/// to pick a directory). Ordered by the last activity of the channel each repo
+/// is bound to.
+async fn workspaces_json(State(host): State<Arc<Host>>) -> Response {
+    let junto_home = match crate::host::junto_home() {
+        Ok(home) => home,
+        Err(err) => return internal(format!("no junto home: {err}")),
+    };
+    let mappings = match crate::launch::all_workspaces(&junto_home) {
+        Ok(mappings) => mappings,
+        Err(err) => return internal(format!("reading workspaces: {err}")),
+    };
+    // Channel id → last activity, for recency ordering.
+    let activity: std::collections::HashMap<String, i64> = host
+        .inventory()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| {
+            (
+                s.id.to_string(),
+                s.last_activity.map(|t| t.as_millis()).unwrap_or(0),
+            )
+        })
+        .collect();
+    // Newest channel's repo first; dedup repos keeping their best (latest) rank.
+    let mut ranked: Vec<(i64, String)> = mappings
+        .into_iter()
+        .map(|(channel, repo)| {
+            let when = activity.get(&channel.to_string()).copied().unwrap_or(0);
+            (when, repo.display().to_string())
+        })
+        .collect();
+    ranked.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    let mut seen = std::collections::HashSet::new();
+    let repos: Vec<String> = ranked
+        .into_iter()
+        .filter_map(|(_, repo)| seen.insert(repo.clone()).then_some(repo))
+        .collect();
+    axum::Json(repos).into_response()
+}
+
+/// The configured **Agents** the launch picker offers (`docs/adr/0023`/`0024`).
+/// The first entry is the default (the stock agent for the default harness).
+/// The native launch controls render this as the agent dropdown.
+async fn agents_json() -> Response {
+    #[derive(Serialize)]
+    struct McpServerItem {
+        name: String,
+        url: String,
+    }
+    #[derive(Serialize)]
+    struct Item {
+        slug: String,
+        name: String,
+        harness: String,
+        model: Option<String>,
+        role: Option<String>,
+        mcp_servers: Vec<McpServerItem>,
+        skills: Vec<String>,
+        plugins: Vec<String>,
+    }
+    let junto_home = match crate::host::junto_home() {
+        Ok(home) => home,
+        Err(err) => return internal(format!("no junto home: {err}")),
+    };
+    match crate::agent::all_agents(&junto_home) {
+        Ok(agents) => {
+            let items: Vec<Item> = agents
+                .into_iter()
+                .map(|a| Item {
+                    slug: a.slug,
+                    name: a.name,
+                    harness: a.harness,
+                    model: a.model,
+                    role: a.role,
+                    mcp_servers: a
+                        .mcp_servers
+                        .into_iter()
+                        .map(|s| McpServerItem {
+                            name: s.name,
+                            url: s.url,
+                        })
+                        .collect(),
+                    skills: a.skills,
+                    plugins: a.plugins,
+                })
+                .collect();
+            axum::Json(items).into_response()
+        }
+        Err(err) => internal(format!("reading agents: {err}")),
+    }
+}
+
+/// The whole **lineage DAG** across channels (nodes + diverge/converge edges) —
+/// the data a native surface draws as a git-style branch graph. Read-only.
+async fn lineage_json(State(host): State<Arc<Host>>) -> Response {
+    #[derive(Serialize)]
+    struct Milestone {
+        ms: i64,
+        label: String,
+    }
+    #[derive(Serialize)]
+    struct Node {
+        id: String,
+        name: String,
+        first_ms: Option<i64>,
+        last_ms: Option<i64>,
+        /// Key points along the channel's track, each with explanatory text.
+        milestones: Vec<Milestone>,
+    }
+    #[derive(Serialize)]
+    struct Edge {
+        from: String,
+        to: String,
+        relation: String,
+    }
+    #[derive(Serialize)]
+    struct Graph {
+        nodes: Vec<Node>,
+        edges: Vec<Edge>,
+    }
+
+    let clip = |s: &str| s.chars().take(70).collect::<String>();
+    let inventory = host.inventory().await.unwrap_or_default();
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    for summary in &inventory {
+        let Some(name) = &summary.name else { continue };
+        let mut milestones = Vec::new();
+        if let Ok((id, view, _)) = project(&host, &summary.id.to_string()).await {
+            // Use each channel's *outgoing* edges so each edge is counted once.
+            for edge in &view.lineage {
+                if edge.direction == junto_kernel::LineageDirection::Outgoing {
+                    edges.push(Edge {
+                        from: id.to_string(),
+                        to: edge.other.to_string(),
+                        relation: format!("{:?}", edge.relation).to_lowercase(),
+                    });
+                }
+            }
+            // Milestones: the subject points along the track, each labelled.
+            for entry in &view.entries {
+                let label = match &entry.payload {
+                    EntryPayload::Assertion { statement, .. } => {
+                        Some(format!("decision · {}", clip(statement)))
+                    }
+                    EntryPayload::Proposal { action, .. } => {
+                        Some(format!("gate · {}", clip(action)))
+                    }
+                    EntryPayload::SessionStarted { intent } => {
+                        Some(format!("session · {}", clip(intent)))
+                    }
+                    EntryPayload::DivergedFrom { .. } => Some("diverged from parent".into()),
+                    EntryPayload::ConvergedInto { .. } => Some("converged into another".into()),
+                    _ => None,
+                };
+                if let Some(label) = label {
+                    milestones.push(Milestone {
+                        ms: entry.timestamp.as_millis(),
+                        label,
+                    });
+                }
+            }
+            // Keep the most recent dozen so the track doesn't get crowded.
+            if milestones.len() > 12 {
+                milestones.drain(0..milestones.len() - 12);
+            }
+        }
+        nodes.push(Node {
+            id: summary.id.to_string(),
+            name: name.clone(),
+            first_ms: summary.first_activity.map(|t| t.as_millis()),
+            last_ms: summary.last_activity.map(|t| t.as_millis()),
+            milestones,
+        });
+    }
+    axum::Json(Graph { nodes, edges }).into_response()
+}
+
+/// A structured **read-only** projection of a channel as JSON — the data a
+/// non-HTML surface (e.g. the native Iced spike, `docs/native-ui-toolkit-
+/// assessment.md`) renders into its own widgets. Mirrors what the HTML channel
+/// page shows: party, lineage edges (the split history), and the entry timeline
+/// with each entry's derived status. Read-only; acts stay POST routes.
+async fn channel_view_json(State(host): State<Arc<Host>>, Path(channel): Path<String>) -> Response {
+    match project(&host, &channel).await {
+        Ok((id, view, _substrate)) => {
+            // Resolve lineage edges' other-channel ids to names for the strip.
+            let names: std::collections::HashMap<String, String> = host
+                .inventory()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|s| s.name.map(|n| (s.id.to_string(), n)))
+                .collect();
+            let mut dto = ChannelDto::from_view(&id, &view, &names);
+            // The channel's remembered workspace, if any — lets the native launch
+            // form pre-fill it instead of asking the user to pick a directory.
+            dto.workspace = crate::host::junto_home()
+                .ok()
+                .and_then(|home| crate::launch::workspace_for(&home, &id).ok().flatten())
+                .map(|repo| repo.display().to_string());
+            axum::Json(dto).into_response()
+        }
+        Err(response) => response,
+    }
+}
+
+#[derive(Serialize)]
+struct ChannelDto {
+    id: String,
+    name: Option<String>,
+    closed: bool,
+    party: Vec<String>,
+    /// The channel's remembered workspace repo, if any (a returning channel).
+    workspace: Option<String>,
+    lineage: Vec<LineageDto>,
+    sessions: Vec<SessionDto>,
+    entries: Vec<EntryDto>,
+}
+
+#[derive(Serialize)]
+struct SessionDto {
+    id: String,
+    state: String,
+    intent: String,
+}
+
+#[derive(Serialize)]
+struct LineageDto {
+    relation: String,
+    direction: String,
+    other: String,
+    other_name: Option<String>,
+    label: String,
+}
+
+#[derive(Serialize)]
+struct EntryDto {
+    id: String,
+    author: String,
+    kind: String,
+    summary: String,
+    status: Option<String>,
+    unrecognized: bool,
+    /// The entry this one acts on, if any — e.g. a SessionUpdated/ArtifactAttached
+    /// points at its SessionStarted, letting a surface group a session's record.
+    target: Option<String>,
+    /// The decision frame's articulated options (`docs/adr/0019`), if any — the
+    /// pre-baked, one-click rationales a verifier can adopt. Empty when none.
+    frame: Vec<FrameOptionDto>,
+}
+
+/// One decision-frame option for the native surface: a labelled choice that
+/// performs `act` with a drafted `rationale`.
+#[derive(Serialize)]
+struct FrameOptionDto {
+    label: String,
+    act: String,
+    rationale: String,
+}
+
+/// The act-route segment for a [`junto_kernel::FrameAct`].
+fn frame_act_route(act: junto_kernel::FrameAct) -> &'static str {
+    match act {
+        junto_kernel::FrameAct::Ratify => "ratify",
+        junto_kernel::FrameAct::Park => "park",
+        junto_kernel::FrameAct::Approve => "approve",
+        junto_kernel::FrameAct::Reject => "reject",
+    }
+}
+
+impl ChannelDto {
+    fn from_view(
+        id: &ChannelId,
+        view: &ChannelView,
+        names: &std::collections::HashMap<String, String>,
+    ) -> Self {
+        let entries = view
+            .entries
+            .iter()
+            .map(|entry| EntryDto::from_entry(entry, view))
+            .collect();
+        let lineage = view
+            .lineage
+            .iter()
+            .map(|edge| LineageDto {
+                relation: format!("{:?}", edge.relation).to_lowercase(),
+                direction: format!("{:?}", edge.direction).to_lowercase(),
+                other: edge.other.to_string(),
+                other_name: names.get(&edge.other.to_string()).cloned(),
+                label: lineage_label(edge),
+            })
+            .collect();
+        // Sessions: each SessionStarted entry + its folded state.
+        let sessions = view
+            .entries
+            .iter()
+            .filter_map(|entry| match &entry.payload {
+                EntryPayload::SessionStarted { intent } => Some(SessionDto {
+                    id: entry.id.to_string(),
+                    state: view
+                        .sessions
+                        .get(&entry.id)
+                        .map(|s| format!("{:?}", s.state).to_lowercase())
+                        .unwrap_or_else(|| "unknown".into()),
+                    intent: intent.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
+        ChannelDto {
+            id: id.to_string(),
+            name: view.name.clone(),
+            closed: view.closed,
+            party: view.party.iter().map(|m| m.display_name.clone()).collect(),
+            workspace: None, // set by the handler (needs junto_home)
+            lineage,
+            sessions,
+            entries,
+        }
+    }
+}
+
+impl EntryDto {
+    fn from_entry(entry: &LedgerEntry, view: &ChannelView) -> Self {
+        let (kind, summary) = match &entry.payload {
+            EntryPayload::ChannelOpened { .. } => ("channel", "opened the channel".to_string()),
+            EntryPayload::MemberAdded { member } => {
+                ("member", format!("added {}", member.display_name))
+            }
+            EntryPayload::ChannelClosed { rationale } => {
+                ("channel", format!("closed — {rationale}"))
+            }
+            EntryPayload::ChannelReopened { rationale } => {
+                ("channel", format!("reopened — {rationale}"))
+            }
+            EntryPayload::DivergedFrom { .. } => ("lineage", "diverged from a parent".to_string()),
+            EntryPayload::ChildDiverged { .. } => {
+                ("lineage", "a side-quest diverged from here".to_string())
+            }
+            EntryPayload::ConvergedInto { .. } => {
+                ("lineage", "converged into another channel".to_string())
+            }
+            EntryPayload::ConvergenceReceived { .. } => {
+                ("lineage", "received a convergence".to_string())
+            }
+            EntryPayload::Assertion { statement, .. } => ("assertion", statement.clone()),
+            EntryPayload::Ratification { rationale, .. } => {
+                ("act", format!("ratified — {rationale}"))
+            }
+            EntryPayload::Park { rationale, .. } => ("act", format!("parked — {rationale}")),
+            EntryPayload::Correction { statement, .. } => {
+                ("act", format!("corrected — {statement}"))
+            }
+            EntryPayload::Proposal { action, .. } => ("proposal", action.clone()),
+            EntryPayload::Approval { rationale, .. } => ("act", format!("approved — {rationale}")),
+            EntryPayload::Rejection { rationale, .. } => ("act", format!("rejected — {rationale}")),
+            EntryPayload::GateExecuted { note, .. } => ("act", format!("gate executed — {note}")),
+            EntryPayload::SessionStarted { intent } => ("session", intent.clone()),
+            EntryPayload::SessionUpdated { note, .. } => ("session", note.clone()),
+            EntryPayload::ArtifactAttached {
+                kind, description, ..
+            } => ("artifact", format!("{kind}: {description}")),
+        };
+        let status = match &entry.payload {
+            EntryPayload::Assertion { .. } | EntryPayload::Correction { .. } => view
+                .standings
+                .get(&entry.id)
+                .map(|s| format!("{s:?}").to_lowercase()),
+            EntryPayload::Proposal { .. } => view
+                .gate_status
+                .get(&entry.id)
+                .map(|s| format!("{s:?}").to_lowercase()),
+            EntryPayload::SessionStarted { .. } => view
+                .sessions
+                .get(&entry.id)
+                .map(|s| format!("{:?}", s.state).to_lowercase()),
+            _ => None,
+        };
+        let frame = match &entry.payload {
+            EntryPayload::Assertion { frame, .. } | EntryPayload::Proposal { frame, .. } => frame
+                .as_ref()
+                .map(|f| {
+                    f.options
+                        .iter()
+                        .map(|o| FrameOptionDto {
+                            label: o.label.clone(),
+                            act: frame_act_route(o.act).to_string(),
+                            rationale: o.rationale.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        EntryDto {
+            id: entry.id.to_string(),
+            author: entry.author.display_name.clone(),
+            kind: kind.to_string(),
+            summary,
+            status,
+            unrecognized: view.unrecognized.contains(&entry.id),
+            target: entry.payload.target().map(|t| t.to_string()),
+            frame,
+        }
+    }
+}
+
+/// A human label for a lineage edge from this channel's point of view.
+fn lineage_label(edge: &junto_kernel::LineageEdge) -> String {
+    use junto_kernel::{LineageDirection as D, LineageRelation as R};
+    match (edge.relation, edge.direction) {
+        (R::Diverge, D::Incoming) => "diverged from parent".to_string(),
+        (R::Diverge, D::Outgoing) => "side-quest diverged from here".to_string(),
+        (R::Converge, D::Incoming) => "received a convergence".to_string(),
+        (R::Converge, D::Outgoing) => "converged into another channel".to_string(),
     }
 }
 

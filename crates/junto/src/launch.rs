@@ -439,6 +439,30 @@ pub fn workspace_for(junto_home: &Path, channel: &ChannelId) -> Result<Option<Pa
         .and_then(|record| record.repos.into_iter().next()))
 }
 
+/// Every remembered (channel → repo) mapping. Used to infer a default
+/// workspace for a fresh channel from what's been used recently elsewhere.
+pub fn all_workspaces(junto_home: &Path) -> Result<Vec<(ChannelId, PathBuf)>> {
+    let path = workspaces_path(junto_home);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let file: WorkspacesFile =
+        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    Ok(file
+        .workspaces
+        .into_iter()
+        .filter_map(|record| {
+            record
+                .repos
+                .into_iter()
+                .next()
+                .map(|repo| (record.channel, repo))
+        })
+        .collect())
+}
+
 /// Remember (or update) a channel's workspace repo.
 pub fn remember_workspace(junto_home: &Path, channel: &ChannelId, repo: &Path) -> Result<()> {
     let repo = dunce::canonicalize(repo)
@@ -629,6 +653,11 @@ pub struct LiveEvent {
     /// otherwise plain text set via `textContent`.
     #[serde(default)]
     pub html: bool,
+    /// The raw Markdown behind a rendered segment, for clients that render
+    /// Markdown themselves (the native app) instead of consuming `text`'s HTML.
+    /// `None` for plain lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub markdown: Option<String>,
 }
 
 impl LiveEvent {
@@ -639,17 +668,25 @@ impl LiveEvent {
             text: text.into(),
             seq: 0,
             html: false,
+            markdown: None,
         }
     }
 
-    /// A growing Markdown segment: `text` is sanitized HTML, keyed by `seq` so
-    /// the client replaces the block in place as it streams.
-    pub(crate) fn segment(kind: &str, html: impl Into<String>, seq: u64) -> Self {
+    /// A growing Markdown segment: `text` is sanitized HTML and `markdown` the
+    /// raw source, keyed by `seq` so the client replaces the block in place as
+    /// it streams.
+    pub(crate) fn segment(
+        kind: &str,
+        markdown: impl Into<String>,
+        html: impl Into<String>,
+        seq: u64,
+    ) -> Self {
         Self {
             kind: kind.into(),
             text: html.into(),
             seq,
             html: true,
+            markdown: Some(markdown.into()),
         }
     }
 
@@ -661,6 +698,7 @@ impl LiveEvent {
             text: text.into(),
             seq,
             html: false,
+            markdown: None,
         }
     }
 }
@@ -1540,8 +1578,11 @@ fn spawn_turn(
     resume: Option<String>,
     agent: crate::agent::Agent,
 ) {
+    // Open the live feed *before* spawning, so it exists the moment this
+    // function returns — a client that subscribes right after the launch/steer
+    // HTTP call lands on the running turn instead of an immediate "end".
+    let mut control_rx = host.live().begin(session);
     tokio::spawn(async move {
-        let mut control_rx = host.live().begin(session);
         let outcome = run_turn(
             &workspace,
             &prompt,
@@ -2853,8 +2894,10 @@ mod tests {
         let session = EntryId::new();
         let _rx = live.begin(session);
         // Two frames of the same growing segment (seq 1) keep only the latest.
-        live.publish(session, LiveEvent::segment("assistant", "<p>hel</p>", 1));
-        live.publish(session, LiveEvent::segment("assistant", "<p>hello</p>", 1));
+        let frame1 = LiveEvent::segment("assistant", "hel", "<p>hel</p>", 1);
+        let frame2 = LiveEvent::segment("assistant", "hello", "<p>hello</p>", 1);
+        live.publish(session, frame1);
+        live.publish(session, frame2);
         // A discrete line (seq 0) always appends.
         live.publish(session, LiveEvent::new("tool", "Bash: ls"));
         let (buffer, _rx2) = live.subscribe(session).expect("feed live");

@@ -1,0 +1,24 @@
+# junto-iced — SPIKE: a native (Iced) multi-channel pane workspace over the
+# junto host. Deliberately its OWN workspace, excluded from the kernel one:
+# Iced's dependency tree is large (same reasoning as junto-desktop). See
+# docs/native-ui-toolkit-assessment.md.
+[package]
+name = "junto-iced"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+description = "Spike: a native (Iced) multi-channel pane workspace over the junto host"
+
+[dependencies]
+iced = { version = "0.13", features = ["tokio", "image", "canvas", "markdown"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Native folder picker for the launch workspace (MIT, cross-platform).
+rfd = "0.15"
+# Open clicked Markdown links in the OS default browser (MIT, cross-platform).
+open = "5"
+
+[workspace]
+# standalone — see the header comment
