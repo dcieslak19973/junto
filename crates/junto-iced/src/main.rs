@@ -793,10 +793,13 @@ fn pane_body<'a>(
         .text_size(12);
     let options_row = row![
         agent_picker,
-        text_input("workspace repo (optional)", &pane.launch_workspace)
-            .on_input(move |v| Message::LaunchWorkspaceChanged(id, v))
-            .size(12)
-            .padding(6),
+        text_input(
+            "workspace repo path (remembered after first launch)",
+            &pane.launch_workspace,
+        )
+        .on_input(move |v| Message::LaunchWorkspaceChanged(id, v))
+        .size(12)
+        .padding(6),
     ]
     .spacing(6)
     .align_y(Center);
