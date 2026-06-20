@@ -85,6 +85,10 @@ struct Pane {
     /// The workspace repo for the launch; empty falls back to the channel's
     /// remembered mapping on the host.
     launch_workspace: String,
+    /// A launch is in flight — disables the launch button and shows "launching…".
+    launching: bool,
+    /// The last launch's error message, if it failed (e.g. no workspace).
+    launch_error: Option<String>,
     /// An entry to surface at the top of the timeline — set when a focus-board
     /// chip jumps here so the card needing attention is immediately visible.
     highlight_entry: Option<String>,
@@ -250,6 +254,8 @@ enum Message {
     LaunchModeToggled(pane_grid::Pane),
     LaunchWorkspaceChanged(pane_grid::Pane, String),
     Launch(pane_grid::Pane),
+    /// The result of a launch (pane, Ok or an error message).
+    Launched(pane_grid::Pane, Result<(), String>),
     SteerTextChanged(pane_grid::Pane, String),
     Steer(pane_grid::Pane),
     Interrupt(pane_grid::Pane),
@@ -473,15 +479,36 @@ impl App {
                     return Task::none();
                 };
                 let intent = state.launch_intent.trim().to_string();
-                if intent.is_empty() {
+                if intent.is_empty() || state.launching {
                     return Task::none();
                 }
                 let channel = state.channel.clone();
                 let agent = state.launch_agent.as_ref().map(|a| a.slug.clone());
                 let mode = if state.launch_outcome { "outcome" } else { "single" };
                 let workspace = state.launch_workspace.trim().to_string();
-                state.launch_intent.clear();
+                // Keep the intent until the launch succeeds, so a failed launch
+                // doesn't lose what was typed.
+                state.launching = true;
+                state.launch_error = None;
                 post_launch(pane, channel, intent, agent, mode, workspace)
+            }
+            Message::Launched(pane, result) => {
+                let Some(state) = self.panes.get_mut(pane) else {
+                    return Task::none();
+                };
+                state.launching = false;
+                match result {
+                    Ok(()) => {
+                        state.launch_error = None;
+                        state.launch_intent.clear();
+                        let channel = state.channel.clone();
+                        fetch(pane, &channel)
+                    }
+                    Err(err) => {
+                        state.launch_error = Some(err);
+                        Task::none()
+                    }
+                }
             }
             Message::SteerTextChanged(pane, value) => {
                 if let Some(state) = self.panes.get_mut(pane) {
@@ -731,14 +758,21 @@ fn pane_body<'a>(
     }
 
     // Launch a session: intent + agent picker + mode toggle + workspace.
-    let intent_row = row![
-        text_input("launch a session — what should it do?", &pane.launch_intent)
-            .on_input(move |v| Message::LaunchIntentChanged(id, v))
-            .on_submit(Message::Launch(id))
-            .padding(6),
-        button("launch").on_press(Message::Launch(id)).padding(6),
-    ]
-    .spacing(6);
+    let intent_input = text_input("launch a session — what should it do?", &pane.launch_intent)
+        .on_input(move |v| Message::LaunchIntentChanged(id, v))
+        .padding(6);
+    // Don't accept submits/clicks while a launch is in flight.
+    let intent_input = if pane.launching {
+        intent_input
+    } else {
+        intent_input.on_submit(Message::Launch(id))
+    };
+    let mut launch_btn = button(text(if pane.launching { "launching…" } else { "launch" }))
+        .padding(6);
+    if !pane.launching {
+        launch_btn = launch_btn.on_press(Message::Launch(id));
+    }
+    let intent_row = row![intent_input, launch_btn].spacing(6);
     let agent_picker: Element<Message> = if agents.is_empty() {
         text("no agents configured").size(11).color(MUTED).into()
     } else {
@@ -769,7 +803,10 @@ fn pane_body<'a>(
     ]
     .spacing(6)
     .align_y(Center);
-    let launch = column![intent_row, options_row].spacing(6);
+    let mut launch = column![intent_row, options_row].spacing(6);
+    if let Some(err) = &pane.launch_error {
+        launch = launch.push(text(format!("⚠ {err}")).size(11).color(RED));
+    }
 
     // Session chips — click to stream a session's live feed.
     let mut chips = row![].spacing(6);
@@ -1161,6 +1198,8 @@ impl Pane {
             launch_agent: None,
             launch_outcome: false,
             launch_workspace: String::new(),
+            launching: false,
+            launch_error: None,
             highlight_entry: None,
             act_drafts: HashMap::new(),
             act_errors: HashMap::new(),
@@ -1609,9 +1648,22 @@ fn post_launch(
             if let Some(agent) = agent {
                 form.push(("agent", agent));
             }
-            let _ = reqwest::Client::new().post(&url).form(&form).send().await;
+            match reqwest::Client::new().post(&url).form(&form).send().await {
+                Ok(resp) if resp.status().is_success() => Ok(()),
+                Ok(resp) => {
+                    let code = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    let body = body.trim();
+                    Err(if body.is_empty() {
+                        format!("launch failed ({code})")
+                    } else {
+                        format!("{code}: {body}")
+                    })
+                }
+                Err(err) => Err(format!("request failed: {err}")),
+            }
         },
-        move |()| Message::Posted(pane),
+        move |result| Message::Launched(pane, result),
     )
 }
 
