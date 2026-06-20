@@ -1510,6 +1510,8 @@ async fn lineage_json(State(host): State<Arc<Host>>) -> Response {
     struct Node {
         id: String,
         name: String,
+        first_ms: Option<i64>,
+        last_ms: Option<i64>,
     }
     #[derive(Serialize)]
     struct Edge {
@@ -1531,6 +1533,8 @@ async fn lineage_json(State(host): State<Arc<Host>>) -> Response {
         nodes.push(Node {
             id: summary.id.to_string(),
             name: name.clone(),
+            first_ms: summary.first_activity.map(|t| t.as_millis()),
+            last_ms: summary.last_activity.map(|t| t.as_millis()),
         });
         // Use each channel's *outgoing* edges so each edge is counted once.
         if let Ok((id, view, _)) = project(&host, &summary.id.to_string()).await {

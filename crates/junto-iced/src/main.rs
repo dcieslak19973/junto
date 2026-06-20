@@ -22,16 +22,17 @@ use serde::Deserialize;
 
 const HOST: &str = "http://127.0.0.1:1727";
 
-// A catppuccin-ish dark palette, close to the web surface.
-const SURFACE: Color = Color::from_rgb(0.19, 0.20, 0.27);
-const TEXT: Color = Color::from_rgb(0.80, 0.84, 0.96);
-const MUTED: Color = Color::from_rgb(0.49, 0.51, 0.63);
-const TEAL: Color = Color::from_rgb(0.58, 0.89, 0.84);
-const GREEN: Color = Color::from_rgb(0.65, 0.89, 0.63);
-const RED: Color = Color::from_rgb(0.95, 0.55, 0.66);
-const YELLOW: Color = Color::from_rgb(0.98, 0.89, 0.69);
-const MAUVE: Color = Color::from_rgb(0.80, 0.65, 0.97);
-const BLUE: Color = Color::from_rgb(0.54, 0.71, 0.98);
+// The web surface's exact palette (Catppuccin Mocha — same hex as render.rs).
+const SURFACE: Color = Color::from_rgb(0.118, 0.118, 0.180); // --card #1e1e2e
+const BORDER: Color = Color::from_rgb(0.192, 0.196, 0.267); // --border #313244
+const TEXT: Color = Color::from_rgb(0.804, 0.839, 0.957); // --text #cdd6f4
+const MUTED: Color = Color::from_rgb(0.498, 0.518, 0.612); // --muted #7f849c
+const TEAL: Color = Color::from_rgb(0.580, 0.886, 0.835); // --teal #94e2d5
+const GREEN: Color = Color::from_rgb(0.651, 0.890, 0.631); // --green #a6e3a1
+const RED: Color = Color::from_rgb(0.953, 0.545, 0.659); // --red #f38ba8
+const YELLOW: Color = Color::from_rgb(0.976, 0.886, 0.686); // --yellow #f9e2af
+const MAUVE: Color = Color::from_rgb(0.796, 0.651, 0.969); // mauve #cba6f7
+const BLUE: Color = Color::from_rgb(0.537, 0.706, 0.980); // --accent #89b4fa
 
 fn main() -> iced::Result {
     let icon = iced::window::icon::from_file_data(include_bytes!("../icon.png"), None).ok();
@@ -81,6 +82,8 @@ struct LineageGraphDto {
 struct GNode {
     id: String,
     name: String,
+    first_ms: Option<i64>,
+    last_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -619,7 +622,7 @@ fn entry_card(entry: &EntryDto) -> Element<'_, Message> {
         .style(move |_theme| container::Style {
             background: Some(Background::Color(SURFACE)),
             border: Border {
-                color: Color { a: 0.5, ..accent },
+                color: BORDER,
                 width: 1.0,
                 radius: 6.0.into(),
             },
@@ -743,107 +746,105 @@ impl Pane {
     }
 }
 
-// ---- the branch graph (git-style diverge/convergence DAG) ----
+// ---- the branch graph: a horizontal time-axis lineage strip, matching the
+// web's `lineage_strip` (newest on the right, log-scaled by age; each channel a
+// track from its first to last activity; diverge/converge as connectors). ----
 
-struct Placed {
+const ROWH: f32 = 32.0;
+const TOP: f32 = 20.0;
+const LABEL_W: f32 = 150.0;
+
+struct Track {
     name: String,
-    point: Point,
+    row: usize,
+    first_ms: i64,
+    last_ms: i64,
     root: bool,
 }
 
-/// A laid-out lineage DAG ready to draw: nodes placed by (depth, order),
-/// names in an aligned column to the right of the lanes.
 struct LineageCanvas {
-    nodes: Vec<Placed>,
-    /// (from, to, is_diverge)
-    edges: Vec<(Point, Point, bool)>,
-    name_x: f32,
+    tracks: Vec<Track>,
+    /// (parent_row, child_row, divergence_ms, is_diverge)
+    links: Vec<(usize, usize, i64, bool)>,
+    now_ms: i64,
+    span_ms: i64,
     height: f32,
 }
 
 impl LineageCanvas {
     fn layout(graph: &LineageGraphDto) -> Self {
-        const COLW: f32 = 22.0;
-        const ROWH: f32 = 30.0;
-        const PADX: f32 = 18.0;
-        const PADY: f32 = 18.0;
-
-        // diverge: parent -> children
-        let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
         let mut is_child: HashSet<&str> = HashSet::new();
         for edge in &graph.edges {
             if edge.relation == "diverge" {
-                children
-                    .entry(edge.from.as_str())
-                    .or_default()
-                    .push(edge.to.as_str());
                 is_child.insert(edge.to.as_str());
             }
         }
 
-        // Pre-order DFS (iterative): x = depth, y = visitation order.
-        let mut placement: HashMap<String, (usize, usize)> = HashMap::new();
-        let mut order = 0usize;
-        let mut visit = |start: &str, placement: &mut HashMap<String, (usize, usize)>, order: &mut usize| {
-            let mut stack = vec![(start.to_string(), 0usize)];
-            while let Some((id, depth)) = stack.pop() {
-                if placement.contains_key(&id) {
-                    continue;
-                }
-                placement.insert(id.clone(), (depth, *order));
-                *order += 1;
-                if let Some(cs) = children.get(id.as_str()) {
-                    for c in cs.iter().rev() {
-                        stack.push(((*c).to_string(), depth + 1));
-                    }
-                }
-            }
-        };
-        for node in &graph.nodes {
-            if !is_child.contains(node.id.as_str()) {
-                visit(&node.id, &mut placement, &mut order);
-            }
-        }
-        for node in &graph.nodes {
-            if !placement.contains_key(&node.id) {
-                visit(&node.id, &mut placement, &mut order);
-            }
-        }
-
-        let max_depth = placement.values().map(|(d, _)| *d).max().unwrap_or(0);
-        let name_x = PADX + (max_depth as f32 + 1.0) * COLW + 10.0;
-        let point_of = |id: &str| {
-            placement
-                .get(id)
-                .map(|(d, r)| Point::new(PADX + *d as f32 * COLW, PADY + *r as f32 * ROWH))
-        };
-
-        let nodes = graph
+        // Stack tracks oldest-first (root spines near the top).
+        let now_ms = graph
             .nodes
             .iter()
-            .filter_map(|n| {
-                point_of(&n.id).map(|p| Placed {
-                    name: n.name.clone(),
-                    point: p,
-                    root: !is_child.contains(n.id.as_str()),
-                })
-            })
+            .filter_map(|n| n.last_ms)
+            .max()
+            .unwrap_or(0);
+        let min_ms = graph
+            .nodes
+            .iter()
+            .filter_map(|n| n.first_ms)
+            .min()
+            .unwrap_or(0);
+
+        let mut ordered: Vec<&GNode> = graph.nodes.iter().collect();
+        ordered.sort_by_key(|n| n.first_ms.unwrap_or(min_ms));
+
+        let mut row_of: HashMap<&str, usize> = HashMap::new();
+        let mut tracks = Vec::new();
+        for (row, n) in ordered.iter().enumerate() {
+            row_of.insert(n.id.as_str(), row);
+            tracks.push(Track {
+                name: n.name.clone(),
+                row,
+                first_ms: n.first_ms.unwrap_or(min_ms),
+                last_ms: n.last_ms.unwrap_or(now_ms),
+                root: !is_child.contains(n.id.as_str()),
+            });
+        }
+        let first_of: HashMap<&str, i64> = graph
+            .nodes
+            .iter()
+            .map(|n| (n.id.as_str(), n.first_ms.unwrap_or(min_ms)))
             .collect();
-        let edges = graph
+
+        let links = graph
             .edges
             .iter()
             .filter_map(|e| {
-                let (a, b) = (point_of(&e.from)?, point_of(&e.to)?);
-                Some((a, b, e.relation == "diverge"))
+                let parent = *row_of.get(e.from.as_str())?;
+                let child = *row_of.get(e.to.as_str())?;
+                let at = *first_of.get(e.to.as_str())?;
+                Some((parent, child, at, e.relation == "diverge"))
             })
             .collect();
-        let height = PADY * 2.0 + order as f32 * ROWH;
+
+        let height = TOP * 2.0 + tracks.len() as f32 * ROWH;
         LineageCanvas {
-            nodes,
-            edges,
-            name_x,
+            tracks,
+            links,
+            now_ms,
+            span_ms: (now_ms - min_ms).max(1),
             height,
         }
+    }
+
+    /// Log-scaled age → x, newest on the right (matches the web's `strip_age_x`).
+    fn x_of(&self, ms: i64, left: f32, right: f32) -> f32 {
+        let age = (self.now_ms - ms).max(0) as f64;
+        let frac = ((age + 1.0).ln() / (self.span_ms as f64 + 1.0).ln()).clamp(0.0, 1.0) as f32;
+        right - frac * (right - left)
+    }
+
+    fn y_of(row: usize) -> f32 {
+        TOP + row as f32 * ROWH + ROWH / 2.0
     }
 }
 
@@ -859,21 +860,36 @@ impl canvas::Program<Message> for LineageCanvas {
         _cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
         let mut frame = Frame::new(renderer, bounds.size());
-        for (a, b, diverge) in &self.edges {
+        let left = LABEL_W;
+        let right = (bounds.width - 24.0).max(left + 60.0);
+
+        // Diverge/converge connectors: a vertical link at the divergence time.
+        for (parent_row, child_row, at_ms, diverge) in &self.links {
+            let x = self.x_of(*at_ms, left, right);
             let color = if *diverge { MAUVE } else { GREEN };
             frame.stroke(
-                &Path::line(*a, *b),
-                Stroke::default().with_color(color).with_width(2.0),
+                &Path::line(
+                    Point::new(x, Self::y_of(*parent_row)),
+                    Point::new(x, Self::y_of(*child_row)),
+                ),
+                Stroke::default().with_color(color).with_width(1.5),
             );
         }
-        for node in &self.nodes {
-            frame.fill(
-                &Path::circle(node.point, 5.0),
-                if node.root { TEAL } else { MAUVE },
+
+        // Tracks: a horizontal line from first to last activity + an end cap.
+        for track in &self.tracks {
+            let y = Self::y_of(track.row);
+            let x0 = self.x_of(track.first_ms, left, right);
+            let x1 = self.x_of(track.last_ms, left, right);
+            let color = if track.root { TEAL } else { MAUVE };
+            frame.stroke(
+                &Path::line(Point::new(x0, y), Point::new(x1.max(x0 + 2.0), y)),
+                Stroke::default().with_color(color).with_width(2.5),
             );
+            frame.fill(&Path::circle(Point::new(x1.max(x0 + 2.0), y), 4.0), color);
             frame.fill_text(canvas::Text {
-                content: node.name.clone(),
-                position: Point::new(self.name_x, node.point.y - 8.0),
+                content: truncate(&track.name, 20),
+                position: Point::new(8.0, y - 8.0),
                 color: TEXT,
                 size: 13.0.into(),
                 ..canvas::Text::default()
