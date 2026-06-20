@@ -201,6 +201,17 @@ struct EntryDto {
     summary: String,
     status: Option<String>,
     unrecognized: bool,
+    /// Pre-baked decision-frame options (`docs/adr/0019`); empty when none.
+    #[serde(default)]
+    frame: Vec<FrameOptionDto>,
+}
+
+/// One decision-frame option — a labelled, pre-baked rationale for one act.
+#[derive(Debug, Clone, Deserialize)]
+struct FrameOptionDto {
+    label: String,
+    act: String,
+    rationale: String,
 }
 
 #[derive(Debug, Clone)]
@@ -213,8 +224,10 @@ enum Message {
     ClearHighlight(pane_grid::Pane),
     /// Edit the rationale draft for an inline verification act (pane, entry, text).
     ActRationaleChanged(pane_grid::Pane, String, String),
-    /// Submit a verification act on an entry (pane, entry, act keyword).
-    Act(pane_grid::Pane, String, &'static str),
+    /// Submit a verification act on an entry (pane, entry, act route, rationale).
+    /// Frame options pass their pre-baked rationale; the free-text form passes
+    /// the typed draft.
+    Act(pane_grid::Pane, String, String, String),
     LineageGraphLoaded(Option<LineageGraphDto>),
     FocusLoaded(Vec<FocusItem>),
     AgentsLoaded(Vec<AgentDto>),
@@ -332,18 +345,14 @@ impl App {
                 }
                 Task::none()
             }
-            Message::Act(pane, entry_id, act) => {
-                let Some(state) = self.panes.get_mut(pane) else {
-                    return Task::none();
-                };
-                let rationale = state
-                    .act_drafts
-                    .get(&entry_id)
-                    .map(|r| r.trim().to_string())
-                    .unwrap_or_default();
+            Message::Act(pane, entry_id, act, rationale) => {
+                let rationale = rationale.trim().to_string();
                 if rationale.is_empty() {
                     return Task::none();
                 }
+                let Some(state) = self.panes.get_mut(pane) else {
+                    return Task::none();
+                };
                 let channel = state.channel.clone();
                 state.act_drafts.remove(&entry_id);
                 post_verify(pane, channel, entry_id, act, rationale)
@@ -947,14 +956,47 @@ fn entry_card<'a>(
 
     let mut card = column![head, text(entry.summary.clone()).size(13).color(TEXT)].spacing(6);
 
-    // Inline verification acts: open assertions/proposals get a rationale box
-    // and affirm/decline buttons (disabled until a rationale is typed — the
-    // host requires one). Acting refetches the pane, so the buttons clear once
-    // the entry resolves.
+    // Inline verification acts on open assertions/proposals. The decision
+    // frame's pre-baked options come first as one-click buttons (each carries
+    // its drafted rationale — adopt it without typing, `docs/adr/0019`), then a
+    // free-text fallback box for a custom rationale. Acting refetches the pane,
+    // so the controls clear once the entry resolves.
     if let Some((affirm, decline)) = entry_acts(entry) {
         let entry_id = entry.id.clone();
+        let mut acts = column![].spacing(6);
+
+        // Pre-baked frame options coherent with this entry's two acts.
+        let mut options = row![].spacing(6);
+        let mut has_options = false;
+        for opt in &entry.frame {
+            if opt.act != affirm && opt.act != decline {
+                continue;
+            }
+            has_options = true;
+            let affirmative = opt.act == affirm;
+            let color = if affirmative { GREEN } else { RED };
+            let label = format!("{}  ({})", opt.label, opt.act);
+            options = options.push(
+                button(text(label).size(11))
+                    .on_press(Message::Act(
+                        id,
+                        entry_id.clone(),
+                        opt.act.clone(),
+                        opt.rationale.clone(),
+                    ))
+                    .padding([3, 10])
+                    .style(move |_t, _s| chip_style(color, affirmative)),
+            );
+        }
+        if has_options {
+            acts = acts.push(scrollable(options).direction(
+                scrollable::Direction::Horizontal(scrollable::Scrollbar::default().width(4).scroller_width(4)),
+            ));
+        }
+
+        // Free-text fallback: type a custom rationale, then affirm/decline.
         let has_rationale = !draft.trim().is_empty();
-        let rationale = text_input("rationale (required)…", draft)
+        let rationale = text_input("custom rationale…", draft)
             .on_input({
                 let entry_id = entry_id.clone();
                 move |v| Message::ActRationaleChanged(id, entry_id.clone(), v)
@@ -968,14 +1010,25 @@ fn entry_card<'a>(
             .padding([3, 10])
             .style(|_t, _s| chip_style(RED, false));
         if has_rationale {
-            affirm_btn = affirm_btn.on_press(Message::Act(id, entry_id.clone(), affirm));
-            decline_btn = decline_btn.on_press(Message::Act(id, entry_id.clone(), decline));
+            affirm_btn = affirm_btn.on_press(Message::Act(
+                id,
+                entry_id.clone(),
+                affirm.to_string(),
+                draft.to_string(),
+            ));
+            decline_btn = decline_btn.on_press(Message::Act(
+                id,
+                entry_id.clone(),
+                decline.to_string(),
+                draft.to_string(),
+            ));
         }
-        card = card.push(
+        acts = acts.push(
             row![rationale, affirm_btn, decline_btn]
                 .spacing(6)
                 .align_y(Center),
         );
+        card = card.push(acts);
     }
 
     let (border_color, border_width) = if highlighted {
@@ -1504,7 +1557,7 @@ fn post_verify(
     pane: pane_grid::Pane,
     channel: String,
     entry: String,
-    act: &'static str,
+    act: String,
     rationale: String,
 ) -> Task<Message> {
     let url = format!("{HOST}/channels/{channel}/entries/{entry}/{act}");

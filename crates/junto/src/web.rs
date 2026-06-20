@@ -1728,6 +1728,28 @@ struct EntryDto {
     summary: String,
     status: Option<String>,
     unrecognized: bool,
+    /// The decision frame's articulated options (`docs/adr/0019`), if any — the
+    /// pre-baked, one-click rationales a verifier can adopt. Empty when none.
+    frame: Vec<FrameOptionDto>,
+}
+
+/// One decision-frame option for the native surface: a labelled choice that
+/// performs `act` with a drafted `rationale`.
+#[derive(Serialize)]
+struct FrameOptionDto {
+    label: String,
+    act: String,
+    rationale: String,
+}
+
+/// The act-route segment for a [`junto_kernel::FrameAct`].
+fn frame_act_route(act: junto_kernel::FrameAct) -> &'static str {
+    match act {
+        junto_kernel::FrameAct::Ratify => "ratify",
+        junto_kernel::FrameAct::Park => "park",
+        junto_kernel::FrameAct::Approve => "approve",
+        junto_kernel::FrameAct::Reject => "reject",
+    }
 }
 
 impl ChannelDto {
@@ -1833,6 +1855,22 @@ impl EntryDto {
                 .map(|s| format!("{:?}", s.state).to_lowercase()),
             _ => None,
         };
+        let frame = match &entry.payload {
+            EntryPayload::Assertion { frame, .. } | EntryPayload::Proposal { frame, .. } => frame
+                .as_ref()
+                .map(|f| {
+                    f.options
+                        .iter()
+                        .map(|o| FrameOptionDto {
+                            label: o.label.clone(),
+                            act: frame_act_route(o.act).to_string(),
+                            rationale: o.rationale.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
         EntryDto {
             id: entry.id.to_string(),
             author: entry.author.display_name.clone(),
@@ -1840,6 +1878,7 @@ impl EntryDto {
             summary,
             status,
             unrecognized: view.unrecognized.contains(&entry.id),
+            frame,
         }
     }
 }
