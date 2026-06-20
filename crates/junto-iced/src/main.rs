@@ -28,8 +28,13 @@ const MAUVE: Color = Color::from_rgb(0.80, 0.65, 0.97);
 const BLUE: Color = Color::from_rgb(0.54, 0.71, 0.98);
 
 fn main() -> iced::Result {
+    let icon = iced::window::icon::from_file_data(include_bytes!("../icon.png"), None).ok();
     iced::application("junto — native spike", App::update, App::view)
         .theme(|_| Theme::CatppuccinMocha)
+        .window(iced::window::Settings {
+            icon,
+            ..Default::default()
+        })
         .run_with(App::new)
 }
 
@@ -67,10 +72,11 @@ struct ChannelDto {
 struct LineageDto {
     #[allow(dead_code)]
     relation: String,
-    #[allow(dead_code)]
     direction: String,
     #[allow(dead_code)]
     other: String,
+    other_name: Option<String>,
+    #[allow(dead_code)]
     label: String,
 }
 
@@ -208,31 +214,29 @@ fn pane_body(content: &Content) -> Element<'_, Message> {
             .padding(12)
             .into(),
         Content::Loaded(dto) => {
-            let mut body = column![].spacing(8).padding(12);
+            let channel = dto.name.clone().unwrap_or_else(|| "(unopened)".into());
 
-            // Header: name + closed flag.
-            let mut header = dto.name.clone().unwrap_or_else(|| "(unopened)".into());
-            if dto.closed {
-                header.push_str("  · closed");
-            }
-            body = body.push(text(header).size(13).color(MUTED));
-
-            // Party.
+            // Pinned at top: the lineage strip (the split / side-quest history)
+            // and the party — they don't scroll with the timeline below.
+            let mut header = column![lineage_strip(&channel, dto)].spacing(8);
             if !dto.party.is_empty() {
-                body = body.push(text(format!("party: {}", dto.party.join(", "))).size(12).color(MUTED));
+                header = header.push(
+                    text(format!("party: {}", dto.party.join(", ")))
+                        .size(12)
+                        .color(MUTED),
+                );
             }
 
-            // Lineage strip — the split / side-quest history.
-            for edge in &dto.lineage {
-                body = body.push(badge(&edge.label, MAUVE));
-            }
-
-            // Entry timeline.
+            // The entry timeline scrolls under it.
+            let mut timeline = column![].spacing(8);
             for entry in &dto.entries {
-                body = body.push(entry_card(entry));
+                timeline = timeline.push(entry_card(entry));
             }
 
-            scrollable(body).height(Fill).into()
+            column![header, scrollable(timeline).height(Fill)]
+                .spacing(10)
+                .padding(12)
+                .into()
         }
     }
 }
@@ -263,6 +267,65 @@ fn entry_card(entry: &EntryDto) -> Element<'_, Message> {
                 radius: 6.0.into(),
             },
             text_color: Some(TEXT),
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// The lineage **timeline strip** pinned at the top of a channel pane: parents/
+/// predecessors on the left, this channel highlighted in the middle, side-quests/
+/// continuations on the right — the split history at a glance.
+fn lineage_strip(channel: &str, dto: &ChannelDto) -> Element<'static, Message> {
+    let mut strip = row![].spacing(8);
+    for edge in dto.lineage.iter().filter(|e| e.direction == "incoming") {
+        let label = edge.other_name.clone().unwrap_or_else(|| "parent".into());
+        strip = strip.push(node(label, MUTED, false));
+        strip = strip.push(text("→").size(14).color(MUTED));
+    }
+    strip = strip.push(node(channel.to_string(), TEAL, true));
+    for edge in dto.lineage.iter().filter(|e| e.direction == "outgoing") {
+        let label = edge.other_name.clone().unwrap_or_else(|| "side-quest".into());
+        strip = strip.push(text("→").size(14).color(MUTED));
+        strip = strip.push(node(label, MAUVE, false));
+    }
+    container(
+        scrollable(strip)
+            .direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::default())),
+    )
+    .padding(8)
+    .width(Fill)
+    .style(|_theme| container::Style {
+        background: Some(Background::Color(Color { a: 0.5, ..SURFACE })),
+        border: Border {
+            radius: 6.0.into(),
+            ..Border::default()
+        },
+        ..container::Style::default()
+    })
+    .into()
+}
+
+/// One node in the lineage strip.
+fn node(label: String, color: Color, highlight: bool) -> Element<'static, Message> {
+    let text_color = if highlight {
+        Color::from_rgb(0.12, 0.12, 0.18)
+    } else {
+        TEXT
+    };
+    let background = if highlight {
+        color
+    } else {
+        Color { a: 0.18, ..color }
+    };
+    container(text(label).size(12).color(text_color))
+        .padding([4, 10])
+        .style(move |_theme| container::Style {
+            background: Some(Background::Color(background)),
+            border: Border {
+                color,
+                width: 1.0,
+                radius: 6.0.into(),
+            },
             ..container::Style::default()
         })
         .into()

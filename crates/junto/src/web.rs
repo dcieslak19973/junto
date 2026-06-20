@@ -1488,7 +1488,17 @@ async fn channel_view_json(
     Path(channel): Path<String>,
 ) -> Response {
     match project(&host, &channel).await {
-        Ok((id, view, _substrate)) => axum::Json(ChannelDto::from_view(&id, &view)).into_response(),
+        Ok((id, view, _substrate)) => {
+            // Resolve lineage edges' other-channel ids to names for the strip.
+            let names: std::collections::HashMap<String, String> = host
+                .inventory()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|s| s.name.map(|n| (s.id.to_string(), n)))
+                .collect();
+            axum::Json(ChannelDto::from_view(&id, &view, &names)).into_response()
+        }
         Err(response) => response,
     }
 }
@@ -1508,6 +1518,7 @@ struct LineageDto {
     relation: String,
     direction: String,
     other: String,
+    other_name: Option<String>,
     label: String,
 }
 
@@ -1522,7 +1533,11 @@ struct EntryDto {
 }
 
 impl ChannelDto {
-    fn from_view(id: &ChannelId, view: &ChannelView) -> Self {
+    fn from_view(
+        id: &ChannelId,
+        view: &ChannelView,
+        names: &std::collections::HashMap<String, String>,
+    ) -> Self {
         let entries = view
             .entries
             .iter()
@@ -1535,6 +1550,7 @@ impl ChannelDto {
                 relation: format!("{:?}", edge.relation).to_lowercase(),
                 direction: format!("{:?}", edge.direction).to_lowercase(),
                 other: edge.other.to_string(),
+                other_name: names.get(&edge.other.to_string()).cloned(),
                 label: lineage_label(edge),
             })
             .collect();
