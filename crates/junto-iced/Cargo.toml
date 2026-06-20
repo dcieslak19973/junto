@@ -15,6 +15,8 @@ iced = { version = "0.13", features = ["tokio", "image", "canvas"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Native folder picker for the launch workspace (MIT, cross-platform).
+rfd = "0.15"
 
 [workspace]
 # standalone — see the header comment

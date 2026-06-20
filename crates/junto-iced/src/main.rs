@@ -254,6 +254,10 @@ enum Message {
     LaunchAgentPicked(pane_grid::Pane, AgentDto),
     LaunchModeChanged(pane_grid::Pane, bool),
     LaunchWorkspaceChanged(pane_grid::Pane, String),
+    /// Open the native folder picker for the launch workspace.
+    BrowseWorkspace(pane_grid::Pane),
+    /// The folder the picker returned (None = cancelled).
+    WorkspacePicked(pane_grid::Pane, Option<String>),
     Launch(pane_grid::Pane),
     /// The result of a launch (pane, Ok or an error message).
     Launched(pane_grid::Pane, Result<(), String>),
@@ -472,6 +476,22 @@ impl App {
             Message::LaunchWorkspaceChanged(pane, value) => {
                 if let Some(state) = self.panes.get_mut(pane) {
                     state.launch_workspace = value;
+                }
+                Task::none()
+            }
+            Message::BrowseWorkspace(pane) => Task::perform(
+                async {
+                    rfd::AsyncFileDialog::new()
+                        .set_title("Pick the workspace repo for this session")
+                        .pick_folder()
+                        .await
+                        .map(|handle| handle.path().display().to_string())
+                },
+                move |picked| Message::WorkspacePicked(pane, picked),
+            ),
+            Message::WorkspacePicked(pane, picked) => {
+                if let (Some(state), Some(path)) = (self.panes.get_mut(pane), picked) {
+                    state.launch_workspace = path;
                 }
                 Task::none()
             }
@@ -800,6 +820,9 @@ fn pane_body<'a>(
         .on_input(move |v| Message::LaunchWorkspaceChanged(id, v))
         .size(12)
         .padding(6),
+        button(text("browse…").size(12))
+            .on_press(Message::BrowseWorkspace(id))
+            .padding(6),
     ]
     .spacing(6)
     .align_y(Center);
