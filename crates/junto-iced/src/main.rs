@@ -265,6 +265,17 @@ impl App {
                 Task::none()
             }
             Message::ChannelPicked(name) => {
+                // If this channel already has an open pane, focus it rather than
+                // opening a duplicate (the focus-board chips route through here too).
+                if let Some(existing) = self
+                    .order
+                    .iter()
+                    .copied()
+                    .find(|p| self.panes.get(*p).is_some_and(|s| s.channel == name))
+                {
+                    self.focus = Some(existing);
+                    return Task::none();
+                }
                 let Some(target) = self.focus.or_else(|| self.order.last().copied())
                 else {
                     return Task::none();
