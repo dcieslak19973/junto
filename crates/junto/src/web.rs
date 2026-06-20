@@ -32,7 +32,7 @@ use axum::{
     routing::{get, post},
 };
 use junto_kernel::{ChannelId, ChannelView, EntryId, EntryPayload, LedgerEntry, Timestamp};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::host::{Host, Resolution};
 use crate::render;
@@ -71,6 +71,7 @@ pub fn router(host: Arc<Host>) -> Router {
         .route("/channels/{channel}/diverge", post(diverge_channel))
         .route("/channels/{channel}/converge", post(converge_channel))
         .route("/channels/{channel}/brief", get(channel_brief))
+        .route("/channels/{channel}/view.json", get(channel_view_json))
         .route("/channels/{channel}/entries/{entry}/{act}", post(verify))
         .with_state(host)
         // Wrap any plain-text error response in a styled page (so a refused
@@ -1474,6 +1475,151 @@ async fn channel_brief(State(host): State<Arc<Host>>, Path(channel): Path<String
                 .into_response()
         }
         Err(response) => response,
+    }
+}
+
+/// A structured **read-only** projection of a channel as JSON — the data a
+/// non-HTML surface (e.g. the native Iced spike, `docs/native-ui-toolkit-
+/// assessment.md`) renders into its own widgets. Mirrors what the HTML channel
+/// page shows: party, lineage edges (the split history), and the entry timeline
+/// with each entry's derived status. Read-only; acts stay POST routes.
+async fn channel_view_json(
+    State(host): State<Arc<Host>>,
+    Path(channel): Path<String>,
+) -> Response {
+    match project(&host, &channel).await {
+        Ok((id, view, _substrate)) => axum::Json(ChannelDto::from_view(&id, &view)).into_response(),
+        Err(response) => response,
+    }
+}
+
+#[derive(Serialize)]
+struct ChannelDto {
+    id: String,
+    name: Option<String>,
+    closed: bool,
+    party: Vec<String>,
+    lineage: Vec<LineageDto>,
+    entries: Vec<EntryDto>,
+}
+
+#[derive(Serialize)]
+struct LineageDto {
+    relation: String,
+    direction: String,
+    other: String,
+    label: String,
+}
+
+#[derive(Serialize)]
+struct EntryDto {
+    id: String,
+    author: String,
+    kind: String,
+    summary: String,
+    status: Option<String>,
+    unrecognized: bool,
+}
+
+impl ChannelDto {
+    fn from_view(id: &ChannelId, view: &ChannelView) -> Self {
+        let entries = view
+            .entries
+            .iter()
+            .map(|entry| EntryDto::from_entry(entry, view))
+            .collect();
+        let lineage = view
+            .lineage
+            .iter()
+            .map(|edge| LineageDto {
+                relation: format!("{:?}", edge.relation).to_lowercase(),
+                direction: format!("{:?}", edge.direction).to_lowercase(),
+                other: edge.other.to_string(),
+                label: lineage_label(edge),
+            })
+            .collect();
+        ChannelDto {
+            id: id.to_string(),
+            name: view.name.clone(),
+            closed: view.closed,
+            party: view.party.iter().map(|m| m.display_name.clone()).collect(),
+            lineage,
+            entries,
+        }
+    }
+}
+
+impl EntryDto {
+    fn from_entry(entry: &LedgerEntry, view: &ChannelView) -> Self {
+        let (kind, summary) = match &entry.payload {
+            EntryPayload::ChannelOpened { .. } => ("channel", "opened the channel".to_string()),
+            EntryPayload::MemberAdded { member } => {
+                ("member", format!("added {}", member.display_name))
+            }
+            EntryPayload::ChannelClosed { rationale } => ("channel", format!("closed — {rationale}")),
+            EntryPayload::ChannelReopened { rationale } => {
+                ("channel", format!("reopened — {rationale}"))
+            }
+            EntryPayload::DivergedFrom { .. } => ("lineage", "diverged from a parent".to_string()),
+            EntryPayload::ChildDiverged { .. } => {
+                ("lineage", "a side-quest diverged from here".to_string())
+            }
+            EntryPayload::ConvergedInto { .. } => {
+                ("lineage", "converged into another channel".to_string())
+            }
+            EntryPayload::ConvergenceReceived { .. } => {
+                ("lineage", "received a convergence".to_string())
+            }
+            EntryPayload::Assertion { statement, .. } => ("assertion", statement.clone()),
+            EntryPayload::Ratification { rationale, .. } => ("act", format!("ratified — {rationale}")),
+            EntryPayload::Park { rationale, .. } => ("act", format!("parked — {rationale}")),
+            EntryPayload::Correction { statement, .. } => {
+                ("act", format!("corrected — {statement}"))
+            }
+            EntryPayload::Proposal { action, .. } => ("proposal", action.clone()),
+            EntryPayload::Approval { rationale, .. } => ("act", format!("approved — {rationale}")),
+            EntryPayload::Rejection { rationale, .. } => ("act", format!("rejected — {rationale}")),
+            EntryPayload::GateExecuted { note, .. } => ("act", format!("gate executed — {note}")),
+            EntryPayload::SessionStarted { intent } => ("session", intent.clone()),
+            EntryPayload::SessionUpdated { note, .. } => ("session", note.clone()),
+            EntryPayload::ArtifactAttached {
+                kind, description, ..
+            } => ("artifact", format!("{kind}: {description}")),
+        };
+        let status = match &entry.payload {
+            EntryPayload::Assertion { .. } | EntryPayload::Correction { .. } => view
+                .standings
+                .get(&entry.id)
+                .map(|s| format!("{s:?}").to_lowercase()),
+            EntryPayload::Proposal { .. } => view
+                .gate_status
+                .get(&entry.id)
+                .map(|s| format!("{s:?}").to_lowercase()),
+            EntryPayload::SessionStarted { .. } => view
+                .sessions
+                .get(&entry.id)
+                .map(|s| format!("{:?}", s.state).to_lowercase()),
+            _ => None,
+        };
+        EntryDto {
+            id: entry.id.to_string(),
+            author: entry.author.display_name.clone(),
+            kind: kind.to_string(),
+            summary,
+            status,
+            unrecognized: view.unrecognized.contains(&entry.id),
+        }
+    }
+}
+
+/// A human label for a lineage edge from this channel's point of view.
+fn lineage_label(edge: &junto_kernel::LineageEdge) -> String {
+    use junto_kernel::{LineageDirection as D, LineageRelation as R};
+    match (edge.relation, edge.direction) {
+        (R::Diverge, D::Incoming) => "diverged from parent".to_string(),
+        (R::Diverge, D::Outgoing) => "side-quest diverged from here".to_string(),
+        (R::Converge, D::Incoming) => "received a convergence".to_string(),
+        (R::Converge, D::Outgoing) => "converged into another channel".to_string(),
     }
 }
 
