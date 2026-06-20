@@ -1471,24 +1471,39 @@ impl App {
     }
 }
 
-/// The always-visible top toolbar: the settings ⚙ and agents ✦ buttons.
+/// The always-visible top tab bar: channels · settings · agents.
 fn admin_toolbar(current: Option<AdminView>) -> Element<'static, Message> {
-    let btn = |label: &'static str, view: AdminView| {
-        let active = current == Some(view);
+    let tab = |label: &'static str, target: Option<AdminView>| {
+        let active = current == target;
         button(text(label).size(13))
-            .on_press(Message::OpenAdmin((!active).then_some(view)))
-            .padding([4, 10])
-            .style(move |_t, _s| chip_style(MAUVE, active))
+            .on_press(Message::OpenAdmin(target))
+            .padding([4, 12])
+            .style(move |_t, _s| tab_style(active))
     };
     row![
         text("junto").size(15),
         Space::with_width(16),
-        btn("settings", AdminView::Settings),
-        btn("agents", AdminView::Agents),
+        tab("channels", None),
+        tab("settings", Some(AdminView::Settings)),
+        tab("agents", Some(AdminView::Agents)),
     ]
-    .spacing(8)
+    .spacing(4)
     .align_y(Center)
     .into()
+}
+
+/// A tab button: the active tab is filled + accented; the rest are plain.
+fn tab_style(active: bool) -> button::Style {
+    button::Style {
+        background: active.then_some(Background::Color(Color { a: 0.22, ..MAUVE })),
+        text_color: if active { TEXT } else { MUTED },
+        border: Border {
+            color: if active { MAUVE } else { Color::TRANSPARENT },
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+        ..button::Style::default()
+    }
 }
 
 /// A bordered card container used by the admin panels.
