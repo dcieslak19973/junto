@@ -1,22 +1,35 @@
 //! SPIKE — a native junto surface in Iced (`docs/native-ui-toolkit-assessment.md`).
 //!
 //! A tmux-style **vertical-split pane workspace**: each pane is a junto channel,
-//! its `/brief` fetched live from the running host and rendered as Markdown.
-//! Type a channel name and `+ pane` to split a new column; drag the dividers to
-//! resize; markdown links open in the OS browser. The point is to *feel* whether
-//! native (Iced) is worth a second surface alongside the served web pages.
+//! rendered from the host's structured JSON read-API (`/channels/{name}/view.json`)
+//! into native widgets — a **lineage strip** (the split/side-quest history), the
+//! party, and the **entry timeline** as colour-coded cards. Type a channel name
+//! and `+ pane` to split a column; drag dividers to resize. The point is to feel
+//! whether native (Iced) beats the webview as the desktop power-surface.
 
 use iced::widget::pane_grid::{self, PaneGrid};
 use iced::widget::{
-    button, column, container, markdown, row, scrollable, text, text_input, Space,
+    button, column, container, row, scrollable, text, text_input, Space,
 };
-use iced::{Element, Fill, Task, Theme};
+use iced::{Background, Border, Color, Element, Fill, Task, Theme};
+use serde::Deserialize;
 
 const HOST: &str = "http://127.0.0.1:1727";
 
+// A catppuccin-ish dark palette, close to the web surface.
+const SURFACE: Color = Color::from_rgb(0.19, 0.20, 0.27);
+const TEXT: Color = Color::from_rgb(0.80, 0.84, 0.96);
+const MUTED: Color = Color::from_rgb(0.49, 0.51, 0.63);
+const TEAL: Color = Color::from_rgb(0.58, 0.89, 0.84);
+const GREEN: Color = Color::from_rgb(0.65, 0.89, 0.63);
+const RED: Color = Color::from_rgb(0.95, 0.55, 0.66);
+const YELLOW: Color = Color::from_rgb(0.98, 0.89, 0.69);
+const MAUVE: Color = Color::from_rgb(0.80, 0.65, 0.97);
+const BLUE: Color = Color::from_rgb(0.54, 0.71, 0.98);
+
 fn main() -> iced::Result {
     iced::application("junto — native spike", App::update, App::view)
-        .theme(|_| Theme::Dark)
+        .theme(|_| Theme::CatppuccinMocha)
         .run_with(App::new)
 }
 
@@ -26,7 +39,6 @@ struct App {
     new_channel: String,
 }
 
-/// One channel column.
 struct Pane {
     channel: String,
     content: Content,
@@ -34,21 +46,53 @@ struct Pane {
 
 enum Content {
     Loading,
-    Brief(Vec<markdown::Item>),
+    Loaded(ChannelDto),
     Error(String),
+}
+
+// --- the host's view.json shape ---
+
+#[derive(Debug, Clone, Deserialize)]
+struct ChannelDto {
+    #[allow(dead_code)]
+    id: String,
+    name: Option<String>,
+    closed: bool,
+    party: Vec<String>,
+    lineage: Vec<LineageDto>,
+    entries: Vec<EntryDto>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LineageDto {
+    #[allow(dead_code)]
+    relation: String,
+    #[allow(dead_code)]
+    direction: String,
+    #[allow(dead_code)]
+    other: String,
+    label: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct EntryDto {
+    author: String,
+    kind: String,
+    summary: String,
+    status: Option<String>,
+    unrecognized: bool,
 }
 
 #[derive(Debug, Clone)]
 enum Message {
     NewChannelChanged(String),
     AddChannel,
-    Fetched(pane_grid::Pane, Result<String, String>),
+    Fetched(pane_grid::Pane, Result<ChannelDto, String>),
     Clicked(pane_grid::Pane),
     Dragged(pane_grid::DragEvent),
     Resized(pane_grid::ResizeEvent),
     Refresh(pane_grid::Pane),
     Close(pane_grid::Pane),
-    LinkClicked(markdown::Url),
 }
 
 impl App {
@@ -77,7 +121,6 @@ impl App {
                 else {
                     return Task::none();
                 };
-                // Vertical axis ⇒ a vertical divider ⇒ side-by-side columns.
                 if let Some((new_pane, _)) =
                     self.panes
                         .split(pane_grid::Axis::Vertical, target, Pane::loading(&name))
@@ -91,7 +134,7 @@ impl App {
             Message::Fetched(pane, result) => {
                 if let Some(state) = self.panes.get_mut(pane) {
                     state.content = match result {
-                        Ok(body) => Content::Brief(markdown::parse(&body).collect()),
+                        Ok(dto) => Content::Loaded(dto),
                         Err(err) => Content::Error(err),
                     };
                 }
@@ -124,10 +167,6 @@ impl App {
                 }
                 Task::none()
             }
-            Message::LinkClicked(url) => {
-                let _ = open::that(url.to_string());
-                Task::none()
-            }
         }
     }
 
@@ -143,7 +182,7 @@ impl App {
 
         let grid = PaneGrid::new(&self.panes, |id, pane, _is_maximized| {
             let title = row![
-                text(pane.channel.clone()),
+                text(pane.channel.clone()).size(15),
                 Space::with_width(Fill),
                 button("↻").on_press(Message::Refresh(id)).padding(4),
                 button("×").on_press(Message::Close(id)).padding(4),
@@ -151,7 +190,7 @@ impl App {
             .spacing(6);
 
             pane_grid::Content::new(pane_body(&pane.content))
-                .title_bar(pane_grid::TitleBar::new(title).padding(6))
+                .title_bar(pane_grid::TitleBar::new(title).padding(8))
         })
         .spacing(6)
         .on_click(Message::Clicked)
@@ -164,23 +203,103 @@ impl App {
 
 fn pane_body(content: &Content) -> Element<'_, Message> {
     match content {
-        Content::Loading => container(text("loading…")).padding(10).into(),
-        Content::Error(err) => container(text(format!("error: {err}")))
-            .padding(10)
+        Content::Loading => container(text("loading…").color(MUTED)).padding(12).into(),
+        Content::Error(err) => container(text(format!("error: {err}")).color(RED))
+            .padding(12)
             .into(),
-        Content::Brief(items) => scrollable(
-            container(
-                markdown::view(
-                    items,
-                    markdown::Settings::default(),
-                    markdown::Style::from_palette(Theme::Dark.palette()),
-                )
-                .map(Message::LinkClicked),
-            )
-            .padding(10),
-        )
-        .height(Fill)
-        .into(),
+        Content::Loaded(dto) => {
+            let mut body = column![].spacing(8).padding(12);
+
+            // Header: name + closed flag.
+            let mut header = dto.name.clone().unwrap_or_else(|| "(unopened)".into());
+            if dto.closed {
+                header.push_str("  · closed");
+            }
+            body = body.push(text(header).size(13).color(MUTED));
+
+            // Party.
+            if !dto.party.is_empty() {
+                body = body.push(text(format!("party: {}", dto.party.join(", "))).size(12).color(MUTED));
+            }
+
+            // Lineage strip — the split / side-quest history.
+            for edge in &dto.lineage {
+                body = body.push(badge(&edge.label, MAUVE));
+            }
+
+            // Entry timeline.
+            for entry in &dto.entries {
+                body = body.push(entry_card(entry));
+            }
+
+            scrollable(body).height(Fill).into()
+        }
+    }
+}
+
+/// One timeline entry as a card: a colour-coded kind badge + author + status,
+/// over the summary text.
+fn entry_card(entry: &EntryDto) -> Element<'_, Message> {
+    let accent = kind_color(&entry.kind);
+    let mut head = row![badge(&entry.kind, accent), text(entry.author.clone()).size(11).color(MUTED)]
+        .spacing(8);
+    if let Some(status) = &entry.status {
+        head = head.push(badge(status, status_color(status)));
+    }
+    if entry.unrecognized {
+        head = head.push(badge("unrecognized", MUTED));
+    }
+
+    let card = column![head, text(entry.summary.clone()).size(13).color(TEXT)].spacing(6);
+
+    container(card)
+        .padding(10)
+        .width(Fill)
+        .style(move |_theme| container::Style {
+            background: Some(Background::Color(SURFACE)),
+            border: Border {
+                color: Color { a: 0.5, ..accent },
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            text_color: Some(TEXT),
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// A small filled pill.
+fn badge(label: &str, color: Color) -> Element<'_, Message> {
+    container(text(label.to_string()).size(11).color(Color::from_rgb(0.12, 0.12, 0.18)))
+        .padding([2, 7])
+        .style(move |_theme| container::Style {
+            background: Some(Background::Color(color)),
+            border: Border {
+                radius: 10.0.into(),
+                ..Border::default()
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
+fn kind_color(kind: &str) -> Color {
+    match kind {
+        "assertion" => BLUE,
+        "proposal" => YELLOW,
+        "session" => TEAL,
+        "act" => GREEN,
+        "lineage" => MAUVE,
+        _ => MUTED,
+    }
+}
+
+fn status_color(status: &str) -> Color {
+    match status {
+        "ratified" | "approved" | "done" => GREEN,
+        "parked" | "rejected" | "error" | "superseded" => RED,
+        "provisional" | "pending" | "working" | "blocked" | "awaitingapproval" => YELLOW,
+        _ => MUTED,
     }
 }
 
@@ -193,13 +312,16 @@ impl Pane {
     }
 }
 
-/// Fetch a channel's `/brief` (Markdown) from the host into `pane`.
+/// Fetch a channel's structured view from the host into `pane`.
 fn fetch(pane: pane_grid::Pane, channel: &str) -> Task<Message> {
-    let url = format!("{HOST}/channels/{channel}/brief");
+    let url = format!("{HOST}/channels/{channel}/view.json");
     Task::perform(
         async move {
             let response = reqwest::get(&url).await.map_err(|e| e.to_string())?;
-            response.text().await.map_err(|e| e.to_string())
+            response
+                .json::<ChannelDto>()
+                .await
+                .map_err(|e| e.to_string())
         },
         move |result| Message::Fetched(pane, result),
     )
