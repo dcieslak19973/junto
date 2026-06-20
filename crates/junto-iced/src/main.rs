@@ -59,6 +59,8 @@ struct App {
     order: Vec<pane_grid::Pane>,
     /// Available channel names for the type-ahead picker.
     channels: combo_box::State<String>,
+    /// The whole lineage DAG, drawn as the always-visible top branch graph.
+    lineage: Option<LineageGraphDto>,
 }
 
 struct Pane {
@@ -76,8 +78,6 @@ enum Content {
     Loading,
     Loaded(ChannelDto),
     Error(String),
-    LineageLoading,
-    Lineage(LineageGraphDto),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -159,8 +159,7 @@ struct EntryDto {
 enum Message {
     ChannelsLoaded(Vec<String>),
     ChannelPicked(String),
-    OpenLineage,
-    LineageFetched(pane_grid::Pane, Result<LineageGraphDto, String>),
+    LineageGraphLoaded(Option<LineageGraphDto>),
     Fetched(pane_grid::Pane, Result<ChannelDto, String>),
     Refresh(pane_grid::Pane),
     Close(pane_grid::Pane),
@@ -184,14 +183,22 @@ impl App {
             focus: Some(first),
             order: vec![first],
             channels: combo_box::State::new(Vec::new()),
+            lineage: None,
         };
-        (app, Task::batch([fetch(first, "junto-dev"), fetch_channels()]))
+        (
+            app,
+            Task::batch([fetch(first, "junto-dev"), fetch_channels(), fetch_lineage_graph()]),
+        )
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::ChannelsLoaded(names) => {
                 self.channels = combo_box::State::new(names);
+                Task::none()
+            }
+            Message::LineageGraphLoaded(graph) => {
+                self.lineage = graph;
                 Task::none()
             }
             Message::ChannelPicked(name) => {
@@ -206,31 +213,6 @@ impl App {
                     self.order.push(new_pane);
                     self.focus = Some(new_pane);
                     return fetch(new_pane, &name);
-                }
-                Task::none()
-            }
-            Message::OpenLineage => {
-                let Some(target) = self.focus.or_else(|| self.panes.iter().next().map(|(p, _)| *p))
-                else {
-                    return Task::none();
-                };
-                let mut pane = Pane::loading("✦ lineage");
-                pane.content = Content::LineageLoading;
-                if let Some((new_pane, _)) =
-                    self.panes.split(pane_grid::Axis::Vertical, target, pane)
-                {
-                    self.order.push(new_pane);
-                    self.focus = Some(new_pane);
-                    return fetch_lineage(new_pane);
-                }
-                Task::none()
-            }
-            Message::LineageFetched(pane, result) => {
-                if let Some(state) = self.panes.get_mut(pane) {
-                    state.content = match result {
-                        Ok(graph) => Content::Lineage(graph),
-                        Err(err) => Content::Error(err),
-                    };
                 }
                 Task::none()
             }
@@ -382,22 +364,44 @@ impl App {
         .spacing(8)
         .align_y(Center);
 
-        // The lineage ribbon: nodes at each open channel's column centre, with
-        // diverge/converge connectors between related open channels.
-        let ribbon = container(Canvas::new(self.ribbon()).width(Fill).height(Fill))
-            .width(Fill)
-            .height(Length::Fixed(96.0))
-            .style(|_theme| container::Style {
-                background: Some(Background::Color(Color { a: 0.4, ..SURFACE })),
-                border: Border {
-                    radius: 6.0.into(),
-                    ..Border::default()
-                },
-                ..container::Style::default()
-            });
+        // The always-visible branch graph: the *whole* lineage DAG (every
+        // channel, every diverge/converge), with currently-open channels
+        // highlighted. Visible regardless of how many panes are open.
+        let open: HashSet<String> = self
+            .order
+            .iter()
+            .filter_map(|id| self.panes.get(*id).map(|p| p.channel.clone()))
+            .collect();
+        let ribbon: Element<Message> = match &self.lineage {
+            Some(graph) => {
+                let canvas = LineageCanvas::layout(graph, &open);
+                let content_h = canvas.height.max(80.0);
+                let view_h = content_h.min(260.0);
+                container(
+                    scrollable(Canvas::new(canvas).width(Fill).height(Length::Fixed(content_h)))
+                        .height(Fill),
+                )
+                .width(Fill)
+                .height(Length::Fixed(view_h))
+                .padding(6)
+                .style(|_theme| container::Style {
+                    background: Some(Background::Color(Color { a: 0.4, ..SURFACE })),
+                    border: Border {
+                        radius: 6.0.into(),
+                        ..Border::default()
+                    },
+                    ..container::Style::default()
+                })
+                .into()
+            }
+            None => container(text("loading lineage…").size(12).color(MUTED))
+                .width(Fill)
+                .height(Length::Fixed(40.0))
+                .padding(8)
+                .into(),
+        };
 
-        // Shared-width columns: the ribbon segments above line up exactly, and
-        // open/close reflows both together.
+        // Shared-width columns, reflowing as channels open/close.
         let mut body = row![].spacing(6);
         for id in &self.order {
             if let Some(pane) = self.panes.get(*id) {
@@ -409,30 +413,6 @@ impl App {
             .spacing(10)
             .padding(10)
             .into()
-    }
-
-    /// Build the ribbon canvas from the open panes (left-to-right) and the
-    /// lineage relationships among them.
-    fn ribbon(&self) -> RibbonCanvas {
-        let cols: Vec<String> = self
-            .order
-            .iter()
-            .filter_map(|id| self.panes.get(*id).map(|p| p.channel.clone()))
-            .collect();
-        let mut links = Vec::new();
-        for (i, id) in self.order.iter().enumerate() {
-            let Some(Content::Loaded(dto)) = self.panes.get(*id).map(|p| &p.content) else {
-                continue;
-            };
-            for edge in &dto.lineage {
-                if let Some(name) = &edge.other_name
-                    && let Some(j) = cols.iter().position(|c| c == name)
-                {
-                    links.push((i, j, edge.relation == "diverge"));
-                }
-            }
-        }
-        RibbonCanvas { cols, links }
     }
 }
 
@@ -466,61 +446,6 @@ fn column_pane(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
         .into()
 }
 
-/// The top lineage ribbon: a node per open channel at its column centre, with
-/// diverge (mauve) / converge (green) connectors curving between related ones.
-struct RibbonCanvas {
-    cols: Vec<String>,
-    links: Vec<(usize, usize, bool)>,
-}
-
-impl canvas::Program<Message> for RibbonCanvas {
-    type State = ();
-
-    fn draw(
-        &self,
-        _state: &(),
-        renderer: &Renderer,
-        _theme: &Theme,
-        bounds: Rectangle,
-        _cursor: mouse::Cursor,
-    ) -> Vec<Geometry> {
-        let mut frame = Frame::new(renderer, bounds.size());
-        let n = self.cols.len().max(1);
-        let colw = bounds.width / n as f32;
-        let cx = |i: usize| (i as f32 + 0.5) * colw;
-        let node_y = bounds.height * 0.42;
-
-        for (i, j, diverge) in &self.links {
-            let (a, b) = (cx(*i), cx(*j));
-            let mut path = canvas::path::Builder::new();
-            path.move_to(Point::new(a, node_y));
-            path.quadratic_curve_to(
-                Point::new((a + b) / 2.0, node_y + bounds.height * 0.32),
-                Point::new(b, node_y),
-            );
-            frame.stroke(
-                &path.build(),
-                Stroke::default()
-                    .with_color(if *diverge { MAUVE } else { GREEN })
-                    .with_width(2.0),
-            );
-        }
-        for (i, name) in self.cols.iter().enumerate() {
-            let x = cx(i);
-            frame.fill(&Path::circle(Point::new(x, node_y), 5.0), TEAL);
-            frame.fill_text(canvas::Text {
-                content: truncate(name, 22),
-                position: Point::new(x, node_y + 12.0),
-                color: TEXT,
-                size: 12.0.into(),
-                horizontal_alignment: iced::alignment::Horizontal::Center,
-                ..canvas::Text::default()
-            });
-        }
-        vec![frame.into_geometry()]
-    }
-}
-
 fn pane_body(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
     let dto = match &pane.content {
         Content::Loading => {
@@ -528,23 +453,6 @@ fn pane_body(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
         }
         Content::Error(err) => {
             return container(text(format!("error: {err}")).color(RED))
-                .padding(12)
-                .into();
-        }
-        Content::LineageLoading => {
-            return container(text("loading lineage…").color(MUTED))
-                .padding(12)
-                .into();
-        }
-        Content::Lineage(graph) => {
-            let graph = LineageCanvas::layout(graph);
-            let height = graph.height.max(120.0);
-            let legend = text("branch graph — diverge (mauve) · converge (green)")
-                .size(12)
-                .color(MUTED);
-            let drawing = Canvas::new(graph).width(Fill).height(Length::Fixed(height));
-            return column![legend, scrollable(drawing).height(Fill)]
-                .spacing(10)
                 .padding(12)
                 .into();
         }
@@ -870,6 +778,8 @@ struct Track {
     first_ms: i64,
     last_ms: i64,
     root: bool,
+    /// This channel is currently open as a pane (highlighted in the graph).
+    open: bool,
 }
 
 struct LineageCanvas {
@@ -882,7 +792,7 @@ struct LineageCanvas {
 }
 
 impl LineageCanvas {
-    fn layout(graph: &LineageGraphDto) -> Self {
+    fn layout(graph: &LineageGraphDto, open: &HashSet<String>) -> Self {
         let mut is_child: HashSet<&str> = HashSet::new();
         for edge in &graph.edges {
             if edge.relation == "diverge" {
@@ -917,6 +827,7 @@ impl LineageCanvas {
                 first_ms: n.first_ms.unwrap_or(min_ms),
                 last_ms: n.last_ms.unwrap_or(now_ms),
                 root: !is_child.contains(n.id.as_str()),
+                open: open.contains(&n.name),
             });
         }
         let first_of: HashMap<&str, i64> = graph
@@ -987,20 +898,33 @@ impl canvas::Program<Message> for LineageCanvas {
         }
 
         // Tracks: a horizontal line from first to last activity + an end cap.
+        // Open channels are highlighted; the rest are dimmed but still drawn so
+        // the whole branching structure is visible regardless of what's open.
         for track in &self.tracks {
             let y = Self::y_of(track.row);
             let x0 = self.x_of(track.first_ms, left, right);
-            let x1 = self.x_of(track.last_ms, left, right);
-            let color = if track.root { TEAL } else { MAUVE };
+            let x1 = self.x_of(track.last_ms, left, right).max(x0 + 2.0);
+            let base = if track.root { TEAL } else { MAUVE };
+            let color = if track.open {
+                base
+            } else {
+                Color { a: 0.45, ..base }
+            };
             frame.stroke(
-                &Path::line(Point::new(x0, y), Point::new(x1.max(x0 + 2.0), y)),
-                Stroke::default().with_color(color).with_width(2.5),
+                &Path::line(Point::new(x0, y), Point::new(x1, y)),
+                Stroke::default()
+                    .with_color(color)
+                    .with_width(if track.open { 3.0 } else { 2.0 }),
             );
-            frame.fill(&Path::circle(Point::new(x1.max(x0 + 2.0), y), 4.0), color);
+            frame.fill(&Path::circle(Point::new(x1, y), if track.open { 5.0 } else { 4.0 }), color);
             frame.fill_text(canvas::Text {
                 content: truncate(&track.name, 20),
                 position: Point::new(8.0, y - 8.0),
-                color: TEXT,
+                color: if track.open {
+                    TEXT
+                } else {
+                    Color { a: 0.7, ..TEXT }
+                },
                 size: 13.0.into(),
                 ..canvas::Text::default()
             });
@@ -1021,6 +945,20 @@ fn fetch(pane: pane_grid::Pane, channel: &str) -> Task<Message> {
                 .map_err(|e| e.to_string())
         },
         move |result| Message::Fetched(pane, result),
+    )
+}
+
+/// Fetch the whole lineage DAG for the always-visible top branch graph.
+fn fetch_lineage_graph() -> Task<Message> {
+    let url = format!("{HOST}/lineage.json");
+    Task::perform(
+        async move {
+            match reqwest::get(&url).await {
+                Ok(response) => response.json::<LineageGraphDto>().await.ok(),
+                Err(_) => None,
+            }
+        },
+        Message::LineageGraphLoaded,
     )
 }
 
@@ -1046,20 +984,6 @@ fn fetch_channels() -> Task<Message> {
     )
 }
 
-/// Fetch the whole lineage DAG for the branch-graph view.
-fn fetch_lineage(pane: pane_grid::Pane) -> Task<Message> {
-    let url = format!("{HOST}/lineage.json");
-    Task::perform(
-        async move {
-            let response = reqwest::get(&url).await.map_err(|e| e.to_string())?;
-            response
-                .json::<LineageGraphDto>()
-                .await
-                .map_err(|e| e.to_string())
-        },
-        move |result| Message::LineageFetched(pane, result),
-    )
-}
 
 /// A long-lived SSE subscription streaming a session's live feed from the host
 /// (`/channels/{channel}/sessions/{session}/stream`) into `Message::Live`.
