@@ -455,10 +455,10 @@ fn pane_body(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
         }
         Content::Loaded(dto) => dto,
     };
-    let channel = dto.name.clone().unwrap_or_else(|| "(unopened)".into());
 
-    // Pinned at top: the lineage strip + party.
-    let mut header = column![lineage_strip(&channel, dto)].spacing(8);
+    // The channel's own header: just the party now (lineage lives in the top
+    // window-wide branch graph, so the per-pane strip is gone).
+    let mut header = column![].spacing(8);
     if !dto.party.is_empty() {
         header = header.push(
             text(format!("party: {}", dto.party.join(", ")))
@@ -642,72 +642,6 @@ fn entry_card(entry: &EntryDto) -> Element<'_, Message> {
                 radius: 6.0.into(),
             },
             text_color: Some(TEXT),
-            ..container::Style::default()
-        })
-        .into()
-}
-
-/// The lineage **timeline strip** pinned at the top of a channel pane: parents/
-/// predecessors on the left, this channel highlighted in the middle, side-quests/
-/// continuations on the right — the split history at a glance.
-fn lineage_strip(channel: &str, dto: &ChannelDto) -> Element<'static, Message> {
-    let mut strip = row![].spacing(8).align_y(Center);
-    for edge in dto.lineage.iter().filter(|e| e.direction == "incoming") {
-        let label = edge.other_name.clone().unwrap_or_else(|| "parent".into());
-        strip = strip.push(node(label, MUTED, false));
-        strip = strip.push(text("→").size(16).color(MUTED));
-    }
-    strip = strip.push(node(channel.to_string(), TEAL, true));
-    for edge in dto.lineage.iter().filter(|e| e.direction == "outgoing") {
-        let label = edge.other_name.clone().unwrap_or_else(|| "side-quest".into());
-        strip = strip.push(text("→").size(16).color(MUTED));
-        strip = strip.push(node(label, MAUVE, false));
-    }
-    container(
-        scrollable(strip)
-            .direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::default())),
-    )
-    .padding([8, 12])
-    .width(Fill)
-    .center_y(Length::Fixed(64.0))
-    .style(|_theme| container::Style {
-        background: Some(Background::Color(Color { a: 0.5, ..SURFACE })),
-        border: Border {
-            radius: 6.0.into(),
-            ..Border::default()
-        },
-        ..container::Style::default()
-    })
-    .into()
-}
-
-/// One node in the lineage strip. Long channel names are truncated to keep the
-/// strip glanceable.
-fn node(label: String, color: Color, highlight: bool) -> Element<'static, Message> {
-    let text_color = if highlight {
-        Color::from_rgb(0.12, 0.12, 0.18)
-    } else {
-        TEXT
-    };
-    let background = if highlight {
-        color
-    } else {
-        Color { a: 0.18, ..color }
-    };
-    let label = if label.chars().count() > 30 {
-        format!("{}…", label.chars().take(29).collect::<String>())
-    } else {
-        label
-    };
-    container(text(label).size(13).color(text_color))
-        .padding([6, 12])
-        .style(move |_theme| container::Style {
-            background: Some(Background::Color(background)),
-            border: Border {
-                color,
-                width: 1.0,
-                radius: 6.0.into(),
-            },
             ..container::Style::default()
         })
         .into()
