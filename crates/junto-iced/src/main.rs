@@ -94,6 +94,10 @@ struct App {
     agent_role: String,
     agent_model: String,
     agent_msg: Option<String>,
+    /// Advanced agent config rows: MCP servers (name, url), skills, plugin paths.
+    agent_mcp: Vec<(String, String)>,
+    agent_skills: Vec<String>,
+    agent_plugins: Vec<String>,
 }
 
 /// The admin views behind the top-bar buttons.
@@ -223,6 +227,19 @@ struct AgentDto {
     /// The agent's role / system prompt, if any (for the management form).
     #[serde(default)]
     role: Option<String>,
+    #[serde(default)]
+    mcp_servers: Vec<McpServerDto>,
+    #[serde(default)]
+    skills: Vec<String>,
+    #[serde(default)]
+    plugins: Vec<String>,
+}
+
+/// One MCP server an agent offers (name + streamable-HTTP url).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct McpServerDto {
+    name: String,
+    url: String,
 }
 
 /// Machine settings (`/settings.json`) for the native settings view.
@@ -520,6 +537,19 @@ enum Message {
     AgentSaved(Result<(), String>),
     DeleteAgent(String),
     AgentDeleted(Result<(), String>),
+    // Advanced agent config rows.
+    McpNameChanged(usize, String),
+    McpUrlChanged(usize, String),
+    McpAddRow,
+    McpRemove(usize),
+    SkillChanged(usize, String),
+    SkillAddRow,
+    SkillRemove(usize),
+    PluginChanged(usize, String),
+    PluginAddRow,
+    PluginRemove(usize),
+    PluginBrowse(usize),
+    PluginPicked(usize, Option<String>),
 }
 
 impl App {
@@ -549,6 +579,9 @@ impl App {
             agent_role: String::new(),
             agent_model: String::new(),
             agent_msg: None,
+            agent_mcp: Vec::new(),
+            agent_skills: Vec::new(),
+            agent_plugins: Vec::new(),
         };
         (
             app,
@@ -1205,6 +1238,13 @@ impl App {
                     .and_then(|s| s.harnesses.iter().find(|h| h.id == agent.harness).cloned());
                 self.agent_role = agent.role.unwrap_or_default();
                 self.agent_model = agent.model.unwrap_or_default();
+                self.agent_mcp = agent
+                    .mcp_servers
+                    .iter()
+                    .map(|s| (s.name.clone(), s.url.clone()))
+                    .collect();
+                self.agent_skills = agent.skills.clone();
+                self.agent_plugins = agent.plugins.clone();
                 self.agent_msg = None;
                 Task::none()
             }
@@ -1214,7 +1254,80 @@ impl App {
                 self.agent_harness = None;
                 self.agent_role.clear();
                 self.agent_model.clear();
+                self.agent_mcp.clear();
+                self.agent_skills.clear();
+                self.agent_plugins.clear();
                 self.agent_msg = None;
+                Task::none()
+            }
+            Message::McpNameChanged(i, v) => {
+                if let Some(row) = self.agent_mcp.get_mut(i) {
+                    row.0 = v;
+                }
+                Task::none()
+            }
+            Message::McpUrlChanged(i, v) => {
+                if let Some(row) = self.agent_mcp.get_mut(i) {
+                    row.1 = v;
+                }
+                Task::none()
+            }
+            Message::McpAddRow => {
+                self.agent_mcp.push((String::new(), String::new()));
+                Task::none()
+            }
+            Message::McpRemove(i) => {
+                if i < self.agent_mcp.len() {
+                    self.agent_mcp.remove(i);
+                }
+                Task::none()
+            }
+            Message::SkillChanged(i, v) => {
+                if let Some(s) = self.agent_skills.get_mut(i) {
+                    *s = v;
+                }
+                Task::none()
+            }
+            Message::SkillAddRow => {
+                self.agent_skills.push(String::new());
+                Task::none()
+            }
+            Message::SkillRemove(i) => {
+                if i < self.agent_skills.len() {
+                    self.agent_skills.remove(i);
+                }
+                Task::none()
+            }
+            Message::PluginChanged(i, v) => {
+                if let Some(p) = self.agent_plugins.get_mut(i) {
+                    *p = v;
+                }
+                Task::none()
+            }
+            Message::PluginAddRow => {
+                self.agent_plugins.push(String::new());
+                Task::none()
+            }
+            Message::PluginRemove(i) => {
+                if i < self.agent_plugins.len() {
+                    self.agent_plugins.remove(i);
+                }
+                Task::none()
+            }
+            Message::PluginBrowse(i) => Task::perform(
+                async {
+                    rfd::AsyncFileDialog::new()
+                        .set_title("Pick a local plugin directory")
+                        .pick_folder()
+                        .await
+                        .map(|h| h.path().display().to_string())
+                },
+                move |picked| Message::PluginPicked(i, picked),
+            ),
+            Message::PluginPicked(i, picked) => {
+                if let (Some(p), Some(path)) = (self.agent_plugins.get_mut(i), picked) {
+                    *p = path;
+                }
                 Task::none()
             }
             Message::AgentNameChanged(value) => {
@@ -1252,6 +1365,9 @@ impl App {
                     harness,
                     self.agent_role.trim().to_string(),
                     self.agent_model.trim().to_string(),
+                    self.agent_mcp.clone(),
+                    self.agent_skills.clone(),
+                    self.agent_plugins.clone(),
                 )
             }
             Message::AgentSaved(result) => match result {
@@ -1262,6 +1378,9 @@ impl App {
                     self.agent_harness = None;
                     self.agent_role.clear();
                     self.agent_model.clear();
+                    self.agent_mcp.clear();
+                    self.agent_skills.clear();
+                    self.agent_plugins.clear();
                     fetch_agents()
                 }
                 Err(err) => {
@@ -1671,6 +1790,79 @@ fn agents_panel(app: &App) -> Element<'_, Message> {
             .size(12)
             .padding(6),
     );
+
+    // --- advanced config: MCP servers, skills, local plugins ---
+    let remove_btn = |msg: Message| {
+        button(text("×").size(12))
+            .on_press(msg)
+            .padding([2, 8])
+            .style(|_t, _s| chip_style(RED, false))
+    };
+    let add_btn = |label: &'static str, msg: Message| {
+        button(text(label).size(11))
+            .on_press(msg)
+            .padding([2, 8])
+            .style(|_t, _s| chip_style(MUTED, false))
+    };
+
+    let mut mcp = column![text("MCP servers").size(12).color(MUTED)].spacing(4);
+    for (i, (name, url)) in app.agent_mcp.iter().enumerate() {
+        mcp = mcp.push(
+            row![
+                text_input("name", name)
+                    .on_input(move |v| Message::McpNameChanged(i, v))
+                    .size(12)
+                    .padding(6)
+                    .width(Length::FillPortion(1)),
+                text_input("https://…/mcp", url)
+                    .on_input(move |v| Message::McpUrlChanged(i, v))
+                    .size(12)
+                    .padding(6)
+                    .width(Length::FillPortion(2)),
+                remove_btn(Message::McpRemove(i)),
+            ]
+            .spacing(6)
+            .align_y(Center),
+        );
+    }
+    mcp = mcp.push(add_btn("+ add server", Message::McpAddRow));
+    form = form.push(mcp);
+
+    let mut skills = column![text("skills").size(12).color(MUTED)].spacing(4);
+    for (i, s) in app.agent_skills.iter().enumerate() {
+        skills = skills.push(
+            row![
+                text_input("skill name (or plugin:skill)", s)
+                    .on_input(move |v| Message::SkillChanged(i, v))
+                    .size(12)
+                    .padding(6),
+                remove_btn(Message::SkillRemove(i)),
+            ]
+            .spacing(6)
+            .align_y(Center),
+        );
+    }
+    skills = skills.push(add_btn("+ add skill", Message::SkillAddRow));
+    form = form.push(skills);
+
+    let mut plugins = column![text("local plugins").size(12).color(MUTED)].spacing(4);
+    for (i, p) in app.agent_plugins.iter().enumerate() {
+        plugins = plugins.push(
+            row![
+                text_input("absolute plugin directory", p)
+                    .on_input(move |v| Message::PluginChanged(i, v))
+                    .size(12)
+                    .padding(6),
+                add_btn("browse…", Message::PluginBrowse(i)),
+                remove_btn(Message::PluginRemove(i)),
+            ]
+            .spacing(6)
+            .align_y(Center),
+        );
+    }
+    plugins = plugins.push(add_btn("+ add plugin", Message::PluginAddRow));
+    form = form.push(plugins);
+
     let mut actions = row![button("save").on_press(Message::SaveAgent).padding(6)].spacing(6);
     if editing {
         actions = actions.push(
@@ -3122,13 +3314,19 @@ fn post_setup_repo(path: String, channel: String) -> Task<Message> {
     )
 }
 
-/// POST an agent create/edit (`/agents`). An empty `slug` creates; a set one edits.
+/// POST an agent create/edit (`/agents`). An empty `slug` creates; a set one
+/// edits. MCP servers / skills / plugins go as repeated keys (the host zips
+/// `mcp_name`+`mcp_url` and collects `skill` / `plugin_path`).
+#[allow(clippy::too_many_arguments)]
 fn post_save_agent(
     slug: Option<String>,
     name: String,
     harness: String,
     role: String,
     model: String,
+    mcp: Vec<(String, String)>,
+    skills: Vec<String>,
+    plugins: Vec<String>,
 ) -> Task<Message> {
     let url = format!("{HOST}/agents");
     Task::perform(
@@ -3141,6 +3339,23 @@ fn post_save_agent(
             ];
             if let Some(slug) = slug {
                 form.push(("slug", slug));
+            }
+            // Repeated keys — reqwest's form serializer keeps duplicates.
+            for (n, u) in mcp {
+                if !n.trim().is_empty() && !u.trim().is_empty() {
+                    form.push(("mcp_name", n));
+                    form.push(("mcp_url", u));
+                }
+            }
+            for s in skills {
+                if !s.trim().is_empty() {
+                    form.push(("skill", s));
+                }
+            }
+            for p in plugins {
+                if !p.trim().is_empty() {
+                    form.push(("plugin_path", p));
+                }
             }
             simple_post_result(&url, &form, "save").await
         },

@@ -1710,12 +1710,20 @@ async fn workspaces_json(State(host): State<Arc<Host>>) -> Response {
 /// The native launch controls render this as the agent dropdown.
 async fn agents_json() -> Response {
     #[derive(Serialize)]
+    struct McpServerItem {
+        name: String,
+        url: String,
+    }
+    #[derive(Serialize)]
     struct Item {
         slug: String,
         name: String,
         harness: String,
         model: Option<String>,
         role: Option<String>,
+        mcp_servers: Vec<McpServerItem>,
+        skills: Vec<String>,
+        plugins: Vec<String>,
     }
     let junto_home = match crate::host::junto_home() {
         Ok(home) => home,
@@ -1731,6 +1739,16 @@ async fn agents_json() -> Response {
                     harness: a.harness,
                     model: a.model,
                     role: a.role,
+                    mcp_servers: a
+                        .mcp_servers
+                        .into_iter()
+                        .map(|s| McpServerItem {
+                            name: s.name,
+                            url: s.url,
+                        })
+                        .collect(),
+                    skills: a.skills,
+                    plugins: a.plugins,
                 })
                 .collect();
             axum::Json(items).into_response()
