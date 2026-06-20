@@ -1336,22 +1336,6 @@ impl App {
             adder_row
         };
         let adder_row = adder_row.push(button("create").on_press(Message::CreateChannel).padding(6));
-        // Admin buttons (right side): settings ⚙ and agents ✦, toggling views.
-        let admin_btn = |label: &'static str, view: AdminView, current: Option<AdminView>| {
-            let active = current == Some(view);
-            button(text(label).size(12))
-                .on_press(Message::OpenAdmin((!active).then_some(view)))
-                .padding(6)
-                .style(move |_t, _s| chip_style(MAUVE, active))
-        };
-        let adder_row = row![
-            adder_row,
-            Space::with_width(Fill),
-            admin_btn("⚙ settings", AdminView::Settings, self.admin),
-            admin_btn("✦ agents", AdminView::Agents, self.admin),
-        ]
-        .spacing(8)
-        .align_y(Center);
         let adder: Element<Message> = match &self.new_channel_error {
             Some(err) => column![adder_row, text(format!("⚠ {err}")).size(11).color(RED)]
                 .spacing(4)
@@ -1365,7 +1349,10 @@ impl App {
                 AdminView::Settings => settings_panel(self),
                 AdminView::Agents => agents_panel(self),
             };
-            return column![adder, panel].spacing(10).padding(10).into();
+            return column![admin_toolbar(self.admin), panel]
+                .spacing(10)
+                .padding(10)
+                .into();
         }
 
         // The always-visible branch graph: the *whole* lineage DAG (every
@@ -1477,11 +1464,31 @@ impl App {
             }
         }
 
-        column![focus_board, adder, ribbon, body.height(Fill)]
+        column![admin_toolbar(self.admin), focus_board, adder, ribbon, body.height(Fill)]
             .spacing(10)
             .padding(10)
             .into()
     }
+}
+
+/// The always-visible top toolbar: the settings ⚙ and agents ✦ buttons.
+fn admin_toolbar(current: Option<AdminView>) -> Element<'static, Message> {
+    let btn = |label: &'static str, view: AdminView| {
+        let active = current == Some(view);
+        button(text(label).size(13))
+            .on_press(Message::OpenAdmin((!active).then_some(view)))
+            .padding([4, 10])
+            .style(move |_t, _s| chip_style(MAUVE, active))
+    };
+    row![
+        text("junto").size(15),
+        Space::with_width(16),
+        btn("settings", AdminView::Settings),
+        btn("agents", AdminView::Agents),
+    ]
+    .spacing(8)
+    .align_y(Center)
+    .into()
 }
 
 /// A bordered card container used by the admin panels.
