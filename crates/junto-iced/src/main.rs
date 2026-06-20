@@ -1004,9 +1004,12 @@ impl App {
             },
             Message::BriefLoaded(pane, md) => {
                 if let Some(state) = self.panes.get_mut(pane) {
+                    // The brief is the agent-facing recall text; strip the id
+                    // noise (UUIDs, @timestamps, digests) the human doesn't care
+                    // about before rendering.
                     state.brief_md = md
                         .filter(|s| !s.trim().is_empty())
-                        .map(|s| markdown::parse(&s).collect());
+                        .map(|s| markdown::parse(&humanize_brief(&s)).collect());
                 }
                 Task::none()
             }
@@ -1706,6 +1709,56 @@ fn feed_line(item: &FeedItem) -> Element<'_, Message> {
         _ => TEXT,
     };
     text(body).size(13).color(color).into()
+}
+
+/// Strip agent-facing id noise from the curated brief before showing it to a
+/// human: channel/entry UUIDs, `@<timestamp>` tokens, and content digests are
+/// dropped (the human surface acts via buttons, not by id).
+fn humanize_brief(md: &str) -> String {
+    md.lines()
+        .map(|line| {
+            line.split(' ')
+                .filter(|tok| !is_id_noise(tok))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Whether a token is an id/hash/timestamp a human reader doesn't want — tested
+/// after stripping wrapping punctuation like `()`, backticks, and brackets.
+fn is_id_noise(token: &str) -> bool {
+    let core = token.trim_matches(|c: char| "()`,[]<>".contains(c));
+    if core.is_empty() {
+        return false;
+    }
+    // A `@1781910552547`-style epoch token.
+    if let Some(digits) = core.strip_prefix('@') {
+        if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+            return true;
+        }
+    }
+    // A content digest, e.g. `sha256:abcd…`.
+    if core.contains(':') && core.split(':').next().is_some_and(|a| a == "sha256") {
+        return true;
+    }
+    is_uuid(core) || is_long_hex(core)
+}
+
+/// A canonical 8-4-4-4-12 hex UUID.
+fn is_uuid(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('-').collect();
+    parts.len() == 5
+        && [8, 4, 4, 4, 12]
+            .iter()
+            .zip(&parts)
+            .all(|(n, p)| p.len() == *n && p.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// A bare hex run long enough to be an id rather than a word (≥12 chars).
+fn is_long_hex(s: &str) -> bool {
+    s.len() >= 12 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Crude tag-stripper for the host's sanitized-HTML feed segments.
