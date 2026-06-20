@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use iced::widget::canvas::{self, Canvas, Frame, Geometry, Path, Stroke};
 use iced::widget::pane_grid;
 use iced::widget::{
-    button, column, combo_box, container, row, scrollable, text, text_input, Space,
+    button, column, combo_box, container, pick_list, row, scrollable, text, text_input, Space,
 };
 use iced::{
     Background, Border, Center, Color, Element, Fill, Length, Point, Rectangle, Renderer, Size,
@@ -63,6 +63,8 @@ struct App {
     lineage: Option<LineageGraphDto>,
     /// Cross-channel "needs you" items — the focus board.
     focus_items: Vec<FocusItem>,
+    /// Configured Agents the launch picker offers (`/agents.json`).
+    agents: Vec<AgentDto>,
 }
 
 struct Pane {
@@ -74,6 +76,15 @@ struct Pane {
     feed: Vec<LiveEvent>,
     launch_intent: String,
     steer_text: String,
+    /// Which configured Agent runs the next launch (None → host default).
+    /// Moot after the channel's agent is established (one per channel, adr/0024).
+    launch_agent: Option<AgentDto>,
+    /// When true, launch runs the code-PR verify/Grader push-gate loop
+    /// (`mode=outcome`); otherwise a single turn (`mode=single`).
+    launch_outcome: bool,
+    /// The workspace repo for the launch; empty falls back to the channel's
+    /// remembered mapping on the host.
+    launch_workspace: String,
 }
 
 enum Content {
@@ -109,6 +120,26 @@ struct GEdge {
     from: String,
     to: String,
     relation: String,
+}
+
+/// A configured Agent the launch picker offers (mirrors `/agents.json`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct AgentDto {
+    slug: String,
+    name: String,
+    harness: String,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+impl std::fmt::Display for AgentDto {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // "name · harness" (with model when overridden) — what the dropdown shows.
+        match &self.model {
+            Some(model) => write!(f, "{} · {} ({model})", self.name, self.harness),
+            None => write!(f, "{} · {}", self.name, self.harness),
+        }
+    }
 }
 
 /// One frame of a session's live feed (mirrors the host's `LiveEvent`).
@@ -172,6 +203,7 @@ enum Message {
     ChannelPicked(String),
     LineageGraphLoaded(Option<LineageGraphDto>),
     FocusLoaded(Vec<FocusItem>),
+    AgentsLoaded(Vec<AgentDto>),
     Fetched(pane_grid::Pane, Result<ChannelDto, String>),
     Refresh(pane_grid::Pane),
     Close(pane_grid::Pane),
@@ -180,6 +212,9 @@ enum Message {
     Live(String, LiveEvent),
     LiveEnded(String),
     LaunchIntentChanged(pane_grid::Pane, String),
+    LaunchAgentPicked(pane_grid::Pane, AgentDto),
+    LaunchModeToggled(pane_grid::Pane),
+    LaunchWorkspaceChanged(pane_grid::Pane, String),
     Launch(pane_grid::Pane),
     SteerTextChanged(pane_grid::Pane, String),
     Steer(pane_grid::Pane),
@@ -197,6 +232,7 @@ impl App {
             channels: combo_box::State::new(Vec::new()),
             lineage: None,
             focus_items: Vec::new(),
+            agents: Vec::new(),
         };
         (
             app,
@@ -205,6 +241,7 @@ impl App {
                 fetch_channels(),
                 fetch_lineage_graph(),
                 fetch_focus(),
+                fetch_agents(),
             ]),
         )
     }
@@ -221,6 +258,10 @@ impl App {
             }
             Message::FocusLoaded(items) => {
                 self.focus_items = items;
+                Task::none()
+            }
+            Message::AgentsLoaded(agents) => {
+                self.agents = agents;
                 Task::none()
             }
             Message::ChannelPicked(name) => {
@@ -305,6 +346,24 @@ impl App {
                 }
                 Task::none()
             }
+            Message::LaunchAgentPicked(pane, agent) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    state.launch_agent = Some(agent);
+                }
+                Task::none()
+            }
+            Message::LaunchModeToggled(pane) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    state.launch_outcome = !state.launch_outcome;
+                }
+                Task::none()
+            }
+            Message::LaunchWorkspaceChanged(pane, value) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    state.launch_workspace = value;
+                }
+                Task::none()
+            }
             Message::Launch(pane) => {
                 let Some(state) = self.panes.get_mut(pane) else {
                     return Task::none();
@@ -314,8 +373,11 @@ impl App {
                     return Task::none();
                 }
                 let channel = state.channel.clone();
+                let agent = state.launch_agent.as_ref().map(|a| a.slug.clone());
+                let mode = if state.launch_outcome { "outcome" } else { "single" };
+                let workspace = state.launch_workspace.trim().to_string();
                 state.launch_intent.clear();
-                post_launch(pane, channel, intent)
+                post_launch(pane, channel, intent, agent, mode, workspace)
             }
             Message::SteerTextChanged(pane, value) => {
                 if let Some(state) = self.panes.get_mut(pane) {
@@ -488,7 +550,7 @@ impl App {
         let mut body = row![].spacing(6);
         for id in &self.order {
             if let Some(pane) = self.panes.get(*id) {
-                body = body.push(column_pane(*id, pane));
+                body = body.push(column_pane(*id, pane, &self.agents));
             }
         }
 
@@ -512,8 +574,12 @@ fn title_row(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
 }
 
 /// One channel pane as a bordered column (custom Columns layout).
-fn column_pane(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
-    container(column![title_row(id, pane), pane_body(id, pane)].spacing(8))
+fn column_pane<'a>(
+    id: pane_grid::Pane,
+    pane: &'a Pane,
+    agents: &'a [AgentDto],
+) -> Element<'a, Message> {
+    container(column![title_row(id, pane), pane_body(id, pane, agents)].spacing(8))
         .width(Length::FillPortion(1))
         .height(Fill)
         .padding(8)
@@ -529,7 +595,11 @@ fn column_pane(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
         .into()
 }
 
-fn pane_body(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
+fn pane_body<'a>(
+    id: pane_grid::Pane,
+    pane: &'a Pane,
+    agents: &'a [AgentDto],
+) -> Element<'a, Message> {
     let dto = match &pane.content {
         Content::Loading => {
             return container(text("loading…").color(MUTED)).padding(12).into();
@@ -553,8 +623,8 @@ fn pane_body(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
         );
     }
 
-    // Launch a session.
-    let launch = row![
+    // Launch a session: intent + agent picker + mode toggle + workspace.
+    let intent_row = row![
         text_input("launch a session — what should it do?", &pane.launch_intent)
             .on_input(move |v| Message::LaunchIntentChanged(id, v))
             .on_submit(Message::Launch(id))
@@ -562,6 +632,37 @@ fn pane_body(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
         button("launch").on_press(Message::Launch(id)).padding(6),
     ]
     .spacing(6);
+    let agent_picker: Element<Message> = if agents.is_empty() {
+        text("no agents configured").size(11).color(MUTED).into()
+    } else {
+        pick_list(agents.to_vec(), pane.launch_agent.clone(), move |a| {
+            Message::LaunchAgentPicked(id, a)
+        })
+        .placeholder("default agent")
+        .text_size(12)
+        .padding(6)
+        .into()
+    };
+    let (mode_label, mode_color) = if pane.launch_outcome {
+        ("outcome (verify loop)", MAUVE)
+    } else {
+        ("single turn", MUTED)
+    };
+    let mode_toggle = button(text(mode_label).size(11).color(mode_color))
+        .on_press(Message::LaunchModeToggled(id))
+        .padding([3, 9])
+        .style(move |_t, _s| chip_style(mode_color, pane.launch_outcome));
+    let options_row = row![
+        agent_picker,
+        mode_toggle,
+        text_input("workspace repo (optional)", &pane.launch_workspace)
+            .on_input(move |v| Message::LaunchWorkspaceChanged(id, v))
+            .size(12)
+            .padding(6),
+    ]
+    .spacing(6)
+    .align_y(Center);
+    let launch = column![intent_row, options_row].spacing(6);
 
     // Session chips — click to stream a session's live feed.
     let mut chips = row![].spacing(6);
@@ -777,6 +878,9 @@ impl Pane {
             feed: Vec::new(),
             launch_intent: String::new(),
             steer_text: String::new(),
+            launch_agent: None,
+            launch_outcome: false,
+            launch_workspace: String::new(),
         }
     }
 }
@@ -1131,6 +1235,20 @@ fn fetch_focus() -> Task<Message> {
     )
 }
 
+/// Fetch the configured Agents for the per-pane launch picker.
+fn fetch_agents() -> Task<Message> {
+    let url = format!("{HOST}/agents.json");
+    Task::perform(
+        async move {
+            match reqwest::get(&url).await {
+                Ok(response) => response.json::<Vec<AgentDto>>().await.unwrap_or_default(),
+                Err(_) => Vec::new(),
+            }
+        },
+        Message::AgentsLoaded,
+    )
+}
+
 /// Fetch the list of channel names for the type-ahead picker.
 fn fetch_channels() -> Task<Message> {
     #[derive(Deserialize)]
@@ -1186,16 +1304,28 @@ fn session_stream(channel: String, session: String) -> impl iced::futures::Strea
     })
 }
 
-/// POST a launch (a new session) for `channel` with `intent`.
-fn post_launch(pane: pane_grid::Pane, channel: String, intent: String) -> Task<Message> {
+/// POST a launch (a new session) for `channel` — intent plus the agent slug,
+/// mode (`single`/`outcome`), and optional workspace the picker selected.
+fn post_launch(
+    pane: pane_grid::Pane,
+    channel: String,
+    intent: String,
+    agent: Option<String>,
+    mode: &'static str,
+    workspace: String,
+) -> Task<Message> {
     let url = format!("{HOST}/channels/{channel}/sessions");
     Task::perform(
         async move {
-            let _ = reqwest::Client::new()
-                .post(&url)
-                .form(&[("intent", intent.as_str()), ("mode", "single")])
-                .send()
-                .await;
+            let mut form = vec![
+                ("intent", intent),
+                ("mode", mode.to_string()),
+                ("workspace", workspace),
+            ];
+            if let Some(agent) = agent {
+                form.push(("agent", agent));
+            }
+            let _ = reqwest::Client::new().post(&url).form(&form).send().await;
         },
         move |()| Message::Posted(pane),
     )

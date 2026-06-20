@@ -75,6 +75,7 @@ pub fn router(host: Arc<Host>) -> Router {
         .route("/channels.json", get(channels_json))
         .route("/lineage.json", get(lineage_json))
         .route("/focus.json", get(focus_json))
+        .route("/agents.json", get(agents_json))
         .route("/channels/{channel}/entries/{entry}/{act}", post(verify))
         .with_state(host)
         // Wrap any plain-text error response in a styled page (so a refused
@@ -1547,6 +1548,38 @@ async fn focus_json(State(host): State<Arc<Host>>) -> Response {
         }
     }
     axum::Json(items).into_response()
+}
+
+/// The configured **Agents** the launch picker offers (`docs/adr/0023`/`0024`).
+/// The first entry is the default (the stock agent for the default harness).
+/// The native launch controls render this as the agent dropdown.
+async fn agents_json() -> Response {
+    #[derive(Serialize)]
+    struct Item {
+        slug: String,
+        name: String,
+        harness: String,
+        model: Option<String>,
+    }
+    let junto_home = match crate::host::junto_home() {
+        Ok(home) => home,
+        Err(err) => return internal(format!("no junto home: {err}")),
+    };
+    match crate::agent::all_agents(&junto_home) {
+        Ok(agents) => {
+            let items: Vec<Item> = agents
+                .into_iter()
+                .map(|a| Item {
+                    slug: a.slug,
+                    name: a.name,
+                    harness: a.harness,
+                    model: a.model,
+                })
+                .collect();
+            axum::Json(items).into_response()
+        }
+        Err(err) => internal(format!("reading agents: {err}")),
+    }
 }
 
 /// The whole **lineage DAG** across channels (nodes + diverge/converge edges) —
