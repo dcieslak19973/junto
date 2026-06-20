@@ -122,6 +122,9 @@ struct Pane {
     /// Parsed Markdown for session memo entries, keyed by entry id (parsed on
     /// load so memo notes render formatted, not as plain text).
     entry_md: HashMap<String, Vec<markdown::Item>>,
+    /// After the next load, auto-select and stream the newest session — set on
+    /// launch so you immediately watch the agent work (Claude-Code-like).
+    watch_newest: bool,
 }
 
 enum Content {
@@ -340,6 +343,8 @@ enum Message {
     Launched(pane_grid::Pane, Result<(), String>),
     SteerTextChanged(pane_grid::Pane, String),
     Steer(pane_grid::Pane),
+    /// The result of a steer POST (pane, Ok or error) — re-streams the resumed turn.
+    Steered(pane_grid::Pane, Result<(), String>),
     Interrupt(pane_grid::Pane),
     Posted(pane_grid::Pane),
     /// Show/hide the launch options (agent / workspace / mode).
@@ -506,6 +511,16 @@ impl App {
                             .filter(|e| e.kind == "session")
                             .map(|e| (e.id.clone(), markdown::parse(&e.summary).collect()))
                             .collect();
+                        // After a launch, jump straight into streaming the new
+                        // session so the agent's work is immediately visible.
+                        if state.watch_newest {
+                            state.watch_newest = false;
+                            if let Some(newest) = dto.sessions.last() {
+                                state.watched = Some(newest.id.clone());
+                                state.streaming = true;
+                                state.feed.clear();
+                            }
+                        }
                         state.content = Content::Loaded(dto);
                         // Jump to the newest entry (bottom) by default.
                         scrollable::snap_to(
@@ -663,6 +678,7 @@ impl App {
                     Ok(()) => {
                         state.launch_error = None;
                         state.launch_intent.clear();
+                        state.watch_newest = true; // stream the new session on load
                         let channel = state.channel.clone();
                         fetch(pane, &channel)
                     }
@@ -722,7 +738,43 @@ impl App {
                 }
                 let channel = state.channel.clone();
                 state.steer_text.clear();
-                post_act(pane, channel, session, "steer", Some(text))
+                // Echo the message immediately so the exchange reads like a chat.
+                state.feed.push(FeedItem {
+                    event: LiveEvent {
+                        kind: "you".into(),
+                        text: text.clone(),
+                        seq: 0,
+                        html: false,
+                        markdown: None,
+                    },
+                    md: None,
+                });
+                let scroll = state.scroll_id.clone();
+                Task::batch([
+                    post_steer(pane, channel, session, text),
+                    scrollable::snap_to(scroll, scrollable::RelativeOffset::END),
+                ])
+            }
+            Message::Steered(pane, result) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    match result {
+                        // Re-stream: a landed session resumes a new turn; a live
+                        // one keeps streaming. Either way ensure the subscription
+                        // is active to show the response.
+                        Ok(()) => state.streaming = true,
+                        Err(err) => state.feed.push(FeedItem {
+                            event: LiveEvent {
+                                kind: "error".into(),
+                                text: err,
+                                seq: 0,
+                                html: false,
+                                markdown: None,
+                            },
+                            md: None,
+                        }),
+                    }
+                }
+                Task::none()
             }
             Message::Interrupt(pane) => {
                 let Some(state) = self.panes.get_mut(pane) else {
@@ -1092,12 +1144,16 @@ fn pane_body<'a>(
                 ));
             }
         }
-        // The current turn's live output, while streaming.
-        if pane.streaming {
+        // The live exchange (your steers + the agent's streaming output). Kept
+        // visible after the turn lands until you leave the session.
+        if pane.streaming || !pane.feed.is_empty() {
             record = record.push(text("— live turn —").size(11).color(MUTED));
             let mut feed = column![].spacing(6);
             for item in &pane.feed {
                 feed = feed.push(feed_line(item));
+            }
+            if pane.streaming {
+                feed = feed.push(text("● working…").size(11).color(YELLOW));
             }
             record = record.push(feed);
         }
@@ -1222,6 +1278,21 @@ fn pane_body<'a>(
 /// One live-feed line — kind-coloured, with any HTML the host rendered stripped
 /// back to plain text (native can't paint HTML).
 fn feed_line(item: &FeedItem) -> Element<'_, Message> {
+    // Your own steer messages, echoed as a chat-style "you ›" line.
+    if item.event.kind == "you" {
+        return container(text(format!("you › {}", item.event.text)).size(13).color(BLUE))
+            .padding([3, 8])
+            .width(Fill)
+            .style(|_theme| container::Style {
+                background: Some(Background::Color(Color { a: 0.12, ..BLUE })),
+                border: Border {
+                    radius: 4.0.into(),
+                    ..Border::default()
+                },
+                ..container::Style::default()
+            })
+            .into();
+    }
     // Model prose renders as Markdown; status/tool/error lines stay plain.
     if let Some(md) = &item.md {
         return markdown::view(
@@ -1676,6 +1747,7 @@ impl Pane {
             launch_expanded: false,
             show_full_history: false,
             entry_md: HashMap::new(),
+            watch_newest: false,
         }
     }
 }
@@ -2227,5 +2299,40 @@ fn post_act(
             let _ = request.send().await;
         },
         move |()| Message::Posted(pane),
+    )
+}
+
+/// POST a steer message and report the result, so the pane can re-stream the
+/// resumed turn (a landed session) or keep streaming (a live one).
+fn post_steer(
+    pane: pane_grid::Pane,
+    channel: String,
+    session: String,
+    message: String,
+) -> Task<Message> {
+    let url = format!("{HOST}/channels/{channel}/sessions/{session}/steer");
+    Task::perform(
+        async move {
+            match reqwest::Client::new()
+                .post(&url)
+                .form(&[("message", message)])
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => Ok(()),
+                Ok(resp) => {
+                    let code = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    let body = body.trim();
+                    Err(if body.is_empty() {
+                        format!("steer failed ({code})")
+                    } else {
+                        format!("{code}: {body}")
+                    })
+                }
+                Err(err) => Err(format!("request failed: {err}")),
+            }
+        },
+        move |result| Message::Steered(pane, result),
     )
 }

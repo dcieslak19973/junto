@@ -1572,8 +1572,11 @@ fn spawn_turn(
     resume: Option<String>,
     agent: crate::agent::Agent,
 ) {
+    // Open the live feed *before* spawning, so it exists the moment this
+    // function returns — a client that subscribes right after the launch/steer
+    // HTTP call lands on the running turn instead of an immediate "end".
+    let mut control_rx = host.live().begin(session);
     tokio::spawn(async move {
-        let mut control_rx = host.live().begin(session);
         let outcome = run_turn(
             &workspace,
             &prompt,
