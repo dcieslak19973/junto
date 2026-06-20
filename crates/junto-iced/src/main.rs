@@ -61,6 +61,8 @@ struct App {
     channels: combo_box::State<String>,
     /// The whole lineage DAG, drawn as the always-visible top branch graph.
     lineage: Option<LineageGraphDto>,
+    /// Cross-channel "needs you" items — the focus board.
+    focus_items: Vec<FocusItem>,
 }
 
 struct Pane {
@@ -142,6 +144,19 @@ struct SessionDto {
     intent: String,
 }
 
+/// One cross-channel "needs you" item on the focus board.
+#[derive(Debug, Clone, Deserialize)]
+struct FocusItem {
+    kind: String,
+    #[allow(dead_code)]
+    entry_id: String,
+    #[allow(dead_code)]
+    channel: String,
+    channel_name: Option<String>,
+    author: String,
+    summary: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct EntryDto {
     author: String,
@@ -156,6 +171,7 @@ enum Message {
     ChannelsLoaded(Vec<String>),
     ChannelPicked(String),
     LineageGraphLoaded(Option<LineageGraphDto>),
+    FocusLoaded(Vec<FocusItem>),
     Fetched(pane_grid::Pane, Result<ChannelDto, String>),
     Refresh(pane_grid::Pane),
     Close(pane_grid::Pane),
@@ -180,10 +196,16 @@ impl App {
             order: vec![first],
             channels: combo_box::State::new(Vec::new()),
             lineage: None,
+            focus_items: Vec::new(),
         };
         (
             app,
-            Task::batch([fetch(first, "junto-dev"), fetch_channels(), fetch_lineage_graph()]),
+            Task::batch([
+                fetch(first, "junto-dev"),
+                fetch_channels(),
+                fetch_lineage_graph(),
+                fetch_focus(),
+            ]),
         )
     }
 
@@ -195,6 +217,10 @@ impl App {
             }
             Message::LineageGraphLoaded(graph) => {
                 self.lineage = graph;
+                Task::none()
+            }
+            Message::FocusLoaded(items) => {
+                self.focus_items = items;
                 Task::none()
             }
             Message::ChannelPicked(name) => {
@@ -394,6 +420,46 @@ impl App {
                 .into(),
         };
 
+        // The focus board: cross-channel "needs you" items. Click one to open
+        // its channel pane (acting on it is the next parity step).
+        let focus_board: Element<Message> = if self.focus_items.is_empty() {
+            container(text("focus · all clear").size(12).color(GREEN))
+                .padding([4, 8])
+                .into()
+        } else {
+            let mut items = row![
+                text(format!("needs you ({}) ▸", self.focus_items.len()))
+                    .size(12)
+                    .color(YELLOW)
+            ]
+            .spacing(8)
+            .align_y(Center);
+            for item in &self.focus_items {
+                let (tag, color) = match item.kind.as_str() {
+                    "gate" => ("gate", YELLOW),
+                    "awaiting-execution" => ("exec", MAUVE),
+                    _ => ("ratify", BLUE),
+                };
+                let chan = item.channel_name.clone().unwrap_or_default();
+                let label = format!("{tag} · {chan} · {}", truncate(&item.summary, 44));
+                let mut chip = button(text(label).size(11)).padding([3, 9]).style(
+                    move |_t, _s| chip_style(color, false),
+                );
+                if let Some(name) = &item.channel_name {
+                    chip = chip.on_press(Message::ChannelPicked(name.clone()));
+                }
+                items = items.push(chip);
+            }
+            container(
+                scrollable(items).direction(scrollable::Direction::Horizontal(
+                    scrollable::Scrollbar::default(),
+                )),
+            )
+            .width(Fill)
+            .padding([4, 4])
+            .into()
+        };
+
         // Shared-width columns, reflowing as channels open/close.
         let mut body = row![].spacing(6);
         for id in &self.order {
@@ -402,7 +468,7 @@ impl App {
             }
         }
 
-        column![adder, ribbon, body.height(Fill)]
+        column![focus_board, adder, ribbon, body.height(Fill)]
             .spacing(10)
             .padding(10)
             .into()
@@ -968,6 +1034,20 @@ fn fetch_lineage_graph() -> Task<Message> {
             }
         },
         Message::LineageGraphLoaded,
+    )
+}
+
+/// Fetch the cross-channel focus board ("needs you" items).
+fn fetch_focus() -> Task<Message> {
+    let url = format!("{HOST}/focus.json");
+    Task::perform(
+        async move {
+            match reqwest::get(&url).await {
+                Ok(response) => response.json::<Vec<FocusItem>>().await.unwrap_or_default(),
+                Err(_) => Vec::new(),
+            }
+        },
+        Message::FocusLoaded,
     )
 }
 

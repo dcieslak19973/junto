@@ -74,6 +74,7 @@ pub fn router(host: Arc<Host>) -> Router {
         .route("/channels/{channel}/view.json", get(channel_view_json))
         .route("/channels.json", get(channels_json))
         .route("/lineage.json", get(lineage_json))
+        .route("/focus.json", get(focus_json))
         .route("/channels/{channel}/entries/{entry}/{act}", post(verify))
         .with_state(host)
         // Wrap any plain-text error response in a styled page (so a refused
@@ -1500,6 +1501,51 @@ async fn channels_json(State(host): State<Arc<Host>>) -> Response {
             })
         })
         .collect();
+    axum::Json(items).into_response()
+}
+
+/// The **focus board** across channels — the cross-channel "needs you" items
+/// (pending gates, approved-but-unexecuted actionable gates, provisional
+/// assertions awaiting verification). The native attention home renders this.
+async fn focus_json(State(host): State<Arc<Host>>) -> Response {
+    #[derive(Serialize)]
+    struct Item {
+        kind: String,
+        entry_id: String,
+        channel: String,
+        channel_name: Option<String>,
+        author: String,
+        summary: String,
+    }
+    let clip = |s: &str| s.chars().take(140).collect::<String>();
+    let inventory = host.inventory().await.unwrap_or_default();
+    let mut items = Vec::new();
+    for summary in &inventory {
+        let Ok((id, view, _)) = project(&host, &summary.id.to_string()).await else {
+            continue;
+        };
+        let group = crate::host::attention_for_view(&id, &view);
+        for item in &group.items {
+            let kind = match item.kind {
+                crate::host::AttentionKind::Gate => "gate",
+                crate::host::AttentionKind::AwaitingExecution => "awaiting-execution",
+                crate::host::AttentionKind::Verification => "verification",
+            };
+            let text = match &item.entry.payload {
+                EntryPayload::Assertion { statement, .. } => clip(statement),
+                EntryPayload::Proposal { action, .. } => clip(action),
+                _ => "—".into(),
+            };
+            items.push(Item {
+                kind: kind.into(),
+                entry_id: item.entry.id.to_string(),
+                channel: id.to_string(),
+                channel_name: group.name.clone(),
+                author: item.entry.author.display_name.clone(),
+                summary: text,
+            });
+        }
+    }
     axum::Json(items).into_response()
 }
 
