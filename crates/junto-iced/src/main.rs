@@ -396,27 +396,31 @@ impl App {
             .collect();
         let ribbon: Element<Message> = match &self.lineage {
             Some(graph) => {
-                // A short, vertically-scrollable band — the whole graph is
-                // reachable by scrolling without it dominating the window.
+                // Sticky ambient (row 0) pinned above a taller, vertically-
+                // scrollable graph of the whole lineage.
                 let canvas = LineageCanvas::layout(graph, &open);
                 let content_h = canvas.height.max(60.0);
-                let view_h = content_h.min(190.0);
-                container(
-                    scrollable(Canvas::new(canvas).width(Fill).height(Length::Fixed(content_h)))
-                        .height(Fill),
+                let scroll_h = content_h.min(300.0);
+                let pinned = Canvas::new(canvas.pinned())
+                    .width(Fill)
+                    .height(Length::Fixed(28.0));
+                let scroll = scrollable(
+                    Canvas::new(canvas).width(Fill).height(Length::Fixed(content_h)),
                 )
-                .width(Fill)
-                .height(Length::Fixed(view_h))
-                .padding(6)
-                .style(|_theme| container::Style {
-                    background: Some(Background::Color(Color { a: 0.4, ..SURFACE })),
-                    border: Border {
-                        radius: 6.0.into(),
-                        ..Border::default()
-                    },
-                    ..container::Style::default()
-                })
-                .into()
+                .height(Fill);
+                container(column![pinned, scroll])
+                    .width(Fill)
+                    .height(Length::Fixed(scroll_h + 34.0))
+                    .padding(6)
+                    .style(|_theme| container::Style {
+                        background: Some(Background::Color(Color { a: 0.4, ..SURFACE })),
+                        border: Border {
+                            radius: 6.0.into(),
+                            ..Border::default()
+                        },
+                        ..container::Style::default()
+                    })
+                    .into()
             }
             None => container(text("loading lineage…").size(12).color(MUTED))
                 .width(Fill)
@@ -781,6 +785,7 @@ const LABEL_W: f32 = 150.0;
 /// and converge (at its end) keep a visible horizontal gap.
 const MIN_TRACK: f32 = 56.0;
 
+#[derive(Clone)]
 struct Track {
     name: String,
     row: usize,
@@ -793,6 +798,7 @@ struct Track {
     milestones: Vec<(i64, String)>,
 }
 
+#[derive(Clone)]
 struct LineageCanvas {
     tracks: Vec<Track>,
     /// (parent_row, child_row, divergence_ms, is_diverge)
@@ -800,6 +806,9 @@ struct LineageCanvas {
     now_ms: i64,
     span_ms: i64,
     height: f32,
+    /// When true, render only the ambient (row 0) track at a fixed y — the
+    /// sticky mainline pinned above the scrollable graph.
+    pinned: bool,
 }
 
 impl LineageCanvas {
@@ -882,7 +891,15 @@ impl LineageCanvas {
             now_ms,
             span_ms: (now_ms - min_ms).max(1),
             height,
+            pinned: false,
         }
+    }
+
+    /// A clone that renders only the ambient (row 0) track — the sticky mainline.
+    fn pinned(&self) -> Self {
+        let mut c = self.clone();
+        c.pinned = true;
+        c
     }
 
     /// Log-scaled age → x, newest on the right (matches the web's `strip_age_x`).
@@ -913,6 +930,40 @@ impl canvas::Program<Message> for LineageCanvas {
         let right = (bounds.width - 24.0).max(left + 60.0);
         let hover = cursor.position_in(bounds);
         let mut tooltip: Option<(Point, String)> = None;
+
+        // Pinned mode: draw only the ambient (row 0) track at a fixed y — the
+        // sticky mainline that stays above the scrollable graph.
+        if self.pinned {
+            if let Some(track) = self.tracks.iter().find(|t| t.row == 0) {
+                let y = bounds.height / 2.0;
+                let x0 = self.x_of(track.first_ms, left, right);
+                let x1 = self.x_of(track.last_ms, left, right).max(x0 + MIN_TRACK);
+                frame.stroke(
+                    &Path::line(Point::new(x0, y), Point::new(x1, y)),
+                    Stroke::default().with_color(TEAL).with_width(3.0),
+                );
+                frame.fill(&Path::circle(Point::new(x1, y), 5.0), TEAL);
+                for (ms, label) in &track.milestones {
+                    let mx = self.x_of(*ms, left, right).clamp(x0, x1);
+                    frame.fill(&Path::circle(Point::new(mx, y), 2.5), TEXT);
+                    if let Some(h) = hover
+                        && (h.x - mx).abs() < 5.0
+                        && (h.y - y).abs() < 5.0
+                    {
+                        tooltip = Some((Point::new(mx, y), label.clone()));
+                    }
+                }
+                frame.fill_text(canvas::Text {
+                    content: format!("⚓ {}", truncate(&track.name, 18)),
+                    position: Point::new(8.0, y - 8.0),
+                    color: TEAL,
+                    size: 13.0.into(),
+                    ..canvas::Text::default()
+                });
+                draw_tooltip(&mut frame, tooltip, bounds);
+            }
+            return vec![frame.into_geometry()];
+        }
 
         // Per-track x-range with a minimum length so diverge/converge keep a gap.
         let mut ranges = vec![(0.0_f32, 0.0_f32); self.tracks.len()];
@@ -1000,25 +1051,28 @@ impl canvas::Program<Message> for LineageCanvas {
             });
         }
 
-        // Hover tooltip explaining the milestone under the cursor.
-        if let Some((dot, label)) = tooltip {
-            let w = (label.chars().count() as f32 * 6.3 + 14.0).min(bounds.width - 8.0);
-            let tx = (dot.x + 8.0).min(bounds.width - w - 4.0).max(4.0);
-            let ty = (dot.y - 24.0).max(2.0);
-            frame.fill(
-                &Path::rectangle(Point::new(tx, ty), Size::new(w, 19.0)),
-                Color { a: 0.97, ..SURFACE },
-            );
-            frame.fill_text(canvas::Text {
-                content: label,
-                position: Point::new(tx + 7.0, ty + 3.0),
-                color: TEXT,
-                size: 11.0.into(),
-                ..canvas::Text::default()
-            });
-        }
+        draw_tooltip(&mut frame, tooltip, bounds);
         vec![frame.into_geometry()]
     }
+}
+
+/// Draw a milestone hover tooltip (a labelled box near the hovered point).
+fn draw_tooltip(frame: &mut Frame, tooltip: Option<(Point, String)>, bounds: Rectangle) {
+    let Some((dot, label)) = tooltip else { return };
+    let w = (label.chars().count() as f32 * 6.3 + 14.0).min(bounds.width - 8.0);
+    let tx = (dot.x + 8.0).min(bounds.width - w - 4.0).max(4.0);
+    let ty = (dot.y - 24.0).max(2.0);
+    frame.fill(
+        &Path::rectangle(Point::new(tx, ty), Size::new(w, 19.0)),
+        Color { a: 0.97, ..SURFACE },
+    );
+    frame.fill_text(canvas::Text {
+        content: label,
+        position: Point::new(tx + 7.0, ty + 3.0),
+        color: TEXT,
+        size: 11.0.into(),
+        ..canvas::Text::default()
+    });
 }
 
 /// Fetch a channel's structured view from the host into `pane`.
