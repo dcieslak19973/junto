@@ -9,7 +9,7 @@
 
 use iced::widget::pane_grid::{self, PaneGrid};
 use iced::widget::{
-    button, column, container, row, scrollable, text, text_input, Space,
+    button, column, combo_box, container, row, scrollable, text, text_input, Space,
 };
 use iced::{Background, Border, Center, Color, Element, Fill, Length, Task, Theme};
 use serde::Deserialize;
@@ -42,7 +42,8 @@ fn main() -> iced::Result {
 struct App {
     panes: pane_grid::State<Pane>,
     focus: Option<pane_grid::Pane>,
-    new_channel: String,
+    /// Available channel names for the type-ahead picker.
+    channels: combo_box::State<String>,
 }
 
 struct Pane {
@@ -118,8 +119,8 @@ struct EntryDto {
 
 #[derive(Debug, Clone)]
 enum Message {
-    NewChannelChanged(String),
-    AddChannel,
+    ChannelsLoaded(Vec<String>),
+    ChannelPicked(String),
     Fetched(pane_grid::Pane, Result<ChannelDto, String>),
     Clicked(pane_grid::Pane),
     Dragged(pane_grid::DragEvent),
@@ -144,22 +145,18 @@ impl App {
         let app = App {
             panes,
             focus: Some(first),
-            new_channel: String::new(),
+            channels: combo_box::State::new(Vec::new()),
         };
-        (app, fetch(first, "junto-dev"))
+        (app, Task::batch([fetch(first, "junto-dev"), fetch_channels()]))
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::NewChannelChanged(value) => {
-                self.new_channel = value;
+            Message::ChannelsLoaded(names) => {
+                self.channels = combo_box::State::new(names);
                 Task::none()
             }
-            Message::AddChannel => {
-                let name = self.new_channel.trim().to_string();
-                if name.is_empty() {
-                    return Task::none();
-                }
+            Message::ChannelPicked(name) => {
                 let Some(target) = self.focus.or_else(|| self.panes.iter().next().map(|(p, _)| *p))
                 else {
                     return Task::none();
@@ -169,7 +166,6 @@ impl App {
                         .split(pane_grid::Axis::Vertical, target, Pane::loading(&name))
                 {
                     self.focus = Some(new_pane);
-                    self.new_channel.clear();
                     return fetch(new_pane, &name);
                 }
                 Task::none()
@@ -322,13 +318,17 @@ impl App {
 
     fn view(&self) -> Element<'_, Message> {
         let adder = row![
-            text_input("channel name…", &self.new_channel)
-                .on_input(Message::NewChannelChanged)
-                .on_submit(Message::AddChannel)
-                .padding(8),
-            button("+ pane").on_press(Message::AddChannel).padding(8),
+            text("open a channel ▸").size(13).color(MUTED),
+            combo_box(
+                &self.channels,
+                "type to search channels…",
+                None,
+                Message::ChannelPicked,
+            )
+            .width(360),
         ]
-        .spacing(8);
+        .spacing(8)
+        .align_y(Center);
 
         let grid = PaneGrid::new(&self.panes, |id, pane, _is_maximized| {
             let title = row![
@@ -681,6 +681,28 @@ fn fetch(pane: pane_grid::Pane, channel: &str) -> Task<Message> {
                 .map_err(|e| e.to_string())
         },
         move |result| Message::Fetched(pane, result),
+    )
+}
+
+/// Fetch the list of channel names for the type-ahead picker.
+fn fetch_channels() -> Task<Message> {
+    #[derive(Deserialize)]
+    struct Item {
+        name: String,
+    }
+    Task::perform(
+        async move {
+            let url = format!("{HOST}/channels.json");
+            match reqwest::get(&url).await {
+                Ok(response) => response
+                    .json::<Vec<Item>>()
+                    .await
+                    .map(|items| items.into_iter().map(|i| i.name).collect())
+                    .unwrap_or_default(),
+                Err(_) => Vec::new(),
+            }
+        },
+        Message::ChannelsLoaded,
     )
 }
 

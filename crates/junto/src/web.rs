@@ -72,6 +72,7 @@ pub fn router(host: Arc<Host>) -> Router {
         .route("/channels/{channel}/converge", post(converge_channel))
         .route("/channels/{channel}/brief", get(channel_brief))
         .route("/channels/{channel}/view.json", get(channel_view_json))
+        .route("/channels.json", get(channels_json))
         .route("/channels/{channel}/entries/{entry}/{act}", post(verify))
         .with_state(host)
         // Wrap any plain-text error response in a styled page (so a refused
@@ -1476,6 +1477,29 @@ async fn channel_brief(State(host): State<Arc<Host>>, Path(channel): Path<String
         }
         Err(response) => response,
     }
+}
+
+/// The list of open channels (name + id) — feeds a native surface's channel
+/// picker / type-ahead. Read-only.
+async fn channels_json(State(host): State<Arc<Host>>) -> Response {
+    #[derive(Serialize)]
+    struct Item {
+        id: String,
+        name: String,
+    }
+    let items: Vec<Item> = host
+        .inventory()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|s| {
+            s.name.map(|name| Item {
+                id: s.id.to_string(),
+                name,
+            })
+        })
+        .collect();
+    axum::Json(items).into_response()
 }
 
 /// A structured **read-only** projection of a channel as JSON — the data a
