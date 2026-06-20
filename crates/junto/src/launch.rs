@@ -439,6 +439,24 @@ pub fn workspace_for(junto_home: &Path, channel: &ChannelId) -> Result<Option<Pa
         .and_then(|record| record.repos.into_iter().next()))
 }
 
+/// Every remembered (channel → repo) mapping. Used to infer a default
+/// workspace for a fresh channel from what's been used recently elsewhere.
+pub fn all_workspaces(junto_home: &Path) -> Result<Vec<(ChannelId, PathBuf)>> {
+    let path = workspaces_path(junto_home);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let file: WorkspacesFile =
+        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    Ok(file
+        .workspaces
+        .into_iter()
+        .filter_map(|record| record.repos.into_iter().next().map(|repo| (record.channel, repo)))
+        .collect())
+}
+
 /// Remember (or update) a channel's workspace repo.
 pub fn remember_workspace(junto_home: &Path, channel: &ChannelId, repo: &Path) -> Result<()> {
     let repo = dunce::canonicalize(repo)

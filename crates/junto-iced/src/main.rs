@@ -66,6 +66,8 @@ struct App {
     focus_items: Vec<FocusItem>,
     /// Configured Agents the launch picker offers (`/agents.json`).
     agents: Vec<AgentDto>,
+    /// Distinct workspace repos, most-recent first — the inferred launch default.
+    recent_workspaces: Vec<String>,
 }
 
 struct Pane {
@@ -181,6 +183,9 @@ struct ChannelDto {
     #[allow(dead_code)]
     closed: bool,
     party: Vec<String>,
+    /// The channel's remembered workspace repo, if any (a returning channel).
+    #[serde(default)]
+    workspace: Option<String>,
     sessions: Vec<SessionDto>,
     entries: Vec<EntryDto>,
 }
@@ -245,6 +250,7 @@ enum Message {
     LineageGraphLoaded(Option<LineageGraphDto>),
     FocusLoaded(Vec<FocusItem>),
     AgentsLoaded(Vec<AgentDto>),
+    WorkspacesLoaded(Vec<String>),
     Fetched(pane_grid::Pane, Result<ChannelDto, String>),
     Refresh(pane_grid::Pane),
     Close(pane_grid::Pane),
@@ -280,6 +286,7 @@ impl App {
             lineage: None,
             focus_items: Vec::new(),
             agents: Vec::new(),
+            recent_workspaces: Vec::new(),
         };
         (
             app,
@@ -289,6 +296,7 @@ impl App {
                 fetch_lineage_graph(),
                 fetch_focus(),
                 fetch_agents(),
+                fetch_workspaces(),
             ]),
         )
     }
@@ -335,6 +343,10 @@ impl App {
             }
             Message::AgentsLoaded(agents) => {
                 self.agents = agents;
+                Task::none()
+            }
+            Message::WorkspacesLoaded(workspaces) => {
+                self.recent_workspaces = workspaces;
                 Task::none()
             }
             Message::ChannelPicked(name) => {
@@ -397,11 +409,21 @@ impl App {
                 }
             },
             Message::Fetched(pane, result) => {
+                // The inferred default workspace for a fresh channel.
+                let default_workspace = self.recent_workspaces.first().cloned();
                 let Some(state) = self.panes.get_mut(pane) else {
                     return Task::none();
                 };
                 match result {
                     Ok(dto) => {
+                        // Pre-fill the workspace: the channel's remembered repo,
+                        // else the most-recently-used one — so the user rarely
+                        // has to pick a directory.
+                        if state.launch_workspace.trim().is_empty()
+                            && let Some(ws) = dto.workspace.clone().or(default_workspace)
+                        {
+                            state.launch_workspace = ws;
+                        }
                         state.content = Content::Loaded(dto);
                         // Jump to the newest entry (bottom) by default.
                         scrollable::snap_to(
@@ -1592,6 +1614,20 @@ fn fetch_focus() -> Task<Message> {
             }
         },
         Message::FocusLoaded,
+    )
+}
+
+/// Fetch the recent workspace repos for the launch default/suggestions.
+fn fetch_workspaces() -> Task<Message> {
+    let url = format!("{HOST}/workspaces.json");
+    Task::perform(
+        async move {
+            match reqwest::get(&url).await {
+                Ok(response) => response.json::<Vec<String>>().await.unwrap_or_default(),
+                Err(_) => Vec::new(),
+            }
+        },
+        Message::WorkspacesLoaded,
     )
 }
 

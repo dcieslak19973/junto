@@ -76,6 +76,7 @@ pub fn router(host: Arc<Host>) -> Router {
         .route("/lineage.json", get(lineage_json))
         .route("/focus.json", get(focus_json))
         .route("/agents.json", get(agents_json))
+        .route("/workspaces.json", get(workspaces_json))
         .route("/channels/{channel}/entries/{entry}/{act}", post(verify))
         .with_state(host)
         // Wrap any plain-text error response in a styled page (so a refused
@@ -1550,6 +1551,44 @@ async fn focus_json(State(host): State<Arc<Host>>) -> Response {
     axum::Json(items).into_response()
 }
 
+/// Distinct **workspace repos**, most-recently-used first — the launch form's
+/// inferred default + suggestions for a fresh channel (so the user rarely has
+/// to pick a directory). Ordered by the last activity of the channel each repo
+/// is bound to.
+async fn workspaces_json(State(host): State<Arc<Host>>) -> Response {
+    let junto_home = match crate::host::junto_home() {
+        Ok(home) => home,
+        Err(err) => return internal(format!("no junto home: {err}")),
+    };
+    let mappings = match crate::launch::all_workspaces(&junto_home) {
+        Ok(mappings) => mappings,
+        Err(err) => return internal(format!("reading workspaces: {err}")),
+    };
+    // Channel id → last activity, for recency ordering.
+    let activity: std::collections::HashMap<String, i64> = host
+        .inventory()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| (s.id.to_string(), s.last_activity.map(|t| t.as_millis()).unwrap_or(0)))
+        .collect();
+    // Newest channel's repo first; dedup repos keeping their best (latest) rank.
+    let mut ranked: Vec<(i64, String)> = mappings
+        .into_iter()
+        .map(|(channel, repo)| {
+            let when = activity.get(&channel.to_string()).copied().unwrap_or(0);
+            (when, repo.display().to_string())
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut seen = std::collections::HashSet::new();
+    let repos: Vec<String> = ranked
+        .into_iter()
+        .filter_map(|(_, repo)| seen.insert(repo.clone()).then_some(repo))
+        .collect();
+    axum::Json(repos).into_response()
+}
+
 /// The configured **Agents** the launch picker offers (`docs/adr/0023`/`0024`).
 /// The first entry is the default (the stock agent for the default harness).
 /// The native launch controls render this as the agent dropdown.
@@ -1687,7 +1726,14 @@ async fn channel_view_json(
                 .into_iter()
                 .filter_map(|s| s.name.map(|n| (s.id.to_string(), n)))
                 .collect();
-            axum::Json(ChannelDto::from_view(&id, &view, &names)).into_response()
+            let mut dto = ChannelDto::from_view(&id, &view, &names);
+            // The channel's remembered workspace, if any — lets the native launch
+            // form pre-fill it instead of asking the user to pick a directory.
+            dto.workspace = crate::host::junto_home()
+                .ok()
+                .and_then(|home| crate::launch::workspace_for(&home, &id).ok().flatten())
+                .map(|repo| repo.display().to_string());
+            axum::Json(dto).into_response()
         }
         Err(response) => response,
     }
@@ -1699,6 +1745,8 @@ struct ChannelDto {
     name: Option<String>,
     closed: bool,
     party: Vec<String>,
+    /// The channel's remembered workspace repo, if any (a returning channel).
+    workspace: Option<String>,
     lineage: Vec<LineageDto>,
     sessions: Vec<SessionDto>,
     entries: Vec<EntryDto>,
@@ -1796,6 +1844,7 @@ impl ChannelDto {
             name: view.name.clone(),
             closed: view.closed,
             party: view.party.iter().map(|m| m.display_name.clone()).collect(),
+            workspace: None, // set by the handler (needs junto_home)
             lineage,
             sessions,
             entries,
