@@ -108,6 +108,9 @@ struct Pane {
     act_pending: HashSet<String>,
     /// The timeline scrollable's id, so we can snap it to the newest entry.
     scroll_id: scrollable::Id,
+    /// Expanded artifacts' inline content, keyed by artifact entry id. Absent =
+    /// collapsed; present = expanded (loading / loaded / error).
+    artifacts: HashMap<String, ArtifactContent>,
 }
 
 enum Content {
@@ -238,6 +241,21 @@ struct FrameOptionDto {
     rationale: String,
 }
 
+/// The fetch state of an artifact's inline content (`/artifacts/{id}/content.json`).
+#[derive(Debug, Clone)]
+enum ArtifactContent {
+    Loading,
+    Loaded { format: String, body: String },
+    Error(String),
+}
+
+/// The host's artifact content payload.
+#[derive(Debug, Clone, Deserialize)]
+struct ArtifactDto {
+    format: String,
+    content: String,
+}
+
 #[derive(Debug, Clone)]
 enum Message {
     ChannelsLoaded(Vec<String>),
@@ -254,6 +272,10 @@ enum Message {
     Act(pane_grid::Pane, String, String, String),
     /// The result of a verification act (pane, entry, Ok or an error message).
     Acted(pane_grid::Pane, String, Result<(), String>),
+    /// Expand/collapse an artifact's inline content (pane, artifact entry id).
+    ToggleArtifact(pane_grid::Pane, String),
+    /// An artifact's content arrived (pane, artifact id, Ok or error).
+    ArtifactLoaded(pane_grid::Pane, String, Result<ArtifactDto, String>),
     LineageGraphLoaded(Option<LineageGraphDto>),
     FocusLoaded(Vec<FocusItem>),
     AgentsLoaded(Vec<AgentDto>),
@@ -591,6 +613,32 @@ impl App {
                     }
                 }
             }
+            Message::ToggleArtifact(pane, artifact_id) => {
+                let Some(state) = self.panes.get_mut(pane) else {
+                    return Task::none();
+                };
+                if state.artifacts.remove(&artifact_id).is_some() {
+                    return Task::none(); // was expanded → collapse
+                }
+                state
+                    .artifacts
+                    .insert(artifact_id.clone(), ArtifactContent::Loading);
+                let channel = state.channel.clone();
+                fetch_artifact(pane, channel, artifact_id)
+            }
+            Message::ArtifactLoaded(pane, artifact_id, result) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    let content = match result {
+                        Ok(dto) => ArtifactContent::Loaded {
+                            format: dto.format,
+                            body: dto.content,
+                        },
+                        Err(err) => ArtifactContent::Error(err),
+                    };
+                    state.artifacts.insert(artifact_id, content);
+                }
+                Task::none()
+            }
             Message::SteerTextChanged(pane, value) => {
                 if let Some(state) = self.panes.get_mut(pane) {
                     state.steer_text = value;
@@ -831,6 +879,9 @@ fn pane_body<'a>(
         Content::Loaded(dto) => dto,
     };
 
+    // An artifact entry's expanded inline content, if the user opened it.
+    let artifact_for = |entry: &EntryDto| pane.artifacts.get(&entry.id);
+
     // The channel's own header: just the party now (lineage lives in the top
     // window-wide branch graph, so the per-pane strip is gone).
     let mut header = column![].spacing(8);
@@ -936,7 +987,8 @@ fn pane_body<'a>(
         let mut record = column![].spacing(8);
         for entry in &dto.entries {
             if entry.id == session_id || entry.target.as_deref() == Some(session_id.as_str()) {
-                record = record.push(timeline_entry(id, entry, false, "", None, false));
+                record =
+                    record.push(timeline_entry(id, entry, false, "", None, false, artifact_for(entry)));
             }
         }
         // The current turn's live output, while streaming.
@@ -1007,7 +1059,8 @@ fn pane_body<'a>(
                         true,
                         draft_for(entry),
                         error_for(entry),
-                        pending_for(entry)
+                        pending_for(entry),
+                        artifact_for(entry)
                     )
                 ]
                 .spacing(4)
@@ -1026,6 +1079,7 @@ fn pane_body<'a>(
                 draft_for(entry),
                 error_for(entry),
                 pending_for(entry),
+                artifact_for(entry),
             ));
         }
         let scroll = scrollable(timeline)
@@ -1115,10 +1169,11 @@ fn timeline_entry<'a>(
     draft: &'a str,
     error: Option<&'a str>,
     pending: bool,
+    artifact: Option<&'a ArtifactContent>,
 ) -> Element<'a, Message> {
     row![
         rail(kind_color(&entry.kind)),
-        entry_card(id, entry, highlighted, draft, error, pending)
+        entry_card(id, entry, highlighted, draft, error, pending, artifact)
     ]
     .spacing(10)
     .into()
@@ -1170,6 +1225,7 @@ fn entry_card<'a>(
     draft: &'a str,
     error: Option<&'a str>,
     pending: bool,
+    artifact: Option<&'a ArtifactContent>,
 ) -> Element<'a, Message> {
     let accent = kind_color(&entry.kind);
     let mut head = row![badge(&entry.kind, accent), text(entry.author.clone()).size(11).color(MUTED)]
@@ -1271,6 +1327,34 @@ fn entry_card<'a>(
         card = card.push(acts);
     }
 
+    // Artifacts: a toggle that lazy-loads the diff/memo/log content inline.
+    if entry.kind == "artifact" {
+        let expanded = artifact.is_some();
+        let toggle_label = if expanded {
+            "hide content ▾"
+        } else {
+            "show content ▸"
+        };
+        card = card.push(
+            button(text(toggle_label).size(11))
+                .on_press(Message::ToggleArtifact(id, entry.id.clone()))
+                .padding([2, 8])
+                .style(|_t, _s| chip_style(TEAL, false)),
+        );
+        match artifact {
+            Some(ArtifactContent::Loading) => {
+                card = card.push(text("loading…").size(11).color(MUTED));
+            }
+            Some(ArtifactContent::Error(err)) => {
+                card = card.push(text(format!("⚠ {err}")).size(11).color(RED));
+            }
+            Some(ArtifactContent::Loaded { format, body }) => {
+                card = card.push(artifact_body(format, body));
+            }
+            None => {}
+        }
+    }
+
     let (border_color, border_width) = if highlighted {
         (YELLOW, 2.0)
     } else {
@@ -1293,6 +1377,72 @@ fn entry_card<'a>(
 }
 
 /// A small filled pill.
+/// Render an artifact's content inline: a diff gets per-line add/remove/hunk
+/// colour; anything else is shown verbatim. Monospace; long artifacts are
+/// truncated (the web view holds the full text).
+fn artifact_body(format: &str, body: &str) -> Element<'static, Message> {
+    const MAX_LINES: usize = 500;
+    let lines: Vec<&str> = body.lines().collect();
+    let is_diff = format == "diff";
+    let mut col = column![].spacing(1);
+    for line in lines.iter().take(MAX_LINES) {
+        let color = if is_diff { diff_line_color(line) } else { TEXT };
+        col = col.push(
+            text((*line).to_string())
+                .font(iced::Font::MONOSPACE)
+                .size(12)
+                .color(color),
+        );
+    }
+    if lines.len() > MAX_LINES {
+        col = col.push(
+            text(format!(
+                "… ({} more lines — open in the web view for the full content)",
+                lines.len() - MAX_LINES
+            ))
+            .size(11)
+            .color(MUTED),
+        );
+    }
+    container(col)
+        .padding(8)
+        .width(Fill)
+        .style(|_theme| container::Style {
+            background: Some(Background::Color(Color {
+                a: 0.6,
+                ..Color::from_rgb(0.067, 0.067, 0.106) // --bg #11111b
+            })),
+            border: Border {
+                color: BORDER,
+                width: 1.0,
+                radius: 4.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// Per-line colour for a unified diff (matches the web's `render_diff`).
+fn diff_line_color(line: &str) -> Color {
+    if line.starts_with("@@") {
+        MAUVE
+    } else if line.starts_with("+++")
+        || line.starts_with("---")
+        || line.starts_with("diff ")
+        || line.starts_with("index ")
+        || line.starts_with("old mode")
+        || line.starts_with("new mode")
+    {
+        MUTED
+    } else if line.starts_with('+') {
+        GREEN
+    } else if line.starts_with('-') {
+        RED
+    } else {
+        TEXT
+    }
+}
+
 fn badge(label: &str, color: Color) -> Element<'static, Message> {
     container(text(label.to_string()).size(11).color(Color::from_rgb(0.12, 0.12, 0.18)))
         .padding([2, 7])
@@ -1347,6 +1497,7 @@ impl Pane {
             act_errors: HashMap::new(),
             act_pending: HashSet::new(),
             scroll_id: scrollable::Id::unique(),
+            artifacts: HashMap::new(),
         }
     }
 }
@@ -1698,6 +1849,24 @@ fn fetch_focus() -> Task<Message> {
             }
         },
         Message::FocusLoaded,
+    )
+}
+
+/// Fetch one artifact's raw content + format for inline rendering.
+fn fetch_artifact(pane: pane_grid::Pane, channel: String, artifact: String) -> Task<Message> {
+    let url = format!("{HOST}/channels/{channel}/artifacts/{artifact}/content.json");
+    let id = artifact.clone();
+    Task::perform(
+        async move {
+            match reqwest::get(&url).await {
+                Ok(resp) if resp.status().is_success() => {
+                    resp.json::<ArtifactDto>().await.map_err(|e| e.to_string())
+                }
+                Ok(resp) => Err(format!("content unavailable ({})", resp.status())),
+                Err(err) => Err(format!("request failed: {err}")),
+            }
+        },
+        move |result| Message::ArtifactLoaded(pane, id.clone(), result),
     )
 }
 

@@ -65,6 +65,10 @@ pub fn router(host: Arc<Host>) -> Router {
             "/channels/{channel}/artifacts/{artifact}",
             get(view_artifact),
         )
+        .route(
+            "/channels/{channel}/artifacts/{artifact}/content.json",
+            get(artifact_content_json),
+        )
         .route("/channels/{channel}/rename", post(rename_channel))
         .route("/channels/{channel}/close", post(close_channel))
         .route("/channels/{channel}/reopen", post(reopen_channel))
@@ -889,61 +893,16 @@ async fn view_artifact(
     State(host): State<Arc<Host>>,
     Path((channel, artifact)): Path<(String, String)>,
 ) -> Response {
-    let Ok(artifact_id) = artifact.parse::<EntryId>() else {
-        return (StatusCode::BAD_REQUEST, "not an artifact id").into_response();
-    };
-    let (_id, view, _substrate) = match project(&host, &channel).await {
-        Ok(projected) => projected,
+    let (content, format) = match resolve_artifact_content(&host, &channel, &artifact).await {
+        Ok(resolved) => resolved,
         Err(response) => return response,
-    };
-    let Some(entry) = view.entries.iter().find(|e| e.id == artifact_id) else {
-        return (StatusCode::NOT_FOUND, "no such artifact in this channel").into_response();
-    };
-    let EntryPayload::ArtifactAttached {
-        kind, provenance, ..
-    } = &entry.payload
-    else {
-        return (StatusCode::BAD_REQUEST, "that entry is not an artifact").into_response();
-    };
-    let Some(file) = provenance.first() else {
-        return (StatusCode::NOT_FOUND, "artifact has no stored content").into_response();
-    };
-    let Some(path) = file_uri_to_path(file.uri.as_str()) else {
-        return (StatusCode::BAD_REQUEST, "artifact is not a local file").into_response();
-    };
-    // Defense in depth: only ever read under this machine's artifacts root.
-    let artifacts_root = match crate::host::junto_home() {
-        Ok(home) => home.join("artifacts"),
-        Err(err) => return internal(format!("no junto home: {err}")),
-    };
-    let (canon_path, canon_root) = match (
-        dunce::canonicalize(&path),
-        dunce::canonicalize(&artifacts_root),
-    ) {
-        (Ok(p), Ok(root)) => (p, root),
-        _ => {
-            return (
-                StatusCode::NOT_FOUND,
-                "artifact content is not on this machine",
-            )
-                .into_response();
-        }
-    };
-    if !canon_path.starts_with(&canon_root) {
-        return (StatusCode::FORBIDDEN, "artifact path is outside the store").into_response();
-    }
-    let content = match std::fs::read_to_string(&canon_path) {
-        Ok(content) => content,
-        Err(err) => {
-            return (StatusCode::NOT_FOUND, format!("reading artifact: {err}")).into_response();
-        }
     };
     // The card's `<details>` lazy-loads this inline. A memo is the agent's
     // prose (rendered as sanitized CommonMark); a diff gets per-line colour;
     // everything else stays verbatim as text.
     let html =
         |body: String| ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], body).into_response();
-    match render::artifact_format(kind) {
+    match format {
         render::ArtifactFormat::Markdown => html(render::render_markdown(&content)),
         render::ArtifactFormat::Diff => html(render::render_diff(&content)),
         render::ArtifactFormat::Raw => (
@@ -952,6 +911,88 @@ async fn view_artifact(
         )
             .into_response(),
     }
+}
+
+/// An artifact's **raw content + format** as JSON — for a non-HTML surface (the
+/// native Iced app) to render itself (diff colouring, etc.). Same content and
+/// security checks as [`view_artifact`], just not pre-rendered to HTML.
+async fn artifact_content_json(
+    State(host): State<Arc<Host>>,
+    Path((channel, artifact)): Path<(String, String)>,
+) -> Response {
+    let (content, format) = match resolve_artifact_content(&host, &channel, &artifact).await {
+        Ok(resolved) => resolved,
+        Err(response) => return response,
+    };
+    #[derive(Serialize)]
+    struct Out {
+        format: &'static str,
+        content: String,
+    }
+    let format = match format {
+        render::ArtifactFormat::Markdown => "markdown",
+        render::ArtifactFormat::Diff => "diff",
+        render::ArtifactFormat::Raw => "raw",
+    };
+    axum::Json(Out { format, content }).into_response()
+}
+
+/// Resolve an artifact entry to its stored content + presentation format,
+/// enforcing that the file sits under this machine's artifacts root (an entry
+/// can arrive by sync carrying any path, so the resolved file is not trusted
+/// until checked). Shared by the HTML and JSON artifact endpoints.
+async fn resolve_artifact_content(
+    host: &Arc<Host>,
+    channel: &str,
+    artifact: &str,
+) -> Result<(String, render::ArtifactFormat), Response> {
+    let Ok(artifact_id) = artifact.parse::<EntryId>() else {
+        return Err((StatusCode::BAD_REQUEST, "not an artifact id").into_response());
+    };
+    let (_id, view, _substrate) = project(host, channel).await?;
+    let Some(entry) = view.entries.iter().find(|e| e.id == artifact_id) else {
+        return Err((StatusCode::NOT_FOUND, "no such artifact in this channel").into_response());
+    };
+    let EntryPayload::ArtifactAttached {
+        kind, provenance, ..
+    } = &entry.payload
+    else {
+        return Err((StatusCode::BAD_REQUEST, "that entry is not an artifact").into_response());
+    };
+    let Some(file) = provenance.first() else {
+        return Err((StatusCode::NOT_FOUND, "artifact has no stored content").into_response());
+    };
+    let Some(path) = file_uri_to_path(file.uri.as_str()) else {
+        return Err((StatusCode::BAD_REQUEST, "artifact is not a local file").into_response());
+    };
+    // Defense in depth: only ever read under this machine's artifacts root.
+    let artifacts_root = match crate::host::junto_home() {
+        Ok(home) => home.join("artifacts"),
+        Err(err) => return Err(internal(format!("no junto home: {err}"))),
+    };
+    let (canon_path, canon_root) = match (
+        dunce::canonicalize(&path),
+        dunce::canonicalize(&artifacts_root),
+    ) {
+        (Ok(p), Ok(root)) => (p, root),
+        _ => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                "artifact content is not on this machine",
+            )
+                .into_response());
+        }
+    };
+    if !canon_path.starts_with(&canon_root) {
+        return Err((StatusCode::FORBIDDEN, "artifact path is outside the store").into_response());
+    }
+    let content = match std::fs::read_to_string(&canon_path) {
+        Ok(content) => content,
+        Err(err) => {
+            return Err((StatusCode::NOT_FOUND, format!("reading artifact: {err}")).into_response());
+        }
+    };
+    Ok((content, render::artifact_format(kind)))
 }
 
 /// Turn a `file://` URI (as `store_artifact` writes it) back into a path.
