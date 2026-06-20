@@ -78,6 +78,29 @@ struct App {
     substrates: Vec<String>,
     /// The substrate selected for the next new channel.
     new_channel_repo: Option<String>,
+    /// Which admin view is open (settings / agents), if any — replaces the
+    /// channel workspace when set.
+    admin: Option<AdminView>,
+    /// Machine settings for the settings view (`/settings.json`).
+    settings: Option<SettingsDto>,
+    /// The repo-setup form (register a home substrate, the GUI `junto init`).
+    repo_path: String,
+    repo_channel: String,
+    repo_msg: Option<Result<String, String>>,
+    /// The agent create/edit form. `agent_slug` Some = editing, None = creating.
+    agent_slug: Option<String>,
+    agent_name: String,
+    agent_harness: Option<HarnessRef>,
+    agent_role: String,
+    agent_model: String,
+    agent_msg: Option<String>,
+}
+
+/// The admin views behind the top-bar buttons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdminView {
+    Settings,
+    Agents,
 }
 
 struct Pane {
@@ -197,6 +220,47 @@ struct AgentDto {
     harness: String,
     #[serde(default)]
     model: Option<String>,
+    /// The agent's role / system prompt, if any (for the management form).
+    #[serde(default)]
+    role: Option<String>,
+}
+
+/// Machine settings (`/settings.json`) for the native settings view.
+#[derive(Debug, Clone, Deserialize)]
+struct SettingsDto {
+    harness: HarnessStatusDto,
+    harnesses: Vec<HarnessRef>,
+    substrates: Vec<String>,
+    identity: Option<IdentityDto>,
+    version: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct HarnessStatusDto {
+    protocol: String,
+    detail: String,
+    backend: String,
+    auth: String,
+    hint: Option<String>,
+}
+
+/// A harness id+label — also the agent form's harness-picker option.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct HarnessRef {
+    id: String,
+    label: String,
+}
+
+impl std::fmt::Display for HarnessRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.label)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct IdentityDto {
+    name: String,
+    email: String,
 }
 
 impl std::fmt::Display for AgentDto {
@@ -312,6 +376,7 @@ enum LifecycleKind {
     Reopen,
     Diverge,
     Converge,
+    Rename,
 }
 
 impl LifecycleKind {
@@ -321,8 +386,20 @@ impl LifecycleKind {
             LifecycleKind::Reopen => "reopen channel",
             LifecycleKind::Diverge => "diverge (side-quest)",
             LifecycleKind::Converge => "converge into…",
+            LifecycleKind::Rename => "rename",
         }
     }
+}
+
+/// What a finished lifecycle act asks the pane to do next.
+#[derive(Debug, Clone)]
+enum LifecycleResult {
+    /// Just refresh this pane (close / reopen / converge).
+    Done,
+    /// Open the named new side-quest in its own pane (diverge).
+    OpenChild(String),
+    /// This channel was renamed — rebind the pane to the new name.
+    Renamed(String),
 }
 
 /// The fetch state of an artifact's inline content (`/artifacts/{id}/content.json`).
@@ -407,9 +484,8 @@ enum Message {
     LifecycleTargetChanged(pane_grid::Pane, String),
     /// Submit the open lifecycle act.
     LifecycleSubmit(pane_grid::Pane),
-    /// A lifecycle act finished: Ok(Some(name)) opens that channel; Ok(None)
-    /// just refreshes; Err carries the message.
-    LifecycleDone(pane_grid::Pane, Result<Option<String>, String>),
+    /// A lifecycle act finished — the Ok variant says what to do next.
+    LifecycleDone(pane_grid::Pane, Result<LifecycleResult, String>),
     SubstratesLoaded(Vec<String>),
     NewChannelRepoChanged(String),
     /// The "new channel" name box.
@@ -424,6 +500,26 @@ enum Message {
     OpenUrl(String),
     /// Copy text to the system clipboard.
     Copy(String),
+    // --- admin: settings, repo setup, agents ---
+    /// Open an admin view, or `None` to return to the channels workspace.
+    OpenAdmin(Option<AdminView>),
+    SettingsLoaded(Option<SettingsDto>),
+    RepoPathChanged(String),
+    BrowseRepo,
+    RepoPicked(Option<String>),
+    RepoChannelChanged(String),
+    SetupRepo,
+    RepoSetupDone(Result<(), String>),
+    AgentEdit(AgentDto),
+    AgentNew,
+    AgentNameChanged(String),
+    AgentHarnessPicked(HarnessRef),
+    AgentRoleChanged(String),
+    AgentModelChanged(String),
+    SaveAgent,
+    AgentSaved(Result<(), String>),
+    DeleteAgent(String),
+    AgentDeleted(Result<(), String>),
 }
 
 impl App {
@@ -442,6 +538,17 @@ impl App {
             new_channel_error: None,
             substrates: Vec::new(),
             new_channel_repo: None,
+            admin: None,
+            settings: None,
+            repo_path: String::new(),
+            repo_channel: String::new(),
+            repo_msg: None,
+            agent_slug: None,
+            agent_name: String::new(),
+            agent_harness: None,
+            agent_role: String::new(),
+            agent_model: String::new(),
+            agent_msg: None,
         };
         (
             app,
@@ -453,6 +560,7 @@ impl App {
                 fetch_agents(),
                 fetch_workspaces(),
                 fetch_substrates(),
+                fetch_settings(),
             ]),
         )
     }
@@ -933,7 +1041,9 @@ impl App {
                     LifecycleKind::Close | LifecycleKind::Reopen | LifecycleKind::Diverge => {
                         !text.is_empty()
                     }
-                    LifecycleKind::Converge => !text.is_empty() && !target.is_empty(),
+                    LifecycleKind::Converge | LifecycleKind::Rename => {
+                        !text.is_empty() && !target.is_empty()
+                    }
                 };
                 if !valid {
                     return Task::none();
@@ -948,14 +1058,18 @@ impl App {
                 };
                 state.lifecycle_pending = false;
                 match result {
-                    Ok(open_name) => {
+                    Ok(outcome) => {
                         state.lifecycle = None;
                         state.lifecycle_error = None;
+                        // Rename rebinds this pane to the new channel name.
+                        if let LifecycleResult::Renamed(new_name) = &outcome {
+                            state.channel = new_name.clone();
+                        }
                         let channel = state.channel.clone();
                         let mut tasks =
                             vec![fetch(pane, &channel), fetch_lineage_graph(), fetch_channels()];
                         // Diverge yields a child to open in its own pane.
-                        if let Some(name) = open_name {
+                        if let LifecycleResult::OpenChild(name) = outcome {
                             let (_, task) = self.open_or_focus(&name);
                             tasks.push(task);
                         }
@@ -1024,6 +1138,145 @@ impl App {
                 Task::none()
             }
             Message::Copy(text) => iced::clipboard::write(text),
+            Message::OpenAdmin(view) => {
+                self.admin = view;
+                Task::none()
+            }
+            Message::SettingsLoaded(settings) => {
+                self.settings = settings;
+                Task::none()
+            }
+            Message::RepoPathChanged(value) => {
+                self.repo_path = value;
+                Task::none()
+            }
+            Message::BrowseRepo => Task::perform(
+                async {
+                    rfd::AsyncFileDialog::new()
+                        .set_title("Pick a git repo to register as a home substrate")
+                        .pick_folder()
+                        .await
+                        .map(|h| h.path().display().to_string())
+                },
+                Message::RepoPicked,
+            ),
+            Message::RepoPicked(picked) => {
+                if let Some(path) = picked {
+                    self.repo_path = path;
+                }
+                Task::none()
+            }
+            Message::RepoChannelChanged(value) => {
+                self.repo_channel = value;
+                Task::none()
+            }
+            Message::SetupRepo => {
+                let path = self.repo_path.trim().to_string();
+                if path.is_empty() {
+                    return Task::none();
+                }
+                self.repo_msg = None;
+                post_setup_repo(path, self.repo_channel.trim().to_string())
+            }
+            Message::RepoSetupDone(result) => {
+                match result {
+                    Ok(()) => {
+                        self.repo_msg = Some(Ok("registered".into()));
+                        self.repo_path.clear();
+                        self.repo_channel.clear();
+                        // A new substrate + ambient channel exist now.
+                        return Task::batch([
+                            fetch_settings(),
+                            fetch_substrates(),
+                            fetch_channels(),
+                            fetch_lineage_graph(),
+                        ]);
+                    }
+                    Err(err) => self.repo_msg = Some(Err(err)),
+                }
+                Task::none()
+            }
+            Message::AgentEdit(agent) => {
+                self.agent_slug = Some(agent.slug);
+                self.agent_name = agent.name;
+                self.agent_harness = self
+                    .settings
+                    .as_ref()
+                    .and_then(|s| s.harnesses.iter().find(|h| h.id == agent.harness).cloned());
+                self.agent_role = agent.role.unwrap_or_default();
+                self.agent_model = agent.model.unwrap_or_default();
+                self.agent_msg = None;
+                Task::none()
+            }
+            Message::AgentNew => {
+                self.agent_slug = None;
+                self.agent_name.clear();
+                self.agent_harness = None;
+                self.agent_role.clear();
+                self.agent_model.clear();
+                self.agent_msg = None;
+                Task::none()
+            }
+            Message::AgentNameChanged(value) => {
+                self.agent_name = value;
+                Task::none()
+            }
+            Message::AgentHarnessPicked(h) => {
+                self.agent_harness = Some(h);
+                Task::none()
+            }
+            Message::AgentRoleChanged(value) => {
+                self.agent_role = value;
+                Task::none()
+            }
+            Message::AgentModelChanged(value) => {
+                self.agent_model = value;
+                Task::none()
+            }
+            Message::SaveAgent => {
+                let name = self.agent_name.trim().to_string();
+                if name.is_empty() {
+                    self.agent_msg = Some("a name is required".into());
+                    return Task::none();
+                }
+                let harness = self
+                    .agent_harness
+                    .as_ref()
+                    .map(|h| h.id.clone())
+                    .or_else(|| self.settings.as_ref().and_then(|s| s.harnesses.first().map(|h| h.id.clone())))
+                    .unwrap_or_else(|| "claude".into());
+                self.agent_msg = None;
+                post_save_agent(
+                    self.agent_slug.clone(),
+                    name,
+                    harness,
+                    self.agent_role.trim().to_string(),
+                    self.agent_model.trim().to_string(),
+                )
+            }
+            Message::AgentSaved(result) => match result {
+                Ok(()) => {
+                    self.agent_msg = None;
+                    self.agent_slug = None;
+                    self.agent_name.clear();
+                    self.agent_harness = None;
+                    self.agent_role.clear();
+                    self.agent_model.clear();
+                    fetch_agents()
+                }
+                Err(err) => {
+                    self.agent_msg = Some(err);
+                    Task::none()
+                }
+            },
+            Message::DeleteAgent(slug) => post_delete_agent(slug),
+            Message::AgentDeleted(result) => match result {
+                Ok(()) => fetch_agents(),
+                Err(err) => {
+                    self.agent_msg = Some(err);
+                    Task::none()
+                }
+            },
         }
     }
 
@@ -1083,12 +1336,37 @@ impl App {
             adder_row
         };
         let adder_row = adder_row.push(button("create").on_press(Message::CreateChannel).padding(6));
+        // Admin buttons (right side): settings ⚙ and agents ✦, toggling views.
+        let admin_btn = |label: &'static str, view: AdminView, current: Option<AdminView>| {
+            let active = current == Some(view);
+            button(text(label).size(12))
+                .on_press(Message::OpenAdmin((!active).then_some(view)))
+                .padding(6)
+                .style(move |_t, _s| chip_style(MAUVE, active))
+        };
+        let adder_row = row![
+            adder_row,
+            Space::with_width(Fill),
+            admin_btn("⚙ settings", AdminView::Settings, self.admin),
+            admin_btn("✦ agents", AdminView::Agents, self.admin),
+        ]
+        .spacing(8)
+        .align_y(Center);
         let adder: Element<Message> = match &self.new_channel_error {
             Some(err) => column![adder_row, text(format!("⚠ {err}")).size(11).color(RED)]
                 .spacing(4)
                 .into(),
             None => adder_row.into(),
         };
+
+        // Admin views replace the channel workspace when open.
+        if let Some(view) = self.admin {
+            let panel = match view {
+                AdminView::Settings => settings_panel(self),
+                AdminView::Agents => agents_panel(self),
+            };
+            return column![adder, panel].spacing(10).padding(10).into();
+        }
 
         // The always-visible branch graph: the *whole* lineage DAG (every
         // channel, every diverge/converge), with currently-open channels
@@ -1206,6 +1484,189 @@ impl App {
     }
 }
 
+/// A bordered card container used by the admin panels.
+fn admin_card<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    container(content)
+        .padding(10)
+        .width(Fill)
+        .style(|_theme| container::Style {
+            background: Some(Background::Color(Color { a: 0.4, ..SURFACE })),
+            border: Border {
+                color: BORDER,
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// The settings view: read-only machine status + the register-a-repo form.
+fn settings_panel(app: &App) -> Element<'_, Message> {
+    let mut col = column![text("settings").size(18)].spacing(12);
+    if let Some(s) = &app.settings {
+        let kv = |k: &str, v: &str| {
+            row![
+                text(format!("{k}:")).size(12).color(MUTED).width(110),
+                text(v.to_string()).size(12).color(TEXT),
+            ]
+            .spacing(6)
+        };
+        col = col.push(admin_card(
+            column![
+                text("harness").size(13).color(TEAL),
+                kv("protocol", &s.harness.protocol),
+                kv("backend", &s.harness.backend),
+                kv("auth", &s.harness.auth),
+                kv("detail", &s.harness.detail),
+            ]
+            .spacing(3),
+        ));
+        let mut subs = column![text("home substrates").size(13).color(TEAL)].spacing(3);
+        for p in &s.substrates {
+            subs = subs.push(text(p.clone()).size(12).color(TEXT));
+        }
+        col = col.push(admin_card(subs));
+        let identity = s
+            .identity
+            .as_ref()
+            .map(|i| format!("{} <{}>", i.name, i.email))
+            .unwrap_or_else(|| "(no git identity)".into());
+        col = col.push(admin_card(
+            column![
+                text("acts authored as").size(13).color(TEAL),
+                text(identity).size(12).color(TEXT),
+            ]
+            .spacing(3),
+        ));
+        col = col.push(text(format!("junto {}", s.version)).size(11).color(MUTED));
+    } else {
+        col = col.push(text("loading…").size(12).color(MUTED));
+    }
+
+    // Register a repo as a home substrate — the GUI `junto init`.
+    let mut repo = column![text("register a repo (home substrate)").size(13).color(TEAL)].spacing(6);
+    repo = repo.push(
+        row![
+            text_input("git repo path…", &app.repo_path)
+                .on_input(Message::RepoPathChanged)
+                .padding(6),
+            button("browse…").on_press(Message::BrowseRepo).padding(6),
+        ]
+        .spacing(6)
+        .align_y(Center),
+    );
+    repo = repo.push(
+        text_input(
+            "ambient channel name (optional; defaults to the dir name)",
+            &app.repo_channel,
+        )
+        .on_input(Message::RepoChannelChanged)
+        .size(12)
+        .padding(6),
+    );
+    repo = repo.push(button("register").on_press(Message::SetupRepo).padding(6));
+    if let Some(msg) = &app.repo_msg {
+        let (label, color) = match msg {
+            Ok(m) => (m.clone(), GREEN),
+            Err(e) => (format!("⚠ {e}"), RED),
+        };
+        repo = repo.push(text(label).size(11).color(color));
+    }
+    col = col.push(admin_card(repo));
+    scrollable(col).height(Fill).into()
+}
+
+/// The agents view: the configured agents with edit/delete, plus a create/edit
+/// form (core fields — name, harness, role, model).
+fn agents_panel(app: &App) -> Element<'_, Message> {
+    let mut list = column![text("agents").size(18)].spacing(8);
+    if app.agents.is_empty() {
+        list = list.push(text("no agents configured").size(12).color(MUTED));
+    }
+    for a in &app.agents {
+        let detail = a
+            .model
+            .clone()
+            .map(|m| format!(" · {m}"))
+            .unwrap_or_default();
+        let role = a.role.clone().unwrap_or_default();
+        let entry = row![
+            column![
+                text(format!("{} · {}{}", a.name, a.harness, detail)).size(13),
+                text(truncate(&role, 70)).size(11).color(MUTED),
+            ]
+            .spacing(2),
+            Space::with_width(Fill),
+            button(text("edit").size(11))
+                .on_press(Message::AgentEdit(a.clone()))
+                .padding([2, 8])
+                .style(|_t, _s| chip_style(BLUE, false)),
+            button(text("delete").size(11))
+                .on_press(Message::DeleteAgent(a.slug.clone()))
+                .padding([2, 8])
+                .style(|_t, _s| chip_style(RED, false)),
+        ]
+        .spacing(6)
+        .align_y(Center);
+        list = list.push(admin_card(entry));
+    }
+
+    let editing = app.agent_slug.is_some();
+    let harnesses: Vec<HarnessRef> = app
+        .settings
+        .as_ref()
+        .map(|s| s.harnesses.clone())
+        .unwrap_or_default();
+    let mut form = column![
+        text(if editing { "edit agent" } else { "new agent" })
+            .size(13)
+            .color(TEAL)
+    ]
+    .spacing(6);
+    form = form.push(
+        text_input("name (e.g. Security Reviewer)", &app.agent_name)
+            .on_input(Message::AgentNameChanged)
+            .padding(6),
+    );
+    if !harnesses.is_empty() {
+        form = form.push(
+            pick_list(harnesses, app.agent_harness.clone(), Message::AgentHarnessPicked)
+                .placeholder("harness")
+                .text_size(12)
+                .padding(6),
+        );
+    }
+    form = form.push(
+        text_input("role / system prompt (optional)", &app.agent_role)
+            .on_input(Message::AgentRoleChanged)
+            .size(12)
+            .padding(6),
+    );
+    form = form.push(
+        text_input("model override (optional)", &app.agent_model)
+            .on_input(Message::AgentModelChanged)
+            .size(12)
+            .padding(6),
+    );
+    let mut actions = row![button("save").on_press(Message::SaveAgent).padding(6)].spacing(6);
+    if editing {
+        actions = actions.push(
+            button(text("new").size(13))
+                .on_press(Message::AgentNew)
+                .padding(6)
+                .style(|_t, _s| chip_style(MUTED, false)),
+        );
+    }
+    form = form.push(actions);
+    if let Some(msg) = &app.agent_msg {
+        form = form.push(text(format!("⚠ {msg}")).size(11).color(RED));
+    }
+    scrollable(column![list, admin_card(form)].spacing(16))
+        .height(Fill)
+        .into()
+}
+
 /// A pane's title bar (channel name + refresh/close).
 fn title_row(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
     row![
@@ -1288,10 +1749,15 @@ fn lifecycle_form(
                     .padding(6),
             );
         }
-        LifecycleKind::Converge => {
+        LifecycleKind::Converge | LifecycleKind::Rename => {
+            let target_placeholder = if kind == LifecycleKind::Rename {
+                "new channel name…"
+            } else {
+                "target channel name…"
+            };
             col = col
                 .push(
-                    text_input("target channel name…", &pane.lifecycle_target)
+                    text_input(target_placeholder, &pane.lifecycle_target)
                         .on_input(move |v| Message::LifecycleTargetChanged(id, v))
                         .size(12)
                         .padding(6),
@@ -1392,11 +1858,12 @@ fn pane_body<'a>(
     header = header.push(party_row);
     // Lifecycle act buttons; a closed channel only offers reopen.
     let acts: &[LifecycleKind] = if dto.closed {
-        &[LifecycleKind::Reopen]
+        &[LifecycleKind::Reopen, LifecycleKind::Rename]
     } else {
         &[
             LifecycleKind::Diverge,
             LifecycleKind::Converge,
+            LifecycleKind::Rename,
             LifecycleKind::Close,
         ]
     };
@@ -2604,6 +3071,89 @@ fn fetch_artifact(pane: pane_grid::Pane, channel: String, artifact: String) -> T
     )
 }
 
+/// Fetch machine settings for the settings view.
+fn fetch_settings() -> Task<Message> {
+    let url = format!("{HOST}/settings.json");
+    Task::perform(
+        async move {
+            match reqwest::get(&url).await {
+                Ok(resp) if resp.status().is_success() => resp.json::<SettingsDto>().await.ok(),
+                _ => None,
+            }
+        },
+        Message::SettingsLoaded,
+    )
+}
+
+/// POST a repo setup (register a home substrate — the GUI `junto init`).
+fn post_setup_repo(path: String, channel: String) -> Task<Message> {
+    let url = format!("{HOST}/repos");
+    Task::perform(
+        async move {
+            let mut form = vec![("path", path)];
+            if !channel.is_empty() {
+                form.push(("channel", channel));
+            }
+            simple_post_result(&url, &form, "setup").await
+        },
+        Message::RepoSetupDone,
+    )
+}
+
+/// POST an agent create/edit (`/agents`). An empty `slug` creates; a set one edits.
+fn post_save_agent(
+    slug: Option<String>,
+    name: String,
+    harness: String,
+    role: String,
+    model: String,
+) -> Task<Message> {
+    let url = format!("{HOST}/agents");
+    Task::perform(
+        async move {
+            let mut form = vec![
+                ("name", name),
+                ("harness", harness),
+                ("role", role),
+                ("model", model),
+            ];
+            if let Some(slug) = slug {
+                form.push(("slug", slug));
+            }
+            simple_post_result(&url, &form, "save").await
+        },
+        Message::AgentSaved,
+    )
+}
+
+/// POST an agent delete (`/agents/{slug}/delete`).
+fn post_delete_agent(slug: String) -> Task<Message> {
+    let url = format!("{HOST}/agents/{slug}/delete");
+    Task::perform(
+        async move { simple_post_result(&url, &[], "delete").await },
+        Message::AgentDeleted,
+    )
+}
+
+/// Shared POST → `Result<(), String>` helper: success when the (redirect-
+/// followed) status is 2xx, else the status + body as an error.
+async fn simple_post_result(url: &str, form: &[(&str, String)], what: &str) -> Result<(), String> {
+    match reqwest::Client::new().post(url).form(form).send().await {
+        Ok(resp) if resp.status().is_success() => Ok(()),
+        Ok(resp) => {
+            let code = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            let body = body.trim();
+            Err(if body.is_empty() {
+                format!("{what} failed ({code})")
+            } else {
+                format!("{code}: {body}")
+            })
+        }
+        Err(err) => Err(format!("request failed: {err}")),
+    }
+}
+
 /// Fetch a channel's curated brief (recall bridge) as Markdown text.
 fn fetch_brief(pane: pane_grid::Pane, channel: String) -> Task<Message> {
     let url = format!("{HOST}/channels/{channel}/brief");
@@ -2823,25 +3373,30 @@ fn post_lifecycle(
     text: String,
     target: String,
 ) -> Task<Message> {
-    let (path, form, open_name) = match kind {
-        LifecycleKind::Close => ("close", vec![("rationale", text)], None),
-        LifecycleKind::Reopen => ("reopen", vec![("rationale", text)], None),
+    let (path, form, outcome) = match kind {
+        LifecycleKind::Close => ("close", vec![("rationale", text)], LifecycleResult::Done),
+        LifecycleKind::Reopen => ("reopen", vec![("rationale", text)], LifecycleResult::Done),
         LifecycleKind::Diverge => (
             "diverge",
             vec![("child_name", text.clone())],
-            Some(text), // open the new side-quest by name
+            LifecycleResult::OpenChild(text), // open the new side-quest by name
         ),
         LifecycleKind::Converge => (
             "converge",
             vec![("target", target), ("rationale", text)],
-            None,
+            LifecycleResult::Done,
+        ),
+        LifecycleKind::Rename => (
+            "rename",
+            vec![("name", target.clone()), ("rationale", text)],
+            LifecycleResult::Renamed(target),
         ),
     };
     let url = format!("{HOST}/channels/{channel}/{path}");
     Task::perform(
         async move {
             match reqwest::Client::new().post(&url).form(&form).send().await {
-                Ok(resp) if resp.status().is_success() => Ok(open_name),
+                Ok(resp) if resp.status().is_success() => Ok(outcome),
                 Ok(resp) => {
                     let code = resp.status();
                     let body = resp.text().await.unwrap_or_default();

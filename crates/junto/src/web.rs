@@ -82,6 +82,7 @@ pub fn router(host: Arc<Host>) -> Router {
         .route("/agents.json", get(agents_json))
         .route("/workspaces.json", get(workspaces_json))
         .route("/substrates.json", get(substrates_json))
+        .route("/settings.json", get(settings_json))
         .route("/channels/{channel}/entries/{entry}/{act}", post(verify))
         .with_state(host)
         // Wrap any plain-text error response in a styled page (so a refused
@@ -1593,6 +1594,67 @@ async fn focus_json(State(host): State<Arc<Host>>) -> Response {
     axum::Json(items).into_response()
 }
 
+/// Machine settings for the native settings view: harness status, the
+/// harnesses available to the agent form, registered substrates, the identity
+/// human acts author as, and the host version. Read-only.
+async fn settings_json(State(host): State<Arc<Host>>) -> Response {
+    #[derive(Serialize)]
+    struct HarnessOut {
+        protocol: &'static str,
+        detail: String,
+        backend: &'static str,
+        auth: &'static str,
+        hint: Option<&'static str>,
+    }
+    #[derive(Serialize)]
+    struct HarnessRef {
+        id: &'static str,
+        label: &'static str,
+    }
+    #[derive(Serialize)]
+    struct IdentityOut {
+        name: String,
+        email: String,
+    }
+    #[derive(Serialize)]
+    struct Out {
+        harness: HarnessOut,
+        harnesses: Vec<HarnessRef>,
+        substrates: Vec<String>,
+        identity: Option<IdentityOut>,
+        version: &'static str,
+    }
+    let status = crate::launch::harness_status();
+    let substrates = host.substrate_paths().unwrap_or_default();
+    let identity = substrates
+        .first()
+        .and_then(|repo| crate::host::git_user(repo).ok())
+        .map(|m| IdentityOut {
+            name: m.display_name,
+            email: m.email,
+        });
+    let out = Out {
+        harness: HarnessOut {
+            protocol: status.protocol,
+            detail: status.detail,
+            backend: status.backend,
+            auth: status.auth,
+            hint: status.hint,
+        },
+        harnesses: crate::launch::all_harnesses()
+            .iter()
+            .map(|h| HarnessRef {
+                id: h.id,
+                label: h.label,
+            })
+            .collect(),
+        substrates: substrates.iter().map(|p| p.display().to_string()).collect(),
+        identity,
+        version: env!("CARGO_PKG_VERSION"),
+    };
+    axum::Json(out).into_response()
+}
+
 /// The registered **home substrates** (repo paths) — for the native new-channel
 /// form to pick which substrate a channel opens in (when more than one).
 async fn substrates_json(State(host): State<Arc<Host>>) -> Response {
@@ -1653,6 +1715,7 @@ async fn agents_json() -> Response {
         name: String,
         harness: String,
         model: Option<String>,
+        role: Option<String>,
     }
     let junto_home = match crate::host::junto_home() {
         Ok(home) => home,
@@ -1667,6 +1730,7 @@ async fn agents_json() -> Response {
                     name: a.name,
                     harness: a.harness,
                     model: a.model,
+                    role: a.role,
                 })
                 .collect();
             axum::Json(items).into_response()
