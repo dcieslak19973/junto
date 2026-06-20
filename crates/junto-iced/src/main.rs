@@ -125,6 +125,10 @@ struct Pane {
     /// After the next load, auto-select and stream the newest session — set on
     /// launch so you immediately watch the agent work (Claude-Code-like).
     watch_newest: bool,
+    /// Bumped each time streaming (re)starts, so the SSE subscription id changes
+    /// and Iced actually restarts it for a new turn (a finished subscription
+    /// with an unchanged id is never restarted — the Iced footgun).
+    stream_nonce: u64,
 }
 
 enum Content {
@@ -518,6 +522,7 @@ impl App {
                             if let Some(newest) = dto.sessions.last() {
                                 state.watched = Some(newest.id.clone());
                                 state.streaming = true;
+                                state.stream_nonce += 1;
                                 state.feed.clear();
                             }
                         }
@@ -553,6 +558,7 @@ impl App {
                 if let Some(state) = self.panes.get_mut(pane) {
                     state.watched = Some(session);
                     state.streaming = true; // try to stream; ends fast if not live
+                    state.stream_nonce += 1;
                     state.feed.clear();
                 }
                 Task::none()
@@ -758,10 +764,16 @@ impl App {
             Message::Steered(pane, result) => {
                 if let Some(state) = self.panes.get_mut(pane) {
                     match result {
-                        // Re-stream: a landed session resumes a new turn; a live
-                        // one keeps streaming. Either way ensure the subscription
-                        // is active to show the response.
-                        Ok(()) => state.streaming = true,
+                        // A landed session resumes a new turn → start a fresh
+                        // subscription (new nonce). A live one is already
+                        // streaming in place — leave it (re-subscribing would
+                        // replay and duplicate the feed).
+                        Ok(()) => {
+                            if !state.streaming {
+                                state.streaming = true;
+                                state.stream_nonce += 1;
+                            }
+                        }
                         Err(err) => state.feed.push(FeedItem {
                             event: LiveEvent {
                                 kind: "error".into(),
@@ -817,8 +829,9 @@ impl App {
                     .as_ref()
                     .filter(|_| state.streaming)
                     .map(|session| {
+                        // Id includes the nonce so a new turn restarts the stream.
                         iced::Subscription::run_with_id(
-                            session.clone(),
+                            (session.clone(), state.stream_nonce),
                             session_stream(state.channel.clone(), session.clone()),
                         )
                     })
@@ -1748,6 +1761,7 @@ impl Pane {
             show_full_history: false,
             entry_md: HashMap::new(),
             watch_newest: false,
+            stream_nonce: 0,
         }
     }
 }
