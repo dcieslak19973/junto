@@ -12,7 +12,8 @@ use std::collections::{HashMap, HashSet};
 use iced::widget::canvas::{self, Canvas, Frame, Geometry, Path, Stroke};
 use iced::widget::pane_grid;
 use iced::widget::{
-    button, column, combo_box, container, pick_list, row, scrollable, text, text_input, Space,
+    button, checkbox, column, combo_box, container, pick_list, row, scrollable, text, text_input,
+    Space,
 };
 use iced::{
     Background, Border, Center, Color, Element, Fill, Length, Point, Rectangle, Renderer, Size,
@@ -251,7 +252,7 @@ enum Message {
     LiveEnded(String),
     LaunchIntentChanged(pane_grid::Pane, String),
     LaunchAgentPicked(pane_grid::Pane, AgentDto),
-    LaunchModeToggled(pane_grid::Pane),
+    LaunchModeChanged(pane_grid::Pane, bool),
     LaunchWorkspaceChanged(pane_grid::Pane, String),
     Launch(pane_grid::Pane),
     /// The result of a launch (pane, Ok or an error message).
@@ -462,9 +463,9 @@ impl App {
                 }
                 Task::none()
             }
-            Message::LaunchModeToggled(pane) => {
+            Message::LaunchModeChanged(pane, outcome) => {
                 if let Some(state) = self.panes.get_mut(pane) {
-                    state.launch_outcome = !state.launch_outcome;
+                    state.launch_outcome = outcome;
                 }
                 Task::none()
             }
@@ -784,18 +785,14 @@ fn pane_body<'a>(
         .padding(6)
         .into()
     };
-    let (mode_label, mode_color) = if pane.launch_outcome {
-        ("outcome (verify loop)", MAUVE)
-    } else {
-        ("single turn", MUTED)
-    };
-    let mode_toggle = button(text(mode_label).size(11).color(mode_color))
-        .on_press(Message::LaunchModeToggled(id))
-        .padding([3, 9])
-        .style(move |_t, _s| chip_style(mode_color, pane.launch_outcome));
+    // Mode as a checkbox (matches the web): unchecked = a single turn (default);
+    // checked = the code-PR push-gate verify/Grader loop (docs/adr/0025).
+    let mode_checkbox = checkbox("code-PR push-gate (verify loop)", pane.launch_outcome)
+        .on_toggle(move |on| Message::LaunchModeChanged(id, on))
+        .size(16)
+        .text_size(12);
     let options_row = row![
         agent_picker,
-        mode_toggle,
         text_input("workspace repo (optional)", &pane.launch_workspace)
             .on_input(move |v| Message::LaunchWorkspaceChanged(id, v))
             .size(12)
@@ -803,7 +800,7 @@ fn pane_body<'a>(
     ]
     .spacing(6)
     .align_y(Center);
-    let mut launch = column![intent_row, options_row].spacing(6);
+    let mut launch = column![intent_row, options_row, mode_checkbox].spacing(6);
     if let Some(err) = &pane.launch_error {
         launch = launch.push(text(format!("⚠ {err}")).size(11).color(RED));
     }
