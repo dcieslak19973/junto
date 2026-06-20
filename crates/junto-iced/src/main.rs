@@ -832,28 +832,27 @@ impl canvas::Program<Message> for LineageCanvas {
         let hover = cursor.position_in(bounds);
         let mut tooltip: Option<(Point, String)> = None;
 
-        // Diverge/converge connectors, drawn as arcs that bow in opposite
-        // directions so they stay distinguishable even when a short side-quest's
-        // diverge and converge points land close together: diverge (mauve) bows
-        // left (branch out), converge (green) bows right (merge back).
+        // Diverge/converge connectors: straight vertical links, distinguished by
+        // style so they read even when a short side-quest's diverge and converge
+        // land close — diverge solid (mauve), converge dashed (green).
         for (parent_row, child_row, at_ms, diverge) in &self.links {
             let x = self.x_of(*at_ms, left, right);
             let y0 = Self::y_of(*parent_row);
             let y1 = Self::y_of(*child_row);
-            let (color, bulge) = if *diverge {
-                (MAUVE, -12.0)
+            let color = if *diverge { MAUVE } else { GREEN };
+            let base = Stroke::default().with_color(color).with_width(1.6);
+            let stroke = if *diverge {
+                base
             } else {
-                (GREEN, 12.0)
+                canvas::Stroke {
+                    line_dash: canvas::LineDash {
+                        segments: &[4.0, 3.0],
+                        offset: 0,
+                    },
+                    ..base
+                }
             };
-            let mut path = canvas::path::Builder::new();
-            path.move_to(Point::new(x, y0));
-            path.quadratic_curve_to(Point::new(x + bulge, (y0 + y1) / 2.0), Point::new(x, y1));
-            frame.stroke(
-                &path.build(),
-                Stroke::default().with_color(color).with_width(1.8),
-            );
-            // A small node where it meets the parent track, to anchor the arc.
-            frame.fill(&Path::circle(Point::new(x, y0), 2.0), color);
+            frame.stroke(&Path::line(Point::new(x, y0), Point::new(x, y1)), stroke);
         }
 
         // Tracks: a horizontal line from first to last activity + an end cap,
