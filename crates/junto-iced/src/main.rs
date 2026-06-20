@@ -39,6 +39,10 @@ fn main() -> iced::Result {
     iced::application("junto — native spike", App::update, App::view)
         .subscription(App::subscription)
         .theme(|_| Theme::CatppuccinMocha)
+        // The web uses `Inter, system-ui, sans-serif`; on Windows system-ui is
+        // Segoe UI (used by name at runtime — not bundled, so no redistribution).
+        // Cross-platform parity later = bundle Inter (OFL, MIT-compatible).
+        .default_font(iced::Font::with_name("Segoe UI"))
         .window(iced::window::Settings {
             icon,
             ..Default::default()
