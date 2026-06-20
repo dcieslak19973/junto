@@ -50,9 +50,22 @@ fn main() -> iced::Result {
         .run_with(App::new)
 }
 
+/// Two layout prototypes to compare: the custom columns with an exactly-aligned
+/// top lineage ribbon, vs. the pane_grid with an approximate ribbon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayoutMode {
+    /// Custom shared-width columns; ribbon segments line up exactly above panes.
+    Columns,
+    /// pane_grid (drag-resize) with the ribbon approximated over even columns.
+    Grid,
+}
+
 struct App {
     panes: pane_grid::State<Pane>,
     focus: Option<pane_grid::Pane>,
+    /// Left-to-right pane order (pane_grid's own iteration isn't ordered).
+    order: Vec<pane_grid::Pane>,
+    layout: LayoutMode,
     /// Available channel names for the type-ahead picker.
     channels: combo_box::State<String>,
 }
@@ -155,6 +168,7 @@ struct EntryDto {
 enum Message {
     ChannelsLoaded(Vec<String>),
     ChannelPicked(String),
+    SetLayout(LayoutMode),
     OpenLineage,
     LineageFetched(pane_grid::Pane, Result<LineageGraphDto, String>),
     Fetched(pane_grid::Pane, Result<ChannelDto, String>),
@@ -181,6 +195,8 @@ impl App {
         let app = App {
             panes,
             focus: Some(first),
+            order: vec![first],
+            layout: LayoutMode::Columns,
             channels: combo_box::State::new(Vec::new()),
         };
         (app, Task::batch([fetch(first, "junto-dev"), fetch_channels()]))
@@ -193,7 +209,7 @@ impl App {
                 Task::none()
             }
             Message::ChannelPicked(name) => {
-                let Some(target) = self.focus.or_else(|| self.panes.iter().next().map(|(p, _)| *p))
+                let Some(target) = self.focus.or_else(|| self.order.last().copied())
                 else {
                     return Task::none();
                 };
@@ -201,9 +217,14 @@ impl App {
                     self.panes
                         .split(pane_grid::Axis::Vertical, target, Pane::loading(&name))
                 {
+                    self.order.push(new_pane);
                     self.focus = Some(new_pane);
                     return fetch(new_pane, &name);
                 }
+                Task::none()
+            }
+            Message::SetLayout(mode) => {
+                self.layout = mode;
                 Task::none()
             }
             Message::OpenLineage => {
@@ -216,6 +237,7 @@ impl App {
                 if let Some((new_pane, _)) =
                     self.panes.split(pane_grid::Axis::Vertical, target, pane)
                 {
+                    self.order.push(new_pane);
                     self.focus = Some(new_pane);
                     return fetch_lineage(new_pane);
                 }
@@ -261,6 +283,7 @@ impl App {
                 Task::none()
             }
             Message::Close(pane) => {
+                self.order.retain(|p| *p != pane);
                 if let Some((_, sibling)) = self.panes.close(pane) {
                     self.focus = Some(sibling);
                 }
@@ -385,33 +408,190 @@ impl App {
                 None,
                 Message::ChannelPicked,
             )
-            .width(360),
+            .width(320),
             Space::with_width(Fill),
-            button("✦ branch graph")
-                .on_press(Message::OpenLineage)
-                .padding(8),
+            layout_button("columns", LayoutMode::Columns, self.layout),
+            layout_button("grid", LayoutMode::Grid, self.layout),
         ]
         .spacing(8)
         .align_y(Center);
 
-        let grid = PaneGrid::new(&self.panes, |id, pane, _is_maximized| {
-            let title = row![
-                text(pane.channel.clone()).size(15),
-                Space::with_width(Fill),
-                button("↻").on_press(Message::Refresh(id)).padding(4),
-                button("×").on_press(Message::Close(id)).padding(4),
-            ]
-            .spacing(6);
+        // The lineage ribbon: nodes at each open channel's column centre, with
+        // diverge/converge connectors between related open channels.
+        let ribbon = container(Canvas::new(self.ribbon()).width(Fill).height(Fill))
+            .width(Fill)
+            .height(Length::Fixed(96.0))
+            .style(|_theme| container::Style {
+                background: Some(Background::Color(Color { a: 0.4, ..SURFACE })),
+                border: Border {
+                    radius: 6.0.into(),
+                    ..Border::default()
+                },
+                ..container::Style::default()
+            });
 
-            pane_grid::Content::new(pane_body(id, pane))
-                .title_bar(pane_grid::TitleBar::new(title).padding(8))
+        let body: Element<Message> = match self.layout {
+            LayoutMode::Columns => {
+                // Shared-width columns: ribbon segments above line up exactly.
+                let mut cols = row![].spacing(6);
+                for id in &self.order {
+                    if let Some(pane) = self.panes.get(*id) {
+                        cols = cols.push(column_pane(*id, pane));
+                    }
+                }
+                cols.height(Fill).into()
+            }
+            LayoutMode::Grid => PaneGrid::new(&self.panes, |id, pane, _is_maximized| {
+                pane_grid::Content::new(pane_body(id, pane))
+                    .title_bar(pane_grid::TitleBar::new(title_row(id, pane)).padding(8))
+            })
+            .spacing(6)
+            .on_click(Message::Clicked)
+            .on_drag(Message::Dragged)
+            .on_resize(8, Message::Resized)
+            .into(),
+        };
+
+        column![adder, ribbon, body]
+            .spacing(10)
+            .padding(10)
+            .into()
+    }
+
+    /// Build the ribbon canvas from the open panes (left-to-right) and the
+    /// lineage relationships among them.
+    fn ribbon(&self) -> RibbonCanvas {
+        let cols: Vec<String> = self
+            .order
+            .iter()
+            .filter_map(|id| self.panes.get(*id).map(|p| p.channel.clone()))
+            .collect();
+        let mut links = Vec::new();
+        for (i, id) in self.order.iter().enumerate() {
+            let Some(Content::Loaded(dto)) = self.panes.get(*id).map(|p| &p.content) else {
+                continue;
+            };
+            for edge in &dto.lineage {
+                if let Some(name) = &edge.other_name
+                    && let Some(j) = cols.iter().position(|c| c == name)
+                {
+                    links.push((i, j, edge.relation == "diverge"));
+                }
+            }
+        }
+        RibbonCanvas { cols, links }
+    }
+}
+
+/// A layout-mode toggle button, highlighted when active.
+fn layout_button(label: &str, mode: LayoutMode, current: LayoutMode) -> Element<'static, Message> {
+    let active = mode == current;
+    button(text(label.to_string()).size(12))
+        .on_press(Message::SetLayout(mode))
+        .padding([4, 10])
+        .style(move |_theme, _status| button::Style {
+            background: Some(Background::Color(if active {
+                TEAL
+            } else {
+                Color { a: 0.15, ..TEAL }
+            })),
+            text_color: if active {
+                Color::from_rgb(0.12, 0.12, 0.18)
+            } else {
+                TEXT
+            },
+            border: Border {
+                color: TEAL,
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            ..button::Style::default()
         })
-        .spacing(6)
-        .on_click(Message::Clicked)
-        .on_drag(Message::Dragged)
-        .on_resize(8, Message::Resized);
+        .into()
+}
 
-        column![adder, grid].spacing(10).padding(10).into()
+/// A pane's title bar (channel name + refresh/close), shared by both layouts.
+fn title_row(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
+    row![
+        text(pane.channel.clone()).size(15),
+        Space::with_width(Fill),
+        button("↻").on_press(Message::Refresh(id)).padding(4),
+        button("×").on_press(Message::Close(id)).padding(4),
+    ]
+    .spacing(6)
+    .into()
+}
+
+/// One channel pane as a bordered column (custom Columns layout).
+fn column_pane(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
+    container(column![title_row(id, pane), pane_body(id, pane)].spacing(8))
+        .width(Length::FillPortion(1))
+        .height(Fill)
+        .padding(8)
+        .style(|_theme| container::Style {
+            background: Some(Background::Color(Color { a: 0.4, ..SURFACE })),
+            border: Border {
+                color: BORDER,
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// The top lineage ribbon: a node per open channel at its column centre, with
+/// diverge (mauve) / converge (green) connectors curving between related ones.
+struct RibbonCanvas {
+    cols: Vec<String>,
+    links: Vec<(usize, usize, bool)>,
+}
+
+impl canvas::Program<Message> for RibbonCanvas {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<Geometry> {
+        let mut frame = Frame::new(renderer, bounds.size());
+        let n = self.cols.len().max(1);
+        let colw = bounds.width / n as f32;
+        let cx = |i: usize| (i as f32 + 0.5) * colw;
+        let node_y = bounds.height * 0.42;
+
+        for (i, j, diverge) in &self.links {
+            let (a, b) = (cx(*i), cx(*j));
+            let mut path = canvas::path::Builder::new();
+            path.move_to(Point::new(a, node_y));
+            path.quadratic_curve_to(
+                Point::new((a + b) / 2.0, node_y + bounds.height * 0.32),
+                Point::new(b, node_y),
+            );
+            frame.stroke(
+                &path.build(),
+                Stroke::default()
+                    .with_color(if *diverge { MAUVE } else { GREEN })
+                    .with_width(2.0),
+            );
+        }
+        for (i, name) in self.cols.iter().enumerate() {
+            let x = cx(i);
+            frame.fill(&Path::circle(Point::new(x, node_y), 5.0), TEAL);
+            frame.fill_text(canvas::Text {
+                content: truncate(name, 22),
+                position: Point::new(x, node_y + 12.0),
+                color: TEXT,
+                size: 12.0.into(),
+                horizontal_alignment: iced::alignment::Horizontal::Center,
+                ..canvas::Text::default()
+            });
+        }
+        vec![frame.into_geometry()]
     }
 }
 
