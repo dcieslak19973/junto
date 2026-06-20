@@ -1510,7 +1510,15 @@ struct ChannelDto {
     closed: bool,
     party: Vec<String>,
     lineage: Vec<LineageDto>,
+    sessions: Vec<SessionDto>,
     entries: Vec<EntryDto>,
+}
+
+#[derive(Serialize)]
+struct SessionDto {
+    id: String,
+    state: String,
+    intent: String,
 }
 
 #[derive(Serialize)]
@@ -1554,12 +1562,30 @@ impl ChannelDto {
                 label: lineage_label(edge),
             })
             .collect();
+        // Sessions: each SessionStarted entry + its folded state.
+        let sessions = view
+            .entries
+            .iter()
+            .filter_map(|entry| match &entry.payload {
+                EntryPayload::SessionStarted { intent } => Some(SessionDto {
+                    id: entry.id.to_string(),
+                    state: view
+                        .sessions
+                        .get(&entry.id)
+                        .map(|s| format!("{:?}", s.state).to_lowercase())
+                        .unwrap_or_else(|| "unknown".into()),
+                    intent: intent.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
         ChannelDto {
             id: id.to_string(),
             name: view.name.clone(),
             closed: view.closed,
             party: view.party.iter().map(|m| m.display_name.clone()).collect(),
             lineage,
+            sessions,
             entries,
         }
     }

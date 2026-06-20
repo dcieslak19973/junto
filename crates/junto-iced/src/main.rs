@@ -30,6 +30,7 @@ const BLUE: Color = Color::from_rgb(0.54, 0.71, 0.98);
 fn main() -> iced::Result {
     let icon = iced::window::icon::from_file_data(include_bytes!("../icon.png"), None).ok();
     iced::application("junto — native spike", App::update, App::view)
+        .subscription(App::subscription)
         .theme(|_| Theme::CatppuccinMocha)
         .window(iced::window::Settings {
             icon,
@@ -47,12 +48,29 @@ struct App {
 struct Pane {
     channel: String,
     content: Content,
+    /// The session whose live feed this pane is streaming, if any.
+    watched: Option<String>,
+    /// Accumulated live events for the watched session.
+    feed: Vec<LiveEvent>,
+    launch_intent: String,
+    steer_text: String,
 }
 
 enum Content {
     Loading,
     Loaded(ChannelDto),
     Error(String),
+}
+
+/// One frame of a session's live feed (mirrors the host's `LiveEvent`).
+#[derive(Debug, Clone, Deserialize)]
+struct LiveEvent {
+    kind: String,
+    text: String,
+    #[serde(default)]
+    seq: u64,
+    #[serde(default)]
+    html: bool,
 }
 
 // --- the host's view.json shape ---
@@ -62,10 +80,19 @@ struct ChannelDto {
     #[allow(dead_code)]
     id: String,
     name: Option<String>,
+    #[allow(dead_code)]
     closed: bool,
     party: Vec<String>,
     lineage: Vec<LineageDto>,
+    sessions: Vec<SessionDto>,
     entries: Vec<EntryDto>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SessionDto {
+    id: String,
+    state: String,
+    intent: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -99,6 +126,16 @@ enum Message {
     Resized(pane_grid::ResizeEvent),
     Refresh(pane_grid::Pane),
     Close(pane_grid::Pane),
+    // Live session pane.
+    Watch(pane_grid::Pane, String),
+    Live(String, LiveEvent),
+    LiveEnded(String),
+    LaunchIntentChanged(pane_grid::Pane, String),
+    Launch(pane_grid::Pane),
+    SteerTextChanged(pane_grid::Pane, String),
+    Steer(pane_grid::Pane),
+    Interrupt(pane_grid::Pane),
+    Posted(pane_grid::Pane),
 }
 
 impl App {
@@ -173,7 +210,114 @@ impl App {
                 }
                 Task::none()
             }
+            Message::Watch(pane, session) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    state.watched = Some(session);
+                    state.feed.clear();
+                }
+                Task::none()
+            }
+            Message::Live(session, event) => {
+                for (_, state) in self.panes.iter_mut() {
+                    if state.watched.as_deref() == Some(session.as_str()) {
+                        // Coalesce streaming Markdown segments by seq.
+                        match state.feed.last_mut() {
+                            Some(last) if event.seq != 0 && last.seq == event.seq => *last = event,
+                            _ => state.feed.push(event),
+                        }
+                        break;
+                    }
+                }
+                Task::none()
+            }
+            Message::LiveEnded(session) => {
+                let mut to_refresh = None;
+                for (pane, state) in self.panes.iter_mut() {
+                    if state.watched.as_deref() == Some(session.as_str()) {
+                        state.watched = None; // ends the subscription; feed stays
+                        to_refresh = Some(*pane);
+                        break;
+                    }
+                }
+                match to_refresh {
+                    Some(pane) => {
+                        let channel = self.panes.get(pane).map(|p| p.channel.clone());
+                        channel.map_or_else(Task::none, |c| fetch(pane, &c))
+                    }
+                    None => Task::none(),
+                }
+            }
+            Message::LaunchIntentChanged(pane, value) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    state.launch_intent = value;
+                }
+                Task::none()
+            }
+            Message::Launch(pane) => {
+                let Some(state) = self.panes.get_mut(pane) else {
+                    return Task::none();
+                };
+                let intent = state.launch_intent.trim().to_string();
+                if intent.is_empty() {
+                    return Task::none();
+                }
+                let channel = state.channel.clone();
+                state.launch_intent.clear();
+                post_launch(pane, channel, intent)
+            }
+            Message::SteerTextChanged(pane, value) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    state.steer_text = value;
+                }
+                Task::none()
+            }
+            Message::Steer(pane) => {
+                let Some(state) = self.panes.get_mut(pane) else {
+                    return Task::none();
+                };
+                let (Some(session), text) = (state.watched.clone(), state.steer_text.trim().to_string())
+                else {
+                    return Task::none();
+                };
+                if text.is_empty() {
+                    return Task::none();
+                }
+                let channel = state.channel.clone();
+                state.steer_text.clear();
+                post_act(pane, channel, session, "steer", Some(text))
+            }
+            Message::Interrupt(pane) => {
+                let Some(state) = self.panes.get_mut(pane) else {
+                    return Task::none();
+                };
+                let Some(session) = state.watched.clone() else {
+                    return Task::none();
+                };
+                let channel = state.channel.clone();
+                post_act(pane, channel, session, "interrupt", None)
+            }
+            Message::Posted(pane) => {
+                let channel = self.panes.get(pane).map(|p| p.channel.clone());
+                channel.map_or_else(Task::none, |c| fetch(pane, &c))
+            }
         }
+    }
+
+    fn subscription(&self) -> iced::Subscription<Message> {
+        // One SSE subscription per pane that is watching a session.
+        let streams: Vec<_> = self
+            .panes
+            .iter()
+            .filter_map(|(_, state)| {
+                state.watched.as_ref().map(|session| {
+                    iced::Subscription::run_with_id(
+                        session.clone(),
+                        session_stream(state.channel.clone(), session.clone()),
+                    )
+                })
+            })
+            .collect();
+        iced::Subscription::batch(streams)
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -195,7 +339,7 @@ impl App {
             ]
             .spacing(6);
 
-            pane_grid::Content::new(pane_body(&pane.content))
+            pane_grid::Content::new(pane_body(id, pane))
                 .title_bar(pane_grid::TitleBar::new(title).padding(8))
         })
         .spacing(6)
@@ -207,38 +351,141 @@ impl App {
     }
 }
 
-fn pane_body(content: &Content) -> Element<'_, Message> {
-    match content {
-        Content::Loading => container(text("loading…").color(MUTED)).padding(12).into(),
-        Content::Error(err) => container(text(format!("error: {err}")).color(RED))
-            .padding(12)
-            .into(),
-        Content::Loaded(dto) => {
-            let channel = dto.name.clone().unwrap_or_else(|| "(unopened)".into());
-
-            // Pinned at top: the lineage strip (the split / side-quest history)
-            // and the party — they don't scroll with the timeline below.
-            let mut header = column![lineage_strip(&channel, dto)].spacing(8);
-            if !dto.party.is_empty() {
-                header = header.push(
-                    text(format!("party: {}", dto.party.join(", ")))
-                        .size(12)
-                        .color(MUTED),
-                );
-            }
-
-            // The entry timeline scrolls under it — git-log style: each entry is
-            // a node on a left rail, newest last (canonical order).
-            let mut timeline = column![].spacing(8);
-            for entry in &dto.entries {
-                timeline = timeline.push(timeline_entry(entry));
-            }
-
-            column![header, scrollable(timeline).height(Fill)]
-                .spacing(10)
-                .padding(12)
-                .into()
+fn pane_body(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
+    let dto = match &pane.content {
+        Content::Loading => {
+            return container(text("loading…").color(MUTED)).padding(12).into();
         }
+        Content::Error(err) => {
+            return container(text(format!("error: {err}")).color(RED))
+                .padding(12)
+                .into();
+        }
+        Content::Loaded(dto) => dto,
+    };
+    let channel = dto.name.clone().unwrap_or_else(|| "(unopened)".into());
+
+    // Pinned at top: the lineage strip + party.
+    let mut header = column![lineage_strip(&channel, dto)].spacing(8);
+    if !dto.party.is_empty() {
+        header = header.push(
+            text(format!("party: {}", dto.party.join(", ")))
+                .size(12)
+                .color(MUTED),
+        );
+    }
+
+    // Launch a session.
+    let launch = row![
+        text_input("launch a session — what should it do?", &pane.launch_intent)
+            .on_input(move |v| Message::LaunchIntentChanged(id, v))
+            .on_submit(Message::Launch(id))
+            .padding(6),
+        button("launch").on_press(Message::Launch(id)).padding(6),
+    ]
+    .spacing(6);
+
+    // Session chips — click to stream a session's live feed.
+    let mut chips = row![].spacing(6);
+    for session in &dto.sessions {
+        let watching = pane.watched.as_deref() == Some(session.id.as_str());
+        let label = format!("{} · {}", truncate(&session.intent, 22), session.state);
+        let chip = button(text(label).size(11))
+            .on_press(Message::Watch(id, session.id.clone()))
+            .padding([3, 8])
+            .style(move |_t, _s| chip_style(status_color(&session.state), watching));
+        chips = chips.push(chip);
+    }
+
+    // Main area: the live feed (if watching) or the entry timeline.
+    let main: Element<Message> = if pane.watched.is_some() {
+        let mut feed = column![].spacing(4);
+        for event in &pane.feed {
+            feed = feed.push(feed_line(event));
+        }
+        let steer = row![
+            text_input("steer the running turn…", &pane.steer_text)
+                .on_input(move |v| Message::SteerTextChanged(id, v))
+                .on_submit(Message::Steer(id))
+                .padding(6),
+            button("steer").on_press(Message::Steer(id)).padding(6),
+            button("interrupt").on_press(Message::Interrupt(id)).padding(6),
+        ]
+        .spacing(6);
+        column![scrollable(feed).height(Fill), steer].spacing(8).into()
+    } else {
+        let mut timeline = column![].spacing(8);
+        for entry in &dto.entries {
+            timeline = timeline.push(timeline_entry(entry));
+        }
+        scrollable(timeline).height(Fill).into()
+    };
+
+    column![header, launch, chips, main]
+        .spacing(10)
+        .padding(12)
+        .into()
+}
+
+/// One live-feed line — kind-coloured, with any HTML the host rendered stripped
+/// back to plain text (native can't paint HTML).
+fn feed_line(event: &LiveEvent) -> Element<'static, Message> {
+    let body = if event.html {
+        strip_html(&event.text)
+    } else {
+        event.text.clone()
+    };
+    let color = match event.kind.as_str() {
+        "thinking" => MUTED,
+        "tool" => TEAL,
+        "error" => RED,
+        "result" => GREEN,
+        _ => TEXT,
+    };
+    text(body).size(13).color(color).into()
+}
+
+/// Crude tag-stripper for the host's sanitized-HTML feed segments.
+fn strip_html(input: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    for ch in input.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out.trim().to_string()
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() > max {
+        format!("{}…", s.chars().take(max - 1).collect::<String>())
+    } else {
+        s.to_string()
+    }
+}
+
+fn chip_style(color: Color, active: bool) -> button::Style {
+    button::Style {
+        background: Some(Background::Color(if active {
+            color
+        } else {
+            Color { a: 0.18, ..color }
+        })),
+        text_color: if active {
+            Color::from_rgb(0.12, 0.12, 0.18)
+        } else {
+            TEXT
+        },
+        border: Border {
+            color,
+            width: 1.0,
+            radius: 10.0.into(),
+        },
+        ..button::Style::default()
     }
 }
 
@@ -414,6 +661,10 @@ impl Pane {
         Pane {
             channel: channel.to_string(),
             content: Content::Loading,
+            watched: None,
+            feed: Vec::new(),
+            launch_intent: String::new(),
+            steer_text: String::new(),
         }
     }
 }
@@ -430,5 +681,74 @@ fn fetch(pane: pane_grid::Pane, channel: &str) -> Task<Message> {
                 .map_err(|e| e.to_string())
         },
         move |result| Message::Fetched(pane, result),
+    )
+}
+
+/// A long-lived SSE subscription streaming a session's live feed from the host
+/// (`/channels/{channel}/sessions/{session}/stream`) into `Message::Live`.
+fn session_stream(channel: String, session: String) -> impl iced::futures::Stream<Item = Message> {
+    use iced::futures::{SinkExt, StreamExt};
+    iced::stream::channel(64, move |mut output| async move {
+        let url = format!("{HOST}/channels/{channel}/sessions/{session}/stream");
+        let Ok(response) = reqwest::get(&url).await else {
+            let _ = output.send(Message::LiveEnded(session)).await;
+            return;
+        };
+        let mut bytes = response.bytes_stream();
+        let mut buf = String::new();
+        while let Some(Ok(chunk)) = bytes.next().await {
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+            // SSE frames are separated by a blank line.
+            while let Some(idx) = buf.find("\n\n") {
+                let frame: String = buf.drain(..idx + 2).collect();
+                if frame.contains("event: end") {
+                    let _ = output.send(Message::LiveEnded(session.clone())).await;
+                    return;
+                }
+                if let Some(data) = frame.lines().find_map(|l| l.strip_prefix("data:")) {
+                    if let Ok(event) = serde_json::from_str::<LiveEvent>(data.trim()) {
+                        let _ = output.send(Message::Live(session.clone(), event)).await;
+                    }
+                }
+            }
+        }
+        let _ = output.send(Message::LiveEnded(session)).await;
+    })
+}
+
+/// POST a launch (a new session) for `channel` with `intent`.
+fn post_launch(pane: pane_grid::Pane, channel: String, intent: String) -> Task<Message> {
+    let url = format!("{HOST}/channels/{channel}/sessions");
+    Task::perform(
+        async move {
+            let _ = reqwest::Client::new()
+                .post(&url)
+                .form(&[("intent", intent.as_str()), ("mode", "single")])
+                .send()
+                .await;
+        },
+        move |()| Message::Posted(pane),
+    )
+}
+
+/// POST a session act — `steer` (with a message) or `interrupt` (no body).
+fn post_act(
+    pane: pane_grid::Pane,
+    channel: String,
+    session: String,
+    act: &'static str,
+    message: Option<String>,
+) -> Task<Message> {
+    let url = format!("{HOST}/channels/{channel}/sessions/{session}/{act}");
+    Task::perform(
+        async move {
+            let request = reqwest::Client::new().post(&url);
+            let request = match message {
+                Some(message) => request.form(&[("message", message)]),
+                None => request,
+            };
+            let _ = request.send().await;
+        },
+        move |()| Message::Posted(pane),
     )
 }
