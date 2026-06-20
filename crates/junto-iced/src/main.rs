@@ -358,6 +358,7 @@ struct FocusItem {
     #[allow(dead_code)]
     channel: String,
     channel_name: Option<String>,
+    /// The proposer's display name (shown on the chip).
     author: String,
     summary: String,
 }
@@ -517,6 +518,12 @@ enum Message {
     OpenUrl(String),
     /// Copy text to the system clipboard.
     Copy(String),
+    /// Refresh everything — channels, lineage, focus, agents, settings, and
+    /// every open pane (a manual full reload).
+    RefreshAll,
+    /// Periodic ambient refresh — channels, lineage, focus only (cheap, doesn't
+    /// disturb pane scroll/streaming).
+    AutoRefresh,
     // --- admin: settings, repo setup, agents ---
     /// Open an admin view, or `None` to return to the channels workspace.
     OpenAdmin(Option<AdminView>),
@@ -693,9 +700,18 @@ impl App {
                         state.act_pending.remove(&entry_id);
                         state.act_errors.remove(&entry_id);
                         state.act_drafts.remove(&entry_id);
+                        // The resolved entry is no longer "needs you" — drop its
+                        // pinned attention card.
+                        if state.highlight_entry.as_deref() == Some(entry_id.as_str()) {
+                            state.highlight_entry = None;
+                        }
                         state.channel.clone()
                     });
-                    channel.map_or_else(Task::none, |c| fetch(pane, &c))
+                    // Refetch the pane AND the focus board (so the resolved item
+                    // leaves the top shelf) and the lineage.
+                    channel.map_or_else(Task::none, |c| {
+                        Task::batch([fetch(pane, &c), fetch_focus(), fetch_lineage_graph()])
+                    })
                 }
                 Err(err) => {
                     if let Some(state) = self.panes.get_mut(pane) {
@@ -1171,6 +1187,25 @@ impl App {
                 Task::none()
             }
             Message::Copy(text) => iced::clipboard::write(text),
+            Message::RefreshAll => {
+                let mut tasks = vec![
+                    fetch_channels(),
+                    fetch_lineage_graph(),
+                    fetch_focus(),
+                    fetch_agents(),
+                    fetch_settings(),
+                ];
+                for id in &self.order {
+                    if let Some(state) = self.panes.get(*id) {
+                        tasks.push(fetch(*id, &state.channel));
+                    }
+                }
+                Task::batch(tasks)
+            }
+            Message::AutoRefresh => {
+                // Ambient only — never refetch panes (would yank scroll/streaming).
+                Task::batch([fetch_channels(), fetch_lineage_graph(), fetch_focus()])
+            }
             Message::OpenAdmin(view) => {
                 self.admin = view;
                 Task::none()
@@ -1418,7 +1453,10 @@ impl App {
                     })
             })
             .collect();
-        iced::Subscription::batch(streams)
+        // A slow ambient refresh so the focus board / lineage stay live as
+        // agents work and sync pulls entries (panes are left alone).
+        let tick = iced::time::every(std::time::Duration::from_secs(20)).map(|_| Message::AutoRefresh);
+        iced::Subscription::batch(streams.into_iter().chain([tick]))
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -1538,7 +1576,11 @@ impl App {
                     _ => ("ratify", BLUE),
                 };
                 let chan = item.channel_name.clone().unwrap_or_default();
-                let label = format!("{tag} · {chan} · {}", truncate(&item.summary, 44));
+                let label = format!(
+                    "{tag} · {chan} · {}: {}",
+                    item.author,
+                    truncate(&item.summary, 40)
+                );
                 let mut chip = button(text(label).size(11)).padding([3, 9]).style(
                     move |_t, _s| chip_style(color, false),
                 );
@@ -1605,6 +1647,11 @@ fn admin_toolbar(current: Option<AdminView>) -> Element<'static, Message> {
         tab("channels", None),
         tab("settings", Some(AdminView::Settings)),
         tab("agents", Some(AdminView::Agents)),
+        Space::with_width(Fill),
+        button(text("↻ refresh").size(12))
+            .on_press(Message::RefreshAll)
+            .padding([4, 12])
+            .style(|_t, _s| chip_style(MUTED, false)),
     ]
     .spacing(4)
     .align_y(Center)
@@ -1653,16 +1700,18 @@ fn settings_panel(app: &App) -> Element<'_, Message> {
             ]
             .spacing(6)
         };
-        col = col.push(admin_card(
-            column![
-                text("harness").size(13).color(TEAL),
-                kv("protocol", &s.harness.protocol),
-                kv("backend", &s.harness.backend),
-                kv("auth", &s.harness.auth),
-                kv("detail", &s.harness.detail),
-            ]
-            .spacing(3),
-        ));
+        let mut harness = column![
+            text("harness").size(13).color(TEAL),
+            kv("protocol", &s.harness.protocol),
+            kv("backend", &s.harness.backend),
+            kv("auth", &s.harness.auth),
+            kv("detail", &s.harness.detail),
+        ]
+        .spacing(3);
+        if let Some(hint) = &s.harness.hint {
+            harness = harness.push(text(format!("hint: {hint}")).size(12).color(YELLOW));
+        }
+        col = col.push(admin_card(harness));
         let mut subs = column![text("home substrates").size(13).color(TEAL)].spacing(3);
         for p in &s.substrates {
             subs = subs.push(text(p.clone()).size(12).color(TEXT));
