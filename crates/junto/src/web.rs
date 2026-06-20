@@ -1701,7 +1701,7 @@ async fn workspaces_json(State(host): State<Arc<Host>>) -> Response {
             (when, repo.display().to_string())
         })
         .collect();
-    ranked.sort_by(|a, b| b.0.cmp(&a.0));
+    ranked.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     let mut seen = std::collections::HashSet::new();
     let repos: Vec<String> = ranked
         .into_iter()
