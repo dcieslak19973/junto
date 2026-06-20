@@ -73,9 +73,13 @@ struct App {
 struct Pane {
     channel: String,
     content: Content,
-    /// The session whose live feed this pane is streaming, if any.
+    /// The session currently being viewed in this pane, if any.
     watched: Option<String>,
-    /// Accumulated live events for the watched session.
+    /// Whether an SSE subscription is actively streaming the watched session's
+    /// turn. Distinct from `watched`: a landed session stays selected (so its
+    /// record + steer box show) but is not streaming.
+    streaming: bool,
+    /// Accumulated live events for the watched session's current turn.
     feed: Vec<LiveEvent>,
     launch_intent: String,
     steer_text: String,
@@ -218,6 +222,9 @@ struct EntryDto {
     summary: String,
     status: Option<String>,
     unrecognized: bool,
+    /// The entry this one acts on (e.g. a session memo/artifact → its session).
+    #[serde(default)]
+    target: Option<String>,
     /// Pre-baked decision-frame options (`docs/adr/0019`); empty when none.
     #[serde(default)]
     frame: Vec<FrameOptionDto>,
@@ -256,6 +263,8 @@ enum Message {
     Close(pane_grid::Pane),
     // Live session pane.
     Watch(pane_grid::Pane, String),
+    /// Close the session view, returning the pane to its timeline.
+    CloseSession(pane_grid::Pane),
     Live(String, LiveEvent),
     LiveEnded(String),
     LaunchIntentChanged(pane_grid::Pane, String),
@@ -455,11 +464,21 @@ impl App {
             Message::Watch(pane, session) => {
                 if let Some(state) = self.panes.get_mut(pane) {
                     state.watched = Some(session);
+                    state.streaming = true; // try to stream; ends fast if not live
+                    state.feed.clear();
+                }
+                Task::none()
+            }
+            Message::CloseSession(pane) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    state.watched = None;
+                    state.streaming = false;
                     state.feed.clear();
                 }
                 Task::none()
             }
             Message::Live(session, event) => {
+                let mut scroll = None;
                 for (_, state) in self.panes.iter_mut() {
                     if state.watched.as_deref() == Some(session.as_str()) {
                         // Coalesce streaming Markdown segments by seq.
@@ -467,16 +486,23 @@ impl App {
                             Some(last) if event.seq != 0 && last.seq == event.seq => *last = event,
                             _ => state.feed.push(event),
                         }
+                        scroll = Some(state.scroll_id.clone());
                         break;
                     }
                 }
-                Task::none()
+                // Keep the newest live output in view.
+                scroll.map_or_else(Task::none, |id| {
+                    scrollable::snap_to(id, scrollable::RelativeOffset::END)
+                })
             }
             Message::LiveEnded(session) => {
                 let mut to_refresh = None;
                 for (pane, state) in self.panes.iter_mut() {
                     if state.watched.as_deref() == Some(session.as_str()) {
-                        state.watched = None; // ends the subscription; feed stays
+                        // Stop streaming but stay on the session, so its landed
+                        // record + steer (resume) box remain. Refetch to pick up
+                        // the persisted memo/artifacts.
+                        state.streaming = false;
                         to_refresh = Some(*pane);
                         break;
                     }
@@ -609,12 +635,16 @@ impl App {
             .panes
             .iter()
             .filter_map(|(_, state)| {
-                state.watched.as_ref().map(|session| {
-                    iced::Subscription::run_with_id(
-                        session.clone(),
-                        session_stream(state.channel.clone(), session.clone()),
-                    )
-                })
+                state
+                    .watched
+                    .as_ref()
+                    .filter(|_| state.streaming)
+                    .map(|session| {
+                        iced::Subscription::run_with_id(
+                            session.clone(),
+                            session_stream(state.channel.clone(), session.clone()),
+                        )
+                    })
             })
             .collect();
         iced::Subscription::batch(streams)
@@ -877,22 +907,75 @@ fn pane_body<'a>(
         chips = chips.push(chip);
     }
 
-    // Main area: the live feed (if watching) or the entry timeline.
-    let main: Element<Message> = if pane.watched.is_some() {
-        let mut feed = column![].spacing(4);
-        for event in &pane.feed {
-            feed = feed.push(feed_line(event));
+    // Main area: the selected session's view (record + live turn + steer) or
+    // the entry timeline.
+    let main: Element<Message> = if let Some(session_id) = pane.watched.clone() {
+        // Header: the session's intent + state, a live indicator, and a close ×.
+        let session_dto = dto.sessions.iter().find(|s| s.id == session_id);
+        let intent = session_dto.map(|s| s.intent.clone()).unwrap_or_default();
+        let state_label = session_dto.map(|s| s.state.clone()).unwrap_or_default();
+        let mut header = row![text(format!("session · {}", truncate(&intent, 36))).size(13)]
+            .spacing(8)
+            .align_y(Center);
+        if !state_label.is_empty() {
+            header = header.push(badge(&state_label, status_color(&state_label)));
+        }
+        if pane.streaming {
+            header = header.push(text("● live").size(11).color(GREEN));
+        }
+        header = header.push(Space::with_width(Fill));
+        header = header.push(
+            button(text("× close").size(11))
+                .on_press(Message::CloseSession(id))
+                .padding([2, 8])
+                .style(|_t, _s| chip_style(MUTED, false)),
+        );
+
+        // The session's persisted record: its SessionStarted entry plus every
+        // entry targeting it (memos, artifacts), in timeline order.
+        let mut record = column![].spacing(8);
+        for entry in &dto.entries {
+            if entry.id == session_id || entry.target.as_deref() == Some(session_id.as_str()) {
+                record = record.push(timeline_entry(id, entry, false, "", None, false));
+            }
+        }
+        // The current turn's live output, while streaming.
+        if pane.streaming {
+            record = record.push(text("— live turn —").size(11).color(MUTED));
+            let mut feed = column![].spacing(4);
+            for event in &pane.feed {
+                feed = feed.push(feed_line(event));
+            }
+            record = record.push(feed);
+        }
+
+        // Steer (resumes a landed turn, or steers a live one) + interrupt.
+        let placeholder = if pane.streaming {
+            "steer the running turn…"
+        } else {
+            "steer — resume the session with a follow-up…"
+        };
+        let steer_input = text_input(placeholder, &pane.steer_text)
+            .on_input(move |v| Message::SteerTextChanged(id, v))
+            .on_submit(Message::Steer(id))
+            .padding(6);
+        let mut interrupt_btn = button("interrupt").padding(6);
+        if pane.streaming {
+            interrupt_btn = interrupt_btn.on_press(Message::Interrupt(id));
         }
         let steer = row![
-            text_input("steer the running turn…", &pane.steer_text)
-                .on_input(move |v| Message::SteerTextChanged(id, v))
-                .on_submit(Message::Steer(id))
-                .padding(6),
+            steer_input,
             button("steer").on_press(Message::Steer(id)).padding(6),
-            button("interrupt").on_press(Message::Interrupt(id)).padding(6),
+            interrupt_btn,
         ]
         .spacing(6);
-        column![scrollable(feed).height(Fill), steer].spacing(8).into()
+        column![
+            header,
+            scrollable(record).id(pane.scroll_id.clone()).height(Fill),
+            steer
+        ]
+        .spacing(8)
+        .into()
     } else {
         let highlight = pane.highlight_entry.as_deref();
         // A focus-board jump pins the attention entry above the scroll so it's
@@ -1210,7 +1293,7 @@ fn entry_card<'a>(
 }
 
 /// A small filled pill.
-fn badge(label: &str, color: Color) -> Element<'_, Message> {
+fn badge(label: &str, color: Color) -> Element<'static, Message> {
     container(text(label.to_string()).size(11).color(Color::from_rgb(0.12, 0.12, 0.18)))
         .padding([2, 7])
         .style(move |_theme| container::Style {
@@ -1250,6 +1333,7 @@ impl Pane {
             channel: channel.to_string(),
             content: Content::Loading,
             watched: None,
+            streaming: false,
             feed: Vec::new(),
             launch_intent: String::new(),
             steer_text: String::new(),

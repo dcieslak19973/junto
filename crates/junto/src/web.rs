@@ -1776,6 +1776,9 @@ struct EntryDto {
     summary: String,
     status: Option<String>,
     unrecognized: bool,
+    /// The entry this one acts on, if any — e.g. a SessionUpdated/ArtifactAttached
+    /// points at its SessionStarted, letting a surface group a session's record.
+    target: Option<String>,
     /// The decision frame's articulated options (`docs/adr/0019`), if any — the
     /// pre-baked, one-click rationales a verifier can adopt. Empty when none.
     frame: Vec<FrameOptionDto>,
@@ -1927,6 +1930,7 @@ impl EntryDto {
             summary,
             status,
             unrecognized: view.unrecognized.contains(&entry.id),
+            target: entry.payload.target().map(|t| t.to_string()),
             frame,
         }
     }
