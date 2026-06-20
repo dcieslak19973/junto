@@ -832,17 +832,28 @@ impl canvas::Program<Message> for LineageCanvas {
         let hover = cursor.position_in(bounds);
         let mut tooltip: Option<(Point, String)> = None;
 
-        // Diverge/converge connectors: a vertical link at the divergence time.
+        // Diverge/converge connectors, drawn as arcs that bow in opposite
+        // directions so they stay distinguishable even when a short side-quest's
+        // diverge and converge points land close together: diverge (mauve) bows
+        // left (branch out), converge (green) bows right (merge back).
         for (parent_row, child_row, at_ms, diverge) in &self.links {
             let x = self.x_of(*at_ms, left, right);
-            let color = if *diverge { MAUVE } else { GREEN };
+            let y0 = Self::y_of(*parent_row);
+            let y1 = Self::y_of(*child_row);
+            let (color, bulge) = if *diverge {
+                (MAUVE, -12.0)
+            } else {
+                (GREEN, 12.0)
+            };
+            let mut path = canvas::path::Builder::new();
+            path.move_to(Point::new(x, y0));
+            path.quadratic_curve_to(Point::new(x + bulge, (y0 + y1) / 2.0), Point::new(x, y1));
             frame.stroke(
-                &Path::line(
-                    Point::new(x, Self::y_of(*parent_row)),
-                    Point::new(x, Self::y_of(*child_row)),
-                ),
-                Stroke::default().with_color(color).with_width(1.5),
+                &path.build(),
+                Stroke::default().with_color(color).with_width(1.8),
             );
+            // A small node where it meets the parent track, to anchor the arc.
+            frame.fill(&Path::circle(Point::new(x, y0), 2.0), color);
         }
 
         // Tracks: a horizontal line from first to last activity + an end cap,
