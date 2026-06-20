@@ -92,6 +92,9 @@ struct Pane {
     act_drafts: HashMap<String, String>,
     /// Per-entry error messages from a failed act, keyed by entry id.
     act_errors: HashMap<String, String>,
+    /// Entry ids with a verification act in flight — drives the "recording…"
+    /// feedback and disables the buttons until the host responds.
+    act_pending: HashSet<String>,
 }
 
 enum Content {
@@ -358,20 +361,23 @@ impl App {
                     return Task::none();
                 };
                 let channel = state.channel.clone();
-                state.act_drafts.remove(&entry_id);
                 state.act_errors.remove(&entry_id); // clear any stale error
+                state.act_pending.insert(entry_id.clone()); // show "recording…"
                 post_verify(pane, channel, entry_id, act, rationale)
             }
             Message::Acted(pane, entry_id, result) => match result {
                 Ok(()) => {
                     let channel = self.panes.get_mut(pane).map(|state| {
+                        state.act_pending.remove(&entry_id);
                         state.act_errors.remove(&entry_id);
+                        state.act_drafts.remove(&entry_id);
                         state.channel.clone()
                     });
                     channel.map_or_else(Task::none, |c| fetch(pane, &c))
                 }
                 Err(err) => {
                     if let Some(state) = self.panes.get_mut(pane) {
+                        state.act_pending.remove(&entry_id);
                         state.act_errors.insert(entry_id, err);
                     }
                     Task::none()
@@ -804,6 +810,7 @@ fn pane_body<'a>(
                 .unwrap_or("")
         };
         let error_for = |entry: &EntryDto| pane.act_errors.get(&entry.id).map(String::as_str);
+        let pending_for = |entry: &EntryDto| pane.act_pending.contains(&entry.id);
         let pinned: Option<Element<Message>> = highlight.and_then(|hid| {
             dto.entries.iter().find(|e| e.id == hid).map(|entry| {
                 let header = row![
@@ -817,7 +824,14 @@ fn pane_body<'a>(
                 .align_y(Center);
                 column![
                     header,
-                    timeline_entry(id, entry, true, draft_for(entry), error_for(entry))
+                    timeline_entry(
+                        id,
+                        entry,
+                        true,
+                        draft_for(entry),
+                        error_for(entry),
+                        pending_for(entry)
+                    )
                 ]
                 .spacing(4)
                 .into()
@@ -828,8 +842,14 @@ fn pane_body<'a>(
             if highlight == Some(entry.id.as_str()) {
                 continue; // pinned above
             }
-            timeline =
-                timeline.push(timeline_entry(id, entry, false, draft_for(entry), error_for(entry)));
+            timeline = timeline.push(timeline_entry(
+                id,
+                entry,
+                false,
+                draft_for(entry),
+                error_for(entry),
+                pending_for(entry),
+            ));
         }
         match pinned {
             Some(pinned) => column![pinned, scrollable(timeline).height(Fill)]
@@ -916,10 +936,11 @@ fn timeline_entry<'a>(
     highlighted: bool,
     draft: &'a str,
     error: Option<&'a str>,
+    pending: bool,
 ) -> Element<'a, Message> {
     row![
         rail(kind_color(&entry.kind)),
-        entry_card(id, entry, highlighted, draft, error)
+        entry_card(id, entry, highlighted, draft, error, pending)
     ]
     .spacing(10)
     .into()
@@ -970,6 +991,7 @@ fn entry_card<'a>(
     highlighted: bool,
     draft: &'a str,
     error: Option<&'a str>,
+    pending: bool,
 ) -> Element<'a, Message> {
     let accent = kind_color(&entry.kind);
     let mut head = row![badge(&entry.kind, accent), text(entry.author.clone()).size(11).color(MUTED)]
@@ -1011,18 +1033,19 @@ fn entry_card<'a>(
             ]
             .spacing(8)
             .align_y(Center);
-            options = options.push(
-                button(inner)
-                    .width(Fill)
-                    .on_press(Message::Act(
-                        id,
-                        entry_id.clone(),
-                        opt.act.clone(),
-                        opt.rationale.clone(),
-                    ))
-                    .padding([4, 10])
-                    .style(move |_t, _s| chip_style(color, affirmative)),
-            );
+            let mut opt_btn = button(inner)
+                .width(Fill)
+                .padding([4, 10])
+                .style(move |_t, _s| chip_style(color, affirmative));
+            if !pending {
+                opt_btn = opt_btn.on_press(Message::Act(
+                    id,
+                    entry_id.clone(),
+                    opt.act.clone(),
+                    opt.rationale.clone(),
+                ));
+            }
+            options = options.push(opt_btn);
         }
         if has_options {
             acts = acts.push(options);
@@ -1043,7 +1066,7 @@ fn entry_card<'a>(
         let mut decline_btn = button(text(decline).size(11))
             .padding([3, 10])
             .style(|_t, _s| chip_style(RED, false));
-        if has_rationale {
+        if has_rationale && !pending {
             affirm_btn = affirm_btn.on_press(Message::Act(
                 id,
                 entry_id.clone(),
@@ -1062,7 +1085,9 @@ fn entry_card<'a>(
                 .spacing(6)
                 .align_y(Center),
         );
-        if let Some(err) = error {
+        if pending {
+            acts = acts.push(text("recording… (writing to the ledger)").size(11).color(YELLOW));
+        } else if let Some(err) = error {
             acts = acts.push(text(format!("⚠ {err}")).size(11).color(RED));
         }
         card = card.push(acts);
@@ -1139,6 +1164,7 @@ impl Pane {
             highlight_entry: None,
             act_drafts: HashMap::new(),
             act_errors: HashMap::new(),
+            act_pending: HashSet::new(),
         }
     }
 }
