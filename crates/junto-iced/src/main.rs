@@ -11,7 +11,7 @@ use iced::widget::pane_grid::{self, PaneGrid};
 use iced::widget::{
     button, column, container, row, scrollable, text, text_input, Space,
 };
-use iced::{Background, Border, Color, Element, Fill, Task, Theme};
+use iced::{Background, Border, Center, Color, Element, Fill, Length, Task, Theme};
 use serde::Deserialize;
 
 const HOST: &str = "http://127.0.0.1:1727";
@@ -276,24 +276,26 @@ fn entry_card(entry: &EntryDto) -> Element<'_, Message> {
 /// predecessors on the left, this channel highlighted in the middle, side-quests/
 /// continuations on the right — the split history at a glance.
 fn lineage_strip(channel: &str, dto: &ChannelDto) -> Element<'static, Message> {
-    let mut strip = row![].spacing(8);
+    let mut strip = row![].spacing(8).align_y(Center).height(Fill);
     for edge in dto.lineage.iter().filter(|e| e.direction == "incoming") {
         let label = edge.other_name.clone().unwrap_or_else(|| "parent".into());
         strip = strip.push(node(label, MUTED, false));
-        strip = strip.push(text("→").size(14).color(MUTED));
+        strip = strip.push(text("→").size(16).color(MUTED));
     }
     strip = strip.push(node(channel.to_string(), TEAL, true));
     for edge in dto.lineage.iter().filter(|e| e.direction == "outgoing") {
         let label = edge.other_name.clone().unwrap_or_else(|| "side-quest".into());
-        strip = strip.push(text("→").size(14).color(MUTED));
+        strip = strip.push(text("→").size(16).color(MUTED));
         strip = strip.push(node(label, MAUVE, false));
     }
     container(
         scrollable(strip)
-            .direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::default())),
+            .direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::default()))
+            .height(Fill),
     )
-    .padding(8)
+    .padding([8, 12])
     .width(Fill)
+    .height(Length::Fixed(64.0))
     .style(|_theme| container::Style {
         background: Some(Background::Color(Color { a: 0.5, ..SURFACE })),
         border: Border {
@@ -305,7 +307,8 @@ fn lineage_strip(channel: &str, dto: &ChannelDto) -> Element<'static, Message> {
     .into()
 }
 
-/// One node in the lineage strip.
+/// One node in the lineage strip. Long channel names are truncated to keep the
+/// strip glanceable.
 fn node(label: String, color: Color, highlight: bool) -> Element<'static, Message> {
     let text_color = if highlight {
         Color::from_rgb(0.12, 0.12, 0.18)
@@ -317,8 +320,13 @@ fn node(label: String, color: Color, highlight: bool) -> Element<'static, Messag
     } else {
         Color { a: 0.18, ..color }
     };
-    container(text(label).size(12).color(text_color))
-        .padding([4, 10])
+    let label = if label.chars().count() > 30 {
+        format!("{}…", label.chars().take(29).collect::<String>())
+    } else {
+        label
+    };
+    container(text(label).size(13).color(text_color))
+        .padding([6, 12])
         .style(move |_theme| container::Style {
             background: Some(Background::Color(background)),
             border: Border {
