@@ -147,6 +147,9 @@ struct Pane {
     lifecycle_pending: bool,
     /// The last lifecycle act's error, if it failed.
     lifecycle_error: Option<String>,
+    /// The channel's curated brief (recall bridge) as parsed Markdown — shown at
+    /// the top of the pane; the full entry history is a click away.
+    brief_md: Option<Vec<markdown::Item>>,
 }
 
 enum Content {
@@ -413,8 +416,10 @@ enum Message {
     CreateChannel,
     /// A channel was created (Ok = its name to open) or failed.
     ChannelCreated(Result<String, String>),
-    /// A clicked Markdown link in the live feed — currently ignored.
-    NoOp,
+    /// The curated brief markdown for a pane's channel (None if unavailable).
+    BriefLoaded(pane_grid::Pane, Option<String>),
+    /// Open a clicked Markdown link in the OS browser.
+    OpenUrl(String),
 }
 
 impl App {
@@ -590,11 +595,15 @@ impl App {
                             }
                         }
                         state.content = Content::Loaded(dto);
-                        // Jump to the newest entry (bottom) by default.
-                        scrollable::snap_to(
-                            state.scroll_id.clone(),
-                            scrollable::RelativeOffset::END,
-                        )
+                        let channel = state.channel.clone();
+                        // Jump to the newest entry (bottom) and refresh the brief.
+                        Task::batch([
+                            scrollable::snap_to(
+                                state.scroll_id.clone(),
+                                scrollable::RelativeOffset::END,
+                            ),
+                            fetch_brief(pane, channel),
+                        ])
                     }
                     Err(err) => {
                         state.content = Content::Error(err);
@@ -993,7 +1002,18 @@ impl App {
                     Task::none()
                 }
             },
-            Message::NoOp => Task::none(),
+            Message::BriefLoaded(pane, md) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    state.brief_md = md
+                        .filter(|s| !s.trim().is_empty())
+                        .map(|s| markdown::parse(&s).collect());
+                }
+                Task::none()
+            }
+            Message::OpenUrl(url) => {
+                let _ = open::that(url);
+                Task::none()
+            }
         }
     }
 
@@ -1202,6 +1222,30 @@ fn column_pane<'a>(
             background: Some(Background::Color(Color { a: 0.4, ..SURFACE })),
             border: Border {
                 color: BORDER,
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// The curated brief (recall bridge) rendered as Markdown in a card at the top
+/// of a pane — standing decisions + what needs attention.
+fn brief_panel(items: &[markdown::Item]) -> Element<'_, Message> {
+    let body = markdown::view(
+        items,
+        markdown::Settings::default(),
+        markdown::Style::from_palette(Theme::CatppuccinMocha.palette()),
+    )
+    .map(|url| Message::OpenUrl(url.to_string()));
+    container(column![text("brief").size(11).color(TEAL), body].spacing(6))
+        .padding(10)
+        .width(Fill)
+        .style(|_theme| container::Style {
+            background: Some(Background::Color(Color { a: 0.5, ..SURFACE })),
+            border: Border {
+                color: TEAL,
                 width: 1.0,
                 radius: 6.0.into(),
             },
@@ -1558,16 +1602,29 @@ fn pane_body<'a>(
                 .into()
             })
         });
-        // Brief by default: show only the most recent entries, with a toggle to
-        // reveal the full history (the newest stay in view via auto-scroll).
-        const BRIEF: usize = 12;
         let total = dto.entries.len();
-        let show_all = pane.show_full_history || total <= BRIEF;
-        let start = if show_all { 0 } else { total - BRIEF };
         let mut timeline = column![].spacing(8);
-        if total > BRIEF {
+        // Lead with the channel's curated brief (recall bridge): standing
+        // decisions + what needs attention. The full entry history is a click
+        // away — when there's no brief, fall back to the most recent entries.
+        if let Some(items) = &pane.brief_md {
+            timeline = timeline.push(brief_panel(items));
+        }
+        // History disclosure. Collapsed default: the brief alone (or, without a
+        // brief, the recent entries). Expanded: the full timeline.
+        const RECENT: usize = 12;
+        let have_brief = pane.brief_md.is_some();
+        let show_all = pane.show_full_history;
+        let start = if show_all {
+            0
+        } else if have_brief {
+            total // brief covers it — hide the entry list
+        } else {
+            total.saturating_sub(RECENT) // no brief → show the recent tail
+        };
+        if total > 0 {
             let label = if show_all {
-                "▾ show recent only".to_string()
+                "▾ hide full history".to_string()
             } else {
                 format!("▸ show full history ({total} entries)")
             };
@@ -1633,7 +1690,7 @@ fn feed_line(item: &FeedItem) -> Element<'_, Message> {
             markdown::Settings::default(),
             markdown::Style::from_palette(Theme::CatppuccinMocha.palette()),
         )
-        .map(|_url| Message::NoOp);
+        .map(|url| Message::OpenUrl(url.to_string()));
     }
     let event = &item.event;
     let body = if event.html {
@@ -1782,7 +1839,7 @@ fn entry_card<'a>(
             markdown::Settings::default(),
             markdown::Style::from_palette(Theme::CatppuccinMocha.palette()),
         )
-        .map(|_url| Message::NoOp)
+        .map(|url| Message::OpenUrl(url.to_string()))
     } else {
         text(entry.summary.clone()).size(13).color(TEXT).into()
     };
@@ -1942,7 +1999,7 @@ fn artifact_body<'a>(
                 markdown::Settings::default(),
                 markdown::Style::from_palette(Theme::CatppuccinMocha.palette()),
             )
-            .map(|_url| Message::NoOp),
+            .map(|url| Message::OpenUrl(url.to_string())),
         )
         .padding(8)
         .width(Fill)
@@ -2087,6 +2144,7 @@ impl Pane {
             lifecycle_target: String::new(),
             lifecycle_pending: false,
             lifecycle_error: None,
+            brief_md: None,
         }
     }
 }
@@ -2456,6 +2514,20 @@ fn fetch_artifact(pane: pane_grid::Pane, channel: String, artifact: String) -> T
             }
         },
         move |result| Message::ArtifactLoaded(pane, id.clone(), result),
+    )
+}
+
+/// Fetch a channel's curated brief (recall bridge) as Markdown text.
+fn fetch_brief(pane: pane_grid::Pane, channel: String) -> Task<Message> {
+    let url = format!("{HOST}/channels/{channel}/brief");
+    Task::perform(
+        async move {
+            match reqwest::get(&url).await {
+                Ok(resp) if resp.status().is_success() => resp.text().await.ok(),
+                _ => None,
+            }
+        },
+        move |md| Message::BriefLoaded(pane, md),
     )
 }
 
