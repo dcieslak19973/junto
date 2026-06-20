@@ -276,7 +276,7 @@ fn entry_card(entry: &EntryDto) -> Element<'_, Message> {
 /// predecessors on the left, this channel highlighted in the middle, side-quests/
 /// continuations on the right — the split history at a glance.
 fn lineage_strip(channel: &str, dto: &ChannelDto) -> Element<'static, Message> {
-    let mut strip = row![].spacing(8).align_y(Center).height(Fill);
+    let mut strip = row![].spacing(8).align_y(Center);
     for edge in dto.lineage.iter().filter(|e| e.direction == "incoming") {
         let label = edge.other_name.clone().unwrap_or_else(|| "parent".into());
         strip = strip.push(node(label, MUTED, false));
@@ -290,12 +290,11 @@ fn lineage_strip(channel: &str, dto: &ChannelDto) -> Element<'static, Message> {
     }
     container(
         scrollable(strip)
-            .direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::default()))
-            .height(Fill),
+            .direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::default())),
     )
     .padding([8, 12])
     .width(Fill)
-    .height(Length::Fixed(64.0))
+    .center_y(Length::Fixed(64.0))
     .style(|_theme| container::Style {
         background: Some(Background::Color(Color { a: 0.5, ..SURFACE })),
         border: Border {
