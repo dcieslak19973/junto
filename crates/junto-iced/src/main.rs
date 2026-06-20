@@ -46,6 +46,8 @@ fn main() -> iced::Result {
         .default_font(iced::Font::with_name("Segoe UI"))
         .window(iced::window::Settings {
             icon,
+            // Tall by default so more of a channel's bottom content is visible.
+            size: Size::new(1400.0, 1040.0),
             ..Default::default()
         })
         .run_with(App::new)
@@ -111,6 +113,15 @@ struct Pane {
     /// Expanded artifacts' inline content, keyed by artifact entry id. Absent =
     /// collapsed; present = expanded (loading / loaded / error).
     artifacts: HashMap<String, ArtifactContent>,
+    /// Whether the launch form's options (agent / workspace / mode) are shown.
+    /// Collapsed by default to keep the launch bar to a single line.
+    launch_expanded: bool,
+    /// Whether the full entry history is shown; false = a brief of recent
+    /// entries with a "show full history" toggle.
+    show_full_history: bool,
+    /// Parsed Markdown for session memo entries, keyed by entry id (parsed on
+    /// load so memo notes render formatted, not as plain text).
+    entry_md: HashMap<String, Vec<markdown::Item>>,
 }
 
 enum Content {
@@ -331,6 +342,10 @@ enum Message {
     Steer(pane_grid::Pane),
     Interrupt(pane_grid::Pane),
     Posted(pane_grid::Pane),
+    /// Show/hide the launch options (agent / workspace / mode).
+    ToggleLaunchOptions(pane_grid::Pane),
+    /// Show all entries vs. the recent brief.
+    ToggleHistory(pane_grid::Pane),
     /// A clicked Markdown link in the live feed — currently ignored.
     NoOp,
 }
@@ -484,6 +499,13 @@ impl App {
                         {
                             state.launch_workspace = ws;
                         }
+                        // Pre-parse session memo notes so they render as Markdown.
+                        state.entry_md = dto
+                            .entries
+                            .iter()
+                            .filter(|e| e.kind == "session")
+                            .map(|e| (e.id.clone(), markdown::parse(&e.summary).collect()))
+                            .collect();
                         state.content = Content::Loaded(dto);
                         // Jump to the newest entry (bottom) by default.
                         scrollable::snap_to(
@@ -716,6 +738,18 @@ impl App {
                 let channel = self.panes.get(pane).map(|p| p.channel.clone());
                 channel.map_or_else(Task::none, |c| fetch(pane, &c))
             }
+            Message::ToggleLaunchOptions(pane) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    state.launch_expanded = !state.launch_expanded;
+                }
+                Task::none()
+            }
+            Message::ToggleHistory(pane) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    state.show_full_history = !state.show_full_history;
+                }
+                Task::none()
+            }
             Message::NoOp => Task::none(),
         }
     }
@@ -924,6 +958,8 @@ fn pane_body<'a>(
 
     // An artifact entry's expanded inline content, if the user opened it.
     let artifact_for = |entry: &EntryDto| pane.artifacts.get(&entry.id);
+    // Parsed Markdown for a session memo entry's summary, if any.
+    let summary_md_for = |entry: &EntryDto| pane.entry_md.get(&entry.id).map(Vec::as_slice);
 
     // The channel's own header: just the party now (lineage lives in the top
     // window-wide branch graph, so the per-pane strip is gone).
@@ -951,7 +987,18 @@ fn pane_body<'a>(
     if !pane.launching {
         launch_btn = launch_btn.on_press(Message::Launch(id));
     }
-    let intent_row = row![intent_input, launch_btn].spacing(6);
+    let options_toggle = button(
+        text(if pane.launch_expanded {
+            "options ▾"
+        } else {
+            "options ▸"
+        })
+        .size(12),
+    )
+    .on_press(Message::ToggleLaunchOptions(id))
+    .padding(6)
+    .style(|_t, _s| chip_style(MUTED, false));
+    let intent_row = row![intent_input, launch_btn, options_toggle].spacing(6);
     let agent_picker: Element<Message> = if agents.is_empty() {
         text("no agents configured").size(11).color(MUTED).into()
     } else {
@@ -984,7 +1031,10 @@ fn pane_body<'a>(
     ]
     .spacing(6)
     .align_y(Center);
-    let mut launch = column![intent_row, options_row, mode_checkbox].spacing(6);
+    let mut launch = column![intent_row].spacing(6);
+    if pane.launch_expanded {
+        launch = launch.push(options_row).push(mode_checkbox);
+    }
     if let Some(err) = &pane.launch_error {
         launch = launch.push(text(format!("⚠ {err}")).size(11).color(RED));
     }
@@ -1030,8 +1080,16 @@ fn pane_body<'a>(
         let mut record = column![].spacing(8);
         for entry in &dto.entries {
             if entry.id == session_id || entry.target.as_deref() == Some(session_id.as_str()) {
-                record =
-                    record.push(timeline_entry(id, entry, false, "", None, false, artifact_for(entry)));
+                record = record.push(timeline_entry(
+                    id,
+                    entry,
+                    false,
+                    "",
+                    None,
+                    false,
+                    artifact_for(entry),
+                    summary_md_for(entry),
+                ));
             }
         }
         // The current turn's live output, while streaming.
@@ -1103,15 +1161,35 @@ fn pane_body<'a>(
                         draft_for(entry),
                         error_for(entry),
                         pending_for(entry),
-                        artifact_for(entry)
+                        artifact_for(entry),
+                        summary_md_for(entry)
                     )
                 ]
                 .spacing(4)
                 .into()
             })
         });
+        // Brief by default: show only the most recent entries, with a toggle to
+        // reveal the full history (the newest stay in view via auto-scroll).
+        const BRIEF: usize = 12;
+        let total = dto.entries.len();
+        let show_all = pane.show_full_history || total <= BRIEF;
+        let start = if show_all { 0 } else { total - BRIEF };
         let mut timeline = column![].spacing(8);
-        for entry in &dto.entries {
+        if total > BRIEF {
+            let label = if show_all {
+                "▾ show recent only".to_string()
+            } else {
+                format!("▸ show full history ({total} entries)")
+            };
+            timeline = timeline.push(
+                button(text(label).size(11))
+                    .on_press(Message::ToggleHistory(id))
+                    .padding([2, 8])
+                    .style(|_t, _s| chip_style(MUTED, false)),
+            );
+        }
+        for entry in dto.entries.iter().skip(start) {
             if highlight == Some(entry.id.as_str()) {
                 continue; // pinned above
             }
@@ -1123,6 +1201,7 @@ fn pane_body<'a>(
                 error_for(entry),
                 pending_for(entry),
                 artifact_for(entry),
+                summary_md_for(entry),
             ));
         }
         let scroll = scrollable(timeline)
@@ -1135,8 +1214,8 @@ fn pane_body<'a>(
     };
 
     column![header, launch, chips, main]
-        .spacing(10)
-        .padding(12)
+        .spacing(8)
+        .padding([8.0_f32, 10.0])
         .into()
 }
 
@@ -1223,10 +1302,11 @@ fn timeline_entry<'a>(
     error: Option<&'a str>,
     pending: bool,
     artifact: Option<&'a ArtifactContent>,
+    summary_md: Option<&'a [markdown::Item]>,
 ) -> Element<'a, Message> {
     row![
         rail(kind_color(&entry.kind)),
-        entry_card(id, entry, highlighted, draft, error, pending, artifact)
+        entry_card(id, entry, highlighted, draft, error, pending, artifact, summary_md)
     ]
     .spacing(10)
     .into()
@@ -1279,6 +1359,7 @@ fn entry_card<'a>(
     error: Option<&'a str>,
     pending: bool,
     artifact: Option<&'a ArtifactContent>,
+    summary_md: Option<&'a [markdown::Item]>,
 ) -> Element<'a, Message> {
     let accent = kind_color(&entry.kind);
     let mut head = row![badge(&entry.kind, accent), text(entry.author.clone()).size(11).color(MUTED)]
@@ -1290,7 +1371,18 @@ fn entry_card<'a>(
         head = head.push(badge("unrecognized", MUTED));
     }
 
-    let mut card = column![head, text(entry.summary.clone()).size(13).color(TEXT)].spacing(6);
+    // The body: a session memo renders as Markdown; everything else is plain.
+    let body: Element<Message> = if let Some(items) = summary_md {
+        markdown::view(
+            items,
+            markdown::Settings::default(),
+            markdown::Style::from_palette(Theme::CatppuccinMocha.palette()),
+        )
+        .map(|_url| Message::NoOp)
+    } else {
+        text(entry.summary.clone()).size(13).color(TEXT).into()
+    };
+    let mut card = column![head, body].spacing(6);
 
     // Inline verification acts on open assertions/proposals. The decision
     // frame's pre-baked options come first as one-click buttons (each carries
@@ -1581,6 +1673,9 @@ impl Pane {
             act_pending: HashSet::new(),
             scroll_id: scrollable::Id::unique(),
             artifacts: HashMap::new(),
+            launch_expanded: false,
+            show_full_history: false,
+            entry_md: HashMap::new(),
         }
     }
 }
