@@ -377,12 +377,53 @@ impl App {
                 let canvas = LineageCanvas::layout(graph, &open);
                 let content_h = canvas.height.max(80.0);
                 let view_h = content_h.min(260.0);
+
+                // The ambient channel: the root (no incoming diverge) with the
+                // earliest start — the mainline everything branches from. Pinned
+                // above the scroll so it stays visible while you scroll the DAG.
+                let is_child: HashSet<&str> = graph
+                    .edges
+                    .iter()
+                    .filter(|e| e.relation == "diverge")
+                    .map(|e| e.to.as_str())
+                    .collect();
+                let ambient = graph
+                    .nodes
+                    .iter()
+                    .filter(|n| !is_child.contains(n.id.as_str()))
+                    .min_by_key(|n| n.first_ms.unwrap_or(i64::MAX))
+                    .map(|n| n.name.clone())
+                    .unwrap_or_else(|| "—".into());
+                let header = row![
+                    container(Space::new(0.0, 0.0))
+                        .width(Length::Fixed(9.0))
+                        .height(Length::Fixed(9.0))
+                        .style(|_theme| container::Style {
+                            background: Some(Background::Color(TEAL)),
+                            border: Border {
+                                radius: 5.0.into(),
+                                ..Border::default()
+                            },
+                            ..container::Style::default()
+                        }),
+                    text(format!("ambient · {ambient}")).size(12).color(TEXT),
+                ]
+                .spacing(8)
+                .align_y(Center)
+                .padding([4, 4]);
+
                 container(
-                    scrollable(Canvas::new(canvas).width(Fill).height(Length::Fixed(content_h)))
+                    column![
+                        header,
+                        scrollable(
+                            Canvas::new(canvas).width(Fill).height(Length::Fixed(content_h))
+                        )
                         .height(Fill),
+                    ]
+                    .spacing(2),
                 )
                 .width(Fill)
-                .height(Length::Fixed(view_h))
+                .height(Length::Fixed(view_h + 28.0))
                 .padding(6)
                 .style(|_theme| container::Style {
                     background: Some(Background::Color(Color { a: 0.4, ..SURFACE })),
