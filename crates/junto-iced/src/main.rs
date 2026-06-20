@@ -227,10 +227,11 @@ fn pane_body(content: &Content) -> Element<'_, Message> {
                 );
             }
 
-            // The entry timeline scrolls under it.
+            // The entry timeline scrolls under it — git-log style: each entry is
+            // a node on a left rail, newest last (canonical order).
             let mut timeline = column![].spacing(8);
             for entry in &dto.entries {
-                timeline = timeline.push(entry_card(entry));
+                timeline = timeline.push(timeline_entry(entry));
             }
 
             column![header, scrollable(timeline).height(Fill)]
@@ -239,6 +240,41 @@ fn pane_body(content: &Content) -> Element<'_, Message> {
                 .into()
         }
     }
+}
+
+/// One history entry: a node on a left rail (git-log style) beside its card.
+/// The rail line fills the row height; with zero column spacing the nodes link
+/// into a continuous history.
+fn timeline_entry(entry: &EntryDto) -> Element<'_, Message> {
+    row![rail(kind_color(&entry.kind)), entry_card(entry)]
+        .spacing(10)
+        .into()
+}
+
+/// The left rail for one entry: a coloured node dot at the card's top. (A
+/// continuous connecting line needs a `Fill` height, which Iced forbids inside
+/// a scrollable — dots-only still reads as a node history.)
+fn rail(color: Color) -> Element<'static, Message> {
+    column![Space::with_height(6), dot(color)]
+        .align_x(Center)
+        .width(Length::Fixed(18.0))
+        .into()
+}
+
+/// A small filled circle (a history node).
+fn dot(color: Color) -> Element<'static, Message> {
+    container(Space::new(0.0, 0.0))
+        .width(Length::Fixed(11.0))
+        .height(Length::Fixed(11.0))
+        .style(move |_theme| container::Style {
+            background: Some(Background::Color(color)),
+            border: Border {
+                radius: 6.0.into(),
+                ..Border::default()
+            },
+            ..container::Style::default()
+        })
+        .into()
 }
 
 /// One timeline entry as a card: a colour-coded kind badge + author + status,
