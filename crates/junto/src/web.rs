@@ -1507,11 +1507,18 @@ async fn channels_json(State(host): State<Arc<Host>>) -> Response {
 /// the data a native surface draws as a git-style branch graph. Read-only.
 async fn lineage_json(State(host): State<Arc<Host>>) -> Response {
     #[derive(Serialize)]
+    struct Milestone {
+        ms: i64,
+        label: String,
+    }
+    #[derive(Serialize)]
     struct Node {
         id: String,
         name: String,
         first_ms: Option<i64>,
         last_ms: Option<i64>,
+        /// Key points along the channel's track, each with explanatory text.
+        milestones: Vec<Milestone>,
     }
     #[derive(Serialize)]
     struct Edge {
@@ -1525,19 +1532,15 @@ async fn lineage_json(State(host): State<Arc<Host>>) -> Response {
         edges: Vec<Edge>,
     }
 
+    let clip = |s: &str| s.chars().take(70).collect::<String>();
     let inventory = host.inventory().await.unwrap_or_default();
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
     for summary in &inventory {
         let Some(name) = &summary.name else { continue };
-        nodes.push(Node {
-            id: summary.id.to_string(),
-            name: name.clone(),
-            first_ms: summary.first_activity.map(|t| t.as_millis()),
-            last_ms: summary.last_activity.map(|t| t.as_millis()),
-        });
-        // Use each channel's *outgoing* edges so each edge is counted once.
+        let mut milestones = Vec::new();
         if let Ok((id, view, _)) = project(&host, &summary.id.to_string()).await {
+            // Use each channel's *outgoing* edges so each edge is counted once.
             for edge in &view.lineage {
                 if edge.direction == junto_kernel::LineageDirection::Outgoing {
                     edges.push(Edge {
@@ -1547,7 +1550,41 @@ async fn lineage_json(State(host): State<Arc<Host>>) -> Response {
                     });
                 }
             }
+            // Milestones: the subject points along the track, each labelled.
+            for entry in &view.entries {
+                let label = match &entry.payload {
+                    EntryPayload::Assertion { statement, .. } => {
+                        Some(format!("decision · {}", clip(statement)))
+                    }
+                    EntryPayload::Proposal { action, .. } => {
+                        Some(format!("gate · {}", clip(action)))
+                    }
+                    EntryPayload::SessionStarted { intent } => {
+                        Some(format!("session · {}", clip(intent)))
+                    }
+                    EntryPayload::DivergedFrom { .. } => Some("diverged from parent".into()),
+                    EntryPayload::ConvergedInto { .. } => Some("converged into another".into()),
+                    _ => None,
+                };
+                if let Some(label) = label {
+                    milestones.push(Milestone {
+                        ms: entry.timestamp.as_millis(),
+                        label,
+                    });
+                }
+            }
+            // Keep the most recent dozen so the track doesn't get crowded.
+            if milestones.len() > 12 {
+                milestones.drain(0..milestones.len() - 12);
+            }
         }
+        nodes.push(Node {
+            id: summary.id.to_string(),
+            name: name.clone(),
+            first_ms: summary.first_activity.map(|t| t.as_millis()),
+            last_ms: summary.last_activity.map(|t| t.as_millis()),
+            milestones,
+        });
     }
     axum::Json(Graph { nodes, edges }).into_response()
 }

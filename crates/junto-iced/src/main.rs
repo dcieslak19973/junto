@@ -15,8 +15,8 @@ use iced::widget::{
     button, column, combo_box, container, row, scrollable, text, text_input, Space,
 };
 use iced::{
-    Background, Border, Center, Color, Element, Fill, Length, Point, Rectangle, Renderer, Task,
-    Theme, mouse,
+    Background, Border, Center, Color, Element, Fill, Length, Point, Rectangle, Renderer, Size,
+    Task, Theme, mouse,
 };
 use serde::Deserialize;
 
@@ -92,6 +92,14 @@ struct GNode {
     name: String,
     first_ms: Option<i64>,
     last_ms: Option<i64>,
+    #[serde(default)]
+    milestones: Vec<MilestoneDto>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MilestoneDto {
+    ms: i64,
+    label: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -118,11 +126,11 @@ struct LiveEvent {
 struct ChannelDto {
     #[allow(dead_code)]
     id: String,
+    #[allow(dead_code)]
     name: Option<String>,
     #[allow(dead_code)]
     closed: bool,
     party: Vec<String>,
-    lineage: Vec<LineageDto>,
     sessions: Vec<SessionDto>,
     entries: Vec<EntryDto>,
 }
@@ -132,18 +140,6 @@ struct SessionDto {
     id: String,
     state: String,
     intent: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct LineageDto {
-    #[allow(dead_code)]
-    relation: String,
-    direction: String,
-    #[allow(dead_code)]
-    other: String,
-    other_name: Option<String>,
-    #[allow(dead_code)]
-    label: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -711,6 +707,8 @@ struct Track {
     root: bool,
     /// This channel is currently open as a pane (highlighted in the graph).
     open: bool,
+    /// Labelled points along the track: (timestamp, explanatory text).
+    milestones: Vec<(i64, String)>,
 }
 
 struct LineageCanvas {
@@ -759,6 +757,11 @@ impl LineageCanvas {
                 last_ms: n.last_ms.unwrap_or(now_ms),
                 root: !is_child.contains(n.id.as_str()),
                 open: open.contains(&n.name),
+                milestones: n
+                    .milestones
+                    .iter()
+                    .map(|m| (m.ms, m.label.clone()))
+                    .collect(),
             });
         }
         let first_of: HashMap<&str, i64> = graph
@@ -809,11 +812,13 @@ impl canvas::Program<Message> for LineageCanvas {
         renderer: &Renderer,
         _theme: &Theme,
         bounds: Rectangle,
-        _cursor: mouse::Cursor,
+        cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
         let mut frame = Frame::new(renderer, bounds.size());
         let left = LABEL_W;
         let right = (bounds.width - 24.0).max(left + 60.0);
+        let hover = cursor.position_in(bounds);
+        let mut tooltip: Option<(Point, String)> = None;
 
         // Diverge/converge connectors: a vertical link at the divergence time.
         for (parent_row, child_row, at_ms, diverge) in &self.links {
@@ -828,9 +833,8 @@ impl canvas::Program<Message> for LineageCanvas {
             );
         }
 
-        // Tracks: a horizontal line from first to last activity + an end cap.
-        // Open channels are highlighted; the rest are dimmed but still drawn so
-        // the whole branching structure is visible regardless of what's open.
+        // Tracks: a horizontal line from first to last activity + an end cap,
+        // plus a labelled dot per milestone (label shown on hover).
         for track in &self.tracks {
             let y = Self::y_of(track.row);
             let x0 = self.x_of(track.first_ms, left, right);
@@ -848,6 +852,26 @@ impl canvas::Program<Message> for LineageCanvas {
                     .with_width(if track.open { 3.0 } else { 2.0 }),
             );
             frame.fill(&Path::circle(Point::new(x1, y), if track.open { 5.0 } else { 4.0 }), color);
+
+            // Milestone points along the track.
+            for (ms, label) in &track.milestones {
+                let mx = self.x_of(*ms, left, right);
+                let dot = Point::new(mx, y);
+                frame.fill(
+                    &Path::circle(dot, 2.5),
+                    Color {
+                        a: if track.open { 0.95 } else { 0.55 },
+                        ..TEXT
+                    },
+                );
+                if let Some(h) = hover
+                    && (h.x - mx).abs() < 5.0
+                    && (h.y - y).abs() < 5.0
+                {
+                    tooltip = Some((dot, label.clone()));
+                }
+            }
+
             frame.fill_text(canvas::Text {
                 content: truncate(&track.name, 20),
                 position: Point::new(8.0, y - 8.0),
@@ -857,6 +881,24 @@ impl canvas::Program<Message> for LineageCanvas {
                     Color { a: 0.7, ..TEXT }
                 },
                 size: 13.0.into(),
+                ..canvas::Text::default()
+            });
+        }
+
+        // Hover tooltip explaining the milestone under the cursor.
+        if let Some((dot, label)) = tooltip {
+            let w = (label.chars().count() as f32 * 6.3 + 14.0).min(bounds.width - 8.0);
+            let tx = (dot.x + 8.0).min(bounds.width - w - 4.0).max(4.0);
+            let ty = (dot.y - 24.0).max(2.0);
+            frame.fill(
+                &Path::rectangle(Point::new(tx, ty), Size::new(w, 19.0)),
+                Color { a: 0.97, ..SURFACE },
+            );
+            frame.fill_text(canvas::Text {
+                content: label,
+                position: Point::new(tx + 7.0, ty + 3.0),
+                color: TEXT,
+                size: 11.0.into(),
                 ..canvas::Text::default()
             });
         }
