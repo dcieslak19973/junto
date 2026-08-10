@@ -1091,7 +1091,7 @@ async fn rename_channel(
         Ok(ledger) => ledger,
         Err(err) => return internal(format!("opening the ledger: {err}")),
     };
-    let entry = LedgerEntry {
+    let mut entry = LedgerEntry {
         signature: None,
         id: EntryId::new(),
         channel: id,
@@ -1103,6 +1103,7 @@ async fn rename_channel(
             rationale,
         },
     };
+    host.sign_entry(&mut entry);
     if let Err(err) = ledger.lock().await.append(entry).await {
         return internal(format!("append failed: {err}"));
     }
@@ -1189,7 +1190,7 @@ async fn lifecycle_act(host: &Host, channel: &str, form: LifecycleForm, close: b
         Ok(ledger) => ledger,
         Err(err) => return internal(format!("opening the ledger: {err}")),
     };
-    let entry = LedgerEntry {
+    let mut entry = LedgerEntry {
         signature: None,
         id: EntryId::new(),
         channel: id,
@@ -1197,6 +1198,7 @@ async fn lifecycle_act(host: &Host, channel: &str, form: LifecycleForm, close: b
         timestamp: Timestamp::now(),
         payload,
     };
+    host.sign_entry(&mut entry);
     if let Err(err) = ledger.lock().await.append(entry).await {
         return internal(format!("append failed: {err}"));
     }
@@ -1470,7 +1472,7 @@ async fn verify(
         return (StatusCode::FORBIDDEN, format!("{err:#}")).into_response();
     }
 
-    let entry = LedgerEntry {
+    let mut entry = LedgerEntry {
         signature: None,
         id: EntryId::new(),
         channel: id,
@@ -1478,6 +1480,7 @@ async fn verify(
         timestamp: Timestamp::now(),
         payload,
     };
+    host.sign_entry(&mut entry);
     if let Err(err) = guard.append(entry).await {
         return internal(format!("append failed: {err}"));
     }

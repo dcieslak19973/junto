@@ -2537,8 +2537,11 @@ async fn store_outcome_signal(
     .await
 }
 
-/// Append one entry to the channel's ledger via the host.
-async fn append(host: &Host, channel_ref: &str, entry: LedgerEntry) -> Result<()> {
+/// Append one entry to the channel's ledger via the host — signed with its
+/// author's machine-local key first (`docs/adr/0033`), so session records and
+/// artifacts carry the agent's own signature, never the operator's.
+async fn append(host: &Host, channel_ref: &str, mut entry: LedgerEntry) -> Result<()> {
+    host.sign_entry(&mut entry);
     match host.resolve(channel_ref).await? {
         crate::host::Resolution::Resolved { ledger, .. } => {
             ledger.lock().await.append(entry).await?;

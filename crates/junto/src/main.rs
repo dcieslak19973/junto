@@ -14,6 +14,7 @@ mod forge;
 mod grader;
 mod host;
 mod init;
+mod keys;
 mod launch;
 mod mcp;
 mod members;

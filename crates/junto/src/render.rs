@@ -2793,6 +2793,17 @@ fn entry_card(entry: &LedgerEntry, view: &ChannelView, channel: &ChannelId) -> S
     } else {
         ""
     };
+    // Authorship verification (`docs/adr/0033`) — a surfaced fact, visible on
+    // the card so unsigned or non-verifying entries are noticed on day one,
+    // not accumulated silently. Redundant on an unrecognized card (that badge
+    // already signals distrust louder).
+    let unverified_badge = if !unrecognized && view.unverified.contains(&entry.id) {
+        "<span class=\"badge unverified\" title=\"signature is missing or does not verify \
+         against the author's recorded key; the entry still projects (docs/adr/0033)\">\
+         unverified</span>"
+    } else {
+        ""
+    };
     let statement = statement
         .map(|text| format!("<div class=\"statement\">{}</div>", escape_html(&text)))
         .unwrap_or_default();
@@ -2815,7 +2826,7 @@ fn entry_card(entry: &LedgerEntry, view: &ChannelView, channel: &ChannelId) -> S
 
     format!(
         "<article class=\"card {family}{flag}\">\
-         <header><span class=\"kind\">{kind}</span>{badge}{unrecognized_badge}\
+         <header><span class=\"kind\">{kind}</span>{badge}{unrecognized_badge}{unverified_badge}\
          <span class=\"spacer\"></span>\
          <span class=\"who\" title=\"{email}\">{who}</span>\
          <span class=\"when\">{when}</span></header>\
@@ -3411,6 +3422,8 @@ border-color:rgba(166,227,161,.3)}\
 border-color:rgba(147,153,178,.3)}\
 .rejected,.unrecognized,.error,.blocked{color:var(--red);background:rgba(243,139,168,.12);\
 border-color:rgba(243,139,168,.3)}\
+.unverified{color:var(--yellow);background:rgba(249,226,175,.12);\
+border-color:rgba(249,226,175,.3)}\
 .working{color:var(--accent);background:rgba(137,180,250,.12);\
 border-color:rgba(137,180,250,.3)}\
 .who{color:var(--soft);font-size:.82rem}\
