@@ -1,4 +1,4 @@
-﻿//! Rendering a channel projection for readers.
+//! Rendering a channel projection for readers.
 //!
 //! Two audiences, one source of truth (the [`ChannelView`] projection):
 //! - [`brief_markdown`] — the **agent** read path: the MCP `view_channel`
@@ -3806,6 +3806,30 @@ mod tests {
             closed: false,
             lineage: Vec::new(),
         }
+    }
+
+    /// `docs/adr/0033` — the unverified badge is *visible* on the rendered
+    /// card (a projection fact nobody sees is theater), and absent from a
+    /// card whose entry verifies.
+    #[test]
+    fn entry_card_shows_unverified_badge_only_when_unverified() {
+        let entry = assertion("claim");
+        let channel = entry.channel;
+
+        let mut flagged = view_with(vec![entry.clone()]);
+        flagged.unverified.insert(entry.id);
+        let html = entry_card(&entry, &flagged, &channel);
+        assert!(
+            html.contains("badge unverified"),
+            "unverified entry renders the badge: {html}"
+        );
+
+        let clean = view_with(vec![entry.clone()]);
+        let html = entry_card(&entry, &clean, &channel);
+        assert!(
+            !html.contains("badge unverified"),
+            "verified entry renders no badge"
+        );
     }
 
     fn assertion(statement: &str) -> LedgerEntry {
