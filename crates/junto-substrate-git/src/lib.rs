@@ -1,4 +1,4 @@
-//! Git-refs [`SubstrateProvider`] — junto's durable record in a local git repo.
+﻿//! Git-refs [`SubstrateProvider`] — junto's durable record in a local git repo.
 //!
 //! Stores a Channel's ledger in dedicated refs under **`refs/junto/*`**,
 //! **partitioned by author** so concurrent writers never contend on the same
@@ -627,6 +627,7 @@ mod tests {
 
     fn assertion(author: &Member, ts: i64, statement: &str) -> LedgerEntry {
         LedgerEntry {
+            signature: None,
             id: junto_kernel::EntryId::new(),
             channel: junto_kernel::ChannelId::new(),
             author: author.clone(),
@@ -823,6 +824,7 @@ mod tests {
         // beyond our single framing \n.
         let ada = Member::human("Ada", "ada@example.com");
         let entry = LedgerEntry {
+            signature: None,
             id: junto_kernel::EntryId::new(),
             channel: junto_kernel::ChannelId::new(),
             author: ada,
@@ -990,6 +992,7 @@ mod tests {
         let bob = Member::human("Bob", "bob@example.com");
         let claim = assertion(&ada, 100, "the claim");
         let mut ratify = LedgerEntry {
+            signature: None,
             id: junto_kernel::EntryId::new(),
             channel: claim.channel,
             author: bob.clone(),

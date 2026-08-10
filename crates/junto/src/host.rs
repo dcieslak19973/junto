@@ -1,4 +1,4 @@
-//! The singleton host (`docs/adr/0015`): one process per machine/user serving
+﻿//! The singleton host (`docs/adr/0015`): one process per machine/user serving
 //! every **registered home substrate**.
 //!
 //! The machine-local registry (`<junto-home>/substrates.toml`) only says which
@@ -487,6 +487,7 @@ impl Host {
         let id = declared_id.unwrap_or_default();
         guard
             .append(LedgerEntry {
+                signature: None,
                 id: EntryId::new(),
                 channel: id,
                 author: opened_by.clone(),
@@ -550,6 +551,7 @@ impl Host {
 
         guard
             .append(LedgerEntry {
+                signature: None,
                 id: EntryId::new(),
                 channel: id,
                 author: granted_by.clone(),
@@ -596,6 +598,7 @@ impl Host {
         let mut guard = parent_ledger.lock().await;
         guard
             .append(LedgerEntry {
+                signature: None,
                 id: EntryId::new(),
                 channel: child.id,
                 author: diverger.clone(),
@@ -608,6 +611,7 @@ impl Host {
             .await?;
         guard
             .append(LedgerEntry {
+                signature: None,
                 id: EntryId::new(),
                 channel: parent_id,
                 author: diverger,
@@ -678,6 +682,7 @@ impl Host {
             let mut guard = src_ledger.lock().await;
             guard
                 .append(LedgerEntry {
+                    signature: None,
                     id: EntryId::new(),
                     channel: src_id,
                     author: converger.clone(),
@@ -687,6 +692,7 @@ impl Host {
                 .await?;
             guard
                 .append(LedgerEntry {
+                    signature: None,
                     id: EntryId::new(),
                     channel: src_id,
                     author: converger.clone(),
@@ -701,6 +707,7 @@ impl Host {
         // failure — or when the target isn't hosted here — park it for the
         // eventually-consistent reconciliation pass (docs/adr/0028).
         let far = LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel: tgt_id,
             author: converger,
@@ -1381,6 +1388,7 @@ mod lineage_tests {
             .lock()
             .await
             .append(LedgerEntry {
+                signature: None,
                 id: EntryId::new(),
                 channel: src_id,
                 author: dan(),
@@ -1445,6 +1453,7 @@ mod lineage_tests {
                 .lock()
                 .await
                 .append(LedgerEntry {
+                    signature: None,
                     id: eid,
                     channel: id,
                     author: dan(),
@@ -1470,6 +1479,7 @@ mod lineage_tests {
             .lock()
             .await
             .append(LedgerEntry {
+                signature: None,
                 id: EntryId::new(),
                 channel: id,
                 author: dan(),
@@ -1509,6 +1519,7 @@ mod lineage_tests {
             .lock()
             .await
             .append(LedgerEntry {
+                signature: None,
                 id: decision,
                 channel: parent_id,
                 author: dan(),
@@ -1526,6 +1537,7 @@ mod lineage_tests {
             .lock()
             .await
             .append(LedgerEntry {
+                signature: None,
                 id: EntryId::new(),
                 channel: parent_id,
                 author: dan(),
@@ -1567,6 +1579,7 @@ mod lineage_tests {
 
         // Park a far-side edge as if a source had converged into tgt.
         let far = LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel: tgt_id,
             author: dan(),
@@ -1603,6 +1616,7 @@ mod lineage_tests {
         let old = Timestamp::from_millis(Timestamp::now().as_millis() - thirty_one_days);
         // Target not hosted here, so it could never land regardless.
         let far = LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel: ChannelId::new(),
             author: dan(),

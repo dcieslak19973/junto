@@ -1,4 +1,4 @@
-//! The MCP write surface — how agents author ledger entries.
+﻿//! The MCP write surface — how agents author ledger entries.
 //!
 //! `junto serve` exposes the kernel's ledger + gate operations as MCP tools
 //! over **streamable HTTP** (`docs/adr/0012`), so any MCP-capable agent
@@ -538,6 +538,7 @@ impl JuntoMcp {
     /// Build the envelope for a fresh entry authored now.
     fn entry(channel: ChannelId, author: Member, payload: EntryPayload) -> LedgerEntry {
         LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel,
             author,

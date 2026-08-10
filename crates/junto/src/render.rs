@@ -1,4 +1,4 @@
-//! Rendering a channel projection for readers.
+﻿//! Rendering a channel projection for readers.
 //!
 //! Two audiences, one source of truth (the [`ChannelView`] projection):
 //! - [`brief_markdown`] — the **agent** read path: the MCP `view_channel`
@@ -3785,6 +3785,7 @@ mod tests {
             entries,
             party: Vec::new(),
             unrecognized: std::collections::HashSet::new(),
+            unverified: Default::default(),
             standings,
             gate_status,
             gate_executions: HashMap::new(),
@@ -3796,6 +3797,7 @@ mod tests {
 
     fn assertion(statement: &str) -> LedgerEntry {
         LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel: ChannelId::new(),
             author: Member::human("Ada", "ada@example.com"),
@@ -3812,6 +3814,7 @@ mod tests {
     /// A verification act entry by Dan, for fold-into-target tests.
     fn act(payload: EntryPayload) -> LedgerEntry {
         LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel: ChannelId::new(),
             author: Member::human("Dan", "dan@example.com"),
@@ -3861,6 +3864,7 @@ mod tests {
     fn channel_page_shows_sessions_with_their_artifacts() {
         let agent = Member::agent("Coder", "coder@junto.local");
         let session = LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel: ChannelId::new(),
             author: agent.clone(),
@@ -3870,6 +3874,7 @@ mod tests {
             },
         };
         let artifact = LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel: ChannelId::new(),
             author: agent,
@@ -4128,6 +4133,7 @@ mod tests {
         // what each entry *is*.
         let decision = assertion("a claim to weigh");
         let work = LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel: ChannelId::new(),
             author: Member::agent("Coder", "coder@junto.local"),
@@ -4163,6 +4169,7 @@ mod tests {
         let parked = assertion("Cold fusion works");
         let superseded = assertion("old text of the claim");
         let correction = LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel: ChannelId::new(),
             author: Member::human("Ada", "ada@example.com"),
@@ -4174,6 +4181,7 @@ mod tests {
             },
         };
         let proposal = LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel: ChannelId::new(),
             author: Member::human("Ada", "ada@example.com"),
@@ -4215,6 +4223,7 @@ mod tests {
             entries,
             party: Vec::new(),
             unrecognized: Default::default(),
+            unverified: Default::default(),
             standings,
             gate_status,
             gate_executions: Default::default(),
@@ -4252,6 +4261,7 @@ mod tests {
             entries,
             party: Vec::new(),
             unrecognized: Default::default(),
+            unverified: Default::default(),
             standings,
             gate_status: Default::default(),
             gate_executions: Default::default(),
@@ -4319,6 +4329,7 @@ mod tests {
     fn html_shows_rationale_and_provenance() {
         // The record's *why* is content, not metadata — the page must carry it.
         let entry = LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel: ChannelId::new(),
             author: Member::agent("Bot", "bot@example.com"),
@@ -4379,6 +4390,7 @@ mod tests {
         // docs/adr/0019: a decision frame becomes one-click acts with the
         // drafted rationale editable in place; the free-text form remains.
         let entry = LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel: ChannelId::new(),
             author: Member::agent("Bot", "bot@example.com"),
