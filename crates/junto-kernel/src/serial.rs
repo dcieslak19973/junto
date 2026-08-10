@@ -1,4 +1,4 @@
-//! The canonical byte form of a [`LedgerEntry`] — junto's durable record format.
+﻿//! The canonical byte form of a [`LedgerEntry`] — junto's durable record format.
 //!
 //! Entries are stored under git refs (`refs/junto/*`, hard constraint #3) and
 //! will eventually be content-addressed, so their byte form must be
@@ -56,6 +56,7 @@ mod tests {
     /// round-trip tests don't depend on.
     fn entry(payload: EntryPayload) -> LedgerEntry {
         LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel: ChannelId::new(),
             author: Member::human("Ada Lovelace", "ada@example.com"),

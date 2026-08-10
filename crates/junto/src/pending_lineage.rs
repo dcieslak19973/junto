@@ -1,4 +1,4 @@
-//! The machine-local **pending-lineage queue** (`docs/adr/0028`).
+﻿//! The machine-local **pending-lineage queue** (`docs/adr/0028`).
 //!
 //! A lineage edge (`docs/adr/0027`) is two entries, one in each endpoint's
 //! ledger. The *near* side always writes; the *far* side is attempted and, on
@@ -82,6 +82,7 @@ mod tests {
 
     fn far_entry(channel: ChannelId) -> LedgerEntry {
         LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel,
             author: Member::human("Dan", "dan@example.com"),

@@ -2793,6 +2793,17 @@ fn entry_card(entry: &LedgerEntry, view: &ChannelView, channel: &ChannelId) -> S
     } else {
         ""
     };
+    // Authorship verification (`docs/adr/0033`) — a surfaced fact, visible on
+    // the card so unsigned or non-verifying entries are noticed on day one,
+    // not accumulated silently. Redundant on an unrecognized card (that badge
+    // already signals distrust louder).
+    let unverified_badge = if !unrecognized && view.unverified.contains(&entry.id) {
+        "<span class=\"badge unverified\" title=\"signature is missing or does not verify \
+         against the author's recorded key; the entry still projects (docs/adr/0033)\">\
+         unverified</span>"
+    } else {
+        ""
+    };
     let statement = statement
         .map(|text| format!("<div class=\"statement\">{}</div>", escape_html(&text)))
         .unwrap_or_default();
@@ -2815,7 +2826,7 @@ fn entry_card(entry: &LedgerEntry, view: &ChannelView, channel: &ChannelId) -> S
 
     format!(
         "<article class=\"card {family}{flag}\">\
-         <header><span class=\"kind\">{kind}</span>{badge}{unrecognized_badge}\
+         <header><span class=\"kind\">{kind}</span>{badge}{unrecognized_badge}{unverified_badge}\
          <span class=\"spacer\"></span>\
          <span class=\"who\" title=\"{email}\">{who}</span>\
          <span class=\"when\">{when}</span></header>\
@@ -3411,6 +3422,8 @@ border-color:rgba(166,227,161,.3)}\
 border-color:rgba(147,153,178,.3)}\
 .rejected,.unrecognized,.error,.blocked{color:var(--red);background:rgba(243,139,168,.12);\
 border-color:rgba(243,139,168,.3)}\
+.unverified{color:var(--yellow);background:rgba(249,226,175,.12);\
+border-color:rgba(249,226,175,.3)}\
 .working{color:var(--accent);background:rgba(137,180,250,.12);\
 border-color:rgba(137,180,250,.3)}\
 .who{color:var(--soft);font-size:.82rem}\
@@ -3785,6 +3798,7 @@ mod tests {
             entries,
             party: Vec::new(),
             unrecognized: std::collections::HashSet::new(),
+            unverified: Default::default(),
             standings,
             gate_status,
             gate_executions: HashMap::new(),
@@ -3794,8 +3808,33 @@ mod tests {
         }
     }
 
+    /// `docs/adr/0033` — the unverified badge is *visible* on the rendered
+    /// card (a projection fact nobody sees is theater), and absent from a
+    /// card whose entry verifies.
+    #[test]
+    fn entry_card_shows_unverified_badge_only_when_unverified() {
+        let entry = assertion("claim");
+        let channel = entry.channel;
+
+        let mut flagged = view_with(vec![entry.clone()]);
+        flagged.unverified.insert(entry.id);
+        let html = entry_card(&entry, &flagged, &channel);
+        assert!(
+            html.contains("badge unverified"),
+            "unverified entry renders the badge: {html}"
+        );
+
+        let clean = view_with(vec![entry.clone()]);
+        let html = entry_card(&entry, &clean, &channel);
+        assert!(
+            !html.contains("badge unverified"),
+            "verified entry renders no badge"
+        );
+    }
+
     fn assertion(statement: &str) -> LedgerEntry {
         LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel: ChannelId::new(),
             author: Member::human("Ada", "ada@example.com"),
@@ -3812,6 +3851,7 @@ mod tests {
     /// A verification act entry by Dan, for fold-into-target tests.
     fn act(payload: EntryPayload) -> LedgerEntry {
         LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel: ChannelId::new(),
             author: Member::human("Dan", "dan@example.com"),
@@ -3861,6 +3901,7 @@ mod tests {
     fn channel_page_shows_sessions_with_their_artifacts() {
         let agent = Member::agent("Coder", "coder@junto.local");
         let session = LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel: ChannelId::new(),
             author: agent.clone(),
@@ -3870,6 +3911,7 @@ mod tests {
             },
         };
         let artifact = LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel: ChannelId::new(),
             author: agent,
@@ -4128,6 +4170,7 @@ mod tests {
         // what each entry *is*.
         let decision = assertion("a claim to weigh");
         let work = LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel: ChannelId::new(),
             author: Member::agent("Coder", "coder@junto.local"),
@@ -4163,6 +4206,7 @@ mod tests {
         let parked = assertion("Cold fusion works");
         let superseded = assertion("old text of the claim");
         let correction = LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel: ChannelId::new(),
             author: Member::human("Ada", "ada@example.com"),
@@ -4174,6 +4218,7 @@ mod tests {
             },
         };
         let proposal = LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel: ChannelId::new(),
             author: Member::human("Ada", "ada@example.com"),
@@ -4215,6 +4260,7 @@ mod tests {
             entries,
             party: Vec::new(),
             unrecognized: Default::default(),
+            unverified: Default::default(),
             standings,
             gate_status,
             gate_executions: Default::default(),
@@ -4252,6 +4298,7 @@ mod tests {
             entries,
             party: Vec::new(),
             unrecognized: Default::default(),
+            unverified: Default::default(),
             standings,
             gate_status: Default::default(),
             gate_executions: Default::default(),
@@ -4319,6 +4366,7 @@ mod tests {
     fn html_shows_rationale_and_provenance() {
         // The record's *why* is content, not metadata — the page must carry it.
         let entry = LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel: ChannelId::new(),
             author: Member::agent("Bot", "bot@example.com"),
@@ -4379,6 +4427,7 @@ mod tests {
         // docs/adr/0019: a decision frame becomes one-click acts with the
         // drafted rationale editable in place; the free-text form remains.
         let entry = LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel: ChannelId::new(),
             author: Member::agent("Bot", "bot@example.com"),

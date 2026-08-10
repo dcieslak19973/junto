@@ -1,4 +1,4 @@
-//! Launching Agent Sessions from the surface (`docs/adr/0023`).
+﻿//! Launching Agent Sessions from the surface (`docs/adr/0023`).
 //!
 //! The **Workspace** is the machine-local mapping channel → repo(s) — where a
 //! channel's Agent Sessions execute (`~/.junto/workspaces.toml`). Paths never
@@ -1431,6 +1431,7 @@ pub async fn launch(
         &host,
         &channel_ref,
         LedgerEntry {
+            signature: None,
             id: session,
             channel,
             author: agent.member(),
@@ -1510,6 +1511,7 @@ async fn record_steer_note(
         host,
         channel_ref,
         LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel,
             author: steered_by,
@@ -1653,6 +1655,7 @@ async fn record_outcome(
         host,
         channel_ref,
         LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel,
             author: agent.member(),
@@ -1679,6 +1682,7 @@ async fn record_outcome(
             host,
             channel_ref,
             LedgerEntry {
+                signature: None,
                 id: EntryId::new(),
                 channel,
                 author: agent.member(),
@@ -1702,6 +1706,7 @@ async fn record_outcome(
         host,
         channel_ref,
         LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel,
             author: agent.member(),
@@ -1744,6 +1749,7 @@ pub async fn launch_outcome(
         &host,
         &channel_ref,
         LedgerEntry {
+            signature: None,
             id: session,
             channel,
             author: agent.member(),
@@ -2009,6 +2015,7 @@ async fn capture_turn(
         host,
         channel_ref,
         LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel,
             author: agent.member(),
@@ -2033,6 +2040,7 @@ async fn capture_turn(
             host,
             channel_ref,
             LedgerEntry {
+                signature: None,
                 id: EntryId::new(),
                 channel,
                 author: agent.member(),
@@ -2051,6 +2059,7 @@ async fn capture_turn(
         host,
         channel_ref,
         LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel,
             author: agent.member(),
@@ -2085,6 +2094,7 @@ async fn store_grader_report(
         host,
         channel_ref,
         LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel,
             author: agent.member(),
@@ -2141,6 +2151,7 @@ async fn finish_outcome(
                         host,
                         channel_ref,
                         LedgerEntry {
+                            signature: None,
                             id: EntryId::new(),
                             channel,
                             author: agent.member(),
@@ -2172,6 +2183,7 @@ async fn finish_outcome(
                 host,
                 channel_ref,
                 LedgerEntry {
+                    signature: None,
                     id: EntryId::new(),
                     channel,
                     author: agent.member(),
@@ -2199,6 +2211,7 @@ async fn finish_outcome(
                 host,
                 channel_ref,
                 LedgerEntry {
+                    signature: None,
                     id: EntryId::new(),
                     channel,
                     author: agent.member(),
@@ -2233,6 +2246,7 @@ async fn finish_outcome(
                 host,
                 channel_ref,
                 LedgerEntry {
+                    signature: None,
                     id: EntryId::new(),
                     channel,
                     author: agent.member(),
@@ -2255,6 +2269,7 @@ async fn finish_outcome(
                 host,
                 channel_ref,
                 LedgerEntry {
+                    signature: None,
                     id: EntryId::new(),
                     channel,
                     author: agent.member(),
@@ -2374,6 +2389,7 @@ async fn try_execute_pr_gate(host: &Host, channel: ChannelId, proposal: EntryId)
                 host,
                 &channel_ref,
                 LedgerEntry {
+                    signature: None,
                     id: EntryId::new(),
                     channel,
                     author: author.clone(),
@@ -2392,6 +2408,7 @@ async fn try_execute_pr_gate(host: &Host, channel: ChannelId, proposal: EntryId)
                 host,
                 &channel_ref,
                 LedgerEntry {
+                    signature: None,
                     id: EntryId::new(),
                     channel,
                     author,
@@ -2416,6 +2433,7 @@ async fn try_execute_pr_gate(host: &Host, channel: ChannelId, proposal: EntryId)
         host,
         &channel_ref,
         LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel,
             author: author.clone(),
@@ -2433,6 +2451,7 @@ async fn try_execute_pr_gate(host: &Host, channel: ChannelId, proposal: EntryId)
         host,
         &channel_ref,
         LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel,
             author: author.clone(),
@@ -2450,6 +2469,7 @@ async fn try_execute_pr_gate(host: &Host, channel: ChannelId, proposal: EntryId)
         host,
         &channel_ref,
         LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel,
             author,
@@ -2498,6 +2518,7 @@ async fn store_outcome_signal(
         host,
         channel_ref,
         LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel,
             author: agent.member(),
@@ -2516,8 +2537,11 @@ async fn store_outcome_signal(
     .await
 }
 
-/// Append one entry to the channel's ledger via the host.
-async fn append(host: &Host, channel_ref: &str, entry: LedgerEntry) -> Result<()> {
+/// Append one entry to the channel's ledger via the host — signed with its
+/// author's machine-local key first (`docs/adr/0033`), so session records and
+/// artifacts carry the agent's own signature, never the operator's.
+async fn append(host: &Host, channel_ref: &str, mut entry: LedgerEntry) -> Result<()> {
+    host.sign_entry(&mut entry);
     match host.resolve(channel_ref).await? {
         crate::host::Resolution::Resolved { ledger, .. } => {
             ledger.lock().await.append(entry).await?;
@@ -2590,6 +2614,7 @@ mod tests {
             .lock()
             .await
             .append(LedgerEntry {
+                signature: None,
                 id: proposal,
                 channel,
                 author: dan.clone(),
@@ -2609,6 +2634,7 @@ mod tests {
             .lock()
             .await
             .append(LedgerEntry {
+                signature: None,
                 id: EntryId::new(),
                 channel,
                 author: dan.clone(),

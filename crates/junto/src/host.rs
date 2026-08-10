@@ -1,4 +1,4 @@
-//! The singleton host (`docs/adr/0015`): one process per machine/user serving
+﻿//! The singleton host (`docs/adr/0015`): one process per machine/user serving
 //! every **registered home substrate**.
 //!
 //! The machine-local registry (`<junto-home>/substrates.toml`) only says which
@@ -340,6 +340,38 @@ impl Host {
             .clone())
     }
 
+    /// Attach `member`'s machine-local public key (`docs/adr/0033`), minting
+    /// the keypair on first use. Used on the **membership-granting** entries
+    /// (genesis, `MemberAdded`) — the party projection reads these as the
+    /// channel keyring. Best-effort: a key-store failure leaves the member
+    /// keyless (their entries surface as unverified) rather than blocking.
+    fn keyed(&self, member: Member) -> Member {
+        let key = self
+            .member_home()
+            .and_then(|home| crate::keys::signing_key(&home, &member.email));
+        match key {
+            Ok(key) => member.with_key(key.public_key()),
+            Err(err) => {
+                tracing::warn!("minting a signing key for {}: {err:#}", member.email);
+                member
+            }
+        }
+    }
+
+    /// Sign `entry` with its author's machine-local key (`docs/adr/0033`),
+    /// minting the keypair on first use. Best-effort by design: verification
+    /// is a surfaced projection fact, never a gate — so a signing failure
+    /// logs and leaves the entry unsigned instead of refusing the write.
+    pub fn sign_entry(&self, entry: &mut LedgerEntry) {
+        let signed = self
+            .member_home()
+            .and_then(|home| crate::keys::signing_key(&home, &entry.author.email))
+            .and_then(|key| entry.sign(&key).map_err(anyhow::Error::from));
+        if let Err(err) = signed {
+            tracing::warn!("signing an entry as {}: {err:#}", entry.author.email);
+        }
+    }
+
     /// One projection sweep serving everything the index page needs: channel
     /// summaries *and* the focus board's attention groups (`docs/attention.md`:
     /// every act awaiting a member, grouped by inquiry — gate-bearing inquiries
@@ -485,17 +517,22 @@ impl Host {
         }
 
         let id = declared_id.unwrap_or_default();
-        guard
-            .append(LedgerEntry {
-                id: EntryId::new(),
-                channel: id,
-                author: opened_by.clone(),
-                timestamp: Timestamp::now(),
-                payload: EntryPayload::ChannelOpened {
-                    name: name.to_string(),
-                },
-            })
-            .await?;
+        // The genesis carries the founder's public key — the first link in the
+        // channel keyring (`docs/adr/0033`) — and is signed like every entry
+        // written through this host.
+        let opened_by = self.keyed(opened_by);
+        let mut genesis = LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel: id,
+            author: opened_by.clone(),
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::ChannelOpened {
+                name: name.to_string(),
+            },
+        };
+        self.sign_entry(&mut genesis);
+        guard.append(genesis).await?;
         // The opener is the founding member; mint their code so the founder
         // can write through the code-checked surfaces (`docs/adr/0017`).
         let founder_code = crate::members::mint(&self.member_home()?, &opened_by)?;
@@ -548,17 +585,22 @@ impl Host {
             return crate::members::mint(&self.member_home()?, &member);
         }
 
-        guard
-            .append(LedgerEntry {
-                id: EntryId::new(),
-                channel: id,
-                author: granted_by.clone(),
-                timestamp: Timestamp::now(),
-                payload: EntryPayload::MemberAdded {
-                    member: member.clone(),
-                },
-            })
-            .await?;
+        // The grant carries the new member's public key — how the keyring
+        // grows (`docs/adr/0033`). An agent's key is its own, minted like its
+        // member code — never its operator's.
+        let member = self.keyed(member);
+        let mut grant = LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel: id,
+            author: granted_by.clone(),
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::MemberAdded {
+                member: member.clone(),
+            },
+        };
+        self.sign_entry(&mut grant);
+        guard.append(grant).await?;
         crate::members::mint(&self.member_home()?, &member)
     }
 
@@ -594,27 +636,29 @@ impl Host {
 
         // The child and parent share a substrate (one ledger Arc holds both).
         let mut guard = parent_ledger.lock().await;
-        guard
-            .append(LedgerEntry {
-                id: EntryId::new(),
-                channel: child.id,
-                author: diverger.clone(),
-                timestamp: Timestamp::now(),
-                payload: EntryPayload::DivergedFrom {
-                    parent: parent_id,
-                    at,
-                },
-            })
-            .await?;
-        guard
-            .append(LedgerEntry {
-                id: EntryId::new(),
-                channel: parent_id,
-                author: diverger,
-                timestamp: Timestamp::now(),
-                payload: EntryPayload::ChildDiverged { child: child.id },
-            })
-            .await?;
+        let mut child_side = LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel: child.id,
+            author: diverger.clone(),
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::DivergedFrom {
+                parent: parent_id,
+                at,
+            },
+        };
+        self.sign_entry(&mut child_side);
+        guard.append(child_side).await?;
+        let mut parent_side = LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel: parent_id,
+            author: diverger,
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::ChildDiverged { child: child.id },
+        };
+        self.sign_entry(&mut parent_side);
+        guard.append(parent_side).await?;
         Ok(child)
     }
 
@@ -676,37 +720,43 @@ impl Host {
         // Source side: converged-into, then closed (convergence closes it).
         {
             let mut guard = src_ledger.lock().await;
-            guard
-                .append(LedgerEntry {
-                    id: EntryId::new(),
-                    channel: src_id,
-                    author: converger.clone(),
-                    timestamp: Timestamp::now(),
-                    payload: EntryPayload::ConvergedInto { target: tgt_id },
-                })
-                .await?;
-            guard
-                .append(LedgerEntry {
-                    id: EntryId::new(),
-                    channel: src_id,
-                    author: converger.clone(),
-                    timestamp: Timestamp::now(),
-                    payload: EntryPayload::ChannelClosed {
-                        rationale: rationale.to_string(),
-                    },
-                })
-                .await?;
+            let mut converged = LedgerEntry {
+                signature: None,
+                id: EntryId::new(),
+                channel: src_id,
+                author: converger.clone(),
+                timestamp: Timestamp::now(),
+                payload: EntryPayload::ConvergedInto { target: tgt_id },
+            };
+            self.sign_entry(&mut converged);
+            guard.append(converged).await?;
+            let mut closed = LedgerEntry {
+                signature: None,
+                id: EntryId::new(),
+                channel: src_id,
+                author: converger.clone(),
+                timestamp: Timestamp::now(),
+                payload: EntryPayload::ChannelClosed {
+                    rationale: rationale.to_string(),
+                },
+            };
+            self.sign_entry(&mut closed);
+            guard.append(closed).await?;
         }
         // Target side: convergence received. Try to write it now; on any
         // failure — or when the target isn't hosted here — park it for the
-        // eventually-consistent reconciliation pass (docs/adr/0028).
-        let far = LedgerEntry {
+        // eventually-consistent reconciliation pass (docs/adr/0028). Signed
+        // **before** enqueueing: the queue's retry contract is fixed bytes
+        // (docs/adr/0028), and the signature is part of the bytes.
+        let mut far = LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel: tgt_id,
             author: converger,
             timestamp: Timestamp::now(),
             payload: EntryPayload::ConvergenceReceived { source: src_id },
         };
+        self.sign_entry(&mut far);
         let landed = match &tgt_ledger {
             Some(ledger) => ledger.lock().await.append(far.clone()).await.is_ok(),
             None => false,
@@ -1255,6 +1305,47 @@ mod lineage_tests {
         (id, view)
     }
 
+    /// `docs/adr/0033` end to end through the host: opening a channel keys
+    /// and signs the genesis; adding an agent member keys the grant with the
+    /// **agent's own** key (never the operator's); every entry written through
+    /// the host verifies, so `unverified` is empty.
+    #[tokio::test]
+    async fn host_writes_are_signed_and_verify() {
+        let (dirs, host) = lineage_host(1);
+        host.open_channel(None, "signed", dan(), None)
+            .await
+            .unwrap();
+        let agent = Member::agent("Worker", "worker@agents.junto");
+        host.add_member("signed", &dan(), agent.clone())
+            .await
+            .unwrap();
+
+        let (_, view) = project(&host, "signed").await;
+        // The roster carries the keys minted into the machine-local store.
+        let home = member_home(&dirs);
+        let dan_key = crate::keys::signing_key(home, "dan@example.com").unwrap();
+        let agent_key = crate::keys::signing_key(home, "worker@agents.junto").unwrap();
+        assert_ne!(
+            dan_key.public_key(),
+            agent_key.public_key(),
+            "an agent's key is its own, never its operator's (docs/adr/0033)"
+        );
+        assert_eq!(
+            view.party.first().and_then(|m| m.public_key.clone()),
+            Some(dan_key.public_key())
+        );
+        assert_eq!(
+            view.party.get(1).and_then(|m| m.public_key.clone()),
+            Some(agent_key.public_key())
+        );
+        // Everything written through the host is signed and verifies.
+        assert!(
+            view.unverified.is_empty(),
+            "host-written entries verify: {:?}",
+            view.unverified
+        );
+    }
+
     #[tokio::test]
     async fn diverge_opens_child_and_records_both_edges() {
         let (dirs, host) = lineage_host(1);
@@ -1381,6 +1472,7 @@ mod lineage_tests {
             .lock()
             .await
             .append(LedgerEntry {
+                signature: None,
                 id: EntryId::new(),
                 channel: src_id,
                 author: dan(),
@@ -1445,6 +1537,7 @@ mod lineage_tests {
                 .lock()
                 .await
                 .append(LedgerEntry {
+                    signature: None,
                     id: eid,
                     channel: id,
                     author: dan(),
@@ -1470,6 +1563,7 @@ mod lineage_tests {
             .lock()
             .await
             .append(LedgerEntry {
+                signature: None,
                 id: EntryId::new(),
                 channel: id,
                 author: dan(),
@@ -1509,6 +1603,7 @@ mod lineage_tests {
             .lock()
             .await
             .append(LedgerEntry {
+                signature: None,
                 id: decision,
                 channel: parent_id,
                 author: dan(),
@@ -1526,6 +1621,7 @@ mod lineage_tests {
             .lock()
             .await
             .append(LedgerEntry {
+                signature: None,
                 id: EntryId::new(),
                 channel: parent_id,
                 author: dan(),
@@ -1567,6 +1663,7 @@ mod lineage_tests {
 
         // Park a far-side edge as if a source had converged into tgt.
         let far = LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel: tgt_id,
             author: dan(),
@@ -1603,6 +1700,7 @@ mod lineage_tests {
         let old = Timestamp::from_millis(Timestamp::now().as_millis() - thirty_one_days);
         // Target not hosted here, so it could never land regardless.
         let far = LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel: ChannelId::new(),
             author: dan(),

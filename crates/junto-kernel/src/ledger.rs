@@ -118,6 +118,14 @@ pub struct ChannelView {
     /// (`docs/adr/0017`: visibility beats mystery). Always empty when `party`
     /// is empty.
     pub unrecognized: HashSet<EntryId>,
+    /// Recognized entries whose signature is absent, malformed, or does not
+    /// verify against the author's projected public key (`docs/adr/0033`).
+    /// A surfaced **fact**, never a drop and never a gate: standings, gates
+    /// and sessions fold identically — authorship verification is independent
+    /// of authority (`docs/adr/0004`). Entries by a keyless member land here
+    /// too (nothing to verify against), so legacy unsigned history reads as
+    /// unverified rather than silently trusted.
+    pub unverified: HashSet<EntryId>,
     /// Current standing per assertion [`EntryId`].
     pub standings: HashMap<EntryId, Standing>,
     /// Current gate status per proposal [`EntryId`].
@@ -297,6 +305,7 @@ impl<S: SubstrateProvider> Ledger<S> {
             .iter()
             .filter(|entry| !unrecognized.contains(&entry.id))
             .collect();
+        let unverified = Self::project_unverified(&party, &recognized);
 
         let standings = Self::project_standings(&recognized);
         let gate_status = Self::project_gates(&recognized);
@@ -338,6 +347,7 @@ impl<S: SubstrateProvider> Ledger<S> {
             entries,
             party,
             unrecognized,
+            unverified,
             standings,
             gate_status,
             gate_executions,
@@ -376,6 +386,37 @@ impl<S: SubstrateProvider> Ledger<S> {
             }
         }
         party
+    }
+
+    /// Which recognized entries fail authorship verification
+    /// (`docs/adr/0033`): the keyring is the Party's projected public keys
+    /// (the membership-granting entries carry them), and an entry is
+    /// **unverified** when its author has no key on the roster or its
+    /// signature does not verify against that key. With an empty Party
+    /// (no genesis) there is no keyring and nothing is marked — consistent
+    /// with membership not being enforced there either.
+    fn project_unverified(party: &[Member], recognized: &[&LedgerEntry]) -> HashSet<EntryId> {
+        if party.is_empty() {
+            return HashSet::new();
+        }
+        let keyring: HashMap<&str, &crate::PublicKey> = party
+            .iter()
+            .filter_map(|member| {
+                member
+                    .public_key
+                    .as_ref()
+                    .map(|key| (member.email.as_str(), key))
+            })
+            .collect();
+        recognized
+            .iter()
+            .filter(|entry| {
+                keyring
+                    .get(entry.author.email.as_str())
+                    .is_none_or(|key| !entry.verifies_with(key))
+            })
+            .map(|entry| entry.id)
+            .collect()
     }
 
     /// Fold this channel's **lineage edges** out of an ordered list of
@@ -589,6 +630,7 @@ mod tests {
         payload: EntryPayload,
     ) -> LedgerEntry {
         LedgerEntry {
+            signature: None,
             id,
             channel,
             author,
@@ -604,6 +646,140 @@ mod tests {
             provenance: Vec::new(),
             frame: None,
         }
+    }
+
+    /// `docs/adr/0033` — verification is a projection fact. A channel whose
+    /// keyed founder signs projects `verified`; a tampered or unsigned entry
+    /// lands in `unverified` but still folds (never a drop, never a gate).
+    #[tokio::test]
+    async fn unverified_is_a_surfaced_fact_not_a_drop() {
+        let key = crate::SigningKey::from_secret_bytes([9; 32]);
+        let dan = Member::human("Dan", "dan@example.com").with_key(key.public_key());
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+
+        // Signed genesis by the keyed founder.
+        let mut genesis = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            1,
+            EntryPayload::ChannelOpened { name: "ch".into() },
+        );
+        genesis.sign(&key).unwrap();
+
+        // A signed assertion verifies; a tampered one and an unsigned one do not.
+        let signed_id = EntryId::new();
+        let mut signed = entry(signed_id, channel, dan.clone(), 2, assertion("signed"));
+        signed.sign(&key).unwrap();
+
+        let tampered_id = EntryId::new();
+        let mut tampered = entry(tampered_id, channel, dan.clone(), 3, assertion("original"));
+        tampered.sign(&key).unwrap();
+        if let EntryPayload::Assertion { statement, .. } = &mut tampered.payload {
+            *statement = "forged".into();
+        }
+
+        let unsigned_id = EntryId::new();
+        let unsigned = entry(unsigned_id, channel, dan.clone(), 4, assertion("unsigned"));
+
+        for e in [genesis.clone(), signed, tampered, unsigned] {
+            ledger.append(e).await.unwrap();
+        }
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert!(!view.unverified.contains(&genesis.id));
+        assert!(!view.unverified.contains(&signed_id));
+        assert!(view.unverified.contains(&tampered_id));
+        assert!(view.unverified.contains(&unsigned_id));
+        // Never a drop: all three assertions still fold into standings.
+        for id in [signed_id, tampered_id, unsigned_id] {
+            assert_eq!(view.standing(&id), Some(Standing::Provisional));
+        }
+    }
+
+    /// `docs/adr/0033` — a keyless member's entries are unverified (nothing to
+    /// verify against), and an empty Party marks nothing, consistent with
+    /// membership not being enforced without a genesis.
+    #[tokio::test]
+    async fn keyless_member_is_unverified_and_no_party_marks_nothing() {
+        let dan = Member::human("Dan", "dan@example.com"); // no key
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+
+        // No genesis: nothing is marked.
+        let floating = EntryId::new();
+        ledger
+            .append(entry(floating, channel, dan.clone(), 1, assertion("pre")))
+            .await
+            .unwrap();
+        let view = ledger.project(&channel).await.unwrap();
+        assert!(view.unverified.is_empty());
+
+        // With a genesis by the keyless founder, entries are unverified.
+        let genesis = EntryId::new();
+        ledger
+            .append(entry(
+                genesis,
+                channel,
+                dan.clone(),
+                0,
+                EntryPayload::ChannelOpened { name: "ch".into() },
+            ))
+            .await
+            .unwrap();
+        let view = ledger.project(&channel).await.unwrap();
+        assert!(view.unverified.contains(&genesis));
+        assert!(view.unverified.contains(&floating));
+    }
+
+    /// `docs/adr/0033` — the keyring comes from the membership-granting
+    /// entries: a member added with a key verifies with it; signing with a
+    /// *different* member's key does not verify.
+    #[tokio::test]
+    async fn keyring_is_per_member_from_member_added() {
+        let founder_key = crate::SigningKey::from_secret_bytes([1; 32]);
+        let agent_key = crate::SigningKey::from_secret_bytes([2; 32]);
+        let dan = Member::human("Dan", "dan@example.com").with_key(founder_key.public_key());
+        let agent = Member::agent("Worker", "worker@agents.junto").with_key(agent_key.public_key());
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+
+        let mut genesis = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            1,
+            EntryPayload::ChannelOpened { name: "ch".into() },
+        );
+        genesis.sign(&founder_key).unwrap();
+        let mut grant = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            2,
+            EntryPayload::MemberAdded {
+                member: agent.clone(),
+            },
+        );
+        grant.sign(&founder_key).unwrap();
+
+        // The agent signs with its own key — verifies. Signing with the
+        // operator's key would not: the keys are per member, not shared.
+        let own_id = EntryId::new();
+        let mut own = entry(own_id, channel, agent.clone(), 3, assertion("mine"));
+        own.sign(&agent_key).unwrap();
+
+        let crossed_id = EntryId::new();
+        let mut crossed = entry(crossed_id, channel, agent.clone(), 4, assertion("crossed"));
+        crossed.sign(&founder_key).unwrap();
+
+        for e in [genesis, grant, own, crossed] {
+            ledger.append(e).await.unwrap();
+        }
+        let view = ledger.project(&channel).await.unwrap();
+        assert!(!view.unverified.contains(&own_id));
+        assert!(view.unverified.contains(&crossed_id));
     }
 
     #[tokio::test]

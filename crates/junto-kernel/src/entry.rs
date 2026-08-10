@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     EntryId, Member, ProvenanceRef, Timestamp, gate::ApprovalRequirement, ids::ChannelId,
-    session::SessionState,
+    session::SessionState, sign::Signature,
 };
 
 /// One immutable record in a Channel's Ledger.
@@ -27,6 +27,12 @@ use crate::{
 /// [`payload`](LedgerEntry::payload) carries the kind-specific content.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LedgerEntry {
+    /// A detached Ed25519 signature over this entry's canonical bytes with
+    /// this field absent (`docs/adr/0033`). Optional — unsigned entries stay
+    /// valid and project (surfaced as `unverified`, never dropped); omitted
+    /// from the canonical bytes when absent so pre-0033 bytes are unchanged.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub signature: Option<Signature>,
     /// Stable, opaque identifier for this entry.
     pub id: EntryId,
     /// The Channel whose Ledger this entry belongs to.

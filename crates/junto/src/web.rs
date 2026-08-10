@@ -1,4 +1,4 @@
-//! The host's web routes — the first human surface.
+﻿//! The host's web routes — the first human surface.
 //!
 //! Three GET endpoints over the same projection (`docs/adr/0013`, `0015`):
 //! - `/` — the channel index: every channel across every registered home
@@ -1091,7 +1091,8 @@ async fn rename_channel(
         Ok(ledger) => ledger,
         Err(err) => return internal(format!("opening the ledger: {err}")),
     };
-    let entry = LedgerEntry {
+    let mut entry = LedgerEntry {
+        signature: None,
         id: EntryId::new(),
         channel: id,
         author,
@@ -1102,6 +1103,7 @@ async fn rename_channel(
             rationale,
         },
     };
+    host.sign_entry(&mut entry);
     if let Err(err) = ledger.lock().await.append(entry).await {
         return internal(format!("append failed: {err}"));
     }
@@ -1188,13 +1190,15 @@ async fn lifecycle_act(host: &Host, channel: &str, form: LifecycleForm, close: b
         Ok(ledger) => ledger,
         Err(err) => return internal(format!("opening the ledger: {err}")),
     };
-    let entry = LedgerEntry {
+    let mut entry = LedgerEntry {
+        signature: None,
         id: EntryId::new(),
         channel: id,
         author,
         timestamp: Timestamp::now(),
         payload,
     };
+    host.sign_entry(&mut entry);
     if let Err(err) = ledger.lock().await.append(entry).await {
         return internal(format!("append failed: {err}"));
     }
@@ -1468,13 +1472,15 @@ async fn verify(
         return (StatusCode::FORBIDDEN, format!("{err:#}")).into_response();
     }
 
-    let entry = LedgerEntry {
+    let mut entry = LedgerEntry {
+        signature: None,
         id: EntryId::new(),
         channel: id,
         author,
         timestamp: Timestamp::now(),
         payload,
     };
+    host.sign_entry(&mut entry);
     if let Err(err) = guard.append(entry).await {
         return internal(format!("append failed: {err}"));
     }
@@ -2212,6 +2218,7 @@ mod tests {
             .lock()
             .await
             .append(LedgerEntry {
+                signature: None,
                 id: target,
                 channel,
                 author: Member::agent("Bot", "bot@example.com"),
@@ -2821,6 +2828,7 @@ mod tests {
         // An ArtifactAttached entry (authored by a member so it projects)
         // whose provenance points at `uri`.
         let attach = |id: EntryId, uri: String| LedgerEntry {
+            signature: None,
             id,
             channel: fx.channel,
             author: Member::agent("Bot", "bot@example.com"),
@@ -3157,6 +3165,7 @@ mod tests {
             .lock()
             .await
             .append(LedgerEntry {
+                signature: None,
                 id: target,
                 channel: opened.id,
                 author: Member::human("Founder", "founder@example.com"),
@@ -3195,6 +3204,7 @@ mod tests {
         // provisional assertion (the web write surface's entry point).
         let channel = ChannelId::new();
         let entry = LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel,
             author: Member::agent("Bot", "bot@example.com"),
@@ -3209,6 +3219,7 @@ mod tests {
             entries: vec![entry.clone()],
             party: Vec::new(),
             unrecognized: Default::default(),
+            unverified: Default::default(),
             sessions: Default::default(),
             closed: false,
             lineage: Vec::new(),

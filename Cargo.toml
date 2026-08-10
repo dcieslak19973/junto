@@ -28,6 +28,9 @@ serde_json = "1.0.145"
 # JCS / RFC 8785 canonical JSON for the durable record (MIT; RFC-compliant
 # successor to the abandoned serde_jcs). See docs/adr/0008.
 serde_json_canonicalizer = "0.3.2"
+# entry signing (docs/adr/0033): Ed25519 — what git/SSH already sign with;
+# detached signatures over the JCS canonical bytes (BSD-3/MIT/Apache)
+ed25519-dalek = "2"
 # async runtime; `process` drives the git CLI in the git-refs substrate, `macros`+`rt`
 # drive the async SubstrateProvider in tests (the in-memory impl does no real I/O)
 tokio = { version = "1.52.3", features = ["macros", "rt", "process"] }

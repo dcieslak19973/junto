@@ -1,4 +1,4 @@
-//! The MCP write surface — how agents author ledger entries.
+﻿//! The MCP write surface — how agents author ledger entries.
 //!
 //! `junto serve` exposes the kernel's ledger + gate operations as MCP tools
 //! over **streamable HTTP** (`docs/adr/0012`), so any MCP-capable agent
@@ -500,13 +500,17 @@ impl JuntoMcp {
         }
     }
 
-    /// Append one entry and report its id.
+    /// Append one entry and report its id — signing it first with its
+    /// author's machine-local key (`docs/adr/0033`): on MCP the author is
+    /// *claimed*, so the signature is what makes the claim verifiable
+    /// downstream.
     async fn append(
         &self,
         channel: &str,
         ledger: SharedLedger,
-        entry: LedgerEntry,
+        mut entry: LedgerEntry,
     ) -> Result<CallToolResult, McpError> {
+        self.host.sign_entry(&mut entry);
         let id = entry.id;
         ledger.lock().await.append(entry).await.map_err(internal)?;
         Ok(text(format!("recorded {id} in channel '{channel}'")))
@@ -538,6 +542,7 @@ impl JuntoMcp {
     /// Build the envelope for a fresh entry authored now.
     fn entry(channel: ChannelId, author: Member, payload: EntryPayload) -> LedgerEntry {
         LedgerEntry {
+            signature: None,
             id: EntryId::new(),
             channel,
             author,
@@ -899,11 +904,12 @@ impl JuntoMcp {
         let (ledger, channel) = self.resolve(&req.channel).await?;
         self.authorize(&ledger, &channel, &author, req.code.as_deref())
             .await?;
-        let entry = Self::entry(
+        let mut entry = Self::entry(
             channel,
             author,
             EntryPayload::SessionStarted { intent: req.intent },
         );
+        self.host.sign_entry(&mut entry);
         let id = entry.id;
         ledger.lock().await.append(entry).await.map_err(internal)?;
         Ok(text(format!(
