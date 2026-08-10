@@ -942,6 +942,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn signed_entries_survive_sync_and_union_merge_verbatim() {
+        // `docs/adr/0033`: the signature rides *inside* the entry's canonical
+        // bytes, so sync — including the union-merge path, which rewrites the
+        // log file in canonical order — must carry it byte-for-byte. Verify a
+        // signed entry still verifies on the *other* machine after a real
+        // divergence reconciliation.
+        let (_hub_dir, hub) = init_bare_hub();
+        let (_a_dir, mut machine_a) = init_repo();
+        let (_b_dir, mut machine_b) = init_repo();
+        let key = junto_kernel::SigningKey::from_secret_bytes([5; 32]);
+        let ada = Member::human("Ada", "ada@example.com");
+        let mut on_a = assertion(&ada, 10, "signed offline on A");
+        on_a.sign(&key).unwrap();
+        let mut on_b = assertion(&ada, 20, "signed offline on B");
+        on_b.channel = on_a.channel;
+        on_b.sign(&key).unwrap();
+        let channel = on_a.channel;
+
+        machine_a.append(on_a.clone()).await.unwrap();
+        machine_b.append(on_b.clone()).await.unwrap();
+        machine_a.sync(&hub, &channel).await.unwrap();
+        machine_b.sync(&hub, &channel).await.unwrap(); // forces the union-merge
+        machine_a.sync(&hub, &channel).await.unwrap();
+
+        for substrate in [&machine_a, &machine_b] {
+            let mut got = substrate.entries(&channel).await.unwrap();
+            got.sort_by_key(|e| e.timestamp.as_millis());
+            // Byte-fidelity: the synced entries equal the originals, signature
+            // included, and still verify against the author's key.
+            assert_eq!(got, vec![on_a.clone(), on_b.clone()]);
+            for entry in &got {
+                assert!(
+                    entry.verifies_with(&key.public_key()),
+                    "signature must survive sync + union-merge verbatim"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn sync_is_idempotent_once_converged() {
         let (_hub_dir, hub) = init_bare_hub();
         let (a_dir, mut machine_a) = init_repo();
