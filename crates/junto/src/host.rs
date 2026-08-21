@@ -605,10 +605,28 @@ impl Host {
             );
         }
 
-        // Re-granting an existing member (the founder included) is a no-op on
-        // the roster — skip the entry, just make sure their code exists.
+        // Re-granting an existing member (the founder included) is a no-op
+        // on the **Party** — `project_party` is first-write-wins by email,
+        // so a second `MemberAdded` never changes the row; display name and
+        // kind stay whatever the first admission set. But it is not
+        // necessarily a no-op on the **keyring**: multi-device enrollment
+        // (`docs/adr/0033`) is expressed as a second `MemberAdded` for the
+        // same email carrying a device key that email has never been
+        // granted (the founder's own second device works the same way —
+        // they author a grant for their own email). Skip the append only
+        // when there is truly no new key to publish: none was supplied, or
+        // the exact key supplied is already on that email's keyring. This
+        // party/keyring divergence is deliberate, not a bug to "fix" back —
+        // it is the whole mechanism multi-device enrollment relies on.
         if view.party.iter().any(|m| m.email == member.email) {
-            return crate::members::mint(&self.member_home()?, &member);
+            let already_granted = key.as_ref().is_some_and(|supplied| {
+                view.keyring
+                    .get(&member.email)
+                    .is_some_and(|grants| grants.iter().any(|grant| &grant.key == supplied))
+            });
+            if key.is_none() || already_granted {
+                return crate::members::mint(&self.member_home()?, &member);
+            }
         }
 
         // Local minting authority (`docs/adr/0033`): when the caller has not
@@ -1516,6 +1534,213 @@ mod lineage_tests {
             grant.key,
             key_before.public_key(),
             "the recorded grant carries the pre-existing local key, not a fresh mint"
+        );
+    }
+
+    /// Multi-device enrollment's headline case (`docs/adr/0033`,
+    /// `docs/superpowers/specs/2026-08-21-device-key-enrollment-design.md`):
+    /// a second `add_member` for an email already on the roster, carrying a
+    /// key that email has never been granted, must still append — that is
+    /// how a second device's key reaches the channel and the keyring.
+    #[tokio::test]
+    async fn add_member_records_a_second_device_for_an_existing_member() {
+        let (_dirs, host) = lineage_host(1);
+        host.open_channel(None, "acme", dan(), None).await.unwrap();
+        let key_a = junto_kernel::SigningKey::from_secret_bytes([7; 32]);
+        let key_b = junto_kernel::SigningKey::from_secret_bytes([13; 32]);
+        assert_ne!(
+            key_a.public_key(),
+            key_b.public_key(),
+            "the fixture must exercise two genuinely distinct device keypairs"
+        );
+        host.add_member(
+            "acme",
+            &dan(),
+            Member::human("Alice", "alice@example.com"),
+            Some(key_a.public_key()),
+        )
+        .await
+        .unwrap();
+        host.add_member(
+            "acme",
+            &dan(),
+            Member::human("Alice", "alice@example.com"),
+            Some(key_b.public_key()),
+        )
+        .await
+        .unwrap();
+
+        let (_, view) = project(&host, "acme").await;
+        let alice_entries = view
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    &entry.payload,
+                    EntryPayload::MemberAdded { member } if member.email == "alice@example.com"
+                )
+            })
+            .count();
+        assert_eq!(
+            alice_entries, 2,
+            "the ledger gained a second MemberAdded for alice's second device"
+        );
+        let keys: Vec<_> = view
+            .keyring
+            .get("alice@example.com")
+            .expect("alice has keyring grants")
+            .iter()
+            .map(|grant| grant.key.clone())
+            .collect();
+        assert!(
+            keys.contains(&key_a.public_key()) && keys.contains(&key_b.public_key()),
+            "the projected keyring carries both of alice's device keys: {keys:?}"
+        );
+    }
+
+    /// The Party is first-write-wins by email — a second device's grant must
+    /// not create a second row, nor change the display name the first
+    /// admission set (`project_party`'s guarantee, which this fix must not
+    /// route around by mutating the email or re-admitting differently).
+    #[tokio::test]
+    async fn add_member_second_device_leaves_party_row_unchanged() {
+        let (_dirs, host) = lineage_host(1);
+        host.open_channel(None, "acme", dan(), None).await.unwrap();
+        let key_a = junto_kernel::SigningKey::from_secret_bytes([7; 32]);
+        let key_b = junto_kernel::SigningKey::from_secret_bytes([13; 32]);
+        host.add_member(
+            "acme",
+            &dan(),
+            Member::human("Alice", "alice@example.com"),
+            Some(key_a.public_key()),
+        )
+        .await
+        .unwrap();
+        // A different display name on the second call: if the party row
+        // were ever affected by the second grant, this assertion would
+        // catch it. Same-name fixtures would make the count check the only
+        // load-bearing assertion here.
+        host.add_member(
+            "acme",
+            &dan(),
+            Member::human("Alice Renamed", "alice@example.com"),
+            Some(key_b.public_key()),
+        )
+        .await
+        .unwrap();
+
+        let (_, view) = project(&host, "acme").await;
+        let alice_rows: Vec<_> = view
+            .party
+            .iter()
+            .filter(|m| m.email == "alice@example.com")
+            .collect();
+        assert_eq!(
+            alice_rows.len(),
+            1,
+            "one party row per email, no matter how many device grants: {alice_rows:?}"
+        );
+        assert_eq!(
+            alice_rows[0].display_name, "Alice",
+            "the party row keeps the FIRST admission's display name, not the second's"
+        );
+    }
+
+    /// Re-supplying a key already granted to that email is still a
+    /// no-op — the case the original unconditional guard existed to
+    /// prevent, and it must keep working now that the guard is conditional.
+    #[tokio::test]
+    async fn add_member_repeat_of_same_key_appends_nothing() {
+        let (_dirs, host) = lineage_host(1);
+        host.open_channel(None, "acme", dan(), None).await.unwrap();
+        let key_a = junto_kernel::SigningKey::from_secret_bytes([7; 32]);
+        host.add_member(
+            "acme",
+            &dan(),
+            Member::human("Alice", "alice@example.com"),
+            Some(key_a.public_key()),
+        )
+        .await
+        .unwrap();
+        host.add_member(
+            "acme",
+            &dan(),
+            Member::human("Alice", "alice@example.com"),
+            Some(key_a.public_key()),
+        )
+        .await
+        .unwrap();
+
+        let (_, view) = project(&host, "acme").await;
+        let alice_entries = view
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    &entry.payload,
+                    EntryPayload::MemberAdded { member } if member.email == "alice@example.com"
+                )
+            })
+            .count();
+        assert_eq!(
+            alice_entries, 1,
+            "the same key twice must not double-append (the original guard's own case)"
+        );
+        assert_eq!(
+            view.keyring
+                .get("alice@example.com")
+                .map(|grants| grants.len()),
+            Some(1),
+            "the keyring holds one grant, not a duplicate of the same key"
+        );
+    }
+
+    /// A keyless re-grant (no new key to publish) is still the pre-0033
+    /// no-op: no entry appended, but the member code is still returned —
+    /// Task 8's keyless-refusal path is for a *new* human with no local key,
+    /// not this already-admitted case.
+    #[tokio::test]
+    async fn add_member_keyless_repeat_still_no_ops() {
+        let (_dirs, host) = lineage_host(1);
+        host.open_channel(None, "acme", dan(), None).await.unwrap();
+        let key_a = junto_kernel::SigningKey::from_secret_bytes([7; 32]);
+        let first = host
+            .add_member(
+                "acme",
+                &dan(),
+                Member::human("Bob", "bob@example.com"),
+                Some(key_a.public_key()),
+            )
+            .await
+            .unwrap();
+        let second = host
+            .add_member(
+                "acme",
+                &dan(),
+                Member::human("Bob", "bob@example.com"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            second.code, first.code,
+            "the same machine-local code is returned, not a fresh mint"
+        );
+        let (_, view) = project(&host, "acme").await;
+        let bob_entries = view
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    &entry.payload,
+                    EntryPayload::MemberAdded { member } if member.email == "bob@example.com"
+                )
+            })
+            .count();
+        assert_eq!(
+            bob_entries, 1,
+            "no key to publish means no entry, exactly like before 0033"
         );
     }
 
