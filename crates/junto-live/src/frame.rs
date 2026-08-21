@@ -114,3 +114,65 @@ impl Frame {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact wire shape is a contract with the host (Task 7) and the
+    /// iced client (Task 9): this asserts the literal JSON string, not just
+    /// a self round-trip — a round-trip alone would still pass if `t`
+    /// became `type`, `rename_all` were dropped, or `data` were renamed.
+    #[test]
+    fn update_frame_serializes_to_the_documented_wire_shape() {
+        let f = Frame::update(b"ab");
+        let json = serde_json::to_string(&f).unwrap();
+        assert_eq!(json, r#"{"t":"update","data":"YWI="}"#);
+    }
+
+    #[test]
+    fn unit_variants_serialize_to_bare_tag_objects() {
+        assert_eq!(
+            serde_json::to_string(&Frame::AuthOk).unwrap(),
+            r#"{"t":"auth_ok"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Frame::End).unwrap(),
+            r#"{"t":"end"}"#
+        );
+    }
+
+    #[test]
+    fn frame_update_round_trips_base64() {
+        let f = Frame::update(b"\x00\x01binary");
+        let json = serde_json::to_string(&f).unwrap();
+        let back: Frame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.update_bytes().unwrap(), b"\x00\x01binary");
+    }
+
+    #[test]
+    fn frame_ephemeral_round_trips_base64() {
+        let f = Frame::ephemeral(b"\x02presence");
+        let json = serde_json::to_string(&f).unwrap();
+        let back: Frame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.ephemeral_bytes().unwrap(), b"\x02presence");
+    }
+
+    #[test]
+    fn bytes_helpers_are_none_for_the_wrong_variant() {
+        assert_eq!(Frame::AuthOk.update_bytes(), None);
+        assert_eq!(Frame::End.ephemeral_bytes(), None);
+    }
+
+    #[test]
+    fn malformed_base64_decodes_to_none_not_a_panic() {
+        let update = Frame::Update {
+            data: "not valid base64 !!!".to_string(),
+        };
+        assert_eq!(update.update_bytes(), None);
+        let ephemeral = Frame::Ephemeral {
+            data: "@@@".to_string(),
+        };
+        assert_eq!(ephemeral.ephemeral_bytes(), None);
+    }
+}

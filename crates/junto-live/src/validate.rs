@@ -21,6 +21,26 @@
 //! module exists to guarantee. `rejected_frame_leaves_server_document_unchanged`
 //! below is not incidental test coverage; it is the proof that the guarantee
 //! holds.
+//!
+//! # What "only add annotations" actually has to mean
+//!
+//! A remote watcher is allowed to *add* annotations — not to touch anything
+//! else. That sounds like it only constrains what is new, but loro's
+//! `annotations` map is last-write-wins and its lists merge by op, not by
+//! value: a synced watcher can overwrite an *existing* annotation id with
+//! arbitrary content, delete it outright, or splice a driver-only list
+//! (`conversation`/`worktree`) at an existing position — all without a
+//! single new key appearing anywhere. A gate that only diffs added-id sets
+//! and container lengths is blind to every one of those. So this function
+//! checks two things, not one:
+//! - every id already in `doc`'s `annotations` map must still map to
+//!   byte-identical stored content in the fork ([`LiveDoc::annotation_raw`]);
+//!   a revision is only ever accepted as a **new** id (see
+//!   [`junto_kernel::Annotation::supersedes`]), never as an in-place
+//!   rewrite of an old one;
+//! - `conversation` and `worktree` must be byte-for-byte identical between
+//!   `doc` and the fork ([`LiveDoc::conversation_matches`],
+//!   [`LiveDoc::worktree_matches`]) — not merely the same length.
 
 use std::collections::HashMap;
 
@@ -40,35 +60,31 @@ use crate::LiveDoc;
 /// their [`PublicKey`], the record of authority this function checks
 /// signatures against.
 ///
-/// A remote watcher may only ever *add* annotations. Every check below is
-/// therefore scoped to annotations that are new in the fork relative to
-/// `doc` — an update that only rewrites already-converged state (the normal
-/// case for loro's CRDT merge semantics) needs no re-validation of what was
-/// already accepted.
-///
-/// Three checks apply to each new annotation, all of which must pass for
-/// the *entire* frame to be accepted:
-/// 1. it parses as an [`Annotation`] at all;
-/// 2. its `author.email` equals `sender_email` — a member may not post an
-///    annotation attributed to someone else;
-/// 3. it carries a signature that verifies against `keyring[sender_email]`.
-///
-/// One structural check applies to the frame as a whole: a watcher may
-/// write only into the `annotations` container. If the fork's
-/// `conversation_len` or `worktree_len` differs from `doc`'s, the frame
-/// touched a driver-only container and is rejected outright, regardless of
-/// what else it contains.
+/// Checked, in order, on every call — including one that turns out to add
+/// nothing at all:
+/// 1. `sender_email` must have a key on file. Absence is not permission:
+///    an unrecognized sender is rejected even if the frame's payload would
+///    otherwise be accepted as a no-op.
+/// 2. `conversation` and `worktree` must be unchanged, content-for-content,
+///    between `doc` and the fork (see the module docs for why a length
+///    check is not enough).
+/// 3. Every annotation id `doc` already has must still hold byte-identical
+///    stored content in the fork (see the module docs).
+/// 4. Every id new to the fork must (a) parse as an [`Annotation`], (b)
+///    have `author.email == sender_email`, (c) be signed, and (d) verify
+///    against `keyring[sender_email]`.
 ///
 /// Any single failure rejects the **whole frame** — there is no partial
-/// acceptance. A frame that adds no annotations and does not touch
-/// `conversation`/`worktree` is legitimate (e.g. it may carry loro metadata
-/// with no visible new keys) and returns `Ok(vec![])`.
+/// acceptance. A frame that adds no annotations and touches nothing else is
+/// legitimate (e.g. it may carry loro metadata with no visible new keys)
+/// and returns `Ok(vec![])`.
 ///
 /// # Errors
 /// Returns `Err(reason)` — a human-readable explanation, not a machine code
-/// — if `bytes` fails to import into the fork, if the frame touched a
-/// driver-only container, or if any new annotation fails one of the three
-/// per-annotation checks above.
+/// — if `bytes` fails to import into the fork, if `sender_email` has no key
+/// on file, if a driver-only container was touched, if an existing
+/// annotation id's content changed, or if any new annotation fails one of
+/// its four checks.
 pub fn validate_annotation_update(
     doc: &LiveDoc,
     bytes: &[u8],
@@ -80,15 +96,31 @@ pub fn validate_annotation_update(
     fork.import_update(bytes)
         .map_err(|e| format!("frame did not import: {e}"))?;
 
-    if fork.conversation_len() != doc.conversation_len()
-        || fork.worktree_len() != doc.worktree_len()
-    {
+    // Checked first and unconditionally, before any other check can return
+    // early: an unrecognized sender must never reach `Ok`, not even via a
+    // frame that (superficially) changes nothing.
+    let sender_key = keyring
+        .get(sender_email)
+        .ok_or_else(|| format!("no verifying key on file for '{sender_email}'"))?;
+
+    if !fork.conversation_matches(doc) || !fork.worktree_matches(doc) {
         return Err(
             "watchers may only write annotations, not conversation/worktree entries".to_string(),
         );
     }
 
+    // Every id the real doc already has must still resolve to the exact
+    // same stored bytes in the fork — see the module docs for why an
+    // added-ids-only diff cannot catch an overwrite or a deletion.
     let existing_ids = doc.annotation_ids();
+    for id in &existing_ids {
+        if fork.annotation_raw(id) != doc.annotation_raw(id) {
+            return Err(format!(
+                "annotation {id} was modified or removed by a watcher; only new annotation ids may be written"
+            ));
+        }
+    }
+
     let mut new_ids: Vec<String> = fork
         .annotation_ids()
         .difference(&existing_ids)
@@ -101,25 +133,15 @@ pub fn validate_annotation_update(
     // error messages and the accepted-annotations ordering reproducible.
     new_ids.sort();
 
-    let sender_key = keyring
-        .get(sender_email)
-        .ok_or_else(|| format!("no verifying key on file for '{sender_email}'"))?;
-
-    // `LiveDoc::annotations` silently skips entries that fail to parse
-    // (that is the right call for *reads*, per its own doc comment) — but
-    // here a new entry that fails to parse is exactly the kind of bad
-    // annotation this gate exists to catch, so it must reject, not vanish.
-    // Look values up by id rather than trusting the parsed list's length.
-    let parsed: HashMap<String, Annotation> = fork
-        .annotations()
-        .into_iter()
-        .map(|a| (a.id.to_string(), a))
-        .collect();
-
     let mut accepted = Vec::with_capacity(new_ids.len());
     for id in &new_ids {
-        let annotation = parsed
-            .get(id)
+        // Only NEW ids are parsed here — existing ones were already
+        // compared as raw bytes above, and re-parsing every historical
+        // annotation on every incoming frame would cost O(session history)
+        // work for O(1) real work.
+        let annotation = fork
+            .annotation_raw(id)
+            .and_then(|raw| Annotation::from_canonical_bytes(raw.as_bytes()).ok())
             .ok_or_else(|| format!("annotation {id} does not parse as an Annotation"))?;
         if annotation.author.email != sender_email {
             return Err(format!(
@@ -132,10 +154,10 @@ pub fn validate_annotation_update(
         }
         if !annotation.verifies_with(sender_key) {
             return Err(format!(
-                "annotation {id} signature does not verify against '{sender_email}'s' key"
+                "annotation {id} signature does not verify against the key on file for '{sender_email}'"
             ));
         }
-        accepted.push(annotation.clone());
+        accepted.push(annotation);
     }
 
     Ok(accepted)
@@ -149,7 +171,6 @@ mod tests {
     };
 
     use super::*;
-    use crate::Frame;
 
     fn keyring_of(
         email: &str,
@@ -266,6 +287,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("only write annotations"));
+        assert_eq!(server.conversation_len(), 0);
     }
 
     /// The fork guarantee, made explicit: a rejected frame must never
@@ -300,10 +322,150 @@ mod tests {
     }
 
     #[test]
-    fn frame_update_round_trips_base64() {
-        let f = Frame::update(b"\x00\x01binary");
-        let json = serde_json::to_string(&f).unwrap();
-        let back: Frame = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.update_bytes().unwrap(), b"\x00\x01binary");
+    fn overwrite_existing_annotation_rejects() {
+        let key = junto_kernel::SigningKey::from_secret_bytes([5; 32]);
+        let attacker_key = junto_kernel::SigningKey::from_secret_bytes([7; 32]);
+        let server = LiveDoc::new();
+        let mut original = test_annotation_by("w@x.com", "original");
+        original.sign(&key).unwrap();
+        server.insert_annotation(&original).unwrap();
+
+        let watcher = LiveDoc::new();
+        watcher.import_update(&server.export_snapshot()).unwrap();
+        // Forge a replacement under the SAME id, signed by a different,
+        // untrusted key. The added-ids diff alone never sees this: the id
+        // is not new, only its content is.
+        let mut forged = original.clone();
+        forged.body = "tampered".into();
+        forged.sign(&attacker_key).unwrap();
+        watcher.insert_annotation(&forged).unwrap();
+        let update = watcher.export_snapshot();
+
+        let err =
+            validate_annotation_update(&server, &update, "w@x.com", &keyring_of("w@x.com", &key))
+                .unwrap_err();
+        assert!(!err.is_empty());
+        assert_eq!(server.annotations().len(), 1);
+        assert_eq!(server.annotations()[0].body, "original");
+    }
+
+    #[test]
+    fn wholesale_annotation_deletion_rejects() {
+        let key = junto_kernel::SigningKey::from_secret_bytes([5; 32]);
+        let server = LiveDoc::new();
+        let mut ann = test_annotation_by("w@x.com", "keep me");
+        ann.sign(&key).unwrap();
+        server.insert_annotation(&ann).unwrap();
+
+        // A hand-rolled peer sharing the server's causal history (so it can
+        // target the existing key) that deletes every annotation instead of
+        // adding one. The added-ids diff is empty — a strict subset can
+        // never be "new" — so this must be caught independently of it.
+        let peer = loro::LoroDoc::new();
+        peer.import(&server.export_snapshot()).unwrap();
+        peer.get_map("annotations")
+            .delete(&ann.id.to_string())
+            .unwrap();
+        peer.commit();
+        let update = peer.export(loro::ExportMode::snapshot()).unwrap();
+
+        let err =
+            validate_annotation_update(&server, &update, "w@x.com", &keyring_of("w@x.com", &key))
+                .unwrap_err();
+        assert!(!err.is_empty());
+        assert_eq!(server.annotations().len(), 1);
+        assert_eq!(server.annotation_ids().len(), 1);
+    }
+
+    #[test]
+    fn conversation_splice_with_equal_length_rejects() {
+        let key = junto_kernel::SigningKey::from_secret_bytes([5; 32]);
+        let server = LiveDoc::new();
+        server.push_conversation(serde_json::json!({"seq": 1}));
+
+        // A hand-rolled peer that shares the server's causal history (so it
+        // can target the existing element's position), then deletes it and
+        // inserts a forged replacement of equal length in the same commit —
+        // a length check alone cannot see this.
+        let peer = loro::LoroDoc::new();
+        peer.import(&server.export_snapshot()).unwrap();
+        let list = peer.get_list("conversation");
+        list.delete(0, 1).unwrap();
+        list.insert(
+            0,
+            serde_json::json!({"seq": 999, "kind": "forged"}).to_string(),
+        )
+        .unwrap();
+        peer.commit();
+        let update = peer.export(loro::ExportMode::snapshot()).unwrap();
+
+        let err =
+            validate_annotation_update(&server, &update, "w@x.com", &keyring_of("w@x.com", &key))
+                .unwrap_err();
+        assert!(
+            err.contains("only write annotations"),
+            "unexpected reason: {err}"
+        );
+        assert_eq!(server.conversation_len(), 1);
+    }
+
+    #[test]
+    fn worktree_splice_with_equal_length_rejects() {
+        let key = junto_kernel::SigningKey::from_secret_bytes([5; 32]);
+        let server = LiveDoc::new();
+        server.push_worktree(serde_json::json!({"path": "src/lib.rs"}));
+
+        let peer = loro::LoroDoc::new();
+        peer.import(&server.export_snapshot()).unwrap();
+        let list = peer.get_list("worktree");
+        list.delete(0, 1).unwrap();
+        list.insert(0, serde_json::json!({"path": "forged.rs"}).to_string())
+            .unwrap();
+        peer.commit();
+        let update = peer.export(loro::ExportMode::snapshot()).unwrap();
+
+        let err =
+            validate_annotation_update(&server, &update, "w@x.com", &keyring_of("w@x.com", &key))
+                .unwrap_err();
+        assert!(
+            err.contains("only write annotations"),
+            "unexpected reason: {err}"
+        );
+        assert_eq!(server.worktree_len(), 1);
+    }
+
+    #[test]
+    fn keyring_absent_sender_rejects() {
+        let key = junto_kernel::SigningKey::from_secret_bytes([5; 32]);
+        let server = LiveDoc::new();
+        let watcher = LiveDoc::new();
+        watcher.import_update(&server.export_snapshot()).unwrap();
+        let mut ann = test_annotation_by("w@x.com", "looks wrong");
+        ann.sign(&key).unwrap();
+        watcher.insert_annotation(&ann).unwrap();
+        let update = watcher.export_snapshot();
+
+        // Empty keyring: sender has no key on file at all.
+        let err =
+            validate_annotation_update(&server, &update, "w@x.com", &HashMap::new()).unwrap_err();
+        assert!(err.contains("no verifying key"), "unexpected reason: {err}");
+        assert!(server.annotations().is_empty());
+    }
+
+    #[test]
+    fn unknown_sender_with_no_changes_still_rejected() {
+        let server = LiveDoc::new();
+        let watcher = LiveDoc::new();
+        watcher.import_update(&server.export_snapshot()).unwrap();
+        // Watcher writes nothing at all — re-exports converged state.
+        let update = watcher.export_snapshot();
+
+        // A sender absent from the keyring must be rejected even though the
+        // frame itself adds no new ids and touches no driver container —
+        // authentication cannot be bypassed by sending a no-op frame.
+        let err =
+            validate_annotation_update(&server, &update, "ghost@nowhere.com", &HashMap::new())
+                .unwrap_err();
+        assert!(err.contains("no verifying key"), "unexpected reason: {err}");
     }
 }

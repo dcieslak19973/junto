@@ -111,6 +111,27 @@ impl LiveDoc {
         self.doc.get_list(WORKTREE).len()
     }
 
+    /// Whether `self` and `other`'s `conversation` containers hold exactly
+    /// the same events, in the same order — not just the same count.
+    ///
+    /// Compares the list's own shallow [`loro::LoroValue`] in one call
+    /// (that type never leaves this method's body — see the struct docs on
+    /// confining `loro` to this crate). A remote watcher must never be able
+    /// to touch this driver-only container at all, so any difference here
+    /// — an append, a truncation, or an equal-length delete-then-insert
+    /// splice that leaves the count unchanged — is a violation; comparing
+    /// only [`LiveDoc::conversation_len`] would miss the splice.
+    #[must_use]
+    pub fn conversation_matches(&self, other: &Self) -> bool {
+        self.doc.get_list(CONVERSATION).get_value() == other.doc.get_list(CONVERSATION).get_value()
+    }
+
+    /// Same contract as [`LiveDoc::conversation_matches`], for `worktree`.
+    #[must_use]
+    pub fn worktree_matches(&self, other: &Self) -> bool {
+        self.doc.get_list(WORKTREE).get_value() == other.doc.get_list(WORKTREE).get_value()
+    }
+
     /// Insert (or overwrite) a signed annotation and commit. The map value is
     /// the annotation's own canonical-JSON bytes ([`Annotation::to_canonical_bytes`])
     /// stored **verbatim as a string**, never decomposed into loro fields:
@@ -164,6 +185,28 @@ impl LiveDoc {
             .keys()
             .map(|k| k.to_string())
             .collect()
+    }
+
+    /// The raw, unparsed canonical-JSON text stored for a single
+    /// annotation id — `None` if no entry with that id exists, or its
+    /// stored value is not a string (see [`LiveDoc::insert_annotation`]:
+    /// entries written through this type are always strings).
+    ///
+    /// Byte-for-byte the same form [`Annotation::verifies_with`] signs
+    /// over — the right comparison for detecting whether a remote watcher
+    /// rewrote or removed an **existing** id in place: parsing both sides
+    /// first would (a) cost a full canonicalization for every entry on
+    /// every incoming frame, most of which never need re-checking, and (b)
+    /// risk treating two byte-different stored values that happen to parse
+    /// to `Annotation`s that compare equal as "unchanged", when the bytes
+    /// each one's signature actually covers are not the same preimage.
+    #[must_use]
+    pub fn annotation_raw(&self, id: &str) -> Option<String> {
+        let value = self.doc.get_map(ANNOTATIONS).get(id)?;
+        match value.into_value().ok()? {
+            LoroValue::String(json) => Some(json.to_string()),
+            _ => None,
+        }
     }
 
     /// Export the full current state as a self-contained snapshot — how a
