@@ -31,7 +31,7 @@ mod web;
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use junto_kernel::{ChannelId, EntryId, Member, PublicKey, Timestamp};
 use rmcp::transport::streamable_http_server::{
@@ -118,18 +118,29 @@ enum Command {
         dir: PathBuf,
     },
     /// Grant channel membership (docs/adr/0017): append a founder-authored
-    /// MemberAdded entry and mint the new member's machine-local code. The
-    /// granter is the home substrate's git user, who must be the channel's
-    /// founding member.
+    /// MemberAdded entry and mint the new member's machine-local code (or,
+    /// with --enroll, attach the key an enrolled device already minted for
+    /// itself). The granter is the home substrate's git user, who must be
+    /// the channel's founding member.
     AddMember {
-        /// The new member's email (the stable identity key).
-        email: String,
-        /// The new member's display name.
-        #[arg(long)]
-        name: String,
-        /// "human" or "agent".
-        #[arg(long, default_value = "agent")]
-        kind: String,
+        /// The new member's email (the stable identity key). Required
+        /// unless --enroll is passed, whose payload already carries the
+        /// email the enrolling device echoed back — retyping it here would
+        /// risk it silently diverging from what was actually enrolled.
+        #[arg(required_unless_present = "enroll")]
+        email: Option<String>,
+        /// The new member's display name. Required unless --enroll is
+        /// passed (same reasoning as `email`).
+        #[arg(long, required_unless_present = "enroll")]
+        name: Option<String>,
+        /// "human" or "agent" — decides whether this machine may mint the
+        /// member's key (docs/adr/0033), so it must be stated, never
+        /// defaulted: a keyless remote human left to default to "agent"
+        /// would skip `Host::add_member`'s refusal gate and mint their
+        /// keypair here anyway. Required unless --enroll is passed, whose
+        /// enrollment act already tells us this is a human (see --enroll).
+        #[arg(long, required_unless_present = "enroll", conflicts_with = "enroll")]
+        kind: Option<String>,
         /// Channel name or id.
         #[arg(long)]
         channel: String,
@@ -146,6 +157,16 @@ enum Command {
         /// brief carries it — no hand-copying.
         #[arg(long)]
         checkout: Option<PathBuf>,
+        /// Complete an enrollment (device-key-enrollment plan, Task 8): the
+        /// third leg of the three-step exchange. `<url>` is the
+        /// `junto://enroll?code=…` URI from `junto enroll`; its embedded
+        /// public key becomes the member's key — this machine never mints
+        /// one for them (docs/adr/0033). Requires the invite that produced
+        /// it still be unredeemed and unexpired; conflicts with `email`/
+        /// `--name`/`--kind` — an enrolled device is by construction a
+        /// remote human, so kind is derived, never taken from a flag.
+        #[arg(long, conflicts_with_all = ["email", "name", "kind"])]
+        enroll: Option<String>,
     },
     /// Mint a founder-issued enrollment invite (device-key-enrollment
     /// plan, Task 6): the first leg of the three-step exchange that lets a
@@ -243,6 +264,7 @@ async fn main() -> Result<()> {
             author_name,
             author_email,
             checkout,
+            enroll,
         } => {
             add_member(
                 channel,
@@ -252,6 +274,7 @@ async fn main() -> Result<()> {
                 author_name,
                 author_email,
                 checkout,
+                enroll,
             )
             .await
         }
@@ -274,23 +297,36 @@ async fn main() -> Result<()> {
 /// defaults to the home substrate's git user — the founder check happens in
 /// the host. No code is demanded here: whoever can run commands on this
 /// machine can edit the code store anyway; codes guard the network surfaces.
+///
+/// With `--enroll`, this completes the three-step exchange
+/// (device-key-enrollment plan, Task 8): the member's identity and public
+/// key come from the validated enroll payload, never re-typed, and the
+/// invite token is burned via `invites::consume` before anything is
+/// recorded — see the ordering comment at the call site below.
+// Every parameter is a distinct clap flag on `Command::AddMember`; a struct
+// would just be `Command::AddMember`'s own fields duplicated one call site
+// away — no clarity gained.
+#[allow(clippy::too_many_arguments)]
 async fn add_member(
     channel: String,
-    email: String,
-    name: String,
-    kind: String,
+    email: Option<String>,
+    name: Option<String>,
+    kind: Option<String>,
     author_name: Option<String>,
     author_email: Option<String>,
     checkout: Option<PathBuf>,
+    enroll_url: Option<String>,
 ) -> Result<()> {
-    let member = match kind.as_str() {
-        "human" => Member::human(&name, &email),
-        "agent" => Member::agent(&name, &email),
-        other => bail!("--kind must be 'human' or 'agent', not '{other}'"),
-    };
     let host = host::Host::from_registry(host::junto_home()?);
-    let substrate = match host.resolve(&channel).await? {
-        host::Resolution::Resolved { substrate, .. } => substrate,
+    // Resolve once, up front, to the CANONICAL id — not whatever the caller
+    // typed. `--enroll`'s `invites::consume` compares the channel string
+    // exactly against what `junto invite` stored (invites.rs:184), and
+    // `--channel` here is a SEPARATE invocation from `junto invite`'s that
+    // may be a human-typed name: passing it through raw would return a
+    // confidently-wrong `WrongChannel` for the exact channel the invite was
+    // issued for.
+    let (substrate, id) = match host.resolve(&channel).await? {
+        host::Resolution::Resolved { substrate, id, .. } => (substrate, id),
         host::Resolution::NotFound => {
             bail!("no channel '{channel}' in any registered substrate")
         }
@@ -299,12 +335,73 @@ async fn add_member(
              address it by id"
         ),
     };
-    let granted_by = match (author_name, author_email) {
-        (Some(name), Some(email)) => Member::human(name, email),
-        (None, None) => host::git_user(&substrate)?,
-        _ => bail!("pass both --author-name and --author-email, or neither"),
+
+    // Whether this member's key came from `--enroll` — once true, the
+    // invite token below is already burned, so every failure from here on
+    // must say so (see `spent_token_context`).
+    let mut enrolled = false;
+    let (member, key) = match enroll_url {
+        Some(url) => {
+            let payload = enroll::decode_enroll(&url).map_err(|err| {
+                if err.to_string().contains("expired") {
+                    err.context(
+                        "enroll codes are short-lived (about 10 minutes); ask them to run \
+                         `junto enroll` again against a fresh invite",
+                    )
+                } else {
+                    err
+                }
+            })?;
+            // Burn the invite token BEFORE recording the member: this fails
+            // closed. A transient append failure after a successful consume
+            // costs the founder one `junto invite` re-run; appending first
+            // and burning the token after would instead leave a live,
+            // replayable token behind an already-recorded member.
+            let consumed = invites::consume(
+                &host::junto_home()?,
+                &payload.invite_token,
+                &payload.email,
+                &id.to_string(),
+            )?;
+            if let Some(err) = consumed_error(consumed, &payload.email, &channel) {
+                return Err(err);
+            }
+            enrolled = true;
+            // An enrolled device is by construction a remote human — this
+            // is the whole point of the exchange. `--kind` conflicts with
+            // `--enroll` on the `Command::AddMember` definition, so there
+            // is no flag to (mis)consult here; deriving it, like the email
+            // in `enroll_payload_from_invite`, keeps the recorded kind tied
+            // to what actually happened rather than what was typed.
+            let member = Member::human(&payload.display_name, &payload.email);
+            (member, Some(payload.public_key.clone()))
+        }
+        None => {
+            let email = email.expect("clap requires email unless --enroll is passed");
+            let name = name.expect("clap requires --name unless --enroll is passed");
+            let kind = kind.expect("clap requires --kind unless --enroll is passed");
+            let member = match kind.as_str() {
+                "human" => Member::human(&name, &email),
+                "agent" => Member::agent(&name, &email),
+                other => bail!("--kind must be 'human' or 'agent', not '{other}'"),
+            };
+            (member, None)
+        }
     };
-    let minted = host.add_member(&channel, &granted_by, member).await?;
+    let email = member.email.clone();
+
+    let granted_by = match (author_name, author_email) {
+        (Some(name), Some(email)) => Ok(Member::human(name, email)),
+        (None, None) => host::git_user(&substrate),
+        _ => Err(anyhow!(
+            "pass both --author-name and --author-email, or neither"
+        )),
+    };
+    let granted_by = spent_token_context(granted_by, enrolled)?;
+    let minted = spent_token_context(
+        host.add_member(&channel, &granted_by, member, key).await,
+        enrolled,
+    )?;
     println!("added {email} to channel '{channel}'");
     if let Some(checkout) = checkout {
         let checkout = dunce::canonicalize(&checkout)
@@ -326,6 +423,61 @@ async fn add_member(
         println!("they already had a member code on this machine; it still applies");
     }
     Ok(())
+}
+
+/// Note, on `result`'s error, that `--enroll`'s invite token is already
+/// burned (device-key-enrollment plan, Task 8, finding 3). Once
+/// `invites::consume` returns `Ok`, the token is single-use and gone; every
+/// failure between there and the recorded `MemberAdded` — a bad
+/// `--author-*` pairing, `git_user` failing, the founder check, the append
+/// itself — must say so, or the operator retries the identical URL and
+/// lands on the `AlreadyUsed` dead end with no idea why. A no-op when
+/// `enrolled` is false (the keyless path never burns a token).
+fn spent_token_context<T>(result: Result<T>, enrolled: bool) -> Result<T> {
+    if enrolled {
+        result.with_context(|| {
+            "the invite token was already burned by this attempt (enroll codes are single-use) \
+             — re-run `junto invite` for a fresh one before retrying `add-member --enroll`"
+        })
+    } else {
+        result
+    }
+}
+
+/// Turn an `invites::consume` outcome into an error the human can act on —
+/// `add_member`'s `--enroll` path. `Consumed::Ok` has no error (the caller
+/// proceeds); every other variant names what happened and what to run next,
+/// since a bare enum name would send them straight back to
+/// `crate::live_bridge`'s pre-enrollment failure mode: a signature that
+/// "does not verify" with no clue why.
+fn consumed_error(
+    consumed: invites::Consumed,
+    member_email: &str,
+    channel: &str,
+) -> Option<anyhow::Error> {
+    match consumed {
+        invites::Consumed::Ok => None,
+        invites::Consumed::Unknown => Some(anyhow!(
+            "no invite on this machine matches this enroll code's token; ask the founder to \
+             run `junto invite --member {member_email} --channel {channel}`"
+        )),
+        invites::Consumed::AlreadyUsed => Some(anyhow!(
+            "this invite has already been redeemed; ask the founder to run `junto invite \
+             --member {member_email} --channel {channel}` again for a fresh one"
+        )),
+        invites::Consumed::Expired => Some(anyhow!(
+            "this invite has expired (invites last about 10 minutes); ask the founder to run \
+             `junto invite --member {member_email} --channel {channel}` again"
+        )),
+        invites::Consumed::WrongMember => Some(anyhow!(
+            "this enroll code's member ({member_email}) does not match who the invite names; \
+             ask the founder to check the invite's --member and reissue if needed"
+        )),
+        invites::Consumed::WrongChannel => Some(anyhow!(
+            "this enroll code was issued for a different channel than '{channel}'; ask the \
+             founder to run `junto invite --member {member_email} --channel {channel}`"
+        )),
+    }
 }
 
 /// This identity's machine-local member code, if one was minted here
@@ -710,5 +862,330 @@ mod tests {
         assert_eq!(payload.public_key, key);
         assert_eq!(payload.display_name, "Dan's Laptop");
         assert_eq!(payload.expires_at, invite.expires_at);
+    }
+
+    fn git_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        dir
+    }
+
+    /// Register a fresh substrate repo and open `name` in it (founder: Dan),
+    /// so `add_member` (which reads the registry via `host::junto_home`)
+    /// can resolve it. Returns the repo (kept alive for its TempDir) and the
+    /// channel's canonical id.
+    async fn setup_channel(name: &str) -> (tempfile::TempDir, ChannelId) {
+        let repo = git_repo();
+        let junto_home = host::junto_home().unwrap();
+        host::register_substrate(&junto_home, repo.path()).unwrap();
+        let fixed = host::Host::fixed(vec![repo.path().to_path_buf()]);
+        let opened = fixed
+            .open_channel(
+                Some(repo.path()),
+                name,
+                Member::human("Dan", "dan@example.com"),
+                None,
+            )
+            .await
+            .unwrap();
+        (repo, opened.id)
+    }
+
+    fn build_enroll_url(
+        token: &str,
+        email: &str,
+        display_name: &str,
+        key: &PublicKey,
+        expires_at: i64,
+    ) -> String {
+        enroll::encode_enroll(&enroll::EnrollPayload {
+            v: 1,
+            invite_token: token.to_string(),
+            email: email.to_string(),
+            display_name: display_name.to_string(),
+            public_key: key.clone(),
+            expires_at,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn consumed_error_ok_has_no_error() {
+        assert!(consumed_error(invites::Consumed::Ok, "alice@example.com", "acme").is_none());
+    }
+
+    #[test]
+    fn consumed_error_unknown_names_no_matching_invite() {
+        let err = consumed_error(invites::Consumed::Unknown, "alice@example.com", "acme")
+            .expect("Unknown must produce an error");
+        let text = err.to_string();
+        assert!(text.contains("no invite"), "{text}");
+        assert!(
+            text.contains("junto invite --member alice@example.com --channel acme"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn consumed_error_already_used_tells_them_to_reissue() {
+        let err = consumed_error(invites::Consumed::AlreadyUsed, "alice@example.com", "acme")
+            .expect("AlreadyUsed must produce an error");
+        let text = err.to_string();
+        assert!(text.contains("already"), "{text}");
+        assert!(
+            text.contains("junto invite --member alice@example.com --channel acme"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn consumed_error_expired_tells_them_invites_are_short_lived() {
+        let err = consumed_error(invites::Consumed::Expired, "alice@example.com", "acme")
+            .expect("Expired must produce an error");
+        let text = err.to_string();
+        assert!(text.contains("expired"), "{text}");
+        assert!(text.contains("10 minutes"), "{text}");
+    }
+
+    #[test]
+    fn consumed_error_wrong_member_names_the_mismatched_email() {
+        let err = consumed_error(
+            invites::Consumed::WrongMember,
+            "mallory@evil.example",
+            "acme",
+        )
+        .expect("WrongMember must produce an error");
+        assert!(err.to_string().contains("mallory@evil.example"), "{err}");
+    }
+
+    #[test]
+    fn consumed_error_wrong_channel_names_the_channel() {
+        let err = consumed_error(invites::Consumed::WrongChannel, "alice@example.com", "acme")
+            .expect("WrongChannel must produce an error");
+        assert!(err.to_string().contains("acme"), "{err}");
+    }
+
+    /// Review finding 1: `--kind` decides whether this machine may mint the
+    /// member's key (docs/adr/0033) — defaulting it to "agent" let a
+    /// keyless human sneak past `Host::add_member`'s refusal gate and get
+    /// minted locally anyway, precisely the bug this plan closes. The most
+    /// likely invocation — no `--kind` at all — must be refused at parse
+    /// time, before any host logic runs.
+    #[test]
+    fn add_member_kind_is_required_on_the_keyless_path() {
+        let Err(err) = Cli::try_parse_from([
+            "junto",
+            "add-member",
+            "alice@example.com",
+            "--name",
+            "Alice",
+            "--channel",
+            "acme",
+        ]) else {
+            panic!("expected a clap parse error");
+        };
+        assert!(err.to_string().contains("--kind"), "{err}");
+    }
+
+    /// Review finding 2: an enrolled device is by construction a remote
+    /// human — `--kind` must not be taken from a flag on that path, so
+    /// clap refuses the combination outright rather than silently ignoring
+    /// whatever `--kind` claims.
+    #[test]
+    fn add_member_kind_conflicts_with_enroll() {
+        let Err(err) = Cli::try_parse_from([
+            "junto",
+            "add-member",
+            "--channel",
+            "acme",
+            "--enroll",
+            "junto://enroll?code=x",
+            "--kind",
+            "human",
+        ]) else {
+            panic!("expected a clap parse error");
+        };
+        assert!(err.to_string().contains("--kind"), "{err}");
+    }
+
+    /// Ruling from the task-8 brief: `--channel` on `add-member --enroll` is
+    /// a SEPARATE invocation from `junto invite`'s and may be a human-typed
+    /// name, but `invites::consume` compares the channel string exactly
+    /// against the CANONICAL id `junto invite` stores. `add_member` must
+    /// resolve `--channel` to that same id before calling `consume`, or a
+    /// name-addressed enrollment for a channel the invite really was issued
+    /// for comes back as a confidently-wrong `WrongChannel`.
+    #[tokio::test]
+    async fn add_member_enroll_resolves_channel_by_name_before_consuming_the_invite() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (_repo, id) = setup_channel("acme").await;
+        let junto_home = host::junto_home().unwrap();
+
+        let token = enroll::mint_invite_token();
+        let expires_at = Timestamp::now().as_millis() + enroll::MAX_INVITE_TTL_MS;
+        // Simulate `junto invite`'s own canonicalization: the invite is
+        // recorded against the RESOLVED id, exactly like `invite()` does.
+        invites::issue(
+            &junto_home,
+            &token,
+            "alice@example.com",
+            &id.to_string(),
+            expires_at,
+        )
+        .unwrap();
+
+        let key = PublicKey::new(format!("ed25519:{}", "a".repeat(64))).unwrap();
+        let url = build_enroll_url(&token, "alice@example.com", "Alice", &key, expires_at);
+
+        // `--channel acme` — the NAME, not the id `invites::issue` above was
+        // keyed against.
+        add_member(
+            "acme".to_string(),
+            None,
+            None,
+            None,
+            Some("Dan".to_string()),
+            Some("dan@example.com".to_string()),
+            None,
+            Some(url),
+        )
+        .await
+        .unwrap();
+
+        // The member landed with the supplied key — proof `consume`
+        // actually returned `Ok`, not just that no error propagated.
+        let fixed = host::Host::fixed(vec![_repo.path().to_path_buf()]);
+        let host::Resolution::Resolved { ledger, id, .. } =
+            fixed.resolve(&id.to_string()).await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+        let view = ledger.lock().await.project(&id).await.unwrap();
+        assert_eq!(
+            view.keyring
+                .get("alice@example.com")
+                .and_then(|grants| grants.first())
+                .map(|grant| grant.key.clone()),
+            Some(key)
+        );
+    }
+
+    /// `AlreadyUsed` end to end: redeeming the same enroll URL twice must
+    /// surface a message telling the human what happened and what to do.
+    #[tokio::test]
+    async fn add_member_enroll_second_use_of_the_same_url_is_refused_as_already_used() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (_repo, id) = setup_channel("acme").await;
+        let junto_home = host::junto_home().unwrap();
+        let token = enroll::mint_invite_token();
+        let expires_at = Timestamp::now().as_millis() + enroll::MAX_INVITE_TTL_MS;
+        invites::issue(
+            &junto_home,
+            &token,
+            "alice@example.com",
+            &id.to_string(),
+            expires_at,
+        )
+        .unwrap();
+        let key = PublicKey::new(format!("ed25519:{}", "b".repeat(64))).unwrap();
+        let url = build_enroll_url(&token, "alice@example.com", "Alice", &key, expires_at);
+
+        add_member(
+            id.to_string(),
+            None,
+            None,
+            None,
+            Some("Dan".to_string()),
+            Some("dan@example.com".to_string()),
+            None,
+            Some(url.clone()),
+        )
+        .await
+        .unwrap();
+
+        let err = add_member(
+            id.to_string(),
+            None,
+            None,
+            None,
+            Some("Dan".to_string()),
+            Some("dan@example.com".to_string()),
+            None,
+            Some(url),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("already"), "{err}");
+    }
+
+    /// Review finding 3: once `invites::consume` returns `Ok`, the token is
+    /// gone. A downstream failure (here, a bad `--author-*` pairing) must
+    /// say the token is already burned, so the operator does not retry the
+    /// identical URL and land on the `AlreadyUsed` dead end with no idea
+    /// why.
+    #[tokio::test]
+    async fn add_member_enroll_failure_after_consume_names_the_spent_token() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (_repo, id) = setup_channel("acme").await;
+        let junto_home = host::junto_home().unwrap();
+        let token = enroll::mint_invite_token();
+        let expires_at = Timestamp::now().as_millis() + enroll::MAX_INVITE_TTL_MS;
+        invites::issue(
+            &junto_home,
+            &token,
+            "alice@example.com",
+            &id.to_string(),
+            expires_at,
+        )
+        .unwrap();
+        let key = PublicKey::new(format!("ed25519:{}", "d".repeat(64))).unwrap();
+        let url = build_enroll_url(&token, "alice@example.com", "Alice", &key, expires_at);
+
+        // Only --author-name, no --author-email: fails the "pass both, or
+        // neither" check AFTER consume already burned the token.
+        let err = add_member(
+            id.to_string(),
+            None,
+            None,
+            None,
+            Some("Dan".to_string()),
+            None,
+            None,
+            Some(url),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("already burned"), "{err}");
+    }
+
+    /// Regression guard: the keyless/interactive path (no `--enroll`) must
+    /// keep minting for the local-agent case.
+    #[tokio::test]
+    async fn add_member_keyless_path_still_mints_for_a_local_agent() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (_repo, id) = setup_channel("acme").await;
+
+        add_member(
+            id.to_string(),
+            Some("worker@agents.junto".to_string()),
+            Some("Worker".to_string()),
+            Some("agent".to_string()),
+            Some("Dan".to_string()),
+            Some("dan@example.com".to_string()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let junto_home = host::junto_home().unwrap();
+        assert!(keys::has_signing_key(&junto_home, "worker@agents.junto").unwrap());
     }
 }

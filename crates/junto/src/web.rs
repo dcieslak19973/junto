@@ -641,7 +641,10 @@ async fn launch_session(
                 ));
             }
         };
-        if let Err(err) = host.add_member(&channel, &granter, agent_member).await {
+        if let Err(err) = host
+            .add_member(&channel, &granter, agent_member, None)
+            .await
+        {
             return (StatusCode::FORBIDDEN, format!("{err:#}")).into_response();
         }
     }
@@ -2220,6 +2223,7 @@ mod tests {
             "web-test",
             &founder,
             Member::agent("Bot", "bot@example.com"),
+            None,
         )
         .await
         .expect("add bot");
@@ -2655,7 +2659,7 @@ mod tests {
         // The harness member must be in the Party for its entries to project.
         let founder = Member::human("Web User", "web@example.com");
         fx.host
-            .add_member("web-test", &founder, crate::launch::harness_member())
+            .add_member("web-test", &founder, crate::launch::harness_member(), None)
             .await
             .expect("grant the harness membership");
         // A workspace repo for the session to run in.

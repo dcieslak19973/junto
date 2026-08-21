@@ -26,13 +26,10 @@
 //! [`decode_enroll`] — so an oversized or malformed code is rejected as
 //! cheaply as possible, before the bytes it might carry are ever parsed.
 //!
-//! `junto invite` (Task 6) and `junto enroll` (Task 7) now call into this
-//! module — through `decode_invite`, that reaches every private helper and
-//! constant `decode_invite`/`decode_enroll` share (`check_expiry`,
-//! `decode_code`, `EXPIRY_CLOCK_SKEW_MS`, `MAX_CODE_CHARS`) — so only
-//! `decode_enroll` itself remains genuinely unreachable, and only it still
-//! carries `#[allow(dead_code)]`, until Task 8 (`junto add-member`) wires
-//! it.
+//! `junto invite` (Task 6), `junto enroll` (Task 7), and
+//! `junto add-member --enroll` (Task 8) now call into this module — every
+//! private helper and constant is reachable from a wired entry point, so
+//! nothing here carries `#[allow(dead_code)]` any more.
 
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
@@ -150,7 +147,6 @@ pub fn decode_invite(url: &str) -> Result<InvitePayload> {
 /// # Errors
 /// Returns an error for an oversized, malformed, wrong-version, out-of-
 /// bounds, or expired code.
-#[allow(dead_code)]
 pub fn decode_enroll(url: &str) -> Result<EnrollPayload> {
     let json = decode_code(url, "enroll")?;
     let payload: EnrollPayload =
