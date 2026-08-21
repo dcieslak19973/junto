@@ -488,14 +488,15 @@ fn classify_auth_failure(view: &ChannelView, email: &str) -> AuthFailure {
 /// Render an [`AuthFailure`] as the text a real human on the other end of
 /// the socket reads. `email` is echoed back in every case: the caller
 /// already sent it in the `Auth` frame, so echoing it back leaks nothing
-/// beyond what the sender already claimed. This channel's membership is
-/// not confidential to begin with, either: the same unauthenticated
-/// router this socket is mounted on already serves the channel's full
-/// party roster with no login at all
-/// (`GET /channels/{channel}/view.json` → `channel_view_json`,
-/// `ChannelDto::party`, `crate::web`) — so a `NotAMember` vs `Unenrolled`
-/// vs `Revoked` distinction here tells a caller nothing about this
-/// channel they could not already read from that plain `GET`.
+/// beyond what the sender already claimed. This channel's membership by
+/// email is not confidential to begin with, either: the same
+/// unauthenticated router this socket is mounted on already renders every
+/// party member's email into the page at `GET /channels/{channel}`
+/// (`channel_page` → `render::channel_html`'s party chips, each one's
+/// `title` attribute set to `escape_html(&member.email)`) — so a
+/// `NotAMember` vs `Unenrolled` vs `Revoked` distinction here tells a
+/// caller nothing about this channel's membership they could not already
+/// read off that plain, unauthenticated page.
 fn render_auth_failure(failure: AuthFailure, email: &str) -> String {
     match failure {
         AuthFailure::NotAMember => format!("'{email}' is not a member of this channel"),
