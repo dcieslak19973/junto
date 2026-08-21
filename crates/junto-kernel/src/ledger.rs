@@ -353,10 +353,10 @@ impl<S: SubstrateProvider> Ledger<S> {
         // roster and on other members' grants — a revoked founder, for
         // instance, keeps founder authority to add members and grant
         // keys. Only the folds below that consume `recognized`
-        // (standings, gates, sessions, lineage, genesis/name,
-        // close/reopen) are gated by revocation. Re-rooting a
-        // compromised founder's authority is unaddressed here and is not
-        // asked for by this plan.
+        // (unverified, standings, gates, sessions, lineage,
+        // genesis/name, close/reopen) are gated by revocation.
+        // Re-rooting a compromised founder's authority is unaddressed
+        // here and is not asked for by this plan.
         let party = Self::project_party(&entries);
         let keyring = match party.first() {
             Some(founder) => Self::project_keyring(&entries, &founder.email),
@@ -366,10 +366,14 @@ impl<S: SubstrateProvider> Ledger<S> {
         // entry's author being in the Party does not depend on where the
         // granting entry falls in canonical order. But membership alone is
         // no longer sufficient for the recognized-based projections below
-        // (standings, gates, sessions, lineage, name, close/reopen) — a
-        // revoked member's post-cutoff entries stop counting toward those,
-        // even though they remain in the Party (`docs/adr/0035`, Task 3;
-        // see `Self::project_unrecognized`).
+        // (unverified, standings, gates, sessions, lineage, name,
+        // close/reopen) — a revoked member's post-cutoff entries stop
+        // counting toward those, even though they remain in the Party
+        // (`docs/adr/0035`, Task 3; see `Self::project_unrecognized`). An
+        // unrecognized entry never reaches `Self::project_unverified`
+        // below at all, since that fold only sees `recognized` — this is
+        // exactly why two Task 2 tests needed a second, never-parked
+        // device to stay meaningful once their sole grant was retired.
         let unrecognized = Self::project_unrecognized(&party, &keyring, &entries);
         let recognized: Vec<&LedgerEntry> = entries
             .iter()
@@ -469,8 +473,9 @@ impl<S: SubstrateProvider> Ledger<S> {
     /// stop; this does **not** rest on whether that later entry ends up
     /// `unrecognized` (`Self::project`) — a second genesis re-authored by an
     /// email already on the roster (the founder's own re-open, or an added
-    /// member's) is *recognized*, since `unrecognized` is computed purely by
-    /// email-set membership, yet must still not grant. Without a hard
+    /// member's) is ordinarily still *recognized*: party membership alone
+    /// decides that, independent of any revocation cutoff
+    /// (`Self::project_unrecognized`) — yet must still not grant. Without a hard
     /// first-genesis-only rule, any peer could inject a signing key for an
     /// arbitrary email by appending a `ChannelOpened`. After the genesis, a
     /// `MemberAdded` contributes a grant iff its author is the founder
