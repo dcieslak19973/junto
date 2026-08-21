@@ -276,6 +276,59 @@ mod tests {
         a.import_update(&b.export_snapshot()).unwrap();
         assert_eq!(a.annotation_ids(), b.annotation_ids());
         assert_eq!(a.annotations().len(), 2);
+        // Value-level convergence on BOTH sides, not just a's: b must read
+        // back exactly what a wrote, and vice versa.
+        assert_eq!(b.annotations().len(), 2);
+        // The signature is the whole point of storing annotations as opaque
+        // canonical bytes rather than decomposed loro fields (see the
+        // insert_annotation doc comment): it must survive the CRDT
+        // round-trip byte-for-byte. Verify each annotation, read back from
+        // the *other* document, against its original signer's key.
+        let from_a_on_b = b
+            .annotations()
+            .into_iter()
+            .find(|ann| ann.body == "from a")
+            .expect("a's annotation present on b");
+        assert!(from_a_on_b.verifies_with(&key_a.public_key()));
+        let from_b_on_a = a
+            .annotations()
+            .into_iter()
+            .find(|ann| ann.body == "from b")
+            .expect("b's annotation present on a");
+        assert!(from_b_on_a.verifies_with(&key_b.public_key()));
+    }
+
+    #[test]
+    fn unparseable_annotation_entries_are_skipped_not_errored() {
+        let key = junto_kernel::SigningKey::from_secret_bytes([3; 32]);
+        let live = LiveDoc::new();
+        let mut valid = test_annotation("valid");
+        valid.sign(&key).unwrap();
+        live.insert_annotation(&valid).unwrap();
+
+        // A peer running some other (or future) annotation schema writes a
+        // value into the same `annotations` map that does not parse as an
+        // `Annotation` at all — the only realistic way this path fires,
+        // since this crate's own writer (`insert_annotation`) never produces
+        // one. Simulate that peer with a bare `loro::LoroDoc` sharing the
+        // same container name and merge it in.
+        let peer = LoroDoc::new();
+        peer.get_map("annotations")
+            .insert("not-an-annotation-id", "not json at all")
+            .unwrap();
+        peer.commit();
+        live.import_update(&peer.export(ExportMode::snapshot()).unwrap())
+            .unwrap();
+
+        // The garbage key is present in the id set (the write itself
+        // converged)...
+        assert!(live.annotation_ids().contains("not-an-annotation-id"));
+        assert_eq!(live.annotation_ids().len(), 2);
+        // ...but `annotations()` skips it and still returns the co-resident
+        // valid entry, rather than erroring or dropping everything.
+        let parsed = live.annotations();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id, valid.id);
     }
 
     #[test]
@@ -286,5 +339,74 @@ mod tests {
         b.import_update(&a.export_snapshot()).unwrap();
         // Read back via the doc's deep value; one list entry.
         assert_eq!(b.conversation_len(), 1);
+    }
+
+    #[test]
+    fn worktree_events_survive_snapshot() {
+        let a = LiveDoc::new();
+        a.push_worktree(serde_json::json!({"kind": "edit", "path": "src/lib.rs"}));
+        let b = LiveDoc::new();
+        b.import_update(&a.export_snapshot()).unwrap();
+        assert_eq!(b.worktree_len(), 1);
+        // The two lists are independent containers: worktree activity must
+        // not show up as a conversation event or vice versa.
+        assert_eq!(b.conversation_len(), 0);
+    }
+
+    #[test]
+    fn fork_produces_an_independently_editable_replica_that_still_converges() {
+        let key = junto_kernel::SigningKey::from_secret_bytes([4; 32]);
+        let original = LiveDoc::new();
+        original.push_conversation(serde_json::json!({"seq": 1}));
+
+        let forked = original.fork();
+
+        // Both replicas keep editing independently after the fork. If
+        // `fork` shared the origin's peer id instead of minting its own
+        // (the exact hazard the struct docs warn about), these concurrent
+        // edits would corrupt one side's op history instead of merging
+        // cleanly below.
+        original.push_conversation(serde_json::json!({"seq": 2}));
+        let mut ann = test_annotation("from fork");
+        ann.sign(&key).unwrap();
+        forked.insert_annotation(&ann).unwrap();
+
+        original.import_update(&forked.export_snapshot()).unwrap();
+        forked.import_update(&original.export_snapshot()).unwrap();
+
+        assert_eq!(original.conversation_len(), 2);
+        assert_eq!(forked.conversation_len(), 2);
+        assert_eq!(original.annotation_ids(), forked.annotation_ids());
+        assert_eq!(original.annotations().len(), 1);
+    }
+
+    #[test]
+    fn subscribe_local_update_fires_on_local_commit() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let live = LiveDoc::new();
+        let fire_count = std::sync::Arc::new(AtomicUsize::new(0));
+        let saw_non_empty_payload = std::sync::Arc::new(AtomicBool::new(false));
+        let fire_count_in_callback = fire_count.clone();
+        let saw_non_empty_payload_in_callback = saw_non_empty_payload.clone();
+        let _subscription = live.subscribe_local_update(move |bytes| {
+            fire_count_in_callback.fetch_add(1, Ordering::SeqCst);
+            if !bytes.is_empty() {
+                saw_non_empty_payload_in_callback.store(true, Ordering::SeqCst);
+            }
+            true
+        });
+
+        live.push_conversation(serde_json::json!({"seq": 1}));
+
+        assert_eq!(
+            fire_count.load(Ordering::SeqCst),
+            1,
+            "callback should fire exactly once for one commit"
+        );
+        assert!(
+            saw_non_empty_payload.load(Ordering::SeqCst),
+            "the update payload delivered to the callback must be non-empty"
+        );
     }
 }

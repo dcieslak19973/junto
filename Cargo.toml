@@ -61,5 +61,10 @@ pulldown-cmark = { version = "0.13", default-features = false, features = ["html
 # CRDT for the ephemeral live-session plane (docs/adr live-session-plane
 # proposal): one loro::LoroDoc per running agent session, holding its
 # conversation stream, worktree events, and multi-author annotations. Never
-# used for the durable ledger record (MIT; see crates/loro/Cargo.toml).
+# used for the durable ledger record. loro itself is MIT (see
+# crates/loro/Cargo.toml); it brings in MPL-2.0 transitives (`im`,
+# `sized-chunks`, `bitmaps`, via loro-internal's normal dependency on `im`) —
+# file-level weak copyleft that permits a Larger Work under other terms
+# (MPL-2.0 §3.3), accepted here by controller ruling; junto's own source
+# stays MIT.
 loro = "1.13"

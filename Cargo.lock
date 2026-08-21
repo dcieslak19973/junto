@@ -1189,7 +1189,6 @@ version = "0.0.0"
 dependencies = [
  "junto-kernel",
  "loro",
- "serde",
  "serde_json",
 ]
 

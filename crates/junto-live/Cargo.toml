@@ -10,5 +10,4 @@ description = "junto live session plane — per-session LiveDoc (loro CRDT)"
 [dependencies]
 junto-kernel.workspace = true
 loro.workspace = true
-serde.workspace = true
 serde_json.workspace = true
