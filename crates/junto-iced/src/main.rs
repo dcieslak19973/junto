@@ -140,6 +140,15 @@ struct Pane {
     /// authenticates — the annotation composer sends signed `Frame`s
     /// through it (Task 10).
     annotate_tx: Option<mpsc::Sender<WireFrame>>,
+    /// The email the live websocket actually authenticated as, captured
+    /// once at `Message::LiveConnected` time. The composer signs and
+    /// authors with THIS, never a live re-read of `watch_email`: the
+    /// subscription id deliberately excludes `watch_email` (`remote_row`'s
+    /// "applies on next watch" caption), so a mid-watch edit to that field
+    /// would otherwise sign as an identity the socket was never
+    /// authenticated as, which the host's `validate_annotation_update`
+    /// rejects outright.
+    annotate_email: Option<String>,
     /// The live doc's current `conversation` container length, mirrored
     /// from the stream task (`Message::ConversationLen`). The composer's
     /// `StreamAnchor` (an empty `path`) anchors at
@@ -525,9 +534,10 @@ enum Message {
     /// A live websocket's presence updated (session, sorted watcher emails).
     Watchers(String, Vec<String>),
     /// A live websocket authenticated and is ready to carry outbound frames
-    /// (session, the write-half sender) — stored as `Pane::annotate_tx` for
-    /// the annotation composer.
-    LiveConnected(String, mpsc::Sender<WireFrame>),
+    /// (session, the write-half sender, the email it actually
+    /// authenticated as) — stored as `Pane::annotate_tx`/`annotate_email`
+    /// for the annotation composer.
+    LiveConnected(String, mpsc::Sender<WireFrame>, String),
     /// The live doc's `conversation` container grew (session, new length) —
     /// mirrored into `Pane::conversation_len` so the composer's
     /// `StreamAnchor` can point at a real CONTAINER index.
@@ -830,6 +840,7 @@ impl App {
                                 state.feed.clear();
                                 state.watchers.clear();
                                 state.annotate_tx = None;
+                                state.annotate_email = None;
                                 state.conversation_len = 0;
                                 state.worktree_commit = None;
                             }
@@ -876,6 +887,7 @@ impl App {
                     state.feed.clear();
                     state.watchers.clear();
                     state.annotate_tx = None;
+                    state.annotate_email = None;
                     state.conversation_len = 0;
                     state.worktree_commit = None;
                 }
@@ -888,6 +900,7 @@ impl App {
                     state.feed.clear();
                     state.watchers.clear();
                     state.annotate_tx = None;
+                    state.annotate_email = None;
                     state.conversation_len = 0;
                     state.worktree_commit = None;
                 }
@@ -929,6 +942,7 @@ impl App {
                         state.streaming = false;
                         state.watchers.clear();
                         state.annotate_tx = None;
+                        state.annotate_email = None;
                         state.conversation_len = 0;
                         state.worktree_commit = None;
                         to_refresh = Some(*pane);
@@ -968,10 +982,11 @@ impl App {
                 }
                 Task::none()
             }
-            Message::LiveConnected(session, tx) => {
+            Message::LiveConnected(session, tx, email) => {
                 for (_, state) in self.panes.iter_mut() {
                     if state.watched.as_deref() == Some(session.as_str()) {
                         state.annotate_tx = Some(tx);
+                        state.annotate_email = Some(email);
                         break;
                     }
                 }
@@ -1048,16 +1063,20 @@ impl App {
                     push_error(state, "malformed session id".to_string());
                     return Task::none();
                 };
-                let email = state.watch_email.trim().to_string();
-                if email.is_empty() {
+                // The email the socket actually authenticated as — never a
+                // live re-read of `watch_email`, which may have been edited
+                // since the socket connected (see `Pane::annotate_email`'s
+                // docs: doing so would sign as an identity the socket was
+                // never authenticated as, which the host rejects outright).
+                let Some(email) = state.annotate_email.clone() else {
                     push_error(
                         state,
-                        "set \"watch as (email)\" above before commenting".to_string(),
+                        "not authenticated yet — wait for the connection to finish".to_string(),
                     );
                     return Task::none();
-                }
-                // Sign with the watch-as identity's key on file — never send
-                // unsigned, since the host would reject it anyway.
+                };
+                // Sign with the authenticated identity's key on file — never
+                // send unsigned, since the host would reject it anyway.
                 let Some(signing_key) = load_signing_key(&email) else {
                     push_error(state, format!("no signing key on file for '{email}'"));
                     return Task::none();
@@ -1071,9 +1090,16 @@ impl App {
                 // an empty path, is a `StreamAnchor` on the most recent
                 // conversation event instead.
                 let anchor = if path.is_empty() {
+                    if state.conversation_len == 0 {
+                        push_error(
+                            state,
+                            "nothing to anchor to yet — wait for the first live event".to_string(),
+                        );
+                        return Task::none();
+                    }
                     Anchor::Stream(StreamAnchor {
                         session,
-                        op_id: state.conversation_len.saturating_sub(1).to_string(),
+                        op_id: (state.conversation_len - 1).to_string(),
                     })
                 } else {
                     let Some(commit_str) = state.worktree_commit.clone() else {
@@ -3430,6 +3456,7 @@ impl Pane {
             watch_email: String::new(),
             watchers: Vec::new(),
             annotate_tx: None,
+            annotate_email: None,
             conversation_len: 0,
             worktree_commit: None,
             annotate_path: String::new(),
@@ -4272,7 +4299,11 @@ fn live_ws_stream(
         // forwarded straight to the socket, below.
         let (annotate_tx, mut annotate_rx) = mpsc::channel::<WireFrame>(16);
         if output
-            .send(Message::LiveConnected(session.clone(), annotate_tx))
+            .send(Message::LiveConnected(
+                session.clone(),
+                annotate_tx,
+                email.clone(),
+            ))
             .await
             .is_err()
         {
