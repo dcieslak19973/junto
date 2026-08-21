@@ -68,3 +68,6 @@ pulldown-cmark = { version = "0.13", default-features = false, features = ["html
 # (MPL-2.0 §3.3), accepted here by controller ruling; junto's own source
 # stays MIT.
 loro = "1.13"
+# base64 encoding for loro update bytes riding inside the JSON websocket
+# frame envelope (`junto-live`'s `Frame`); MIT/Apache-2.0.
+base64 = "0.22"

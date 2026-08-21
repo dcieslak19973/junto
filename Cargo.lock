@@ -1187,8 +1187,10 @@ dependencies = [
 name = "junto-live"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "junto-kernel",
  "loro",
+ "serde",
  "serde_json",
 ]
 
