@@ -93,6 +93,11 @@ pub fn router(host: Arc<Host>) -> Router {
 /// Resolve and project a channel reference, or surface the failure as an
 /// appropriate HTTP status. Also yields the home substrate path — the
 /// channel page's contextual open-an-inquiry form prefills it.
+// Response-as-error is the axum idiom every caller relies on with `?`; the
+// Err path is a cold HTTP error, so the 128-byte variant clippy 1.98 flags
+// (result_large_err) costs nothing per-request, and boxing it would add
+// deref noise at every callsite.
+#[allow(clippy::result_large_err)]
 async fn project(
     host: &Host,
     channel: &str,
@@ -943,6 +948,8 @@ async fn artifact_content_json(
 /// enforcing that the file sits under this machine's artifacts root (an entry
 /// can arrive by sync carrying any path, so the resolved file is not trusted
 /// until checked). Shared by the HTML and JSON artifact endpoints.
+// Response-as-error, cold path — same reasoning as `project` above.
+#[allow(clippy::result_large_err)]
 async fn resolve_artifact_content(
     host: &Arc<Host>,
     channel: &str,
