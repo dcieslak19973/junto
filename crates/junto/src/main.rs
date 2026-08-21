@@ -29,11 +29,11 @@ mod render;
 mod verify;
 mod web;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use junto_kernel::{ChannelId, EntryId, Member, Timestamp};
+use junto_kernel::{ChannelId, EntryId, Member, PublicKey, Timestamp};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
@@ -163,6 +163,19 @@ enum Command {
         #[arg(long)]
         channel: String,
     },
+    /// Mint this device's own keypair and emit its public half
+    /// (device-key-enrollment plan, Task 7): the second leg of the
+    /// exchange. The secret stays on this machine — only the public key
+    /// travels in the printed `junto://enroll?code=…` URI.
+    Enroll {
+        /// The `junto://invite?code=…` URI from `junto invite`.
+        #[arg(long)]
+        invite: String,
+        /// The display name to enroll under. Defaults to this machine's
+        /// git user name.
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// Diverge a child channel from a parent (docs/adr/0027): open the child in
     /// the parent's home substrate (you found it) and record the divergence
     /// edge in both ledgers — the side-quest birth.
@@ -243,6 +256,7 @@ async fn main() -> Result<()> {
             .await
         }
         Command::Invite { member, channel } => invite(channel, member).await,
+        Command::Enroll { invite: url, name } => enroll(url, name).await,
         Command::Diverge {
             child_name,
             from,
@@ -400,6 +414,59 @@ async fn invite(channel: String, member: String) -> Result<()> {
 /// expiry, pinned so this shape is testable without a CLI harness.
 fn invite_line(url: &str, expires_at: i64) -> String {
     format!("{url}\n(expires {})", render::iso_utc(expires_at))
+}
+
+/// Build the `junto enroll` response payload from a validated invite. The
+/// invite token is echoed back verbatim (proves which grant this answers),
+/// the email comes from the invite itself — never re-typed by the device,
+/// which would defeat `invites::consume`'s `WrongMember` check — and
+/// `public_key` is the freshly minted (or reused) key's public half.
+fn enroll_payload_from_invite(
+    invite: &enroll::InvitePayload,
+    key: &PublicKey,
+    name: &str,
+) -> enroll::EnrollPayload {
+    enroll::EnrollPayload {
+        v: 1,
+        invite_token: invite.invite_token.clone(),
+        email: invite.member_email.clone(),
+        display_name: name.to_string(),
+        public_key: key.clone(),
+        expires_at: invite.expires_at,
+    }
+}
+
+/// `junto enroll` — mint this device's own keypair and emit its public
+/// half (device-key-enrollment plan, Task 7). The invite is decoded and
+/// validated *before* any key is minted, so an expired or malformed
+/// invite never leaves a stray keypair on the device. The member email
+/// comes from the invite, never a flag — letting the device re-type it
+/// would defeat `invites::consume`'s `WrongMember` check.
+async fn enroll(invite_url: String, name: Option<String>) -> Result<()> {
+    let invite = enroll::decode_invite(&invite_url).map_err(|err| {
+        if err.to_string().contains("expired") {
+            err.context(
+                "invites are short-lived (about 10 minutes); ask the founder to run \
+                 `junto invite` again for a fresh one",
+            )
+        } else {
+            err
+        }
+    })?;
+    let display_name = match name {
+        Some(name) => name,
+        None => {
+            host::git_user(Path::new("."))
+                .context("no git identity to default --name from; pass --name explicitly")?
+                .display_name
+        }
+    };
+    let key = keys::signing_key(&host::junto_home()?, &invite.member_email)?;
+    let payload = enroll_payload_from_invite(&invite, &key.public_key(), &display_name);
+    let url = enroll::encode_enroll(&payload)?;
+    println!("{url}");
+    println!("this device's private key never leaves this machine — do not copy or share it");
+    Ok(())
 }
 
 /// `junto diverge` — open a child channel off a parent and record the
@@ -624,5 +691,24 @@ mod tests {
             line.contains("2023-11-14 22:13 UTC"),
             "line should contain a human-readable expiry: {line}"
         );
+    }
+
+    #[test]
+    fn enroll_payload_carries_the_invites_email_and_token_verbatim() {
+        let invite = enroll::InvitePayload {
+            v: 1,
+            invite_token: "tok-abc-123".to_string(),
+            member_email: "dan@example.com".to_string(),
+            channel: "junto-dev".to_string(),
+            expires_at: 1_700_000_000_000,
+        };
+        let key = PublicKey::new(format!("ed25519:{}", "a".repeat(64))).unwrap();
+        let payload = enroll_payload_from_invite(&invite, &key, "Dan's Laptop");
+        assert_eq!(payload.v, 1);
+        assert_eq!(payload.invite_token, invite.invite_token);
+        assert_eq!(payload.email, invite.member_email);
+        assert_eq!(payload.public_key, key);
+        assert_eq!(payload.display_name, "Dan's Laptop");
+        assert_eq!(payload.expires_at, invite.expires_at);
     }
 }

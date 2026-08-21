@@ -26,14 +26,13 @@
 //! [`decode_enroll`] — so an oversized or malformed code is rejected as
 //! cheaply as possible, before the bytes it might carry are ever parsed.
 //!
-//! `junto invite` (Task 6) now calls into this module, so
-//! `MAX_INVITE_TTL_MS`, `MAX_FIELD_CHARS`, `InvitePayload`,
-//! `encode_invite`, and `mint_invite_token` no longer carry
-//! `#[allow(dead_code)]`. `junto enroll` (Task 7) will wire `EnrollPayload`,
-//! `encode_enroll`, and `decode_invite` next; `decode_enroll` stays unwired
-//! until Task 8 (`junto add-member`). `EXPIRY_CLOCK_SKEW_MS` and
-//! `MAX_CODE_CHARS` (no wired caller references either by name) keep their
-//! allows until a caller reaches them directly.
+//! `junto invite` (Task 6) and `junto enroll` (Task 7) now call into this
+//! module — through `decode_invite`, that reaches every private helper and
+//! constant `decode_invite`/`decode_enroll` share (`check_expiry`,
+//! `decode_code`, `EXPIRY_CLOCK_SKEW_MS`, `MAX_CODE_CHARS`) — so only
+//! `decode_enroll` itself remains genuinely unreachable, and only it still
+//! carries `#[allow(dead_code)]`, until Task 8 (`junto add-member`) wires
+//! it.
 
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
@@ -53,7 +52,6 @@ pub const MAX_INVITE_TTL_MS: i64 = 600_000;
 /// behind) is still accepted, and the upper bound on how far in the future
 /// `expires_at` may legally sit is `MAX_INVITE_TTL_MS` **plus** this
 /// allowance (issuer's clock ahead). Same value as Orca's envelope.
-#[allow(dead_code)]
 pub const EXPIRY_CLOCK_SKEW_MS: i64 = 30_000;
 
 /// Hard cap on a code's total character count (the whole `junto://…` URI),
@@ -62,7 +60,6 @@ pub const EXPIRY_CLOCK_SKEW_MS: i64 = 30_000;
 /// corrupted code cannot spend CPU decoding or allocating arbitrarily large
 /// input. Orca's own bound, generously above the largest legitimate
 /// payload (every string field at [`MAX_FIELD_CHARS`], base64-expanded).
-#[allow(dead_code)]
 pub const MAX_CODE_CHARS: usize = 132_096;
 
 /// Hard cap on any single string field inside a decoded payload, checked
@@ -91,7 +88,6 @@ pub struct InvitePayload {
 
 /// The payload behind a `junto://enroll?code=…` URI — see the module docs
 /// for why it carries no secret.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnrollPayload {
     pub v: u8,
@@ -116,7 +112,6 @@ pub fn encode_invite(payload: &InvitePayload) -> Result<String> {
 /// # Errors
 /// Returns an error if `payload` cannot be serialized to JSON (not expected
 /// for this type; surfaced rather than panicking).
-#[allow(dead_code)]
 pub fn encode_enroll(payload: &EnrollPayload) -> Result<String> {
     encode("enroll", payload)
 }
@@ -135,7 +130,6 @@ fn encode(host: &str, payload: &(impl Serialize + ?Sized)) -> Result<String> {
 /// # Errors
 /// Returns an error for an oversized, malformed, wrong-version, out-of-
 /// bounds, or expired code.
-#[allow(dead_code)]
 pub fn decode_invite(url: &str) -> Result<InvitePayload> {
     let json = decode_code(url, "invite")?;
     let payload: InvitePayload =
