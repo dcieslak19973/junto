@@ -76,6 +76,8 @@ founder:     junto add-member --enroll junto://enroll?code=…
 
 `keys::signing_key`'s mint-on-first-use stops being the hazard the live-plane review flagged and becomes the enrollment act itself: it mints *that machine's* key, and only the public half leaves.
 
+**The flow is identity-kind agnostic.** Nothing in `invite`/`enroll`/`add-member --enroll` distinguishes a human from an agent — the exchange only ever proves the *device* holds a keypair, never who is behind it. `--kind` on `add-member` (required, on this path too, no default) is where that distinction is made: the founder declares whether the enrolled identity is a human or an agent, the same act of judgment `add-member`'s keyless path already demands. A remote agent — one whose key cannot legitimately be minted on the founder's machine, for the identical reason a remote human's cannot — enrolls exactly like a remote human: through this same three-step exchange.
+
 **One keypair per machine, published per channel.** `keys::signing_key` is keyed by `(junto-home, email)` and is *not* channel-scoped, so a device mints exactly one keypair for an identity no matter how many channels it writes to. The keyring, by contrast, is a **channel** projection — so that one machine key must be published into each channel where the identity is a member, via that channel's own `MemberAdded`. Enrolling a device is therefore per-channel publication of a key that already exists locally, not a new key each time. This follows from membership itself being per-channel (ADR 0017) and is called out because a reader could reasonably assume one enrollment covers everything.
 
 ### Payloads

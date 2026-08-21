@@ -139,9 +139,14 @@ enum Command {
         /// member's key (docs/adr/0033), so it must be stated, never
         /// defaulted: a keyless remote human left to default to "agent"
         /// would skip `Host::add_member`'s refusal gate and mint their
-        /// keypair here anyway. Required unless --enroll is passed, whose
-        /// enrollment act already tells us this is a human (see --enroll).
-        #[arg(long, required_unless_present = "enroll", conflicts_with = "enroll")]
+        /// keypair here anyway. Required on EVERY invocation, including
+        /// `--enroll`: the founder authors the `MemberAdded` and is the
+        /// trust anchor for who is admitted (docs/adr/0017), while an
+        /// enrolling device only proves possession of a keypair — it
+        /// cannot say whether the identity behind it is a human or an
+        /// agent, so that declaration still has to come from the founder,
+        /// not be derived from the act of enrolling.
+        #[arg(long, required = true)]
         kind: Option<String>,
         /// Channel name or id.
         #[arg(long)]
@@ -165,9 +170,13 @@ enum Command {
         /// public key becomes the member's key — this machine never mints
         /// one for them (docs/adr/0033). Requires the invite that produced
         /// it still be unredeemed and unexpired; conflicts with `email`/
-        /// `--name`/`--kind` — an enrolled device is by construction a
-        /// remote human, so kind is derived, never taken from a flag.
-        #[arg(long, conflicts_with_all = ["email", "name", "kind"])]
+        /// `--name` — those come from the enroll payload the device
+        /// echoed back, and retyping them here risks silent divergence
+        /// from what was actually enrolled. `--kind` does NOT conflict
+        /// here: the device proves it holds a keypair, never who holds
+        /// it, so the founder still declares human-or-agent, exactly as
+        /// on the keyless path.
+        #[arg(long, conflicts_with_all = ["email", "name"])]
         enroll: Option<String>,
     },
     /// Mint a founder-issued enrollment invite (device-key-enrollment
@@ -367,10 +376,13 @@ async fn main() -> Result<()> {
 /// machine can edit the code store anyway; codes guard the network surfaces.
 ///
 /// With `--enroll`, this completes the three-step exchange
-/// (device-key-enrollment plan, Task 8): the member's identity and public
-/// key come from the validated enroll payload, never re-typed, and the
-/// invite token is burned via `invites::consume` before anything is
-/// recorded — see the ordering comment at the call site below.
+/// (device-key-enrollment plan, Task 8): the member's email, display name,
+/// and public key come from the validated enroll payload, never re-typed,
+/// and the invite token is burned via `invites::consume` before anything
+/// is recorded — see the ordering comment at the call site below. `kind`
+/// is the one thing the payload cannot supply (the device proves it holds
+/// a keypair, not who holds it), so it is still taken from `--kind`,
+/// exactly as on the keyless path below.
 // Every parameter is a distinct clap flag on `Command::AddMember`; a struct
 // would just be `Command::AddMember`'s own fields duplicated one call site
 // away — no clarity gained.
@@ -428,19 +440,26 @@ async fn add_member(
                 return Err(err);
             }
             enrolled = true;
-            // An enrolled device is by construction a remote human — this
-            // is the whole point of the exchange. `--kind` conflicts with
-            // `--enroll` on the `Command::AddMember` definition, so there
-            // is no flag to (mis)consult here; deriving it, like the email
-            // in `enroll_payload_from_invite`, keeps the recorded kind tied
-            // to what actually happened rather than what was typed.
-            let member = Member::human(&payload.display_name, &payload.email);
+            // The device proved it holds a keypair; it did not prove who
+            // holds it. `--kind` is required here too (see the field doc
+            // on `Command::AddMember::kind`), so the founder — the trust
+            // anchor for who is admitted (docs/adr/0017) — still declares
+            // whether this identity is a human or an agent. Only email,
+            // display name, and key come from the payload, exactly as
+            // before: those the enrolling device genuinely knows better
+            // than a retyped flag could.
+            let kind = kind.expect("clap requires --kind on every add-member invocation");
+            let member = match kind.as_str() {
+                "human" => Member::human(&payload.display_name, &payload.email),
+                "agent" => Member::agent(&payload.display_name, &payload.email),
+                other => bail!("--kind must be 'human' or 'agent', not '{other}'"),
+            };
             (member, Some(payload.public_key.clone()))
         }
         None => {
             let email = email.expect("clap requires email unless --enroll is passed");
             let name = name.expect("clap requires --name unless --enroll is passed");
-            let kind = kind.expect("clap requires --kind unless --enroll is passed");
+            let kind = kind.expect("clap requires --kind on every add-member invocation");
             let member = match kind.as_str() {
                 "human" => Member::human(&name, &email),
                 "agent" => Member::agent(&name, &email),
@@ -1365,12 +1384,67 @@ mod tests {
         assert!(err.to_string().contains("--kind"), "{err}");
     }
 
-    /// Review finding 2: an enrolled device is by construction a remote
-    /// human — `--kind` must not be taken from a flag on that path, so
-    /// clap refuses the combination outright rather than silently ignoring
-    /// whatever `--kind` claims.
+    /// The founder now declares `kind` on the `--enroll` path too (agent
+    /// enrollment fix): the device proves it holds a keypair, never who
+    /// holds it, so `--kind` and `--enroll` must parse together rather
+    /// than clap refusing the combination outright. A mutation that
+    /// reinstates `conflicts_with = "enroll"` on `kind` (or vice versa)
+    /// turns this `Ok` back into the old parse error.
     #[test]
-    fn add_member_kind_conflicts_with_enroll() {
+    fn add_member_kind_no_longer_conflicts_with_enroll() {
+        Cli::try_parse_from([
+            "junto",
+            "add-member",
+            "--channel",
+            "acme",
+            "--enroll",
+            "junto://enroll?code=x",
+            "--kind",
+            "agent",
+        ])
+        .expect("--kind must be accepted alongside --enroll");
+    }
+
+    /// The guard that keeps Task 8's Critical closed: `--kind` losing its
+    /// old `conflicts_with = "enroll"` must not silently resurrect a
+    /// default. `--enroll` with no `--kind` at all is still refused at
+    /// parse time, on both paths.
+    #[test]
+    fn add_member_enroll_still_requires_kind() {
+        let Err(err) = Cli::try_parse_from([
+            "junto",
+            "add-member",
+            "--channel",
+            "acme",
+            "--enroll",
+            "junto://enroll?code=x",
+        ]) else {
+            panic!("expected a clap parse error");
+        };
+        assert!(err.to_string().contains("--kind"), "{err}");
+    }
+
+    /// `--enroll`'s email and display name come from the validated
+    /// payload, never re-typed (unlike `--kind`, which the payload cannot
+    /// supply) — retyping either risks silent divergence from what was
+    /// actually enrolled, so both flags still conflict with `--enroll`.
+    #[test]
+    fn add_member_enroll_still_conflicts_with_email_and_name() {
+        let Err(err) = Cli::try_parse_from([
+            "junto",
+            "add-member",
+            "alice@example.com",
+            "--channel",
+            "acme",
+            "--enroll",
+            "junto://enroll?code=x",
+            "--kind",
+            "human",
+        ]) else {
+            panic!("expected a clap parse error for --enroll + email");
+        };
+        assert!(err.to_string().to_lowercase().contains("email"), "{err}");
+
         let Err(err) = Cli::try_parse_from([
             "junto",
             "add-member",
@@ -1380,10 +1454,12 @@ mod tests {
             "junto://enroll?code=x",
             "--kind",
             "human",
+            "--name",
+            "Alice",
         ]) else {
-            panic!("expected a clap parse error");
+            panic!("expected a clap parse error for --enroll + --name");
         };
-        assert!(err.to_string().contains("--kind"), "{err}");
+        assert!(err.to_string().contains("--name"), "{err}");
     }
 
     /// Ruling from the task-8 brief: `--channel` on `add-member --enroll` is
@@ -1421,7 +1497,7 @@ mod tests {
             "acme".to_string(),
             None,
             None,
-            None,
+            Some("human".to_string()),
             Some("Dan".to_string()),
             Some("dan@example.com".to_string()),
             None,
@@ -1472,7 +1548,7 @@ mod tests {
             id.to_string(),
             None,
             None,
-            None,
+            Some("human".to_string()),
             Some("Dan".to_string()),
             Some("dan@example.com".to_string()),
             None,
@@ -1485,7 +1561,7 @@ mod tests {
             id.to_string(),
             None,
             None,
-            None,
+            Some("human".to_string()),
             Some("Dan".to_string()),
             Some("dan@example.com".to_string()),
             None,
@@ -1525,7 +1601,7 @@ mod tests {
             id.to_string(),
             None,
             None,
-            None,
+            Some("human".to_string()),
             Some("Dan".to_string()),
             None,
             None,
@@ -1558,6 +1634,133 @@ mod tests {
 
         let junto_home = host::junto_home().unwrap();
         assert!(keys::has_signing_key(&junto_home, "worker@agents.junto").unwrap());
+    }
+
+    /// The defect this fix closes: before it, `--enroll` hardcoded
+    /// `Member::human`, so an agent enrolled from another machine could
+    /// only ever be recorded `Human` — durable, in an append-only record
+    /// with no delete. This asserts BOTH the recorded `MemberKind` and
+    /// that the key is the payload's (the device's own), not a locally
+    /// minted one — a wrong implementation that ignored `--kind` and
+    /// reused `Member::human`'s key handling could still pass a
+    /// key-only or kind-only check.
+    #[tokio::test]
+    async fn add_member_enroll_kind_agent_records_agent_with_the_payloads_key() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (_repo, id) = setup_channel("acme").await;
+        let junto_home = host::junto_home().unwrap();
+        let token = enroll::mint_invite_token();
+        let expires_at = Timestamp::now().as_millis() + enroll::MAX_INVITE_TTL_MS;
+        invites::issue(
+            &junto_home,
+            &token,
+            "worker@agents.junto",
+            &id.to_string(),
+            expires_at,
+        )
+        .unwrap();
+        let key = PublicKey::new(format!("ed25519:{}", "e".repeat(64))).unwrap();
+        let url = build_enroll_url(&token, "worker@agents.junto", "Worker", &key, expires_at);
+
+        add_member(
+            id.to_string(),
+            None,
+            None,
+            Some("agent".to_string()),
+            Some("Dan".to_string()),
+            Some("dan@example.com".to_string()),
+            None,
+            Some(url),
+        )
+        .await
+        .unwrap();
+
+        let fixed = host::Host::fixed(vec![_repo.path().to_path_buf()]);
+        let host::Resolution::Resolved { ledger, id, .. } =
+            fixed.resolve(&id.to_string()).await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+        let view = ledger.lock().await.project(&id).await.unwrap();
+        let recorded = view
+            .party
+            .iter()
+            .find(|m| m.email == "worker@agents.junto")
+            .expect("enrolled agent is on the roster");
+        assert_eq!(
+            recorded.kind,
+            junto_kernel::MemberKind::Agent,
+            "{recorded:?}"
+        );
+        assert_eq!(
+            view.keyring
+                .get("worker@agents.junto")
+                .and_then(|grants| grants.first())
+                .map(|grant| grant.key.clone()),
+            Some(key),
+            "the recorded key must be the payload's own, not a locally minted one"
+        );
+        // The founder's machine never minted a key for the agent.
+        assert!(!keys::has_signing_key(&junto_home, "worker@agents.junto").unwrap());
+    }
+
+    /// No regression: `--enroll --kind human` still records `Human` with
+    /// the payload's key, exactly as before this fix.
+    #[tokio::test]
+    async fn add_member_enroll_kind_human_still_records_human_with_the_payloads_key() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (_repo, id) = setup_channel("acme").await;
+        let junto_home = host::junto_home().unwrap();
+        let token = enroll::mint_invite_token();
+        let expires_at = Timestamp::now().as_millis() + enroll::MAX_INVITE_TTL_MS;
+        invites::issue(
+            &junto_home,
+            &token,
+            "alice@example.com",
+            &id.to_string(),
+            expires_at,
+        )
+        .unwrap();
+        let key = PublicKey::new(format!("ed25519:{}", "f".repeat(64))).unwrap();
+        let url = build_enroll_url(&token, "alice@example.com", "Alice", &key, expires_at);
+
+        add_member(
+            id.to_string(),
+            None,
+            None,
+            Some("human".to_string()),
+            Some("Dan".to_string()),
+            Some("dan@example.com".to_string()),
+            None,
+            Some(url),
+        )
+        .await
+        .unwrap();
+
+        let fixed = host::Host::fixed(vec![_repo.path().to_path_buf()]);
+        let host::Resolution::Resolved { ledger, id, .. } =
+            fixed.resolve(&id.to_string()).await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+        let view = ledger.lock().await.project(&id).await.unwrap();
+        let recorded = view
+            .party
+            .iter()
+            .find(|m| m.email == "alice@example.com")
+            .expect("enrolled human is on the roster");
+        assert_eq!(
+            recorded.kind,
+            junto_kernel::MemberKind::Human,
+            "{recorded:?}"
+        );
+        assert_eq!(
+            view.keyring
+                .get("alice@example.com")
+                .and_then(|grants| grants.first())
+                .map(|grant| grant.key.clone()),
+            Some(key)
+        );
     }
 
     fn set_git_identity(repo: &Path, name: &str, email: &str) {
@@ -2152,7 +2355,7 @@ mod tests {
             channel_id.to_string(),
             None,
             None,
-            None,
+            Some("human".to_string()),
             Some("Dan".to_string()),
             Some("dan@example.com".to_string()),
             None,

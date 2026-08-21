@@ -2063,7 +2063,7 @@ mod tests {
             channel.to_string(),
             None,
             None,
-            None,
+            Some("human".to_string()),
             None, // --author-name/--author-email: default to git_user(&substrate)
             None,
             None,
