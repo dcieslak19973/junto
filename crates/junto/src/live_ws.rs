@@ -546,6 +546,7 @@ mod tests {
         junto_kernel::SigningKey,
         tempfile::TempDir,
         tempfile::TempDir,
+        tokio::sync::mpsc::Receiver<crate::launch::TurnControl>,
     ) {
         let dir = tempfile::tempdir().expect("tempdir");
         assert!(
@@ -581,11 +582,27 @@ mod tests {
             crate::keys::signing_key(member_home.path(), "dan@x.com").expect("founder signing key");
 
         let session = EntryId::new();
-        let live = host.live_plane().begin(session);
+        // `LiveSessions::begin`, not `live_plane().begin` directly: this
+        // also opens the session's control channel, so tests can hold
+        // `control_rx` and assert an urgent annotation reaches it as a
+        // `TurnControl::Steer` (`crate::live_bridge`'s delivery test).
+        let control_rx = host.live().begin(session);
+        let live = host
+            .live_plane()
+            .get(session)
+            .expect("live plane session began");
         live.doc
             .push_conversation(&serde_json::json!({"seq": 1, "kind": "status", "text": "hi"}));
 
-        (host, channel, session, signing_key, dir, member_home)
+        (
+            host,
+            channel,
+            session,
+            signing_key,
+            dir,
+            member_home,
+            control_rx,
+        )
     }
 
     /// Serve `host`'s router on an ephemeral localhost port; returns the
@@ -604,7 +621,8 @@ mod tests {
 
     #[tokio::test]
     async fn watcher_authenticates_receives_snapshot_and_posts_annotation() {
-        let (host, channel, session, signing_key, _dir, _member_home) = fixture().await;
+        let (host, channel, session, signing_key, _dir, _member_home, _control_rx) =
+            fixture().await;
         let addr = serve_router(host.clone()).await;
 
         let url = format!("ws://{addr}/channels/{channel}/sessions/{session}/live");
@@ -692,7 +710,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_signature_over_the_wrong_bytes_is_rejected_without_auth_ok() {
-        let (host, channel, session, signing_key, _dir, _member_home) = fixture().await;
+        let (host, channel, session, signing_key, _dir, _member_home, _control_rx) =
+            fixture().await;
         let addr = serve_router(host).await;
 
         let url = format!("ws://{addr}/channels/{channel}/sessions/{session}/live");
@@ -732,7 +751,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_unknown_email_is_rejected() {
-        let (host, channel, session, signing_key, _dir, _member_home) = fixture().await;
+        let (host, channel, session, signing_key, _dir, _member_home, _control_rx) =
+            fixture().await;
         let addr = serve_router(host).await;
 
         let url = format!("ws://{addr}/channels/{channel}/sessions/{session}/live");
@@ -769,7 +789,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_second_watcher_observes_the_first_watchers_accepted_annotation() {
-        let (host, channel, session, signing_key, _dir, _member_home) = fixture().await;
+        let (host, channel, session, signing_key, _dir, _member_home, _control_rx) =
+            fixture().await;
         let addr = serve_router(host.clone()).await;
         let url = format!("ws://{addr}/channels/{channel}/sessions/{session}/live");
 
@@ -829,5 +850,61 @@ mod tests {
             Some("seen by the other watcher".to_string()),
             "the second watcher must receive the first watcher's accepted annotation"
         );
+    }
+
+    #[tokio::test]
+    async fn urgent_annotation_steers_the_running_turn_immediately() {
+        let (host, channel, session, signing_key, _dir, _member_home, mut control_rx) =
+            fixture().await;
+        let addr = serve_router(host).await;
+
+        let url = format!("ws://{addr}/channels/{channel}/sessions/{session}/live");
+        let (mut ws, _response) = tokio_tungstenite::connect_async(url)
+            .await
+            .expect("connect");
+
+        let nonce = match recv_until(&mut ws, |f| matches!(f, Frame::Challenge { .. })).await {
+            Frame::Challenge { nonce } => nonce,
+            _ => unreachable!(),
+        };
+        let signature = signing_key.sign_bytes(nonce.as_bytes());
+        send_frame(
+            &mut ws,
+            &Frame::Auth {
+                email: "dan@x.com".to_string(),
+                signature: signature.into(),
+            },
+        )
+        .await;
+        assert_eq!(
+            recv_until(&mut ws, |f| matches!(
+                f,
+                Frame::AuthOk | Frame::Rejected { .. }
+            ))
+            .await,
+            Frame::AuthOk
+        );
+        recv_until(&mut ws, |f| matches!(f, Frame::Update { .. })).await; // the snapshot
+
+        let mut annotation = test_annotation("dan@x.com", "off by one");
+        annotation.urgent = true;
+        annotation.sign(&signing_key).expect("sign");
+        let local = LiveDoc::new();
+        local.insert_annotation(&annotation).expect("insert");
+        send_frame(&mut ws, &Frame::update(&local.export_snapshot())).await;
+
+        let signal = tokio::time::timeout(Duration::from_secs(5), control_rx.recv())
+            .await
+            .expect("a control signal arrives before the timeout")
+            .expect("the control channel is still open");
+        match signal {
+            crate::launch::TurnControl::Steer(message) => {
+                assert!(
+                    message.contains("off by one"),
+                    "steer message missing the annotation body: {message}"
+                );
+            }
+            other => panic!("expected a Steer control signal, got {other:?}"),
+        }
     }
 }

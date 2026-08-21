@@ -49,14 +49,17 @@ pub(crate) struct SessionLive {
     /// Watcher annotations validated but not yet delivered to the driving
     /// agent as steering context. Appended by [`crate::live_ws`] (via
     /// [`crate::live_bridge::deliver`]) after
-    /// `junto_live::validate_annotation_update` accepts them; drained by
-    /// the steering bridge (a later task — this task only appends).
+    /// `junto_live::validate_annotation_update` accepts them; drained at the
+    /// next turn boundary by [`crate::live_bridge::flush_pending`], or
+    /// immediately by [`crate::live_bridge::deliver`]'s urgent path when the
+    /// running turn's control channel rejects a steer (no turn currently
+    /// live) — either way, nothing appended here is ever silently dropped.
     pub pending: Mutex<Vec<junto_kernel::Annotation>>,
     /// The session's workspace path, for re-anchoring annotations before
-    /// they're delivered as steering context (the annotation→steer bridge,
-    /// a later task). Left `None` by every tap in this task — declared here
-    /// once so that later task doesn't need a second edit to this struct.
-    #[allow(dead_code)]
+    /// they're delivered as steering context. Set from `spawn_turn`/
+    /// `spawn_outcome_loop` (`crate::launch`), which already have it in
+    /// hand; `None` until then, and [`crate::live_bridge`] renders a
+    /// pinned-only position rather than fabricate one when it is.
     pub workspace: Mutex<Option<PathBuf>>,
     /// Keeps `doc`'s local-update subscription alive for as long as this
     /// session lives; the subscription itself forwards every local commit

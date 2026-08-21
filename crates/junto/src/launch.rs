@@ -1703,6 +1703,15 @@ fn spawn_turn(
     // function returns — a client that subscribes right after the launch/steer
     // HTTP call lands on the running turn instead of an immediate "end".
     let mut control_rx = host.live().begin(session);
+    // Populate the live plane's workspace so `crate::live_bridge` can
+    // re-anchor annotations against it; this is the one place a running
+    // turn's workspace path is in hand at `begin` time.
+    if let Some(live) = host.live_plane().get(session) {
+        *live.workspace.lock().expect("live plane workspace lock") = Some(workspace.clone());
+    }
+    // Flush any annotations queued while no turn was running for this
+    // session (e.g. between turns) now that the control channel is up.
+    crate::live_bridge::flush_pending(std::sync::Arc::clone(&host), channel_ref.clone(), session);
     tokio::spawn(async move {
         let outcome = run_turn(
             &workspace,
@@ -1956,6 +1965,17 @@ fn spawn_outcome_loop(
 ) {
     tokio::spawn(async move {
         let _control_rx = host.live().begin(session);
+        // Populate the live plane's workspace so `crate::live_bridge` can
+        // re-anchor annotations against it, and flush any queued while no
+        // turn was running for this session — same wiring as `spawn_turn`.
+        if let Some(live) = host.live_plane().get(session) {
+            *live.workspace.lock().expect("live plane workspace lock") = Some(workspace.clone());
+        }
+        crate::live_bridge::flush_pending(
+            std::sync::Arc::clone(&host),
+            channel_ref.clone(),
+            session,
+        );
 
         // Prepare a PR branch the worker commits onto (the push-gate's
         // deliverable). Best-effort: without it, grading falls back to the
