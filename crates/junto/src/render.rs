@@ -715,7 +715,7 @@ pub fn transcript_markdown(name: &str, id: &ChannelId, view: &ChannelView) -> St
         let when = entry.timestamp.as_millis();
         let who = format!("{} <{}>", entry.author.display_name, entry.author.email);
         let marker = if view.unrecognized.contains(&entry.id) {
-            " [unrecognized author — not in the party; excluded from projection]"
+            " [unrecognized author — not in the party, or revoked as of this entry's timestamp; excluded from projection]"
         } else {
             ""
         };
@@ -2788,8 +2788,9 @@ fn entry_card(entry: &LedgerEntry, view: &ChannelView, channel: &ChannelId) -> S
         .map(|label| format!("<span class=\"badge {label}\">{label}</span>"))
         .unwrap_or_default();
     let unrecognized_badge = if unrecognized {
-        "<span class=\"badge unrecognized\" title=\"author is not in the party; excluded \
-         from standings and gates (docs/adr/0017)\">unrecognized</span>"
+        "<span class=\"badge unrecognized\" title=\"author is not in the party, or was \
+         revoked as of this entry's timestamp; excluded from standings and gates \
+         (docs/adr/0017, docs/adr/0035)\">unrecognized</span>"
     } else {
         ""
     };

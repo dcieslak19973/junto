@@ -163,10 +163,13 @@ pub struct ChannelView {
     /// also when the party is non-empty but no member on it has ever carried
     /// a key — a keyless founder yields a non-empty roster with no grants.
     pub keyring: Keyring,
-    /// Entries whose author is not in the [`party`](ChannelView::party) —
-    /// retained and surfaced, but excluded from standings and gate folding
-    /// (`docs/adr/0017`: visibility beats mystery). Always empty when `party`
-    /// is empty.
+    /// Entries that do not count: their author is not in the
+    /// [`party`](ChannelView::party) (`docs/adr/0017`), **or** is in the
+    /// party but was revoked as of the entry's own timestamp
+    /// (`docs/adr/0035`, `Self::project_unrecognized`) — the party still
+    /// lists a revoked member. Retained and surfaced, never dropped, but
+    /// excluded from standings and gate folding (visibility beats
+    /// mystery). Always empty when `party` is empty.
     pub unrecognized: HashSet<EntryId>,
     /// Recognized entries whose signature is absent, malformed, or does not
     /// verify against any grant in the [`keyring`](ChannelView::keyring)
@@ -341,6 +344,19 @@ impl<S: SubstrateProvider> Ledger<S> {
         let mut seen = HashSet::new();
         entries.retain(|entry| seen.insert(entry.id));
 
+        // `party` and `keyring` are folded from the full `entries` list
+        // below, never from `recognized` — deliberately: recognition is
+        // *derived from* the keyring (`Self::project_unrecognized` needs
+        // it to compute a cutoff), so gating the keyring on recognition
+        // would be circular. Consequence: a revoked member's own later
+        // `MemberAdded`/`Park` entries still take full effect on the
+        // roster and on other members' grants — a revoked founder, for
+        // instance, keeps founder authority to add members and grant
+        // keys. Only the folds below that consume `recognized`
+        // (standings, gates, sessions, lineage, genesis/name,
+        // close/reopen) are gated by revocation. Re-rooting a
+        // compromised founder's authority is unaddressed here and is not
+        // asked for by this plan.
         let party = Self::project_party(&entries);
         let keyring = match party.first() {
             Some(founder) => Self::project_keyring(&entries, &founder.email),
@@ -349,9 +365,11 @@ impl<S: SubstrateProvider> Ledger<S> {
         // Membership is set-based, not temporal (`docs/adr/0017`): an
         // entry's author being in the Party does not depend on where the
         // granting entry falls in canonical order. But membership alone is
-        // no longer sufficient — a revoked member's post-cutoff entries
-        // stop counting even though they remain in the Party
-        // (`docs/adr/0035`, Task 3; see `Self::project_unrecognized`).
+        // no longer sufficient for the recognized-based projections below
+        // (standings, gates, sessions, lineage, name, close/reopen) — a
+        // revoked member's post-cutoff entries stop counting toward those,
+        // even though they remain in the Party (`docs/adr/0035`, Task 3;
+        // see `Self::project_unrecognized`).
         let unrecognized = Self::project_unrecognized(&party, &keyring, &entries);
         let recognized: Vec<&LedgerEntry> = entries
             .iter()
@@ -573,7 +591,10 @@ impl<S: SubstrateProvider> Ledger<S> {
     /// own: an unverified entry is still *recognized*, so it still carries
     /// standings, closes gates, and appears in sessions and lineage.
     /// Retiring every one of a member's keys would, without this, leave
-    /// them merely flagged rather than actually offboarded.
+    /// them merely flagged there rather than excluded from them. It does
+    /// **not** touch the roster or a revoked member's own future grant or
+    /// membership authority — see the note above `Self::project_party`'s
+    /// call site for that exact boundary.
     fn project_unrecognized(
         party: &[Member],
         keyring: &Keyring,
@@ -584,17 +605,20 @@ impl<S: SubstrateProvider> Ledger<S> {
         }
         let member_emails: HashSet<&str> =
             party.iter().map(|member| member.email.as_str()).collect();
+        // `Option<Timestamp>`'s derived `Ord` places `None` before every
+        // `Some`, so `.min()` over each grant's `retired_at` yields `None`
+        // (no grants, or at least one still active — no cutoff either
+        // way) unless every grant is `Some`, in which case it yields the
+        // earliest of them — exactly the decision above, panic-free and
+        // without a second traversal.
         let cutoffs: HashMap<&str, Timestamp> = keyring
             .iter()
             .filter_map(|(email, grants)| {
-                if grants.is_empty() || grants.iter().any(|grant| grant.retired_at.is_none()) {
-                    return None;
-                }
                 let cutoff = grants
                     .iter()
-                    .filter_map(|grant| grant.retired_at)
+                    .map(|grant| grant.retired_at)
                     .min()
-                    .expect("checked non-empty and all-retired above");
+                    .flatten()?;
                 Some((email.as_str(), cutoff))
             })
             .collect();
@@ -3104,7 +3128,8 @@ mod tests {
     /// their later entries from *counting*, not just from verifying: an
     /// entry stamped strictly after the retirement of the author's last
     /// active grant is unrecognized, mirroring `KeyGrant::active_at`'s
-    /// inclusive boundary (at-or-before the park still counts).
+    /// inclusive boundary — an entry stamped *at exactly* the cutoff still
+    /// counts, only strictly-after entries do not.
     #[tokio::test]
     async fn revoked_members_post_cutoff_entries_are_unrecognized() {
         let founder_key = crate::SigningKey::from_secret_bytes([1; 32]);
@@ -3149,6 +3174,14 @@ mod tests {
                 rationale: "device lost".into(),
             },
         );
+        let at_cutoff_id = EntryId::new();
+        let at_cutoff = entry(
+            at_cutoff_id,
+            channel,
+            agent.clone(),
+            4,
+            assertion("at cutoff"),
+        );
         let after_id = EntryId::new();
         let after = entry(
             after_id,
@@ -3158,7 +3191,7 @@ mod tests {
             assertion("after cutoff"),
         );
 
-        for e in [genesis_entry, grant, before, park, after] {
+        for e in [genesis_entry, grant, before, park, at_cutoff, after] {
             ledger.append(e).await.unwrap();
         }
 
@@ -3166,6 +3199,10 @@ mod tests {
         assert!(
             !view.unrecognized.contains(&before_id),
             "stamped before the cutoff, still counts"
+        );
+        assert!(
+            !view.unrecognized.contains(&at_cutoff_id),
+            "stamped at exactly the cutoff, the boundary is inclusive — still counts"
         );
         assert!(
             view.unrecognized.contains(&after_id),
