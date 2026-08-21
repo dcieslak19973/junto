@@ -6,7 +6,7 @@
 //! for a time, and leave. That transient liveness has no place in a permanent
 //! record.
 //!
-//! [`Presence`] wraps loro's [`EphemeralStore`](loro::EphemeralStore), a
+//! [`Presence`] wraps loro's [`EphemeralStore`](loro::awareness::EphemeralStore), a
 //! last-write-wins keyed store with automatic timeout-based expiry. A watcher
 //! sends a heartbeat every 10 seconds; if 30 seconds pass without a heartbeat,
 //! that watcher is assumed gone and is forgotten. The store syncs on its own
@@ -17,9 +17,8 @@ use loro::awareness::EphemeralStore;
 /// Ephemeral membership: tracks which emails are currently watching this live
 /// session.
 ///
-/// This struct is the only place in this crate that names the `loro` type
-/// [`EphemeralStore`] in a public signature. All loro types are confined here;
-/// `Presence` itself exposes only `String` in its API.
+/// loro's [`EphemeralStore`] is confined to this module's private field; `Presence`
+/// exposes only `String` and `Vec<u8>` in its public API.
 #[derive(Debug)]
 pub struct Presence {
     store: EphemeralStore,
@@ -34,6 +33,13 @@ impl Presence {
     pub fn new() -> Self {
         Self {
             store: EphemeralStore::new(30_000),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_timeout(ms: i64) -> Self {
+        Self {
+            store: EphemeralStore::new(ms),
         }
     }
 
@@ -64,11 +70,10 @@ impl Presence {
         watchers
     }
 
-    /// Serialize all current presence state (including expired entries) to bytes.
+    /// Serialize all non-expired presence state to bytes.
     ///
-    /// Use this to send presence state to other replicas. The bytes include
-    /// the time each entry was written; the receiving replica will respect
-    /// those times and discard entries that have already expired.
+    /// The bytes include the timestamp of each entry; the receiving replica will
+    /// respect those timestamps and discard entries that have already expired.
     #[must_use]
     pub fn encode_all(&self) -> Vec<u8> {
         self.store.encode_all()
@@ -122,16 +127,12 @@ mod tests {
 
     #[test]
     fn entries_expire_after_timeout() {
-        let a = Presence::new();
+        let a = Presence::with_timeout(50);
         a.set_watching("temp@x.com");
         assert_eq!(a.watchers(), vec!["temp@x.com".to_string()]);
 
-        // Sleep for 1.5 seconds (which is less than 30s timeout, so should still be there)
-        std::thread::sleep(std::time::Duration::from_millis(1500));
-        assert_eq!(a.watchers(), vec!["temp@x.com".to_string()]);
-
-        // Sleep until timeout + margin (30s + some margin)
-        std::thread::sleep(std::time::Duration::from_millis(31_500));
+        // Sleep past timeout: 50ms timeout + 200ms sleep = well past expiry
+        std::thread::sleep(std::time::Duration::from_millis(200));
         assert_eq!(a.watchers(), vec![] as Vec<String>);
     }
 }
