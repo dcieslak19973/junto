@@ -22,6 +22,24 @@
 //! below is not incidental test coverage; it is the proof that the guarantee
 //! holds.
 //!
+//! # Why it forks *twice*, and compares fork-against-fork, never fork-against-`doc`
+//!
+//! `doc` is not read-only in practice: the driving turn writes into the
+//! same session's `LiveDoc` from another tokio worker many times a second
+//! while an agent streams (`LiveSessions::publish` ->
+//! `SessionLive::publish_conversation` -> `doc.push_conversation`). An
+//! earlier version of this function forked once and compared that frozen
+//! fork against the still-mutating `doc` — so a conversation/worktree push
+//! landing between the fork and the comparison made them differ through no
+//! fault of the sender, rejecting a perfectly good frame with a misleading
+//! "watchers may only write annotations" reason, worst exactly when the
+//! agent is most active. [`validate_annotation_update`] instead takes a
+//! `baseline` fork first, then forks `baseline` itself to get `fork` —
+//! both frozen at the same instant, before `bytes` is imported into
+//! `fork`. Every comparison below (driver-container match, existing-id
+//! byte-identity) is `fork` against `baseline`, never against `doc`, so
+//! nothing under comparison can move mid-check.
+//!
 //! # What "only add annotations" actually has to mean
 //!
 //! A remote watcher is allowed to *add* annotations — not to touch anything
@@ -95,8 +113,18 @@ pub fn validate_annotation_update(
     sender_email: &str,
     keyring: &HashMap<String, PublicKey>,
 ) -> Result<Vec<Annotation>, String> {
-    // The fork: see the module docs for why this is the whole point.
-    let fork = doc.fork();
+    // Two forks, both frozen the instant they are taken: the driving turn
+    // writes into `doc` concurrently (`LiveSessions::publish` ->
+    // `SessionLive::publish_conversation` -> `doc.push_conversation`, many
+    // times a second while an agent streams), so comparing an imported
+    // fork against the still-*live* `doc` would reject a perfectly good
+    // frame whenever a conversation/worktree push lands mid-validation —
+    // see `concurrent_conversation_push_never_rejects_a_valid_frame` below.
+    // `baseline` is never imported into; it is only ever compared against,
+    // standing in for "what `doc` looked like the instant we started" so
+    // every check below is race-free by construction.
+    let baseline = doc.fork();
+    let fork = baseline.fork();
     fork.import_update(bytes)
         .map_err(|e| format!("frame did not import: {e}"))?;
 
@@ -107,18 +135,18 @@ pub fn validate_annotation_update(
         .get(sender_email)
         .ok_or_else(|| format!("no verifying key on file for '{sender_email}'"))?;
 
-    if !fork.conversation_matches(doc) || !fork.worktree_matches(doc) {
+    if !fork.conversation_matches(&baseline) || !fork.worktree_matches(&baseline) {
         return Err(
             "watchers may only write annotations, not conversation/worktree entries".to_string(),
         );
     }
 
-    // Every id the real doc already has must still resolve to the exact
-    // same stored bytes in the fork — see the module docs for why an
+    // Every id `baseline` already has must still resolve to the exact same
+    // stored bytes in the fork — see the module docs for why an
     // added-ids-only diff cannot catch an overwrite or a deletion.
-    let existing_ids = doc.annotation_ids();
+    let existing_ids = baseline.annotation_ids();
     for id in &existing_ids {
-        if fork.annotation_raw(id) != doc.annotation_raw(id) {
+        if fork.annotation_raw(id) != baseline.annotation_raw(id) {
             return Err(format!(
                 "annotation {id} was modified or removed by a watcher; only new annotation ids may be written"
             ));
@@ -530,5 +558,74 @@ mod tests {
             validate_annotation_update(&server, &update, "ghost@nowhere.com", &HashMap::new())
                 .unwrap_err();
         assert!(err.contains("no verifying key"), "unexpected reason: {err}");
+    }
+
+    /// Regression test for the final-branch-review race (BLOCKER 1): the
+    /// pre-fix gate compared a FROZEN fork against the STILL-MUTATING real
+    /// `doc`, so any conversation/worktree push landing between the fork
+    /// and the comparison made them differ through no fault of the sender
+    /// and rejected an otherwise-valid annotation frame. This mirrors
+    /// `LiveSessions::publish` -> `SessionLive::publish_conversation` ->
+    /// `doc.push_conversation` running on another tokio worker while an
+    /// agent streams — many times a second, exactly the situation the live
+    /// plane exists for. Hammering `server` with concurrent conversation
+    /// pushes from another thread while repeatedly validating the SAME
+    /// valid frame (which never touches conversation/worktree at all)
+    /// reproduces the race reliably against the old code and must never
+    /// fail against the fixed code, which derives both comparison sides
+    /// from forks taken atomically together.
+    #[test]
+    fn concurrent_conversation_push_never_rejects_a_valid_frame() {
+        let key = junto_kernel::SigningKey::from_secret_bytes([5; 32]);
+        let server = LiveDoc::new();
+        let watcher = LiveDoc::new();
+        watcher.import_update(&server.export_snapshot()).unwrap();
+        let mut ann = test_annotation_by("w@x.com", "looks wrong");
+        ann.sign(&key).unwrap();
+        watcher.insert_annotation(&ann).unwrap();
+        let update = watcher.export_snapshot();
+        let keyring = keyring_of("w@x.com", &key);
+
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let mut first_failure: Option<(usize, String)> = None;
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                // Bounded, not `while !stop`: the race this test targets
+                // fires within the first handful of pushes (confirmed by
+                // hand against the pre-fix code — attempt 0 failed
+                // immediately), so this cap is generous headroom, not a
+                // tight budget. An unbounded pusher would let `conversation`
+                // grow without limit for as long as the main loop below
+                // takes, making every subsequent `doc.fork()` progressively
+                // more expensive and the whole test slower than it needs to
+                // be for no gain in coverage.
+                let mut i = 0u64;
+                while i < 2_000 && !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    server.push_conversation(&serde_json::json!({"seq": 0, "i": i}));
+                    i += 1;
+                }
+            });
+
+            // Never `assert!`/panic inside this closure while the pusher
+            // thread might still be spinning: `thread::scope` joins spawned
+            // threads before a panic can unwind past it, and the pusher
+            // only stops when told to, so panicking here would deadlock
+            // the test instead of failing it. Record the first failure and
+            // always signal `stop` before leaving the scope.
+            for attempt in 0..50 {
+                let result = validate_annotation_update(&server, &update, "w@x.com", &keyring);
+                if let Err(reason) = result {
+                    first_failure = Some((attempt, reason));
+                    break;
+                }
+            }
+
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+
+        assert!(
+            first_failure.is_none(),
+            "valid annotation frame rejected during concurrent conversation activity: {first_failure:?}"
+        );
     }
 }
