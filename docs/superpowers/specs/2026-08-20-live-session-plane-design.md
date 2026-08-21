@@ -53,20 +53,20 @@ Three planes, strict separation:
 ```
   Live plane (ephemeral, CRDT)      Session plane (existing)      Record (untouched)
  ┌──────────────────────────┐     ┌───────────────────────┐     ┌────────────────────┐
- │  LiveDoc per session     │◄────│  ACP loop             │     │ append-only entries│
- │  (loro document)         │     │  steer / interrupt    │     │ refs/junto/*       │
- │   • conversation (drv)   │────►│  owned worktree       │     │ union-merge sync   │
- │   • worktree      (drv)  │     └───────────────────────┘     └────────────────────┘
- │   • annotations (multi)  │        session end: LiveDoc               ▲
- │   • presence  (ephemeral)│        archived as versioned              │
- └──────────────────────────┘        session artifact ──────────────────┘
-                                     (ratified outcomes only, via
-                                      existing verification acts)
+ │  LiveDoc per session      │◄────│  ACP loop             │     │ append-only entries│
+ │  (loro document)          │────►│  steer / interrupt    │     │ refs/junto/*       │
+ │   • conversation (drv)    │     │  owned worktree       │     │ union-merge sync   │
+ │   • worktree      (drv)   │     └───────────────────────┘     └────────────────────┘
+ │   • annotations (multi)   │        session end: LiveDoc               ▲
+ └──────────────────────────┘        archived as versioned              │
+  + Presence (loro EphemeralStore,    session artifact ──────────────────┘
+    own sync channel, never archived) (ratified outcomes only, via
+                                       existing verification acts)
 ```
 
 ### LiveDoc
 
-One **loro** document per live session (MIT — verify at adoption), four
+One **loro** document per live session (MIT — verify at adoption), three
 containers with two write policies:
 
 | Container | Writers | Content |
@@ -74,7 +74,11 @@ containers with two write policies:
 | `conversation` | driver's host only | the session stream junto already emits over SSE (ADR 0023): turns, tool events, thinking |
 | `worktree` | driver's host only | edit/diff events derived from ACP tool-call events + periodic `git diff` snapshots. **No FS watcher in v1.** |
 | `annotations` | any authenticated member | signed annotation ops (below), add-only |
-| `presence` | any authenticated member | loro ephemeral store; never persisted |
+
+**Presence** (who is watching) is **not** a `LiveDoc` container: it rides
+loro's separate ephemeral store on its own sync channel — any authenticated
+member may write into it, never persisted, and never archived with the
+document snapshot at session end.
 
 Single-writer on `conversation`/`worktree` is **enforced by session ownership
 (policy), not by the data model** — lifting it later (rung 3: a shared plan
