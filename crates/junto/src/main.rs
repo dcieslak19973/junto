@@ -33,7 +33,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use junto_kernel::{ChannelId, EntryId, Member};
+use junto_kernel::{ChannelId, EntryId, Member, Timestamp};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
@@ -147,6 +147,22 @@ enum Command {
         #[arg(long)]
         checkout: Option<PathBuf>,
     },
+    /// Mint a founder-issued enrollment invite (device-key-enrollment
+    /// plan, Task 6): the first leg of the three-step exchange that lets a
+    /// new device join without a private key ever leaving it. Only the
+    /// channel's founding member may issue one — an invite the caller
+    /// cannot themselves complete would send the recipient through the
+    /// whole exchange to fail at `junto add-member`.
+    Invite {
+        /// The new member's email — the invite is a grant for exactly this
+        /// identity; `junto enroll` reads it back off the invite, never
+        /// re-typed by the enrolling device.
+        #[arg(long)]
+        member: String,
+        /// Channel name or id to invite them into.
+        #[arg(long)]
+        channel: String,
+    },
     /// Diverge a child channel from a parent (docs/adr/0027): open the child in
     /// the parent's home substrate (you found it) and record the divergence
     /// edge in both ledgers — the side-quest birth.
@@ -226,6 +242,7 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Command::Invite { member, channel } => invite(channel, member).await,
         Command::Diverge {
             child_name,
             from,
@@ -306,6 +323,83 @@ fn member_code_for(email: &str) -> Result<Option<String>> {
         .into_iter()
         .find(|record| record.member.email == email)
         .map(|record| record.code))
+}
+
+/// `junto invite` — mint a founder-issued enrollment invite
+/// (device-key-enrollment plan, Task 6). Refuses if the channel does not
+/// exist, or if the caller (this machine's git user) is not the channel's
+/// founding member (`view.party.first()`) — an invite the caller cannot
+/// themselves complete is worse than an error.
+async fn invite(channel: String, member: String) -> Result<()> {
+    let host = host::Host::from_registry(host::junto_home()?);
+    let (substrate, ledger, id) = match host.resolve(&channel).await? {
+        host::Resolution::Resolved {
+            substrate,
+            ledger,
+            id,
+        } => (substrate, ledger, id),
+        host::Resolution::NotFound => {
+            bail!("no channel '{channel}' in any registered substrate")
+        }
+        host::Resolution::Ambiguous(substrates) => bail!(
+            "channel name '{channel}' exists in several substrates ({substrates:?}); \
+             address it by id"
+        ),
+    };
+    let view = ledger.lock().await.project(&id).await?;
+    let Some(founder) = view.party.first() else {
+        bail!(
+            "channel '{channel}' has no genesis, so it has no founding member to issue \
+             invites (membership is not enforced on pre-genesis channels)"
+        );
+    };
+    let caller = host::git_user(&substrate)?;
+    if founder.email != caller.email {
+        bail!(
+            "only the founding member ({} <{}>) can issue invites for '{channel}' \
+             (docs/adr/0017)",
+            founder.display_name,
+            founder.email
+        );
+    }
+    if member.chars().count() > enroll::MAX_FIELD_CHARS {
+        bail!(
+            "--member exceeds the {}-char limit",
+            enroll::MAX_FIELD_CHARS
+        );
+    }
+
+    let token = enroll::mint_invite_token();
+    let expires_at = Timestamp::now().as_millis() + enroll::MAX_INVITE_TTL_MS;
+    // The invite's channel field carries the RESOLVED id, not whatever the
+    // caller typed (a name or an id): `invites::consume` (Task 8) compares
+    // it exactly, so an invite minted with `--channel <name>` must match an
+    // enrollment completed against `--channel <id>` for the same channel —
+    // otherwise the two legs of one exchange land on different strings and
+    // redemption fails with a misleading `WrongChannel`.
+    let canonical_channel = id.to_string();
+    invites::issue(
+        &host::junto_home()?,
+        &token,
+        &member,
+        &canonical_channel,
+        expires_at,
+    )?;
+    let url = enroll::encode_invite(&enroll::InvitePayload {
+        v: 1,
+        invite_token: token,
+        member_email: member,
+        channel: canonical_channel,
+        expires_at,
+    })?;
+    println!("{}", invite_line(&url, expires_at));
+    Ok(())
+}
+
+/// Format `junto invite`'s output: the shareable URI plus a human-readable
+/// expiry, pinned so this shape is testable without a CLI harness.
+fn invite_line(url: &str, expires_at: i64) -> String {
+    format!("{url}\n(expires {})", render::iso_utc(expires_at))
 }
 
 /// `junto diverge` — open a child channel off a parent and record the
@@ -510,4 +604,25 @@ async fn open(
     );
     init::print_founder_code(&opened);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invite_line_contains_the_uri_and_a_human_readable_expiry() {
+        let url = "junto://invite?code=abc123";
+        // 1_700_000_000_000ms = 2023-11-14T22:13:20Z; asserted as a literal
+        // so this test does not use `iso_utc` as its own oracle — mutating
+        // `iso_utc` to its raw-millis fallback must fail this test too, not
+        // just pin "invite_line calls iso_utc".
+        let expires_at = 1_700_000_000_000;
+        let line = invite_line(url, expires_at);
+        assert!(line.contains(url), "line should contain the URI: {line}");
+        assert!(
+            line.contains("2023-11-14 22:13 UTC"),
+            "line should contain a human-readable expiry: {line}"
+        );
+    }
 }

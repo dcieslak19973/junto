@@ -26,10 +26,14 @@
 //! [`decode_enroll`] — so an oversized or malformed code is rejected as
 //! cheaply as possible, before the bytes it might carry are ever parsed.
 //!
-//! Not yet wired to a CLI command — Tasks 6-8 (`junto invite`, `junto
-//! enroll`, `junto add-member`) call into this module; until then its public
-//! surface is exercised only by this file's own tests, so each externally
-//! callable item below carries its own `#[allow(dead_code)]`.
+//! `junto invite` (Task 6) now calls into this module, so
+//! `MAX_INVITE_TTL_MS`, `MAX_FIELD_CHARS`, `InvitePayload`,
+//! `encode_invite`, and `mint_invite_token` no longer carry
+//! `#[allow(dead_code)]`. `junto enroll` (Task 7) will wire `EnrollPayload`,
+//! `encode_enroll`, and `decode_invite` next; `decode_enroll` stays unwired
+//! until Task 8 (`junto add-member`). `EXPIRY_CLOCK_SKEW_MS` and
+//! `MAX_CODE_CHARS` (no wired caller references either by name) keep their
+//! allows until a caller reaches them directly.
 
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
@@ -42,7 +46,6 @@ use serde::{Deserialize, Serialize};
 /// rather than invented for junto. Long enough for a human to relay a code
 /// (paste it into chat, read it aloud) but short enough that a leaked or
 /// forgotten code stops mattering quickly.
-#[allow(dead_code)]
 pub const MAX_INVITE_TTL_MS: i64 = 600_000;
 
 /// Allowance for clock skew between the two machines exchanging a code, in
@@ -66,7 +69,6 @@ pub const MAX_CODE_CHARS: usize = 132_096;
 /// after JSON parsing. Bounds the cost of holding or echoing a field back
 /// to a human and catches a payload that parses cleanly but carries absurd
 /// content (e.g. a `channel` name someone pasted a book into).
-#[allow(dead_code)]
 pub const MAX_FIELD_CHARS: usize = 4_096;
 
 /// The current version this crate produces and accepts. `decode_invite` and
@@ -78,7 +80,6 @@ const PAYLOAD_VERSION: u8 = 1;
 /// The payload behind a `junto://invite?code=…` URI — see the module docs
 /// for what it grants and why [`invite_token`](Self::invite_token) is a
 /// secret.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InvitePayload {
     pub v: u8,
@@ -106,7 +107,6 @@ pub struct EnrollPayload {
 /// # Errors
 /// Returns an error if `payload` cannot be serialized to JSON (not expected
 /// for this type; surfaced rather than panicking).
-#[allow(dead_code)]
 pub fn encode_invite(payload: &InvitePayload) -> Result<String> {
     encode("invite", payload)
 }
@@ -222,7 +222,6 @@ fn check_expiry(expires_at: i64) -> Result<()> {
 /// crate's existing entropy source, `keys.rs`/`members.rs`) as 43 base64url
 /// characters (no padding). This IS the bearer secret an invite proves
 /// possession of, unlike the enroll payload's public key.
-#[allow(dead_code)]
 #[must_use]
 pub fn mint_invite_token() -> String {
     let mut bytes = [0u8; 32];

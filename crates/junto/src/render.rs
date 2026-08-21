@@ -3573,8 +3573,10 @@ fn escape_html(text: &str) -> String {
     out
 }
 
-/// Epoch milliseconds → `YYYY-MM-DD HH:MM UTC` for the human page.
-fn iso_utc(millis: i64) -> String {
+/// Epoch milliseconds → `YYYY-MM-DD HH:MM UTC` — the human page's format,
+/// reused by `junto invite`'s printed expiry so the CLI and the web page
+/// render a timestamp the same way.
+pub(crate) fn iso_utc(millis: i64) -> String {
     match time::OffsetDateTime::from_unix_timestamp(millis.div_euclid(1000)) {
         Ok(dt) => format!(
             "{:04}-{:02}-{:02} {:02}:{:02} UTC",

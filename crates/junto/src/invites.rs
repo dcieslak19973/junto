@@ -32,9 +32,9 @@
 //! is no file-locking convention in this crate to reuse, and adding one
 //! here alone would be scope this task doesn't need.
 //!
-//! Not yet wired to a CLI command — Task 8 (`junto add-member`) calls
-//! `consume`, and the founder's `junto invite` calls `issue`; until then
-//! each externally callable item below carries its own `#[allow(dead_code)]`.
+//! `junto invite` (Task 6) now calls `issue`, which no longer carries its
+//! own `#[allow(dead_code)]`. `consume` (called by Task 8's `junto
+//! add-member`) and `prune` remain unwired and keep theirs.
 
 use std::path::{Path, PathBuf};
 
@@ -121,7 +121,6 @@ fn save(junto_home: &Path, file: &InvitesFile) -> Result<()> {
 /// # Errors
 /// Returns an error if `<junto-home>/invites.toml` cannot be read or
 /// written.
-#[allow(dead_code)]
 pub fn issue(
     junto_home: &Path,
     token: &str,
