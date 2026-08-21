@@ -238,12 +238,10 @@ impl LedgerEntry {
         let Some(signature) = &self.signature else {
             return false;
         };
-        let (Ok(verifying), Ok(sig), Ok(bytes)) =
-            (key.to_dalek(), signature.to_dalek(), self.signing_bytes())
-        else {
+        let Ok(bytes) = self.signing_bytes() else {
             return false;
         };
-        verifying.verify_strict(&bytes, &sig).is_ok()
+        key.verify_bytes(&bytes, signature)
     }
 }
 

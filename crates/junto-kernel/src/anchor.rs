@@ -20,12 +20,14 @@ use crate::{ContentDigest, EntryId, Member, PublicKey, Signature, SigningKey, Ti
 /// A 1-indexed, inclusive line span within a file — editor line numbers, not
 /// byte offsets, since that is what a human reviewer points at.
 ///
-/// Serializes as a plain `{start, end}` struct (no newtype string form is
-/// needed: both fields are already primitives); validated on construction via
-/// [`Span::new`] rather than on deserialize, since a `Span` only ever appears
-/// nested inside a [`CodeAnchor`] whose containing [`Annotation`] revalidates
-/// nothing else structurally either.
+/// Serializes as a plain `{start, end}` object via the private [`SpanRepr`]
+/// wire shape; **deserialization re-validates** through [`Span::new`] (via
+/// [`TryFrom`]), so a malformed span cannot enter the kernel through the
+/// canonical-bytes boundary (see [`crate::serial`]) — the same
+/// re-validation-on-the-way-in rule as [`CommitOid`] and
+/// [`crate::ContentDigest`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "SpanRepr", into = "SpanRepr")]
 pub struct Span {
     /// First line of the span, 1-indexed.
     pub start: u32,
@@ -46,6 +48,32 @@ impl Span {
             )));
         }
         Ok(Self { start, end })
+    }
+}
+
+/// The bare `{start, end}` wire shape [`Span`] (de)serializes through, so
+/// serde routes every deserialized value through [`Span::new`] for
+/// re-validation instead of constructing a `Span` directly and skipping it.
+#[derive(Serialize, Deserialize)]
+struct SpanRepr {
+    start: u32,
+    end: u32,
+}
+
+impl From<Span> for SpanRepr {
+    fn from(span: Span) -> Self {
+        Self {
+            start: span.start,
+            end: span.end,
+        }
+    }
+}
+
+impl TryFrom<SpanRepr> for Span {
+    type Error = crate::Error;
+
+    fn try_from(repr: SpanRepr) -> crate::Result<Self> {
+        Self::new(repr.start, repr.end)
     }
 }
 
@@ -371,5 +399,36 @@ mod tests {
         let json = serde_json::to_string(&a).unwrap();
         assert!(json.contains("\"kind\":\"stream\""));
         assert_eq!(a, serde_json::from_str::<Anchor>(&json).unwrap());
+    }
+
+    /// Builds the canonical bytes of an `Anchor::Code` annotation with the
+    /// given (possibly invalid) span, constructed as raw JSON — bypassing
+    /// `Span::new` entirely — to exercise the deserialize boundary itself.
+    fn annotation_bytes_with_span(start: i64, end: i64) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "id": AnnotationId::new().to_string(),
+            "author": { "display_name": "Dan", "email": "dan@example.com", "kind": "Human" },
+            "anchor": {
+                "kind": "code",
+                "commit": "a".repeat(40),
+                "path": "src/anchor.rs",
+                "blob": "sha256:deadbeef",
+                "span": { "start": start, "end": end },
+            },
+            "body": "x",
+            "urgent": false,
+            "timestamp": 1_700_000_000_000i64,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn malformed_span_is_rejected_on_deserialize() {
+        // start == 0: rejected by Span::new's 1-indexed invariant.
+        assert!(Annotation::from_canonical_bytes(&annotation_bytes_with_span(0, 0)).is_err());
+        // end < start: rejected as an inverted range.
+        assert!(Annotation::from_canonical_bytes(&annotation_bytes_with_span(7, 3)).is_err());
+        // A valid span still deserializes.
+        assert!(Annotation::from_canonical_bytes(&annotation_bytes_with_span(3, 3)).is_ok());
     }
 }
