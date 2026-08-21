@@ -49,9 +49,12 @@ use crate::launch::NotLive;
 /// same durable string. This cap alone does NOT make the rendered message
 /// bounded — that overclaim is what the final branch review's residual
 /// caught (IMPORTANT 3): [`MAX_ANNOTATION_EXCERPT_BYTES`] bounds the
-/// sibling excerpt fields on the same path, and
-/// [`MAX_STEER_MESSAGE_BYTES`] bounds the whole rendered batch. Only all
-/// three together make the guarantee true.
+/// sibling excerpt fields, [`MAX_ANCHOR_LOCATION_BYTES`] bounds the anchor
+/// fields named in the block header, and [`MAX_STEER_MESSAGE_BYTES`]
+/// bounds the whole rendered batch. Only all four together bound every
+/// remote-controlled byte on this path — stating that any one of them
+/// alone keeps the rendered message finite would be the same overclaim
+/// again.
 const MAX_ANNOTATION_BODY_BYTES: usize = 4096;
 
 /// Hard cap, independent of [`MAX_ANNOTATION_BODY_BYTES`], on any single
@@ -67,20 +70,48 @@ const MAX_ANNOTATION_BODY_BYTES: usize = 4096;
 /// while keeping either source from reaching the ledger unbounded.
 const MAX_ANNOTATION_EXCERPT_BYTES: usize = 2048;
 
-/// Hard cap on the TOTAL bytes of one rendered steer message.
-/// [`MAX_ANNOTATION_BODY_BYTES`] and [`MAX_ANNOTATION_EXCERPT_BYTES`]
-/// bound a single annotation's contribution, but [`deliver_batch`] renders
-/// an entire batch into ONE ledger note, and an accepted (already
-/// individually-legal) 8 MiB websocket frame can still carry an unbounded
-/// NUMBER of annotations — roughly 2000 individually-legal 4 KiB bodies in
-/// one frame would otherwise still produce one multi-megabyte immutable
-/// ledger entry, because nothing bounded the *batch*, only each annotation
-/// inside it. 16 KiB keeps a genuinely busy review's worth of comments in
-/// one steer message while keeping the ledger entry itself finite
-/// regardless of batch size. See [`assemble_batch`] for how blocks beyond
-/// the budget are withheld from THIS message — never dropped, since they
-/// are already durable in the `LiveDoc`.
+/// Hard cap on the anchor-location bytes [`format_steer`] renders into a
+/// block's header line: [`junto_kernel::CodeAnchor::path`] and
+/// [`junto_kernel::StreamAnchor::op_id`]. Both are attacker-signed
+/// `String`s the kernel does not length-bound — `op_id` is documented on
+/// the type itself as "opaque… its shape is the live-document layer's
+/// concern," and `path` carries no length check in
+/// `validate_annotation_update` either. Without this cap a single
+/// annotation with an oversized `path` or `op_id`, an empty excerpt, and a
+/// minimal `body` would still let ONE comment fill the frame and become a
+/// multi-megabyte immutable entry — reachable with one annotation instead
+/// of the many [`MAX_STEER_MESSAGE_BYTES`] guards against, because
+/// [`assemble_batch`] always renders the first block regardless of size.
+/// 256 bytes is generous for any real repo-relative path or CRDT op id.
+const MAX_ANCHOR_LOCATION_BYTES: usize = 256;
+
+/// Hard cap on the TOTAL bytes of one rendered steer message, including
+/// [`assemble_batch`]'s own withheld-count marker when one is appended —
+/// see [`MARKER_RESERVE_BYTES`] for how the marker is kept inside this
+/// budget rather than added on top of it. [`MAX_ANNOTATION_BODY_BYTES`],
+/// [`MAX_ANNOTATION_EXCERPT_BYTES`], and [`MAX_ANCHOR_LOCATION_BYTES`]
+/// bound a single annotation's contribution (together, well under this
+/// budget — see [`assemble_batch`]'s doc comment for the measured worst
+/// case), but [`deliver_batch`] renders an entire batch into ONE ledger
+/// note, and an accepted (already individually-legal) 8 MiB websocket
+/// frame can still carry an unbounded NUMBER of annotations — roughly
+/// 2000 individually-legal 4 KiB bodies in one frame would otherwise
+/// still produce one multi-megabyte immutable ledger entry, because
+/// nothing bounded the *batch*, only each annotation inside it. 16 KiB
+/// keeps a genuinely busy review's worth of comments in one steer message
+/// while keeping the ledger entry itself finite regardless of batch size.
 const MAX_STEER_MESSAGE_BYTES: usize = 16384;
+
+/// Bytes of [`MAX_STEER_MESSAGE_BYTES`] reserved for [`assemble_batch`]'s
+/// own withheld-count marker, so the FINISHED message (rendered blocks
+/// *plus* the marker, when one is appended) never exceeds the budget —
+/// only the blocks portion would if the marker were appended on top of a
+/// full budget instead of carved out of it. The marker's only variable
+/// content is the withheld count and the (fixed, 5-digit) budget number
+/// itself; even an absurd withheld count of one billion renders under 200
+/// bytes, so 300 leaves comfortable headroom without meaningfully
+/// shrinking the room left for actual comment content.
+const MARKER_RESERVE_BYTES: usize = 300;
 
 /// Shared truncation: cut `value` to at most `max` bytes on a UTF-8 char
 /// boundary and append an explicit marker naming what was cut. A silently
@@ -116,18 +147,36 @@ fn capped_excerpt(excerpt: &str) -> std::borrow::Cow<'_, str> {
     truncate_with_marker(excerpt, MAX_ANNOTATION_EXCERPT_BYTES)
 }
 
+/// An anchor-location field (`CodeAnchor.path` or `StreamAnchor.op_id`),
+/// truncated to at most [`MAX_ANCHOR_LOCATION_BYTES`] — see
+/// [`truncate_with_marker`]. Applied by [`format_steer`] before either
+/// field is formatted into the block header, so an oversized path or op
+/// id can't reach the ledger through the one field this branch's caps
+/// used to leave open.
+fn capped_location(location: &str) -> std::borrow::Cow<'_, str> {
+    truncate_with_marker(location, MAX_ANCHOR_LOCATION_BYTES)
+}
+
 /// Assemble already-rendered, in-order per-annotation `blocks` (each one
-/// already bounded by [`MAX_ANNOTATION_BODY_BYTES`] /
-/// [`MAX_ANNOTATION_EXCERPT_BYTES`] before it ever reaches this function)
-/// into one steer message capped at [`MAX_STEER_MESSAGE_BYTES`] total.
+/// already bounded by [`MAX_ANNOTATION_BODY_BYTES`],
+/// [`MAX_ANNOTATION_EXCERPT_BYTES`], and [`MAX_ANCHOR_LOCATION_BYTES`]
+/// before any of them ever reaches this function — measured worst case
+/// for one block with every capped field maxed out and an `Orphaned`
+/// re-anchor: ~10.7 KB, well under the budget below) into one steer
+/// message capped at [`MAX_STEER_MESSAGE_BYTES`] total, marker included.
 ///
-/// Renders whole blocks, in order, until adding the next one would exceed
-/// the budget, then stops — a block is never partially rendered here. The
-/// FIRST block always renders in full regardless of its own size: a batch
-/// must never render as nothing but a withheld-count, and in practice a
-/// lone block's own field caps have already bounded it (their sum is well
-/// under this budget), so letting it through here unconditionally keeps
-/// the message finite either way.
+/// Renders whole blocks, in order, against a budget already reduced by
+/// [`MARKER_RESERVE_BYTES`] (so the withheld-count marker, if one ends up
+/// appended, still fits inside [`MAX_STEER_MESSAGE_BYTES`] rather than
+/// pushing the total over it), until adding the next one would exceed
+/// that reduced budget, then stops — a block is never partially rendered
+/// here. The FIRST block always renders in full regardless of its own
+/// size: a batch must never render as nothing but a withheld-count. Today
+/// that clause is a defensive fallback, not a reachable path — every
+/// block's own field caps bound it to well under the (reduced) budget, as
+/// measured above — but if a future cap change ever let a single block
+/// exceed the budget, this function still renders it whole rather than
+/// mangling it further.
 ///
 /// Any blocks left over are never silently lost: they are already durable
 /// in the session's `LiveDoc` and, at turn end, in that turn's archived
@@ -136,12 +185,13 @@ fn capped_excerpt(excerpt: &str) -> std::borrow::Cow<'_, str> {
 /// bounded, not the record of the annotations themselves. The withheld
 /// count and that fact are both stated in an explicit trailing line.
 fn assemble_batch(blocks: Vec<String>) -> String {
+    let block_budget = MAX_STEER_MESSAGE_BYTES.saturating_sub(MARKER_RESERVE_BYTES);
     let mut out = String::new();
     let mut included = 0usize;
     for (i, block) in blocks.iter().enumerate() {
         if i > 0 {
             let projected = out.len() + 1 + block.len();
-            if projected > MAX_STEER_MESSAGE_BYTES {
+            if projected > block_budget {
                 break;
             }
             out.push('\n');
@@ -207,11 +257,12 @@ fn resolve_stream_excerpt(live_doc: Option<&LiveDoc>, op_id: &str) -> Option<Str
 /// anything the watcher commented on; an unresolvable stream anchor says so
 /// plainly too, rather than emitting a bare, meaningless event number.
 ///
-/// Whichever excerpt wins is capped by [`capped_excerpt`] and `body` by
-/// [`capped_body`] before either reaches the block; the finished blocks are
-/// then handed to [`assemble_batch`], which bounds the WHOLE rendered
-/// batch at [`MAX_STEER_MESSAGE_BYTES`] — the three caps together are what
-/// keep this function's output finite, not any one of them alone.
+/// Whichever excerpt wins is capped by [`capped_excerpt`], `body` by
+/// [`capped_body`], and the anchor's own `path`/`op_id` by
+/// [`capped_location`] before any of them reaches the block; the finished
+/// blocks are then handed to [`assemble_batch`], which bounds the WHOLE
+/// rendered batch at [`MAX_STEER_MESSAGE_BYTES`] — all four caps together
+/// are what keep this function's output finite, not any one of them alone.
 pub(crate) fn format_steer(
     annotations: &[Annotation],
     reanchored: &[Option<Reanchor>],
@@ -232,7 +283,8 @@ pub(crate) fn format_steer(
             };
             let location = match &annotation.anchor {
                 Anchor::Code(code) => {
-                    let pinned = format!("{}:{}-{}", code.path, code.span.start, code.span.end);
+                    let path = capped_location(&code.path);
+                    let pinned = format!("{path}:{}-{}", code.span.start, code.span.end);
                     match current {
                         None | Some(Reanchor::Exact { .. }) => pinned,
                         Some(Reanchor::Moved { span }) => {
@@ -249,13 +301,16 @@ pub(crate) fn format_steer(
                 // event itself can still fail to resolve (unparseable `op_id`,
                 // no `LiveDoc` in hand, or an out-of-range index), and that
                 // must be said plainly rather than left implicit in a bare
-                // number the agent has no way to act on.
+                // number the agent has no way to act on. Capped here too: an
+                // `op_id` that fails to parse as an index (so `stream_excerpt`
+                // is `None`) still reaches this "could not resolve" branch
+                // and gets displayed raw otherwise.
                 Anchor::Stream(stream) if stream_excerpt.is_some() => {
-                    format!("on conversation event {}", stream.op_id)
+                    format!("on conversation event {}", capped_location(&stream.op_id))
                 }
                 Anchor::Stream(stream) => format!(
                     "on conversation event {} (could not resolve — the event is unavailable)",
-                    stream.op_id
+                    capped_location(&stream.op_id)
                 ),
             };
             let on = if matches!(annotation.anchor, Anchor::Stream(_)) {
@@ -932,20 +987,90 @@ mod tests {
             "withheld comments must be stated as retained, not lost: {out}"
         );
         assert!(
-            out.len() <= MAX_STEER_MESSAGE_BYTES + 500,
-            "the assembled message must stay close to the byte budget, plus only the \
-             withheld-count marker's own small overhead: {} bytes",
+            out.len() <= MAX_STEER_MESSAGE_BYTES,
+            "the assembled message (blocks plus the withheld-count marker) must never \
+             exceed the byte budget itself — MARKER_RESERVE_BYTES exists precisely so \
+             the marker never pushes it over: {} bytes",
             out.len()
+        );
+    }
+
+    #[test]
+    fn oversized_code_path_is_truncated_and_the_message_stays_bounded() {
+        // A single annotation, reachable as `assemble_batch`'s unconditional
+        // first block, with an oversized `CodeAnchor.path`, no excerpt, and
+        // a minimal body: before the anchor-location cap, this path alone
+        // could fill the frame and reach the ledger as one multi-megabyte
+        // entry — no second annotation required.
+        let huge_path = "p".repeat(MAX_ANCHOR_LOCATION_BYTES + 500);
+        let ann = code_annotation("a@x.com", &huge_path, 1, 1, None, "short body");
+        let out = format_steer(&[ann], &[None], None);
+        assert!(
+            out.len() < huge_path.len(),
+            "the rendered output must be shorter than the oversized path alone"
+        );
+        assert!(
+            out.contains("truncated"),
+            "a truncated path must carry an explicit marker: {out}"
+        );
+        assert!(
+            out.contains("short body"),
+            "the body must still render: {out}"
+        );
+    }
+
+    #[test]
+    fn oversized_stream_op_id_is_truncated_and_the_message_stays_bounded() {
+        // Same vector as the path test, on the stream-anchor side: `op_id`
+        // is documented as opaque and kernel-unvalidated. A non-numeric
+        // huge `op_id` fails `resolve_stream_excerpt`'s `parse::<usize>()`
+        // and falls into the "could not resolve" branch, which — before
+        // this cap — displayed the raw, unbounded `op_id` verbatim.
+        let huge_op_id = "o".repeat(MAX_ANCHOR_LOCATION_BYTES + 500);
+        let ann = Annotation {
+            id: AnnotationId::new(),
+            author: Member::human("Watcher", "dan@x.com"),
+            anchor: Anchor::Stream(junto_kernel::StreamAnchor {
+                session: EntryId::new(),
+                op_id: huge_op_id.clone(),
+            }),
+            body: "short body".into(),
+            excerpt: None,
+            supersedes: None,
+            urgent: false,
+            timestamp: Timestamp::from_millis(1_700_000_000_000),
+            signature: None,
+        };
+        let out = format_steer(&[ann], &[None], None);
+        assert!(
+            out.len() < huge_op_id.len(),
+            "the rendered output must be shorter than the oversized op_id alone"
+        );
+        assert!(
+            out.contains("truncated"),
+            "a truncated op_id must carry an explicit marker: {out}"
+        );
+        assert!(
+            out.contains("could not resolve"),
+            "a non-numeric op_id must still say it could not resolve: {out}"
+        );
+        assert!(
+            out.contains("short body"),
+            "the body must still render: {out}"
         );
     }
 
     #[test]
     fn single_block_over_budget_still_renders_whole() {
         // Decision 4: a batch must never render as nothing but a
-        // withheld-count. A lone block's own field caps have already
-        // bounded it in practice (their sum is well under the message
-        // budget), but the assembler itself must not further truncate or
-        // drop a lone block even if it were somehow to exceed the budget.
+        // withheld-count. With all four field caps in place (body,
+        // excerpt, and now anchor location), a lone block's measured worst
+        // case is ~10.7 KB — well under the ~16.1 KB reduced block budget
+        // (MAX_STEER_MESSAGE_BYTES minus MARKER_RESERVE_BYTES) — so this
+        // branch is a defensive fallback for a future cap change, not a
+        // reachable path today. Exercised directly against `assemble_batch`
+        // (not `format_steer`) because no combination of legal, capped
+        // field values can actually produce a block this large.
         let huge_block = format!(
             "[watcher comment — a@x.com on a.rs:1-1]\n{}\n",
             "z".repeat(MAX_STEER_MESSAGE_BYTES + 1000)
