@@ -63,6 +63,20 @@ impl PublicKey {
         ed25519_dalek::VerifyingKey::from_bytes(&bytes)
             .map_err(|e| Error::Invariant(format!("invalid ed25519 public key: {e}")))
     }
+
+    /// Verify a detached signature over arbitrary bytes — the shared
+    /// primitive behind [`LedgerEntry::verifies_with`] and any other caller
+    /// with its own preimage (e.g. a websocket handshake nonce, an
+    /// [`crate::anchor::Annotation`]). Malformed keys/signatures simply fail
+    /// to verify rather than erroring, matching `verifies_with`'s
+    /// surfaced-fact-not-error stance (`docs/adr/0033`).
+    #[must_use]
+    pub fn verify_bytes(&self, message: &[u8], signature: &Signature) -> bool {
+        let (Ok(key), Ok(sig)) = (self.to_dalek(), signature.to_dalek()) else {
+            return false;
+        };
+        key.verify_strict(message, &sig).is_ok()
+    }
 }
 
 impl TryFrom<String> for PublicKey {
@@ -174,7 +188,12 @@ impl SigningKey {
         ))
     }
 
-    fn sign(&self, message: &[u8]) -> Signature {
+    /// Sign arbitrary bytes with this key — the shared primitive behind
+    /// [`LedgerEntry::sign`] (over an entry's signing bytes) and any other
+    /// caller with its own preimage (e.g. a websocket handshake nonce, which
+    /// is not a ledger entry).
+    #[must_use]
+    pub fn sign_bytes(&self, message: &[u8]) -> Signature {
         use ed25519_dalek::Signer as _;
         Signature(format!(
             "{PREFIX}{}",
@@ -206,7 +225,7 @@ impl LedgerEntry {
     /// Returns [`Error::Serialization`] if the preimage cannot be produced.
     pub fn sign(&mut self, key: &SigningKey) -> Result<()> {
         self.signature = None;
-        self.signature = Some(key.sign(&self.signing_bytes()?));
+        self.signature = Some(key.sign_bytes(&self.signing_bytes()?));
         Ok(())
     }
 
@@ -342,5 +361,13 @@ mod tests {
         let key = key_from(7);
         let restored = SigningKey::from_secret_hex(&key.to_secret_hex()).unwrap();
         assert_eq!(key.public_key(), restored.public_key());
+    }
+
+    #[test]
+    fn byte_level_sign_verify_round_trip() {
+        let key = SigningKey::from_secret_bytes([3; 32]);
+        let sig = key.sign_bytes(b"nonce-bytes");
+        assert!(key.public_key().verify_bytes(b"nonce-bytes", &sig));
+        assert!(!key.public_key().verify_bytes(b"other", &sig));
     }
 }
