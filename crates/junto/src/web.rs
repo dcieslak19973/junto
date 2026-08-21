@@ -106,34 +106,7 @@ pub(crate) async fn project(
     host: &Host,
     channel: &str,
 ) -> Result<(ChannelId, ChannelView, std::path::PathBuf), Response> {
-    let resolution = host
-        .resolve(channel)
-        .await
-        .map_err(|err| internal(format!("resolving '{channel}': {err}")))?;
-    let (ledger, id, substrate) = match resolution {
-        Resolution::Resolved {
-            ledger,
-            id,
-            substrate,
-        } => (ledger, id, substrate),
-        Resolution::NotFound => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                format!("no channel '{channel}' in any registered substrate"),
-            )
-                .into_response());
-        }
-        Resolution::Ambiguous(substrates) => {
-            return Err((
-                StatusCode::CONFLICT,
-                format!(
-                    "channel name '{channel}' exists in several substrates ({substrates:?}); \
-                     address it by id"
-                ),
-            )
-                .into_response());
-        }
-    };
+    let (ledger, id, substrate) = resolve_for_projection(host, channel).await?;
     let view = ledger
         .lock()
         .await
@@ -141,6 +114,58 @@ pub(crate) async fn project(
         .await
         .map_err(|err| internal(format!("projection failed: {err}")))?;
     Ok((id, view, substrate))
+}
+
+/// [`project`], but always re-folds from the substrate
+/// (`junto_kernel::Ledger::project_fresh`) instead of `project`'s cached
+/// read. The one caller: `crate::live_ws::live_session`'s handshake — see
+/// `Ledger::project_fresh`'s doc comment for why a long-running `junto
+/// serve` needs this specifically (a `revoke-member`/`retire-device` run
+/// in a separate process never invalidates this process's cache) and why
+/// every other reader here keeps using the cached [`project`].
+#[allow(clippy::result_large_err)]
+pub(crate) async fn project_fresh(
+    host: &Host,
+    channel: &str,
+) -> Result<(ChannelId, ChannelView, std::path::PathBuf), Response> {
+    let (ledger, id, substrate) = resolve_for_projection(host, channel).await?;
+    let view = ledger
+        .lock()
+        .await
+        .project_fresh(&id)
+        .await
+        .map_err(|err| internal(format!("projection failed: {err}")))?;
+    Ok((id, view, substrate))
+}
+
+async fn resolve_for_projection(
+    host: &Host,
+    channel: &str,
+) -> Result<(crate::host::SharedLedger, ChannelId, std::path::PathBuf), Response> {
+    let resolution = host
+        .resolve(channel)
+        .await
+        .map_err(|err| internal(format!("resolving '{channel}': {err}")))?;
+    match resolution {
+        Resolution::Resolved {
+            ledger,
+            id,
+            substrate,
+        } => Ok((ledger, id, substrate)),
+        Resolution::NotFound => Err((
+            StatusCode::NOT_FOUND,
+            format!("no channel '{channel}' in any registered substrate"),
+        )
+            .into_response()),
+        Resolution::Ambiguous(substrates) => Err((
+            StatusCode::CONFLICT,
+            format!(
+                "channel name '{channel}' exists in several substrates ({substrates:?}); \
+                 address it by id"
+            ),
+        )
+            .into_response()),
+    }
 }
 
 fn internal(message: String) -> Response {

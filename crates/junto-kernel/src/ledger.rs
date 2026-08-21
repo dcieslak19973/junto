@@ -337,6 +337,35 @@ impl<S: SubstrateProvider> Ledger<S> {
         {
             return Ok(view.clone());
         }
+        self.project_uncached(channel).await
+    }
+
+    /// [`Self::project`], but always re-folds from the substrate — skips
+    /// the cache-read fast path (still writes the fresh result into the
+    /// shared cache afterward, so it also refreshes every other reader's
+    /// next cache hit, not just this call's).
+    ///
+    /// For every reader except one, [`Self::project`]'s
+    /// [`PROJECTION_TTL`] staleness is an accepted trade for avoiding a
+    /// re-fold on rapid navigation (see that method's docs) — the human
+    /// read surface tolerates it. The live-plane websocket handshake
+    /// (`junto::live_ws::live_session`) is the one exception this exists
+    /// for: an operator's `revoke-member`/`retire-device` runs as a
+    /// SEPARATE process from a long-running `junto serve` — a separate
+    /// `Host`, a separate `Ledger`, a separate in-memory cache — so that
+    /// process's cache invalidation on append never reaches the serving
+    /// process's cache at all. Without this, a just-revoked member could
+    /// still authenticate a new live connection for up to
+    /// [`PROJECTION_TTL`] after the revoking command already returned.
+    /// One fresh read per connection is negligible.
+    ///
+    /// # Errors
+    /// Propagates any error from the underlying [`SubstrateProvider`].
+    pub async fn project_fresh(&self, channel: &ChannelId) -> Result<ChannelView> {
+        self.project_uncached(channel).await
+    }
+
+    async fn project_uncached(&self, channel: &ChannelId) -> Result<ChannelView> {
         let mut entries = self.substrate.entries(channel).await?;
         entries.sort_by(LedgerEntry::canonical_cmp);
         // Keep the first occurrence of each id (in canonical order), so a

@@ -63,12 +63,20 @@ const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 /// different — that's a normal race (the watcher followed a link to a
 /// session that already ended) — so it upgrades anyway and the socket itself
 /// carries the graceful `Frame::End` close (see [`serve`]).
+///
+/// Projects via [`crate::web::project_fresh`], never the cached
+/// [`crate::web::project`] every other route here uses: `authenticate`
+/// below is exactly the gate a `revoke-member`/`retire-device` run in a
+/// separate `junto` process exists to close, and that process's cache
+/// cached path is fine for the human read surface; it is not fine for
+/// "was this key just revoked" (`junto_kernel::Ledger::project_fresh`'s
+/// doc comment).
 pub(crate) async fn live_session(
     State(host): State<Arc<Host>>,
     Path((channel, session)): Path<(String, String)>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let (_id, view, _substrate) = match crate::web::project(&host, &channel).await {
+    let (_id, view, _substrate) = match crate::web::project_fresh(&host, &channel).await {
         Ok(resolved) => resolved,
         Err(response) => return response,
     };
@@ -2086,12 +2094,18 @@ mod tests {
             "freshly granted, must be active"
         );
 
-        // (c) the founder's own keys.toml holds no key for alice — proven
-        // non-vacuous by a same-fixture, same-host positive control: a
-        // KEYLESS grant on this identical host DOES mint locally
-        // (`Host::keyed`'s fallback path), so the absence checked next is
-        // a fact specifically about the --enroll path, not an artifact of
-        // `has_signing_key`/`keys.toml` never working in this fixture.
+        // (c) the founder's own keys.toml holds no key for alice. The real
+        // counterfactual for this check is the plan's original bug: a
+        // pre-fix `Host::keyed` (host.rs:371-377) that minted locally even
+        // when a device's own key WAS supplied — the negative assertion
+        // below guards exactly that, and the `dan@x.com` sanity check
+        // right above already proves `has_signing_key` sees this exact
+        // store. The control that follows is a narrower, same-fixture
+        // positive: a KEYLESS *agent* grant (not human — a keyless HUMAN
+        // is refused outright, `host.rs:665-678`, never reaching
+        // `Host::keyed` at all) on this identical host DOES mint locally,
+        // ruling out "this store/check silently never works in this
+        // fixture" as an alternative explanation for the absence.
         assert!(
             crate::keys::has_signing_key(&founder_home, "dan@x.com").expect("check"),
             "sanity: the founder's own key really is on this machine"
@@ -2111,8 +2125,9 @@ mod tests {
             .expect("keyless control grant");
         assert!(
             crate::keys::has_signing_key(&founder_home, "worker@agents.junto").expect("check"),
-            "control: a keyless grant on this SAME host DOES mint locally — proves (c)'s \
-             absence is meaningful, not vacuous"
+            "control: a keyless AGENT grant on this SAME host DOES mint locally — rules out a \
+             broken has_signing_key/keys.toml in this fixture (the counterfactual (c) actually \
+             guards against is Host::keyed ignoring a supplied key, not this control)"
         );
 
         // (b) an entry signed by the new device's key projects as
@@ -2325,6 +2340,51 @@ mod tests {
         fresh_append(&founder_home, channel, after_entry).await;
 
         let view = fresh_view(&founder_home, channel).await;
+        // Precondition for everything below: T1 < mid entry < T2,
+        // STRICTLY and GENUINELY distinct — never assumed from the two
+        // 30ms sleeps alone. `retire_device`/`revoke_member` stamp
+        // `Timestamp::now()` internally (no way to inject a value), and
+        // `Timestamp::now()` is millisecond-resolution over a
+        // non-monotonic `SystemTime` with ~15.6ms tick granularity on
+        // Windows — two ticks of sleep is not a proof. If T1 and T2 ever
+        // landed on the same tick (or the clock stepped back), `min ==
+        // max` and the crux assertion below would pass whether the fold
+        // takes the earliest or the latest retirement — the exact
+        // regression this test exists to catch, silently disarmed. Assert
+        // the bracket explicitly, from the SAME final projection the
+        // criteria below read, so a collapsed window fails loudly here
+        // instead of quietly validating nothing.
+        let alice_grants = view
+            .keyring
+            .get("alice@example.com")
+            .expect("alice still has grants on record");
+        let t1 = alice_grants
+            .iter()
+            .find(|g| g.granted_by == grant_a.granted_by)
+            .and_then(|g| g.retired_at)
+            .expect("device A's grant must be retired (step 1)");
+        let t2 = alice_grants
+            .iter()
+            .find(|g| g.key == key_b.public_key())
+            .and_then(|g| g.retired_at)
+            .expect("device B's grant must be retired (step 3)");
+        let mid_ts = view
+            .entries
+            .iter()
+            .find(|e| e.id == mid_entry_id)
+            .expect("the mid entry is on record")
+            .timestamp;
+        assert!(
+            t1 < mid_ts,
+            "the mid entry must be stamped strictly after T1 (device A's retirement): \
+             T1={t1:?} mid={mid_ts:?}"
+        );
+        assert!(
+            mid_ts < t2,
+            "the mid entry must be stamped strictly before T2 (device B's retirement): \
+             mid={mid_ts:?} T2={t2:?}"
+        );
+        assert_ne!(t1, t2, "T1 and T2 must be genuinely distinct retirements");
 
         // (e): a later entry is unrecognized once every device is retired.
         assert!(
@@ -2345,8 +2405,15 @@ mod tests {
         assert!(view.standings.contains_key(&mid_entry_id));
 
         // (f): the earlier (pre-retirement, criterion-b) entry keeps its
-        // standing — revocation must never retroactively unrecognize
-        // entries written before any cutoff existed at all.
+        // standing — revocation must never retroactively unrecognize an
+        // entry written before ANY cutoff existed. This entry sits
+        // strictly before both T1 and T2, so it is the one a "retirement
+        // applies too broadly" regression (e.g. an unbounded/backward
+        // cutoff, or folding starting from the wrong end of the grant
+        // list) would catch — not a boundary `>=`-vs-`>` flip at the
+        // cutoff itself (`project_unrecognized`'s `entry.timestamp >
+        // cutoff`), which only reclassifies an entry stamped EXACTLY AT a
+        // cutoff, and this one is not.
         assert!(
             !view.unrecognized.contains(&verified_entry_id),
             "revocation must never retroactively unrecognize entries written before any cutoff"
@@ -2357,6 +2424,97 @@ mod tests {
         assert!(
             view.party.iter().any(|m| m.email == "alice@example.com"),
             "a fully revoked member must stay in the party"
+        );
+    }
+
+    /// Regression guard for the staleness `live_session` used to have: a
+    /// long-running `junto serve` (`host` here, held open across the whole
+    /// connection, exactly like a real server) and a `junto revoke-member`
+    /// run in a genuinely SEPARATE process (`revoker` — an independent
+    /// `Host::fixed_with_member_home` over the identical substrate, so an
+    /// independent `Ledger` with its own in-memory projection cache) race:
+    /// `revoker`'s own cache invalidation on append never reaches `host`'s
+    /// cache at all. Before `live_session` switched to
+    /// `crate::web::project_fresh`, a `host` whose cache was already warm
+    /// (any earlier request for this channel) would keep authenticating
+    /// alice's now-revoked key for up to `PROJECTION_TTL` (15s) after
+    /// `revoker`'s revocation already returned — this test forces exactly
+    /// that warm-cache condition (an explicit `view_of(&host, ..)` call
+    /// before the revocation) so a regression back to the cached
+    /// `crate::web::project` fails this test immediately rather than only
+    /// intermittently, depending on whether some earlier request happened
+    /// to warm the cache first.
+    #[tokio::test]
+    async fn a_revocation_from_a_separate_process_is_visible_to_a_live_connection_immediately() {
+        let (host, channel, session, _key_a, dir, member_home, _control_rx) = fixture().await;
+        let founder = Member::human("Dan", "dan@x.com");
+        let alice_key = junto_kernel::SigningKey::from_secret_bytes([55; 32]);
+        host.add_member(
+            &channel.to_string(),
+            &founder,
+            Member::human("Alice", "alice@example.com"),
+            Some(alice_key.public_key()),
+        )
+        .await
+        .expect("grant alice a device");
+
+        // Warm `host`'s own projection cache — the state any real
+        // `junto serve` would already be in after serving one earlier
+        // request for this channel (the channel page, an earlier live
+        // connection, anything).
+        let view_before = view_of(&host, &channel).await;
+        assert!(
+            view_before
+                .keyring
+                .get("alice@example.com")
+                .is_some_and(|grants| grants.iter().any(|g| g.retired_at.is_none())),
+            "sanity: alice's grant must be active (and now cached) before the revocation"
+        );
+
+        // A SEPARATE `Host` over the identical substrate + member home —
+        // a real separate `junto revoke-member` process would build
+        // exactly this, never `host`'s in-memory cache.
+        let revoker = Host::fixed_with_member_home(
+            vec![dir.path().to_path_buf()],
+            Some(member_home.path().to_path_buf()),
+        );
+        let grant_id = view_of(&revoker, &channel)
+            .await
+            .keyring
+            .get("alice@example.com")
+            .and_then(|grants| grants.iter().find(|g| g.key == alice_key.public_key()))
+            .expect("alice's grant, read fresh by the revoking process")
+            .granted_by;
+        retire_grant(&revoker, &channel, &founder, grant_id, Timestamp::now()).await;
+
+        // Connect through the ORIGINAL, warm-cached `host` and try to
+        // authenticate with alice's now-revoked key.
+        let addr = serve_router(host.clone()).await;
+        let url = format!("ws://{addr}/channels/{channel}/sessions/{session}/live");
+        let (mut ws, _response) = tokio_tungstenite::connect_async(url)
+            .await
+            .expect("connect");
+        let nonce = match recv_until(&mut ws, |f| matches!(f, Frame::Challenge { .. })).await {
+            Frame::Challenge { nonce } => nonce,
+            _ => unreachable!(),
+        };
+        let signature = alice_key.sign_bytes(nonce.as_bytes());
+        send_frame(
+            &mut ws,
+            &Frame::Auth {
+                email: "alice@example.com".to_string(),
+                signature: signature.into(),
+            },
+        )
+        .await;
+        let response = recv_until(&mut ws, |f| {
+            matches!(f, Frame::AuthOk | Frame::Rejected { .. })
+        })
+        .await;
+        assert!(
+            matches!(response, Frame::Rejected { .. }),
+            "a revocation from a separate process must be visible to this connection \
+             immediately, not after PROJECTION_TTL: {response:?}"
         );
     }
 }
