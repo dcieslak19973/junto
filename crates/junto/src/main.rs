@@ -33,7 +33,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
-use junto_kernel::{ChannelId, EntryId, Member, PublicKey, Timestamp};
+use junto_kernel::{
+    ChannelId, ChannelView, EntryId, EntryPayload, LedgerEntry, Member, PublicKey, Timestamp,
+};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
@@ -223,6 +225,59 @@ enum Command {
         #[arg(long, default_value = "converged")]
         rationale: String,
     },
+    /// List every key grant in a channel (device-key-enrollment plan, Task
+    /// 9): per grant, the member, a 16-hex fingerprint (never the full
+    /// public key on a shared terminal), the granting entry id (the handle
+    /// `retire-device` consumes), and its retirement timestamp when set.
+    Keys {
+        #[command(subcommand)]
+        action: KeysCommand,
+    },
+    /// Revoke a member's active devices in one act (device-key-enrollment
+    /// plan, Task 9): a founder-authored Park for every currently active
+    /// key grant they hold. The member stays in the party — this only
+    /// stops their entries recorded after now from counting toward
+    /// standings, gates, sessions and lineage (docs/adr/0035). Founder-only.
+    RevokeMember {
+        /// The member being revoked.
+        #[arg(long)]
+        member: String,
+        /// Channel name or id.
+        #[arg(long)]
+        channel: String,
+        /// Why.
+        #[arg(long)]
+        rationale: String,
+    },
+    /// Retire exactly one device's key grant (device-key-enrollment plan,
+    /// Task 9): a founder-authored Park targeting the entry that granted
+    /// it. Founder-only.
+    RetireDevice {
+        /// The granting entry id, from `junto keys list`.
+        #[arg(long)]
+        grant: String,
+        /// Channel name or id.
+        #[arg(long)]
+        channel: String,
+        /// Why.
+        #[arg(long)]
+        rationale: String,
+    },
+}
+
+/// `junto keys` subcommands (device-key-enrollment plan, Task 9).
+#[derive(Subcommand)]
+enum KeysCommand {
+    /// List every key grant in a channel: member, fingerprint, the
+    /// granting entry id, and its retirement timestamp when set.
+    List {
+        /// Channel name or id.
+        #[arg(long)]
+        channel: String,
+        /// Restrict the listing to this member's grants.
+        #[arg(long)]
+        member: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -290,6 +345,19 @@ async fn main() -> Result<()> {
             into,
             rationale,
         } => converge(source, into, rationale).await,
+        Command::Keys { action } => match action {
+            KeysCommand::List { channel, member } => keys_list(channel, member).await,
+        },
+        Command::RevokeMember {
+            member,
+            channel,
+            rationale,
+        } => revoke_member(channel, member, rationale).await,
+        Command::RetireDevice {
+            grant,
+            channel,
+            rationale,
+        } => retire_device(channel, grant, rationale).await,
     }
 }
 
@@ -679,6 +747,215 @@ async fn converge(source: String, into: String, rationale: String) -> Result<()>
     Ok(())
 }
 
+/// Resolve a channel reference to its home substrate, ledger and canonical
+/// id — the shape `invite`/`add_member`/`converge` each already match,
+/// shared here so the three Task 9 commands do not each repeat it a fourth
+/// time.
+async fn resolve_channel(
+    host: &host::Host,
+    channel: &str,
+) -> Result<(PathBuf, host::SharedLedger, ChannelId)> {
+    match host.resolve(channel).await? {
+        host::Resolution::Resolved {
+            substrate,
+            ledger,
+            id,
+        } => Ok((substrate, ledger, id)),
+        host::Resolution::NotFound => {
+            bail!("no channel '{channel}' in any registered substrate")
+        }
+        host::Resolution::Ambiguous(substrates) => bail!(
+            "channel name '{channel}' exists in several substrates ({substrates:?}); \
+             address it by id"
+        ),
+    }
+}
+
+/// Refuse unless `caller` is `view`'s founding member (device-key-
+/// enrollment plan, Task 9) — revocation, like granting membership
+/// (`invite`, `add-member`), is a founder-only act.
+fn require_founder(view: &ChannelView, caller: &Member, channel: &str) -> Result<()> {
+    let Some(founder) = view.party.first() else {
+        bail!(
+            "channel '{channel}' has no genesis, so it has no founding member to authorize \
+             revocation (membership is not enforced on pre-genesis channels)"
+        );
+    };
+    if founder.email != caller.email {
+        bail!(
+            "only the founding member ({} <{}>) can revoke keys in '{channel}' \
+             (docs/adr/0033)",
+            founder.display_name,
+            founder.email
+        );
+    }
+    Ok(())
+}
+
+/// Every currently active grant for `email` — the set `revoke-member` parks
+/// in one act (device-key-enrollment plan, Task 9). Already-retired grants
+/// are skipped: parking one again would append a `Park` that
+/// [`junto_kernel::KeyGrant`]'s earliest-wins fold (Task 2) makes a no-op,
+/// reporting a success that changed nothing.
+fn grants_to_park(view: &ChannelView, email: &str) -> Vec<EntryId> {
+    view.keyring
+        .get(email)
+        .into_iter()
+        .flatten()
+        .filter(|grant| grant.retired_at.is_none())
+        .map(|grant| grant.granted_by)
+        .collect()
+}
+
+/// A stable, 16-hex-char fingerprint for `key` (device-key-enrollment plan,
+/// Task 9) — safe to print on a shared terminal, unlike the full
+/// `ed25519:<64 hex>` public key. The 16 hex characters *after* the
+/// prefix, not the prefix itself, so two distinct keys never collide on
+/// the printed prefix.
+fn fingerprint(key: &PublicKey) -> String {
+    key.as_str()
+        .strip_prefix("ed25519:")
+        .unwrap_or(key.as_str())
+        .chars()
+        .take(16)
+        .collect()
+}
+
+/// `junto keys list` — print every grant in a channel: member, fingerprint,
+/// the granting entry id (`retire-device`'s `--grant` handle), and its
+/// retirement timestamp when set (device-key-enrollment plan, Task 9).
+async fn keys_list(channel: String, member: Option<String>) -> Result<()> {
+    let host = host::Host::from_registry(host::junto_home()?);
+    let (_substrate, ledger, id) = resolve_channel(&host, &channel).await?;
+    let view = ledger.lock().await.project(&id).await?;
+
+    let mut emails: Vec<&String> = match &member {
+        Some(email) => view.keyring.keys().filter(|e| *e == email).collect(),
+        None => view.keyring.keys().collect(),
+    };
+    emails.sort();
+
+    let mut printed = 0usize;
+    for email in emails {
+        for grant in &view.keyring[email] {
+            printed += 1;
+            let status = match grant.retired_at {
+                Some(ts) => format!("retired {}", render::iso_utc(ts.as_millis())),
+                None => "active".to_string(),
+            };
+            println!(
+                "{email}  {}  granted_by={}  {status}",
+                fingerprint(&grant.key),
+                grant.granted_by
+            );
+        }
+    }
+    if printed == 0 {
+        match member {
+            Some(email) => println!("no key grants for {email} in channel '{channel}'"),
+            None => println!("no key grants in channel '{channel}'"),
+        }
+    }
+    Ok(())
+}
+
+/// `junto revoke-member` — park every active key grant for `member` in one
+/// act (device-key-enrollment plan, Task 9): the operator-facing,
+/// account-level form of `retire-device`'s per-grant retirement (Task 2).
+/// Refuses unless the caller is the channel's founder, and refuses if
+/// `member` has no active grant (nothing to do). Revocation never removes
+/// the member from the party — recognition is party-set membership, and
+/// removal would erase their whole history (`docs/adr/0035`, Task 3) — so
+/// the printed warning names that consequence explicitly rather than
+/// letting the operator assume otherwise.
+async fn revoke_member(channel: String, member: String, rationale: String) -> Result<()> {
+    let host = host::Host::from_registry(host::junto_home()?);
+    let (substrate, ledger, id) = resolve_channel(&host, &channel).await?;
+    let view = ledger.lock().await.project(&id).await?;
+    let caller = host::git_user(&substrate)?;
+    require_founder(&view, &caller, &channel)?;
+
+    let targets = grants_to_park(&view, &member);
+    if targets.is_empty() {
+        bail!(
+            "{member} has no active key grants in channel '{channel}' — nothing to revoke \
+             (already fully retired, or never held a key)"
+        );
+    }
+    for target in &targets {
+        let mut entry = LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel: id,
+            author: caller.clone(),
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::Park {
+                target: *target,
+                rationale: rationale.clone(),
+            },
+        };
+        host.sign_entry(&mut entry);
+        ledger.lock().await.append(entry).await?;
+    }
+    println!(
+        "parked {} grant(s) for {member} in channel '{channel}'",
+        targets.len()
+    );
+    println!(
+        "{member} stays in the party — this only stops their entries recorded after now from \
+         counting toward standings, gates, sessions and lineage"
+    );
+    Ok(())
+}
+
+/// `junto retire-device` — park exactly one key grant, named by the entry
+/// that granted it (`junto keys list`'s `granted_by`, device-key-
+/// enrollment plan, Task 9). Refuses unless the caller is the channel's
+/// founder. Task 2's projection treats a `Park` targeting anything but a
+/// key-granting entry as a silent no-op — this looks the grant up in the
+/// keyring FIRST and refuses if it is not there, or is already retired
+/// (parking it again would be exactly that no-op), rather than reporting a
+/// successful park that changed nothing.
+async fn retire_device(channel: String, grant: String, rationale: String) -> Result<()> {
+    let target: EntryId = grant
+        .parse()
+        .with_context(|| format!("--grant '{grant}' is not a valid entry id"))?;
+    let host = host::Host::from_registry(host::junto_home()?);
+    let (substrate, ledger, id) = resolve_channel(&host, &channel).await?;
+    let view = ledger.lock().await.project(&id).await?;
+    let caller = host::git_user(&substrate)?;
+    require_founder(&view, &caller, &channel)?;
+
+    match view
+        .keyring
+        .values()
+        .flatten()
+        .find(|grant| grant.granted_by == target)
+    {
+        None => bail!(
+            "'{grant}' does not name a key-granting entry in channel '{channel}' — check \
+             `junto keys list --channel {channel}` for the granted_by id to pass here"
+        ),
+        Some(found) if found.retired_at.is_some() => {
+            bail!("grant '{grant}' is already retired — parking it again would not change anything")
+        }
+        Some(_) => {}
+    }
+
+    let mut entry = LedgerEntry {
+        signature: None,
+        id: EntryId::new(),
+        channel: id,
+        author: caller,
+        timestamp: Timestamp::now(),
+        payload: EntryPayload::Park { target, rationale },
+    };
+    host.sign_entry(&mut entry);
+    ledger.lock().await.append(entry).await?;
+    println!("retired device grant '{grant}' in channel '{channel}'");
+    Ok(())
+}
+
 /// Print the briefs of every channel this checkout is bound to. Best-effort by
 /// design — a SessionStart hook must never break session start, so failures
 /// are notes on stderr and the exit is always success.
@@ -866,14 +1143,24 @@ mod tests {
 
     fn git_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        assert!(
-            std::process::Command::new("git")
-                .args(["init", "-q"])
-                .current_dir(dir.path())
-                .status()
-                .unwrap()
-                .success()
-        );
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(dir.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "-q"]);
+        // Repo-local identity, deterministic and matching `setup_channel`'s
+        // founder — isolates `host::git_user` (Task 9's revocation
+        // commands read it directly, with no `--author-*` override) from
+        // whatever git config the machine running the tests happens to
+        // have.
+        git(&["config", "user.name", "Dan"]);
+        git(&["config", "user.email", "dan@example.com"]);
         dir
     }
 
@@ -1187,5 +1474,336 @@ mod tests {
 
         let junto_home = host::junto_home().unwrap();
         assert!(keys::has_signing_key(&junto_home, "worker@agents.junto").unwrap());
+    }
+
+    fn set_git_identity(repo: &Path, name: &str, email: &str) {
+        for (key, value) in [("user.name", name), ("user.email", email)] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(["-C", &repo.display().to_string(), "config", key, value])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+    }
+
+    /// A minimal `ChannelView` carrying only `keyring` — every other field
+    /// defaulted, since `grants_to_park` reads nothing else.
+    fn channel_view_with_keyring(keyring: junto_kernel::Keyring) -> ChannelView {
+        ChannelView {
+            name: None,
+            entries: Vec::new(),
+            party: Vec::new(),
+            keyring,
+            unrecognized: std::collections::HashSet::new(),
+            unverified: std::collections::HashSet::new(),
+            standings: std::collections::HashMap::new(),
+            gate_status: std::collections::HashMap::new(),
+            gate_executions: std::collections::HashMap::new(),
+            sessions: std::collections::HashMap::new(),
+            closed: false,
+            lineage: Vec::new(),
+        }
+    }
+
+    /// The only difference between the two grants below is `retired_at` —
+    /// same key, same email, arbitrary distinct `granted_by` ids — so a
+    /// mutation that drops the `retired_at` filter (returns both) or
+    /// inverts it (returns the retired one instead) fails this exact
+    /// assertion, not just a differently-shaped one.
+    #[test]
+    fn grants_to_park_returns_only_the_active_grant_when_the_email_has_a_mix() {
+        use junto_kernel::KeyGrant;
+        let key = PublicKey::new(format!("ed25519:{}", "a".repeat(64))).unwrap();
+        let active_id = EntryId::new();
+        let retired_id = EntryId::new();
+        let mut keyring = junto_kernel::Keyring::new();
+        keyring.insert(
+            "alice@example.com".to_string(),
+            vec![
+                KeyGrant {
+                    key: key.clone(),
+                    granted_by: retired_id,
+                    retired_at: Some(Timestamp::from_millis(10)),
+                },
+                KeyGrant {
+                    key,
+                    granted_by: active_id,
+                    retired_at: None,
+                },
+            ],
+        );
+        let view = channel_view_with_keyring(keyring);
+        assert_eq!(grants_to_park(&view, "alice@example.com"), vec![active_id]);
+    }
+
+    #[test]
+    fn grants_to_park_returns_empty_for_an_email_with_no_grants_at_all() {
+        let view = channel_view_with_keyring(junto_kernel::Keyring::new());
+        assert!(grants_to_park(&view, "nobody@example.com").is_empty());
+    }
+
+    /// Pinned to a literal expected string, not to calling `fingerprint`
+    /// again — proves the 16 chars come from *after* the 8-char
+    /// `ed25519:` prefix, not the prefix itself (which would wrongly read
+    /// `ed25519:01234567`).
+    #[test]
+    fn fingerprint_is_the_16_hex_chars_after_the_prefix_not_the_prefix_itself() {
+        let key =
+            PublicKey::new(format!("ed25519:{}{}", "0123456789abcdef", "0".repeat(48))).unwrap();
+        assert_eq!(fingerprint(&key), "0123456789abcdef");
+    }
+
+    #[test]
+    fn fingerprint_differs_between_distinct_keys() {
+        let key_a = PublicKey::new(format!("ed25519:{}", "1".repeat(64))).unwrap();
+        let key_b = PublicKey::new(format!("ed25519:{}", "2".repeat(64))).unwrap();
+        assert_ne!(fingerprint(&key_a), fingerprint(&key_b));
+    }
+
+    /// Append a founder-authored `MemberAdded` carrying `key` for `email`
+    /// directly — bypasses `Host::add_member`'s "already on the roster is
+    /// a no-op" guard, the only way this suite can put a *second* device
+    /// grant on one member (mirrors the kernel's own multi-grant fixtures
+    /// in `junto-kernel/src/ledger.rs`).
+    async fn grant_key(
+        ledger: &host::SharedLedger,
+        channel: ChannelId,
+        email: &str,
+        key: &PublicKey,
+    ) -> EntryId {
+        let id = EntryId::new();
+        let entry = LedgerEntry {
+            signature: None,
+            id,
+            channel,
+            author: Member::human("Dan", "dan@example.com"),
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::MemberAdded {
+                member: Member::human("Device", email).with_key(key.clone()),
+            },
+        };
+        ledger.lock().await.append(entry).await.unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn revoke_member_parks_every_active_grant_and_leaves_the_member_in_the_party() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (repo, channel_id) = setup_channel("acme").await;
+        let fixed = host::Host::fixed(vec![repo.path().to_path_buf()]);
+        let host::Resolution::Resolved { ledger, id, .. } =
+            fixed.resolve(&channel_id.to_string()).await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+        let key1 = PublicKey::new(format!("ed25519:{}", "1".repeat(64))).unwrap();
+        let key2 = PublicKey::new(format!("ed25519:{}", "2".repeat(64))).unwrap();
+        grant_key(&ledger, id, "alice@example.com", &key1).await;
+        grant_key(&ledger, id, "alice@example.com", &key2).await;
+
+        revoke_member(
+            channel_id.to_string(),
+            "alice@example.com".to_string(),
+            "left the org".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let view = ledger.lock().await.project(&id).await.unwrap();
+        let grants = view.keyring.get("alice@example.com").unwrap();
+        assert_eq!(grants.len(), 2);
+        assert!(
+            grants.iter().all(|g| g.retired_at.is_some()),
+            "both grants should be parked: {grants:?}"
+        );
+        assert!(
+            view.party.iter().any(|m| m.email == "alice@example.com"),
+            "revocation must not remove the member from the party"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_member_refuses_when_the_email_has_no_active_grants() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (_repo, channel_id) = setup_channel("acme").await;
+        let err = revoke_member(
+            channel_id.to_string(),
+            "nobody@example.com".to_string(),
+            "why not".to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("no active key grants"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn revoke_member_refuses_a_non_founder_caller() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (repo, channel_id) = setup_channel("acme").await;
+        set_git_identity(repo.path(), "Eve", "eve@example.com");
+        let err = revoke_member(
+            channel_id.to_string(),
+            "alice@example.com".to_string(),
+            "not my call".to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("founding member"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn retire_device_parks_exactly_the_named_grant() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (repo, channel_id) = setup_channel("acme").await;
+        let fixed = host::Host::fixed(vec![repo.path().to_path_buf()]);
+        let host::Resolution::Resolved { ledger, id, .. } =
+            fixed.resolve(&channel_id.to_string()).await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+        let key = PublicKey::new(format!("ed25519:{}", "3".repeat(64))).unwrap();
+        let grant_id = grant_key(&ledger, id, "bob@example.com", &key).await;
+
+        retire_device(
+            channel_id.to_string(),
+            grant_id.to_string(),
+            "device lost".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let view = ledger.lock().await.project(&id).await.unwrap();
+        let grant = &view.keyring["bob@example.com"][0];
+        assert!(grant.retired_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn retire_device_refuses_a_grant_id_that_does_not_exist() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (_repo, channel_id) = setup_channel("acme").await;
+        let bogus = EntryId::new();
+        let err = retire_device(
+            channel_id.to_string(),
+            bogus.to_string(),
+            "device lost".to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not name a key-granting entry"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn retire_device_refuses_a_grant_id_that_is_not_key_granting() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (repo, channel_id) = setup_channel("acme").await;
+        let fixed = host::Host::fixed(vec![repo.path().to_path_buf()]);
+        let host::Resolution::Resolved { ledger, id, .. } =
+            fixed.resolve(&channel_id.to_string()).await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+        let not_a_grant = EntryId::new();
+        let entry = LedgerEntry {
+            signature: None,
+            id: not_a_grant,
+            channel: id,
+            author: Member::human("Dan", "dan@example.com"),
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::Assertion {
+                statement: "not a key grant".into(),
+                rationale: "just a claim".into(),
+                provenance: Vec::new(),
+                frame: None,
+            },
+        };
+        ledger.lock().await.append(entry).await.unwrap();
+
+        let err = retire_device(
+            channel_id.to_string(),
+            not_a_grant.to_string(),
+            "device lost".to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not name a key-granting entry"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn retire_device_refuses_a_grant_already_retired() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (repo, channel_id) = setup_channel("acme").await;
+        let fixed = host::Host::fixed(vec![repo.path().to_path_buf()]);
+        let host::Resolution::Resolved { ledger, id, .. } =
+            fixed.resolve(&channel_id.to_string()).await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+        let key = PublicKey::new(format!("ed25519:{}", "4".repeat(64))).unwrap();
+        let grant_id = grant_key(&ledger, id, "carl@example.com", &key).await;
+        let park_entry = LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel: id,
+            author: Member::human("Dan", "dan@example.com"),
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::Park {
+                target: grant_id,
+                rationale: "device lost the first time".into(),
+            },
+        };
+        ledger.lock().await.append(park_entry).await.unwrap();
+
+        let err = retire_device(
+            channel_id.to_string(),
+            grant_id.to_string(),
+            "device lost again?".to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("already retired"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn retire_device_refuses_a_non_founder_caller() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (repo, channel_id) = setup_channel("acme").await;
+        set_git_identity(repo.path(), "Eve", "eve@example.com");
+        let err = retire_device(
+            channel_id.to_string(),
+            EntryId::new().to_string(),
+            "not my call".to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("founding member"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn keys_list_runs_clean_with_and_without_grants() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (repo, channel_id) = setup_channel("acme").await;
+        let fixed = host::Host::fixed(vec![repo.path().to_path_buf()]);
+        let host::Resolution::Resolved { ledger, id, .. } =
+            fixed.resolve(&channel_id.to_string()).await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+        keys_list(channel_id.to_string(), None).await.unwrap();
+        let key = PublicKey::new(format!("ed25519:{}", "5".repeat(64))).unwrap();
+        grant_key(&ledger, id, "dana@example.com", &key).await;
+        keys_list(channel_id.to_string(), None).await.unwrap();
+        keys_list(channel_id.to_string(), Some("dana@example.com".to_string()))
+            .await
+            .unwrap();
     }
 }
