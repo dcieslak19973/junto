@@ -615,14 +615,22 @@ impl Host {
         // granted (the founder's own second device works the same way —
         // they author a grant for their own email). Skip the append only
         // when there is truly no new key to publish: none was supplied, or
-        // the exact key supplied is already on that email's keyring. This
-        // party/keyring divergence is deliberate, not a bug to "fix" back —
-        // it is the whole mechanism multi-device enrollment relies on.
+        // that exact key already has an ACTIVE grant on this email's
+        // keyring. A *retired* grant for the same key does not count —
+        // re-admitting a member after `revoke-member` parked every grant
+        // must still append, or `add-member --enroll` reports success
+        // while leaving them cut off (and `keys::signing_key` mints a
+        // device's key only once, so there is no other path to a fresh
+        // one). This is by design, not a bug to "fix" back: a retired
+        // grant is re-grantable, and the party/keyring divergence here is
+        // the whole mechanism multi-device enrollment relies on.
         if view.party.iter().any(|m| m.email == member.email) {
             let already_granted = key.as_ref().is_some_and(|supplied| {
-                view.keyring
-                    .get(&member.email)
-                    .is_some_and(|grants| grants.iter().any(|grant| &grant.key == supplied))
+                view.keyring.get(&member.email).is_some_and(|grants| {
+                    grants
+                        .iter()
+                        .any(|grant| &grant.key == supplied && grant.retired_at.is_none())
+                })
             });
             if key.is_none() || already_granted {
                 return crate::members::mint(&self.member_home()?, &member);
@@ -1696,37 +1704,32 @@ mod lineage_tests {
     }
 
     /// A keyless re-grant (no new key to publish) is still the pre-0033
-    /// no-op: no entry appended, but the member code is still returned —
-    /// Task 8's keyless-refusal path is for a *new* human with no local key,
-    /// not this already-admitted case.
+    /// no-op: no entry appended. The second, keyless call must still
+    /// succeed — Task 8's keyless-refusal path (`key.is_none()` and no
+    /// local key for a human) is for a *new* human with no local key, not
+    /// this already-admitted case; it must not fall through to that
+    /// `bail!`.
     #[tokio::test]
     async fn add_member_keyless_repeat_still_no_ops() {
         let (_dirs, host) = lineage_host(1);
         host.open_channel(None, "acme", dan(), None).await.unwrap();
         let key_a = junto_kernel::SigningKey::from_secret_bytes([7; 32]);
-        let first = host
-            .add_member(
-                "acme",
-                &dan(),
-                Member::human("Bob", "bob@example.com"),
-                Some(key_a.public_key()),
-            )
-            .await
-            .unwrap();
-        let second = host
-            .add_member(
-                "acme",
-                &dan(),
-                Member::human("Bob", "bob@example.com"),
-                None,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            second.code, first.code,
-            "the same machine-local code is returned, not a fresh mint"
-        );
+        host.add_member(
+            "acme",
+            &dan(),
+            Member::human("Bob", "bob@example.com"),
+            Some(key_a.public_key()),
+        )
+        .await
+        .unwrap();
+        host.add_member(
+            "acme",
+            &dan(),
+            Member::human("Bob", "bob@example.com"),
+            None,
+        )
+        .await
+        .unwrap();
         let (_, view) = project(&host, "acme").await;
         let bob_entries = view
             .entries
@@ -1741,6 +1744,143 @@ mod lineage_tests {
         assert_eq!(
             bob_entries, 1,
             "no key to publish means no entry, exactly like before 0033"
+        );
+    }
+
+    /// Re-admitting a member's device after `revoke-member` parked its
+    /// grant (Task 9, main.rs) must still append — the dedup that skips a
+    /// repeat of the same key only holds while that grant is ACTIVE.
+    /// Without this, `add-member --enroll` for a returning member would
+    /// report success while leaving them cut off, with no other way back:
+    /// `keys::signing_key` mints a device's key once and returns it
+    /// forever, so there is no CLI path to a fresh keypair for the same
+    /// device.
+    #[tokio::test]
+    async fn add_member_re_grants_a_previously_revoked_key() {
+        let (_dirs, host) = lineage_host(1);
+        host.open_channel(None, "acme", dan(), None).await.unwrap();
+        let key_a = junto_kernel::SigningKey::from_secret_bytes([7; 32]);
+        host.add_member(
+            "acme",
+            &dan(),
+            Member::human("Alice", "alice@example.com"),
+            Some(key_a.public_key()),
+        )
+        .await
+        .unwrap();
+
+        // Revoke it — a founder-authored Park targeting the grant's
+        // `granted_by` entry id, exactly what `junto revoke-member`
+        // constructs (main.rs). Appended directly on the ledger: this is
+        // the act, not something `Host::add_member` performs.
+        let (id, view) = project(&host, "acme").await;
+        let grant_id = view
+            .keyring
+            .get("alice@example.com")
+            .and_then(|grants| grants.first())
+            .expect("alice has a grant to revoke")
+            .granted_by;
+        let mut park = LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel: id,
+            author: dan(),
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::Park {
+                target: grant_id,
+                rationale: "device lost".into(),
+            },
+        };
+        host.sign_entry(&mut park);
+        let Resolution::Resolved { ledger, .. } = host.resolve("acme").await.unwrap() else {
+            panic!("channel 'acme' resolves");
+        };
+        ledger.lock().await.append(park).await.unwrap();
+
+        // The park must actually have retired the grant, or the rest of
+        // this test would exercise nothing.
+        let (_, view) = project(&host, "acme").await;
+        assert!(
+            view.keyring["alice@example.com"][0].retired_at.is_some(),
+            "the park must retire alice's only grant before re-enrollment is exercised"
+        );
+
+        // Re-enroll the SAME device (the same key) after revocation.
+        host.add_member(
+            "acme",
+            &dan(),
+            Member::human("Alice", "alice@example.com"),
+            Some(key_a.public_key()),
+        )
+        .await
+        .unwrap();
+
+        let (_, view) = project(&host, "acme").await;
+        let alice_grants = view
+            .keyring
+            .get("alice@example.com")
+            .expect("alice has grants");
+        assert_eq!(
+            alice_grants.len(),
+            2,
+            "re-granting after revocation appends a new grant alongside the retired one: \
+             {alice_grants:?}"
+        );
+        assert!(
+            alice_grants
+                .iter()
+                .any(|g| g.key == key_a.public_key() && g.retired_at.is_none()),
+            "alice's re-enrollment leaves an ACTIVE grant for her key: {alice_grants:?}"
+        );
+    }
+
+    /// `docs/superpowers/specs/2026-08-21-device-key-enrollment-design.md`
+    /// line 61: "the founder's own second device works naturally — they
+    /// author a `MemberAdded` for their own email carrying the new key."
+    /// Pinned as a contract, not just verified by inspection: the founder
+    /// is always on the Party (so the guard is entered), and
+    /// `project_keyring` grants on `entry.author.email == founder_email`
+    /// with no self-exclusion, so nothing here needs a special case.
+    #[tokio::test]
+    async fn add_member_records_the_founders_own_second_device() {
+        let (_dirs, host) = lineage_host(1);
+        host.open_channel(None, "acme", dan(), None).await.unwrap();
+        let (_, view_before) = project(&host, "acme").await;
+        let founder_key_before = view_before.keyring["dan@example.com"][0].key.clone();
+
+        let key_b = junto_kernel::SigningKey::from_secret_bytes([13; 32]);
+        assert_ne!(
+            founder_key_before,
+            key_b.public_key(),
+            "the fixture's second device key must genuinely differ from the founder's first"
+        );
+
+        // The founder grants membership to themself, carrying a second
+        // device's key.
+        host.add_member("acme", &dan(), dan(), Some(key_b.public_key()))
+            .await
+            .unwrap();
+
+        let (_, view) = project(&host, "acme").await;
+        let dan_grants = view
+            .keyring
+            .get("dan@example.com")
+            .expect("dan has keyring grants");
+        assert_eq!(
+            dan_grants.len(),
+            2,
+            "the founder's genesis key plus their second device's key: {dan_grants:?}"
+        );
+        let dan_rows: Vec<_> = view
+            .party
+            .iter()
+            .filter(|m| m.email == "dan@example.com")
+            .collect();
+        assert_eq!(
+            dan_rows.len(),
+            1,
+            "the founder still has exactly one party row, not a duplicate for their second \
+             device: {dan_rows:?}"
         );
     }
 
