@@ -447,6 +447,7 @@ mod tests {
         Member, Span, Timestamp,
     };
     use junto_live::LiveDoc;
+    use sha2::Digest as _;
     use tokio_tungstenite::tungstenite::Message as ClientMessage;
 
     use super::*;
@@ -1077,6 +1078,30 @@ mod tests {
              event published before it connected"
         );
 
+        // --- Setup for the live-fan-out property below: a second watcher
+        // connects and authenticates now, strictly before any annotation
+        // exists, so a later Update it receives can only be the live
+        // broadcast of watcher1's write, never something already folded
+        // into its own initial snapshot. Asserting `annotations().len() ==
+        // 0` here is what makes that later assertion mean something. ---
+        let (mut watcher2, _r2) = tokio_tungstenite::connect_async(url.clone())
+            .await
+            .expect("connect watcher2");
+        authenticate(&mut watcher2, &signing_key).await;
+        let watcher2_initial =
+            recv_until(&mut watcher2, |f| matches!(f, Frame::Update { .. })).await;
+        let local_w2_initial = LiveDoc::new();
+        local_w2_initial
+            .import_update(&watcher2_initial.update_bytes().expect("update payload"))
+            .expect("import watcher2's initial snapshot");
+        assert_eq!(
+            local_w2_initial.annotations().len(),
+            0,
+            "setup: watcher2 must connect before the annotation exists — \
+             otherwise the live fan-out assertion below would trivially \
+             pass off its own snapshot instead of a live broadcast"
+        );
+
         // --- Point 3: the watcher inserts a signed urgent annotation and
         // sends the update. ---
         let mut annotation = test_annotation("dan@x.com", "please double-check the bounds check");
@@ -1125,36 +1150,62 @@ mod tests {
             other => panic!("point 4b: expected a Steer control signal, got {other:?}"),
         }
 
-        // --- Point 5: a SECOND watcher connects after the annotation
-        // already exists and must receive it in its own initial snapshot —
-        // deliberately distinct from
-        // `a_second_watcher_observes_the_first_watchers_accepted_annotation`,
-        // which connects before the write and only ever sees it via the
-        // later outbound-broadcast fan-out. ---
-        let (mut watcher2, _r2) = tokio_tungstenite::connect_async(url.clone())
-            .await
-            .expect("connect watcher2");
-        authenticate(&mut watcher2, &signing_key).await;
-        let snapshot2 = recv_until(&mut watcher2, |f| matches!(f, Frame::Update { .. })).await;
-        let local2 = LiveDoc::new();
-        local2
-            .import_update(&snapshot2.update_bytes().expect("update payload"))
-            .expect("import second watcher's snapshot");
+        // --- Live fan-out: watcher2 never sent anything itself, and (per
+        // the setup assertion above) connected before the annotation
+        // existed — so the next Update it receives can only be the live
+        // broadcast of watcher1's accepted write. This is the property
+        // point 5 names as "fan-out", proven here as it happens rather
+        // than via a future snapshot (that's the separate, late-joiner
+        // property proven immediately below). ---
+        let fanned_out = recv_until(&mut watcher2, |f| matches!(f, Frame::Update { .. })).await;
+        let local_w2_live = LiveDoc::new();
+        local_w2_live
+            .import_update(&fanned_out.update_bytes().expect("update payload"))
+            .expect("import watcher2's live fan-out update");
         assert_eq!(
-            local2.conversation_len(),
+            local_w2_live
+                .annotations()
+                .iter()
+                .find(|a| a.id == annotation.id)
+                .map(|a| a.body.clone()),
+            Some("please double-check the bounds check".to_string()),
+            "live fan-out: a watcher connected before the write must receive \
+             the accepted annotation as a live Update, not only in some \
+             future snapshot"
+        );
+
+        // --- Point 5: a THIRD watcher connects only now, after the
+        // annotation already exists, and must receive it in its own
+        // initial snapshot — the late-joiner property, distinct from the
+        // live-fan-out property just proven above. Also deliberately
+        // distinct from
+        // `a_second_watcher_observes_the_first_watchers_accepted_annotation`,
+        // which connects before the write and only ever sees it via
+        // outbound-broadcast fan-out. ---
+        let (mut watcher3, _r3) = tokio_tungstenite::connect_async(url.clone())
+            .await
+            .expect("connect watcher3");
+        authenticate(&mut watcher3, &signing_key).await;
+        let snapshot3 = recv_until(&mut watcher3, |f| matches!(f, Frame::Update { .. })).await;
+        let local3 = LiveDoc::new();
+        local3
+            .import_update(&snapshot3.update_bytes().expect("update payload"))
+            .expect("import third watcher's snapshot");
+        assert_eq!(
+            local3.conversation_len(),
             1,
-            "point 5: the second watcher's initial snapshot must still carry \
+            "point 5: the third watcher's initial snapshot must still carry \
              the one conversation event"
         );
         assert_eq!(
-            local2
+            local3
                 .annotations()
                 .iter()
                 .find(|a| a.id == annotation.id)
                 .map(|a| a.body.clone()),
             Some("please double-check the bounds check".to_string()),
             "point 5: a watcher connecting after the annotation was accepted \
-             must receive it in its own snapshot, not only via later fan-out"
+             must receive it in its own snapshot, not only via live fan-out"
         );
 
         // --- Point 6: finishing the session ends every socket with
@@ -1165,15 +1216,27 @@ mod tests {
             .finish(session)
             .expect("point 6: finish must return the session's final snapshot bytes");
 
+        // `recv_until` only ever returns a frame its predicate accepted, so
+        // comparing its result to `Frame::End` can never fail — a missing
+        // End would instead surface as `recv_until`'s generic "timed out" /
+        // "socket closed" panic, naming neither point 6 nor which watcher.
+        // `recv_until_or_timeout` makes the comparison real: `None` is a
+        // reachable, distinct outcome, so each assertion below actually
+        // exercises and names its own watcher.
         assert_eq!(
-            recv_until(&mut watcher1, |f| matches!(f, Frame::End)).await,
-            Frame::End,
-            "point 6: the first watcher must receive Frame::End"
+            recv_until_or_timeout(&mut watcher1, |f| matches!(f, Frame::End)).await,
+            Some(Frame::End),
+            "point 6: watcher1 must receive Frame::End when the session finishes"
         );
         assert_eq!(
-            recv_until(&mut watcher2, |f| matches!(f, Frame::End)).await,
-            Frame::End,
-            "point 6: the second watcher must receive Frame::End"
+            recv_until_or_timeout(&mut watcher2, |f| matches!(f, Frame::End)).await,
+            Some(Frame::End),
+            "point 6: watcher2 must receive Frame::End when the session finishes"
+        );
+        assert_eq!(
+            recv_until_or_timeout(&mut watcher3, |f| matches!(f, Frame::End)).await,
+            Some(Frame::End),
+            "point 6: watcher3 must receive Frame::End when the session finishes"
         );
 
         let agent = crate::agent::Agent {
@@ -1187,13 +1250,22 @@ mod tests {
             skills: Vec::new(),
             plugins: Vec::new(),
         };
+        // A literal, test-supplied name. This exercises archiving and
+        // re-import, not the `turn-{turn}`-numbered collision-avoidance
+        // convention itself (that convention lives in
+        // `spawn_turn`/`capture_turn`, which derive the real turn number —
+        // see `archive_live_snapshot`'s doc comment for why a name unique
+        // per turn matters there). The literal below is both what this
+        // test writes and what it reads back, so nothing here proves that
+        // naming rule.
+        let artifact_name = "turn-1-live.loro";
         crate::launch::archive_live_snapshot(
             &host,
             &channel.to_string(),
             channel,
             session,
             &agent,
-            "turn-1-live.loro",
+            artifact_name,
             &final_snapshot,
         )
         .await
@@ -1203,7 +1275,7 @@ mod tests {
             home.path()
                 .join("artifacts")
                 .join(session.to_string())
-                .join("turn-1-live.loro"),
+                .join(artifact_name),
         )
         .expect(
             "point 6: the archived turn-1-live.loro artifact must exist under \
@@ -1264,10 +1336,23 @@ mod tests {
             "point 6: the ArtifactAttached entry must carry exactly one provenance ref"
         );
         assert!(
-            recorded[0].uri.as_str().ends_with("turn-1-live.loro"),
+            recorded[0].uri.as_str().ends_with(artifact_name),
             "point 6: the recorded provenance must point at the archived \
              artifact, got: {:?}",
             recorded[0].uri
+        );
+        // The URI matching the filename only proves the ledger entry names
+        // *a* file with the right name — not that it is the right
+        // *content*. `archive_live_snapshot`'s own doc comment names
+        // exactly this hazard: a colliding artifact name could silently
+        // corrupt an earlier entry's recorded digest. Prove the digest
+        // actually corresponds to the bytes archived on disk.
+        let expected_digest = format!("sha256:{:x}", sha2::Sha256::digest(archived_hex.as_bytes()));
+        assert_eq!(
+            recorded[0].digest.as_ref().map(|d| d.as_str()),
+            Some(expected_digest.as_str()),
+            "point 6: the recorded provenance digest must match the archived \
+             artifact's actual on-disk bytes, not merely share its filename"
         );
     }
 }
