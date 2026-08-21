@@ -28,11 +28,65 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use junto_kernel::{Anchor, Annotation, EntryId};
+use junto_kernel::{Anchor, Annotation, EntryId, Member};
+use junto_live::LiveDoc;
 use junto_substrate_git::reanchor::{Reanchor, reanchor};
 
 use crate::host::{Host, Resolution};
 use crate::launch::NotLive;
+
+/// Hard cap on an annotation's `body` bytes carried into the steer message
+/// and, from there, verbatim into the DURABLE ledger: [`deliver_batch`] ->
+/// `crate::launch::steer_live` -> `record_steer_note` -> `append` writes
+/// `SessionUpdated { note: format!("steer: {message}") }` to
+/// `refs/junto/*`. Nothing else bounds this: not the composer, not
+/// `validate_annotation_update` (only the 8 MiB websocket frame limit
+/// does, and only per *frame*, not per body) — so this is the one path in
+/// the branch by which a remote peer's own bytes reach an unbounded,
+/// immutable, permanently-synced-to-every-remote entry with no delete
+/// (IMPORTANT 3 of the final branch review). 4 KiB is generous for real
+/// prose (several long paragraphs) while keeping one oversized or
+/// malicious comment from becoming a multi-megabyte permanent record.
+const MAX_ANNOTATION_BODY_BYTES: usize = 4096;
+
+/// `body`, truncated to at most [`MAX_ANNOTATION_BODY_BYTES`] (respecting
+/// UTF-8 character boundaries) with an explicit marker appended when it
+/// was — a truncated comment must never silently read as complete.
+fn capped_body(body: &str) -> std::borrow::Cow<'_, str> {
+    if body.len() <= MAX_ANNOTATION_BODY_BYTES {
+        return std::borrow::Cow::Borrowed(body);
+    }
+    let mut end = MAX_ANNOTATION_BODY_BYTES;
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    std::borrow::Cow::Owned(format!(
+        "{}\n…[truncated: {end} of {} bytes shown]",
+        &body[..end],
+        body.len()
+    ))
+}
+
+/// Resolve a [`junto_kernel::StreamAnchor`]'s `op_id` back to the
+/// conversation event it names, for [`format_steer`] to quote as the
+/// excerpt when the annotation didn't pin one itself (IMPORTANT 5 of the
+/// final branch review). The shipped composer (`junto-iced`) sets `op_id`
+/// to the `conversation` container's own index and never sets `excerpt`,
+/// so without this every stream-anchored comment reached the agent as a
+/// bare, unresolvable event number with no quoted content at all. `None`
+/// when `op_id` doesn't parse as an index, `live_doc` is unavailable, or
+/// the index doesn't resolve. Prefers the event's raw `markdown` source
+/// over its (possibly sanitized HTML) `text` field — see
+/// `crate::launch::LiveEvent`.
+fn resolve_stream_excerpt(live_doc: Option<&LiveDoc>, op_id: &str) -> Option<String> {
+    let index: usize = op_id.parse().ok()?;
+    let event = live_doc?.conversation_event(index)?;
+    event
+        .get("markdown")
+        .and_then(|v| v.as_str())
+        .or_else(|| event.get("text").and_then(|v| v.as_str()))
+        .map(str::to_string)
+}
 
 /// Render a batch of annotations as one steer message for the driving
 /// agent's context.
@@ -40,25 +94,43 @@ use crate::launch::NotLive;
 /// `reanchored[i]` is the current position of `annotations[i]`'s anchor
 /// (`None` when re-anchoring wasn't attempted or failed — see
 /// [`reanchor_batch`]); the two slices are parallel by index, matching how
-/// [`deliver_batch`] builds them together.
+/// [`deliver_batch`] builds them together. `live_doc` is the session's
+/// live document, when one is registered — used only to resolve a
+/// `Anchor::Stream` annotation's referenced event (see
+/// [`resolve_stream_excerpt`]); `None` degrades every stream anchor to the
+/// "could not resolve" wording rather than panicking or fabricating
+/// content.
 ///
 /// The agent has no other view of the watcher's screen, so each block names
 /// **who** commented, **where** (the pinned `path:span`, plus where that
-/// span sits now if it moved), quotes the **pinned excerpt** if the
-/// annotation carried one — it travels with the comment, every line of it
-/// prefixed so a multi-line span (the normal case: a `CodeAnchor` pins a
-/// line *range*) reads as one quoted block rather than bleeding into the
-/// comment that follows — because the current file content may no longer
-/// match what the watcher was actually looking at. An `Orphaned` re-anchor
-/// says so plainly rather than pointing at a line range that no longer
-/// corresponds to anything the watcher commented on.
-pub(crate) fn format_steer(annotations: &[Annotation], reanchored: &[Option<Reanchor>]) -> String {
+/// span sits now if it moved), quotes an **excerpt** — the annotation's own
+/// pinned one if it carried one, otherwise (for a stream anchor) the
+/// referenced conversation event's own text — every line of it prefixed so
+/// a multi-line span (the normal case: a `CodeAnchor` pins a line *range*)
+/// reads as one quoted block rather than bleeding into the comment that
+/// follows — because the current file content may no longer match what the
+/// watcher was actually looking at. An `Orphaned` re-anchor says so plainly
+/// rather than pointing at a line range that no longer corresponds to
+/// anything the watcher commented on; an unresolvable stream anchor says so
+/// plainly too, rather than emitting a bare, meaningless event number.
+pub(crate) fn format_steer(
+    annotations: &[Annotation],
+    reanchored: &[Option<Reanchor>],
+    live_doc: Option<&LiveDoc>,
+) -> String {
     let mut out = String::new();
     for (i, annotation) in annotations.iter().enumerate() {
         if i > 0 {
             out.push('\n');
         }
         let current = reanchored.get(i).copied().flatten();
+        // Resolved once per annotation: it doubles as the location note
+        // (whether the referenced event could be found at all) and, absent
+        // a pinned `excerpt`, as the excerpt itself.
+        let stream_excerpt = match &annotation.anchor {
+            Anchor::Stream(stream) => resolve_stream_excerpt(live_doc, &stream.op_id),
+            Anchor::Code(_) => None,
+        };
         let location = match &annotation.anchor {
             Anchor::Code(code) => {
                 let pinned = format!("{}:{}-{}", code.path, code.span.start, code.span.end);
@@ -74,8 +146,18 @@ pub(crate) fn format_steer(annotations: &[Annotation], reanchored: &[Option<Rean
             }
             // LiveDoc op ids are stable by construction (CRDT positions
             // don't drift the way line numbers do), so a stream anchor has
-            // no re-anchored position to report — nothing to compute here.
-            Anchor::Stream(stream) => format!("on conversation event {}", stream.op_id),
+            // no re-anchored *position* to report — but the referenced
+            // event itself can still fail to resolve (unparseable `op_id`,
+            // no `LiveDoc` in hand, or an out-of-range index), and that
+            // must be said plainly rather than left implicit in a bare
+            // number the agent has no way to act on.
+            Anchor::Stream(stream) if stream_excerpt.is_some() => {
+                format!("on conversation event {}", stream.op_id)
+            }
+            Anchor::Stream(stream) => format!(
+                "on conversation event {} (could not resolve — the event is unavailable)",
+                stream.op_id
+            ),
         };
         let on = if matches!(annotation.anchor, Anchor::Stream(_)) {
             location
@@ -86,7 +168,12 @@ pub(crate) fn format_steer(annotations: &[Annotation], reanchored: &[Option<Rean
             "[watcher comment — {} {on}]\n",
             annotation.author.email
         ));
-        if let Some(excerpt) = &annotation.excerpt {
+        // The annotation's own pinned excerpt wins when present — it
+        // travels with the comment because the current file content may no
+        // longer match what the watcher was actually looking at. A
+        // resolved stream event is the fallback, not a replacement.
+        let excerpt = annotation.excerpt.as_deref().or(stream_excerpt.as_deref());
+        if let Some(excerpt) = excerpt {
             // Every line quoted, not just the first: a `CodeAnchor`'s span
             // is a line *range* (the excerpt is normally multi-line), and
             // an unmarked line reads to the model as the start of the
@@ -97,7 +184,7 @@ pub(crate) fn format_steer(annotations: &[Annotation], reanchored: &[Option<Rean
                 out.push('\n');
             }
         }
-        out.push_str(&annotation.body);
+        out.push_str(&capped_body(&annotation.body));
         out.push('\n');
     }
     out
@@ -161,18 +248,66 @@ async fn deliver_batch(
     };
     // Best-effort: `None` (no `SessionLive`, or no workspace recorded on it
     // yet) just means `reanchor_batch` renders every anchor pinned-only —
-    // never a reason to withhold the comment itself.
-    let workspace = host.live_plane().get(session).and_then(|live| {
+    // never a reason to withhold the comment itself. Keep the `Arc` alive
+    // (not just its workspace clone) for the whole function: `format_steer`
+    // below also borrows `live.doc` to resolve stream-anchor excerpts.
+    let live = host.live_plane().get(session);
+    let workspace = live.as_ref().and_then(|live| {
         live.workspace
             .lock()
             .expect("live plane workspace lock")
             .clone()
     });
     let reanchored = reanchor_batch(workspace.as_deref(), &annotations).await;
-    let message = format_steer(&annotations, &reanchored);
+    let message = format_steer(&annotations, &reanchored, live.as_deref().map(|s| &s.doc));
     // The batch becomes one steer message, so the ledger's steer note
-    // records a single author: the first annotation's, in batch order.
-    let steered_by = first.author.clone();
+    // records a single author: the first annotation's, in batch order —
+    // subject to IMPORTANT 4 of the final branch review, below.
+    let sender = first.author.clone();
+    // `steer_live` -> `record_steer_note` -> `append` -> `Host::sign_entry`
+    // resolves (and, on a miss, MINTS AND PERSISTS) a signing key for
+    // whatever email is passed as `author`. `sender` is a REMOTE watcher's
+    // `Member`; using it unconditionally would silently write a new
+    // private key for someone else's identity into THIS machine's
+    // `keys.toml` the moment the driving host isn't the one that granted
+    // that watcher's membership — and the entry would still land in
+    // `ChannelView::unverified` (ADR 0033) anyway, since a freshly-minted
+    // key here is never in the channel's keyring. Author as `sender` only
+    // when this host already holds a key for that identity (the correct,
+    // common case); otherwise author as the session's own driving agent
+    // and name the watcher in the note text instead, so nothing is lost.
+    // `host.member_home()` (not the global `crate::host::junto_home()`)
+    // is deliberate: it is the exact path `sign_entry` itself signs
+    // against, override included — checking a different home would check
+    // the wrong store.
+    let member_home = host.member_home().ok();
+    let sender_has_local_key = member_home
+        .as_deref()
+        .and_then(|home| crate::keys::has_signing_key(home, &sender.email).ok())
+        .unwrap_or(false);
+    let (steered_by, message) = if sender_has_local_key {
+        (sender, message)
+    } else {
+        // The driving agent config store (`agents.toml`,
+        // `harness_sessions.json`) is the machine-wide junto home, not
+        // `member_home` — the same distinction `crate::launch`'s own
+        // callers (`steer`, `record_outcome`) already draw. `resume_agent`
+        // fails only if that home can't even be read, in which case
+        // `sign_entry`'s own key lookup below would fail identically, so
+        // this fallback introduces no new failure mode.
+        let driving_agent = crate::host::junto_home()
+            .ok()
+            .and_then(|home| crate::launch::resume_agent(&home, &session).ok())
+            .map(|agent| agent.member())
+            .unwrap_or_else(|| Member::agent("junto live bridge", "live-bridge@junto.local"));
+        (
+            driving_agent,
+            format!(
+                "(relayed on behalf of watcher {}, who has no local signing key on this host) {message}",
+                sender.email
+            ),
+        )
+    };
     if let Err(NotLive) =
         crate::launch::steer_live(Arc::clone(&host), id, channel, session, steered_by, message)
             .await
@@ -305,6 +440,7 @@ mod tests {
             &[Some(Reanchor::Moved {
                 span: Span::new(15, 17).unwrap(),
             })],
+            None,
         );
         assert!(out.contains("dan@x.com"));
         assert!(out.contains("src/foo.rs:12-14"));
@@ -316,7 +452,7 @@ mod tests {
     #[test]
     fn orphaned_anchor_is_stated_not_hidden() {
         let ann = code_annotation("dan@x.com", "src/foo.rs", 3, 3, Some("old line"), "why?");
-        let out = format_steer(&[ann], &[Some(Reanchor::Orphaned)]);
+        let out = format_steer(&[ann], &[Some(Reanchor::Orphaned)], None);
         assert!(out.contains("code has changed since"));
     }
 
@@ -328,6 +464,7 @@ mod tests {
             &[Some(Reanchor::Exact {
                 span: Span::new(5, 5).unwrap(),
             })],
+            None,
         );
         assert!(out.contains("src/foo.rs:5-5"));
         assert!(!out.contains("moved to"));
@@ -338,14 +475,14 @@ mod tests {
     fn batch_concatenates_in_order() {
         let a = code_annotation("a@x.com", "a.rs", 1, 1, None, "first");
         let b = code_annotation("b@x.com", "b.rs", 2, 2, None, "second");
-        let out = format_steer(&[a, b], &[None, None]);
+        let out = format_steer(&[a, b], &[None, None], None);
         assert!(out.find("first").unwrap() < out.find("second").unwrap());
     }
 
     #[test]
     fn missing_excerpt_omits_the_quote_block() {
         let ann = code_annotation("a@x.com", "a.rs", 1, 1, None, "no excerpt here");
-        let out = format_steer(&[ann], &[None]);
+        let out = format_steer(&[ann], &[None], None);
         assert!(!out.contains('>'));
     }
 
@@ -359,7 +496,7 @@ mod tests {
             Some("let x = 1;\nlet y = 2;"),
             "both wrong",
         );
-        let out = format_steer(&[ann], &[None]);
+        let out = format_steer(&[ann], &[None], None);
         assert!(
             out.contains("> let x = 1;\n> let y = 2;\n"),
             "every excerpt line must carry its own quote marker: {out}"
@@ -382,7 +519,7 @@ mod tests {
             timestamp: Timestamp::from_millis(1_700_000_000_000),
             signature: None,
         };
-        let out = format_steer(&[ann], &[None]);
+        let out = format_steer(&[ann], &[None], None);
         assert!(out.contains("on conversation event 12@7"));
     }
 
@@ -448,5 +585,135 @@ mod tests {
             "the undelivered batch must land back on the pending queue"
         );
         assert_eq!(requeued[0].id, id);
+    }
+
+    #[test]
+    fn oversized_body_is_truncated_with_a_marker() {
+        // IMPORTANT 3 of the final branch review: `annotation.body` is the
+        // one path by which a remote peer's own bytes reach the durable
+        // ledger via `steer_live`'s `note: format!("steer: {message}")`.
+        let huge = "x".repeat(MAX_ANNOTATION_BODY_BYTES + 500);
+        let ann = code_annotation("a@x.com", "a.rs", 1, 1, None, &huge);
+        let out = format_steer(&[ann], &[None], None);
+        assert!(
+            out.len() < huge.len(),
+            "the rendered output must be shorter than the oversized body"
+        );
+        assert!(
+            out.contains("truncated"),
+            "a truncated body must carry an explicit marker: {out}"
+        );
+        assert!(
+            out.contains(&"x".repeat(MAX_ANNOTATION_BODY_BYTES)),
+            "exactly the cap's worth of the original bytes must survive"
+        );
+    }
+
+    #[test]
+    fn body_within_the_cap_is_rendered_verbatim_and_unmarked() {
+        let body = "well within the cap";
+        let ann = code_annotation("a@x.com", "a.rs", 1, 1, None, body);
+        let out = format_steer(&[ann], &[None], None);
+        assert!(out.contains(body));
+        assert!(!out.contains("truncated"));
+    }
+
+    #[test]
+    fn resolvable_stream_anchor_quotes_the_referenced_event() {
+        // IMPORTANT 5 of the final branch review.
+        let doc = LiveDoc::new();
+        doc.push_conversation(&serde_json::json!({
+            "kind": "assistant",
+            "text": "<p>hi there</p>",
+            "markdown": "hi there",
+        }));
+        let ann = Annotation {
+            id: AnnotationId::new(),
+            author: Member::human("Watcher", "dan@x.com"),
+            anchor: Anchor::Stream(junto_kernel::StreamAnchor {
+                session: EntryId::new(),
+                op_id: "0".into(),
+            }),
+            body: "what's this doing?".into(),
+            excerpt: None,
+            supersedes: None,
+            urgent: false,
+            timestamp: Timestamp::from_millis(1_700_000_000_000),
+            signature: None,
+        };
+        let out = format_steer(&[ann], &[None], Some(&doc));
+        assert!(out.contains("on conversation event 0"));
+        assert!(!out.contains("could not resolve"), "{out}");
+        assert!(
+            out.contains("> hi there"),
+            "the resolved event's own text must be quoted as the excerpt: {out}"
+        );
+    }
+
+    #[test]
+    fn unresolvable_stream_anchor_says_so_plainly() {
+        // Empty doc: index 0 doesn't exist. Must not silently emit a bare,
+        // meaningless event number as if it were resolved.
+        let doc = LiveDoc::new();
+        let ann = Annotation {
+            id: AnnotationId::new(),
+            author: Member::human("Watcher", "dan@x.com"),
+            anchor: Anchor::Stream(junto_kernel::StreamAnchor {
+                session: EntryId::new(),
+                op_id: "0".into(),
+            }),
+            body: "what's this doing?".into(),
+            excerpt: None,
+            supersedes: None,
+            urgent: false,
+            timestamp: Timestamp::from_millis(1_700_000_000_000),
+            signature: None,
+        };
+        let out = format_steer(&[ann], &[None], Some(&doc));
+        assert!(
+            out.contains("could not resolve"),
+            "an unresolvable stream anchor must say so plainly: {out}"
+        );
+        assert!(
+            !out.contains('>'),
+            "no excerpt block when nothing resolved: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_remote_author_never_gets_a_minted_key() {
+        // IMPORTANT 4 of the final branch review: `steered_by` used to be
+        // `first.author` unconditionally, handed straight to `steer_live`
+        // -> `record_steer_note` -> `append` -> `Host::sign_entry`, which
+        // mints and persists a signing key on a miss. A remote watcher
+        // this host never granted membership to must never get a key
+        // minted for their email on this machine.
+        let (host, channel_ref, _dir, member_home) = host_with_channel().await;
+        let session = EntryId::new();
+        // Steerable and registered, so `steer_live` actually reaches
+        // `record_steer_note`/`append`/`sign_entry` instead of stopping at
+        // `NotLive` — this test must prove the mint never happens even
+        // when the note genuinely gets recorded.
+        let _control_rx = host
+            .live()
+            .begin(Arc::clone(&host), channel_ref.clone(), session, true);
+
+        let mut annotation = code_annotation(
+            "unknown@remote.example.com",
+            "src/foo.rs",
+            1,
+            1,
+            None,
+            "please look",
+        );
+        annotation.urgent = true;
+
+        deliver(Arc::clone(&host), channel_ref, session, vec![annotation]).await;
+
+        assert!(
+            !crate::keys::has_signing_key(member_home.path(), "unknown@remote.example.com")
+                .unwrap(),
+            "an unidentified remote watcher must never get a locally-minted signing key"
+        );
     }
 }

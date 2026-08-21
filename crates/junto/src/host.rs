@@ -321,8 +321,14 @@ impl Host {
     }
 
     /// Where this host's member-code store lives (`docs/adr/0017`): the
-    /// machine registry's junto home, unless overridden (tests).
-    fn member_home(&self) -> Result<PathBuf> {
+    /// machine registry's junto home, unless overridden (tests). Exposed
+    /// crate-wide (not just to [`Host::sign_entry`]) so a caller that needs
+    /// to ask "does this host hold a key for X" — e.g.
+    /// `crate::live_bridge::deliver_batch`'s non-minting lookup — resolves
+    /// the identical path `sign_entry` signs against, including the
+    /// test-only override; asking a *different* home would silently check
+    /// the wrong store.
+    pub(crate) fn member_home(&self) -> Result<PathBuf> {
         if let Some(home) = &self.member_home_override {
             return Ok(home.clone());
         }
