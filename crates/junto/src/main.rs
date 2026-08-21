@@ -392,17 +392,10 @@ async fn add_member(
     // `--channel` here is a SEPARATE invocation from `junto invite`'s that
     // may be a human-typed name: passing it through raw would return a
     // confidently-wrong `WrongChannel` for the exact channel the invite was
-    // issued for.
-    let (substrate, id) = match host.resolve(&channel).await? {
-        host::Resolution::Resolved { substrate, id, .. } => (substrate, id),
-        host::Resolution::NotFound => {
-            bail!("no channel '{channel}' in any registered substrate")
-        }
-        host::Resolution::Ambiguous(substrates) => bail!(
-            "channel name '{channel}' exists in several substrates ({substrates:?}); \
-             address it by id"
-        ),
-    };
+    // issued for. Also yields `ledger`, so the revocation-cutoff check
+    // below can project the pre-enrollment view without a second
+    // resolve.
+    let (substrate, ledger, id) = resolve_channel(&host, &channel).await?;
 
     // Whether this member's key came from `--enroll` — once true, the
     // invite token below is already burned, so every failure from here on
@@ -457,6 +450,24 @@ async fn add_member(
         }
     };
     let email = member.email.clone();
+    // Finding 2, part 3 (final fix wave): re-enrolling a member who
+    // currently has a revocation cutoff silently restores it — say so.
+    // Advisory only, gated to `--enroll` (the real re-enrollment path);
+    // never refuses, since re-admission is legitimate (docs/adr/0035).
+    if enrolled {
+        let view = spent_token_context(
+            ledger
+                .lock()
+                .await
+                .project(&id)
+                .await
+                .map_err(anyhow::Error::from),
+            enrolled,
+        )?;
+        if let Some(warning) = revocation_cutoff_warning(&view, &email, &channel) {
+            println!("{warning}");
+        }
+    }
 
     let granted_by = match (author_name, author_email) {
         (Some(name), Some(email)) => Ok(Member::human(name, email)),
@@ -564,7 +575,14 @@ fn member_code_for(email: &str) -> Result<Option<String>> {
 /// exist, or if the caller (this machine's git user) is not the channel's
 /// founding member (`view.party.first()`) — an invite the caller cannot
 /// themselves complete is worse than an error.
+///
+/// Prunes `invites.toml` first (final fix wave, finding 1): every call
+/// appends a new record, so without this the file would grow without
+/// bound (`invites::prune`'s own doc comment) — `invite` is the one
+/// command guaranteed to run whenever a human is actively using this
+/// mechanism, so it is the natural place to reclaim long-expired ones.
 async fn invite(channel: String, member: String) -> Result<()> {
+    invites::prune(&host::junto_home()?)?;
     let host = host::Host::from_registry(host::junto_home()?);
     let (substrate, ledger, id) = match host.resolve(&channel).await? {
         host::Resolution::Resolved {
@@ -807,6 +825,35 @@ fn grants_to_park(view: &ChannelView, email: &str) -> Vec<EntryId> {
         .collect()
 }
 
+/// The warning `add-member --enroll` prints when `email` currently holds a
+/// revocation cutoff (finding 2, final fix wave): at least one grant and
+/// every one of them retired — the exact condition
+/// [`junto_kernel::ChannelView::unrecognized`]'s cutoff fold requires
+/// (`crates/junto-kernel/src/ledger.rs`'s `project_unrecognized`). `None`
+/// when there is no cutoff to disturb: no grant at all, or at least one
+/// still active.
+///
+/// Re-enrolling such a member is legitimate — `Host::add_member`
+/// deliberately re-grants a previously retired key — but the fresh grant
+/// it appends is unconditionally active, so it drops the cutoff and
+/// restores every entry `email` wrote after it back to recognized
+/// (standings, gate approvals, session and lineage folds included),
+/// silently unless this warns (`docs/adr/0035`'s "Re-admitting a revoked
+/// member" consequence). This only detects and names the condition; it
+/// never refuses — re-admission must still go through.
+fn revocation_cutoff_warning(view: &ChannelView, email: &str, channel: &str) -> Option<String> {
+    let grants = view.keyring.get(email)?;
+    if grants.is_empty() || grants.iter().any(|grant| grant.retired_at.is_none()) {
+        return None;
+    }
+    Some(format!(
+        "warning: {email} currently has a revocation cutoff in channel '{channel}' (every \
+         grant they hold is retired) — re-enrolling them grants a fresh ACTIVE key, which \
+         restores every entry they wrote after that cutoff (standings, gate approvals, \
+         session and lineage folds) back to recognized"
+    ))
+}
+
 /// A stable, 16-hex-char fingerprint for `key` (device-key-enrollment plan,
 /// Task 9) — safe to print on a shared terminal, unlike the full
 /// `ed25519:<64 hex>` public key. The 16 hex characters *after* the
@@ -879,18 +926,38 @@ async fn keys_list(channel: String, member: Option<String>) -> Result<()> {
 /// `junto revoke-member` — park every active key grant for `member` in one
 /// act (device-key-enrollment plan, Task 9): the operator-facing,
 /// account-level form of `retire-device`'s per-grant retirement (Task 2).
-/// Refuses unless the caller is the channel's founder, and refuses if
-/// `member` has no active grant (nothing to do). Revocation never removes
-/// the member from the party — recognition is party-set membership, and
-/// removal would erase their whole history (`docs/adr/0035`, Task 3) — so
-/// the printed warning names that consequence explicitly rather than
-/// letting the operator assume otherwise.
+/// Refuses unless the caller is the channel's founder, refuses if
+/// `member` has no active grant (nothing to do), and refuses if `member`
+/// IS the founder (finding 3, final fix wave) — `require_founder` only
+/// gates who may revoke, nothing gated who may *be* revoked, and parking
+/// the founder's own grants would hand them a cutoff and unrecognize
+/// every act they author afterward. Revocation never removes the member
+/// from the party — recognition is party-set membership, and removal
+/// would erase their whole history (`docs/adr/0035`, Task 3) — so the
+/// printed warning names that consequence explicitly rather than letting
+/// the operator assume otherwise.
 async fn revoke_member(channel: String, member: String, rationale: String) -> Result<()> {
     let host = host::Host::from_registry(host::junto_home()?);
     let (substrate, ledger, id) = resolve_channel(&host, &channel).await?;
     let view = ledger.lock().await.project(&id).await?;
     let caller = host::git_user(&substrate)?;
     require_founder(&view, &caller, &channel)?;
+    // `require_founder` already proved `caller.email` IS the channel's
+    // founder (only the founder passes that check) — so this alone tells
+    // `member` apart from every other footgun this file already refuses
+    // (an already-retired grant, an email with no active grants): the
+    // caller can only ever be revoking either themselves or someone else.
+    if member == caller.email {
+        bail!(
+            "'{member}' is the founder of '{channel}' — revoke-member would park every one \
+             of the founder's own key grants and unrecognize everything they author from \
+             that moment on. To rotate one of the founder's own machines, retire just that \
+             device instead: `junto retire-device --grant <id> --channel {channel}` (get \
+             <id> from `junto keys list --channel {channel}`); or, when moving to a new \
+             device, enroll it FIRST with `junto add-member --enroll` and only retire the \
+             old device's grant once the new one is in place"
+        );
+    }
 
     let targets = grants_to_park(&view, &member);
     if targets.is_empty() {
@@ -1912,5 +1979,285 @@ mod tests {
         let lines = keys_list_lines(&view, Some("alice@example.com"));
         assert_eq!(lines.len(), 1);
         assert!(lines[0].starts_with("alice@example.com"), "{}", lines[0]);
+    }
+
+    /// Finding 1 (final fix wave): `prune` fell between two task briefs
+    /// and shipped wired to nothing. This exercises the REAL `invite()`
+    /// path end to end — not `invites::prune` directly, which is
+    /// `invites.rs`'s own test — to pin the WIRING itself: removing the
+    /// `invites::prune(...)?` call from `invite()`'s top would leave the
+    /// stale record `Expired` (still on disk) rather than `Unknown`
+    /// (actually removed), failing the first assertion below.
+    #[tokio::test]
+    async fn invite_prunes_a_long_expired_record_but_leaves_a_live_one() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (_repo, channel_id) = setup_channel("acme").await;
+        let junto_home = host::junto_home().unwrap();
+
+        let now = Timestamp::now().as_millis();
+        let stale = "s".repeat(43);
+        let live = "l".repeat(43);
+        // Pre-seeded directly (not through `invite()`, which always mints
+        // a fresh, unexpired record) so the fixture controls exactly
+        // which record is prunable: well past the 24h grace window, and
+        // one that has not expired at all.
+        invites::issue(
+            &junto_home,
+            &stale,
+            "stale@example.com",
+            "some-other-channel",
+            now - 25 * 60 * 60 * 1000,
+        )
+        .unwrap();
+        invites::issue(
+            &junto_home,
+            &live,
+            "live@example.com",
+            "some-other-channel",
+            now + 60_000,
+        )
+        .unwrap();
+
+        invite(channel_id.to_string(), "someone@example.com".to_string())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            invites::consume(
+                &junto_home,
+                &stale,
+                "stale@example.com",
+                "some-other-channel"
+            )
+            .unwrap(),
+            invites::Consumed::Unknown
+        ));
+        assert!(matches!(
+            invites::consume(&junto_home, &live, "live@example.com", "some-other-channel").unwrap(),
+            invites::Consumed::Ok
+        ));
+    }
+
+    #[test]
+    fn revocation_cutoff_warning_is_none_when_the_email_has_no_grants_at_all() {
+        let view = channel_view_with_keyring(junto_kernel::Keyring::new());
+        assert!(revocation_cutoff_warning(&view, "nobody@example.com", "acme").is_none());
+    }
+
+    /// The mixed fixture — one retired grant, one still active — is the
+    /// one that actually distinguishes "every grant retired" from "has A
+    /// retired grant": a wrong `.any()`/`.all()` swap, or dropping the
+    /// active-grant check entirely, would both still pass a fixture built
+    /// from only-retired or only-active grants but fails this one.
+    #[test]
+    fn revocation_cutoff_warning_is_none_while_any_grant_is_still_active() {
+        use junto_kernel::KeyGrant;
+        let key = PublicKey::new(format!("ed25519:{}", "b".repeat(64))).unwrap();
+        let mut keyring = junto_kernel::Keyring::new();
+        keyring.insert(
+            "alice@example.com".to_string(),
+            vec![
+                KeyGrant {
+                    key: key.clone(),
+                    granted_by: EntryId::new(),
+                    retired_at: Some(Timestamp::from_millis(10)),
+                },
+                KeyGrant {
+                    key,
+                    granted_by: EntryId::new(),
+                    retired_at: None,
+                },
+            ],
+        );
+        let view = channel_view_with_keyring(keyring);
+        assert!(revocation_cutoff_warning(&view, "alice@example.com", "acme").is_none());
+    }
+
+    #[test]
+    fn revocation_cutoff_warning_fires_and_names_the_email_and_channel_when_every_grant_is_retired()
+    {
+        use junto_kernel::KeyGrant;
+        let key = PublicKey::new(format!("ed25519:{}", "c".repeat(64))).unwrap();
+        let mut keyring = junto_kernel::Keyring::new();
+        keyring.insert(
+            "alice@example.com".to_string(),
+            vec![
+                KeyGrant {
+                    key: key.clone(),
+                    granted_by: EntryId::new(),
+                    retired_at: Some(Timestamp::from_millis(10)),
+                },
+                KeyGrant {
+                    key,
+                    granted_by: EntryId::new(),
+                    retired_at: Some(Timestamp::from_millis(20)),
+                },
+            ],
+        );
+        let view = channel_view_with_keyring(keyring);
+        let warning = revocation_cutoff_warning(&view, "alice@example.com", "acme")
+            .expect("every grant retired must produce a warning");
+        assert!(warning.contains("alice@example.com"), "{warning}");
+        assert!(warning.contains("acme"), "{warning}");
+        assert!(warning.contains("cutoff"), "{warning}");
+    }
+
+    /// Finding 2, part 3 (final fix wave): the cutoff-warning check added
+    /// to `add_member` is advisory only, never a refusal — re-enrolling a
+    /// member who currently has a revocation cutoff must still succeed
+    /// and still grant an active key. Were the new check wired as a
+    /// `bail!` instead of a `println!`, this `.unwrap()` would panic on
+    /// an `Err` instead.
+    #[tokio::test]
+    async fn add_member_enroll_still_succeeds_when_re_enrolling_a_revoked_member() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (repo, channel_id) = setup_channel("acme").await;
+        let junto_home = host::junto_home().unwrap();
+        let setup_host = host::Host::fixed(vec![repo.path().to_path_buf()]);
+        let host::Resolution::Resolved { ledger, id, .. } =
+            setup_host.resolve(&channel_id.to_string()).await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+
+        let old_key = PublicKey::new(format!("ed25519:{}", "5".repeat(64))).unwrap();
+        let grant_id = grant_key(&ledger, id, "alice@example.com", &old_key).await;
+        let park = LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel: id,
+            author: Member::human("Dan", "dan@example.com"),
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::Park {
+                target: grant_id,
+                rationale: "lost device".into(),
+            },
+        };
+        ledger.lock().await.append(park).await.unwrap();
+
+        let expires_at = Timestamp::now().as_millis() + enroll::MAX_INVITE_TTL_MS;
+        let token = enroll::mint_invite_token();
+        invites::issue(
+            &junto_home,
+            &token,
+            "alice@example.com",
+            &channel_id.to_string(),
+            expires_at,
+        )
+        .unwrap();
+        let new_key = PublicKey::new(format!("ed25519:{}", "6".repeat(64))).unwrap();
+        let url = build_enroll_url(&token, "alice@example.com", "Alice", &new_key, expires_at);
+
+        add_member(
+            channel_id.to_string(),
+            None,
+            None,
+            None,
+            Some("Dan".to_string()),
+            Some("dan@example.com".to_string()),
+            None,
+            Some(url),
+        )
+        .await
+        .unwrap();
+
+        let verify_host = host::Host::fixed(vec![repo.path().to_path_buf()]);
+        let host::Resolution::Resolved { ledger, id, .. } =
+            verify_host.resolve(&channel_id.to_string()).await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+        let view = ledger.lock().await.project(&id).await.unwrap();
+        let grants = view.keyring.get("alice@example.com").unwrap();
+        assert_eq!(
+            grants.len(),
+            2,
+            "re-enrollment appends a second grant: {grants:?}"
+        );
+        assert!(
+            grants
+                .iter()
+                .any(|g| g.key == new_key && g.retired_at.is_none()),
+            "re-enrollment's new key must be ACTIVE: {grants:?}"
+        );
+    }
+
+    /// Finding 3 (final fix wave): `require_founder` only gates who may
+    /// CALL `revoke-member`, not who may BE revoked — `grants_to_park`
+    /// reads `view.keyring` by email with no exclusion. The founder is
+    /// given a genuine ACTIVE grant first (their own second device), so a
+    /// removed guard would let this call actually succeed and park it,
+    /// not merely fail earlier on `grants_to_park`'s unrelated "nothing
+    /// to revoke" check.
+    #[tokio::test]
+    async fn revoke_member_refuses_to_revoke_the_founder() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (repo, channel_id) = setup_channel("acme").await;
+        let fixed = host::Host::fixed(vec![repo.path().to_path_buf()]);
+        let host::Resolution::Resolved { ledger, id, .. } =
+            fixed.resolve(&channel_id.to_string()).await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+        let key = PublicKey::new(format!("ed25519:{}", "3".repeat(64))).unwrap();
+        grant_key(&ledger, id, "dan@example.com", &key).await;
+
+        let err = revoke_member(
+            channel_id.to_string(),
+            "dan@example.com".to_string(),
+            "rotating laptop".to_string(),
+        )
+        .await
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("founder"), "{text}");
+        assert!(text.contains("retire-device"), "{text}");
+        assert!(text.contains("add-member --enroll"), "{text}");
+
+        let view = ledger.lock().await.project(&id).await.unwrap();
+        assert!(
+            view.keyring["dan@example.com"]
+                .iter()
+                .all(|g| g.retired_at.is_none()),
+            "a refused revoke-member must not park anything"
+        );
+    }
+
+    /// Finding 3 (final fix wave): the founder guard belongs on
+    /// `revoke-member` only — `retire-device` parks one grant at a time,
+    /// and the founder may legitimately need it to rotate a single
+    /// machine. Pins that `retire_device` is untouched by finding 3's fix
+    /// — an over-broad guard copied onto this function too would make
+    /// the `.unwrap()` below panic on an `Err`.
+    #[tokio::test]
+    async fn retire_device_still_works_on_a_founder_grant() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (repo, channel_id) = setup_channel("acme").await;
+        let fixed = host::Host::fixed(vec![repo.path().to_path_buf()]);
+        let host::Resolution::Resolved { ledger, id, .. } =
+            fixed.resolve(&channel_id.to_string()).await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+        let key = PublicKey::new(format!("ed25519:{}", "4".repeat(64))).unwrap();
+        let grant_id = grant_key(&ledger, id, "dan@example.com", &key).await;
+
+        retire_device(
+            channel_id.to_string(),
+            grant_id.to_string(),
+            "rotating this one device".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let view = ledger.lock().await.project(&id).await.unwrap();
+        let grant = view.keyring["dan@example.com"]
+            .iter()
+            .find(|g| g.granted_by == grant_id)
+            .unwrap();
+        assert!(
+            grant.retired_at.is_some(),
+            "retire-device must still be able to park a founder's own single grant"
+        );
     }
 }

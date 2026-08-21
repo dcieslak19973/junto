@@ -67,10 +67,11 @@ const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 /// Projects via [`crate::web::project_fresh`], never the cached
 /// [`crate::web::project`] every other route here uses: `authenticate`
 /// below is exactly the gate a `revoke-member`/`retire-device` run in a
-/// separate `junto` process exists to close, and that process's cache
-/// cached path is fine for the human read surface; it is not fine for
-/// "was this key just revoked" (`junto_kernel::Ledger::project_fresh`'s
-/// doc comment).
+/// separate `junto` process exists to close, and that separate process's
+/// cache invalidation on append never reaches THIS process's cache — the
+/// cached path is fine for the human read surface, but not for "was this
+/// key just revoked" (`junto_kernel::Ledger::project_fresh`'s doc
+/// comment).
 pub(crate) async fn live_session(
     State(host): State<Arc<Host>>,
     Path((channel, session)): Path<(String, String)>,

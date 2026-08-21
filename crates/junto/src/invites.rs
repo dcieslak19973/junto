@@ -32,9 +32,12 @@
 //! is no file-locking convention in this crate to reuse, and adding one
 //! here alone would be scope this task doesn't need.
 //!
-//! `junto invite` (Task 6) calls `issue`, and `junto add-member --enroll`
-//! (Task 8) calls `consume` — neither carries `#[allow(dead_code)]` any
-//! more. `prune` remains unwired (Task 9's) and keeps its own.
+//! `junto invite` (Task 6) calls `issue`, `junto add-member --enroll`
+//! (Task 8) calls `consume`, and `junto invite` itself calls `prune` at
+//! its own top (final fix wave, finding 1 — `prune` fell between Task 9's
+//! brief, which shipped `keys list`/`revoke-member`/`retire-device`
+//! instead, and Task 6's, written before `prune` existed): none of the
+//! three carries `#[allow(dead_code)]` any more.
 
 use std::path::{Path, PathBuf};
 
@@ -190,7 +193,6 @@ pub fn consume(
 /// # Errors
 /// Returns an error if `<junto-home>/invites.toml` cannot be read or (when
 /// anything is pruned) written.
-#[allow(dead_code)]
 pub fn prune(junto_home: &Path) -> Result<usize> {
     let mut file = load(junto_home)?;
     let cutoff = now_ms() - PRUNE_AFTER_EXPIRY_MS;

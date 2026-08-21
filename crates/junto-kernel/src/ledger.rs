@@ -3258,6 +3258,94 @@ mod tests {
         );
     }
 
+    /// Final fix wave, finding 2 — ADR 0035's "re-admitting a revoked
+    /// member" consequence, pinned so a future change to either half
+    /// (the cutoff fold or the re-grant path) is deliberate, not
+    /// accidental. Composed: revoke a member (every grant retired), an
+    /// entry they write in the gap is `unrecognized` — then re-admit the
+    /// SAME email with a fresh grant, and that SAME entry (never
+    /// rewritten, never re-signed) flips back to recognized, because
+    /// `project_unrecognized`'s cutoff fold sees an active grant again
+    /// and stops reporting a cutoff at all. This is NOT the per-grant
+    /// start bound the branch review considered and rejected — nothing
+    /// here gives the re-grant its own lower bound, which is exactly why
+    /// the gap entry (stamped well before the re-grant) still counts.
+    #[tokio::test]
+    async fn re_enrolling_a_revoked_member_restores_their_gap_window_to_recognized() {
+        let founder_key = crate::SigningKey::from_secret_bytes([1; 32]);
+        let agent_key = crate::SigningKey::from_secret_bytes([2; 32]);
+        let dan = Member::human("Dan", "dan@example.com").with_key(founder_key.public_key());
+        let agent = Member::agent("Worker", "worker@agents.junto").with_key(agent_key.public_key());
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+
+        let genesis_entry = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            1,
+            EntryPayload::ChannelOpened { name: "ch".into() },
+        );
+        let grant_id = EntryId::new();
+        let grant = entry(
+            grant_id,
+            channel,
+            dan.clone(),
+            2,
+            EntryPayload::MemberAdded {
+                member: agent.clone(),
+            },
+        );
+        let park = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            3,
+            EntryPayload::Park {
+                target: grant_id,
+                rationale: "device lost".into(),
+            },
+        );
+        let gap_id = EntryId::new();
+        let gap = entry(
+            gap_id,
+            channel,
+            agent.clone(),
+            4,
+            assertion("written after revocation, before re-admission"),
+        );
+
+        for e in [genesis_entry, grant, park, gap] {
+            ledger.append(e).await.unwrap();
+        }
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert!(
+            view.unrecognized.contains(&gap_id),
+            "revoked and not yet re-admitted: the gap-window entry is unrecognized"
+        );
+
+        // Re-admit the SAME email — `Host::add_member`'s deliberate
+        // re-grant of a previously retired key.
+        let regrant = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            5,
+            EntryPayload::MemberAdded { member: agent },
+        );
+        ledger.append(regrant).await.unwrap();
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert!(
+            !view.unrecognized.contains(&gap_id),
+            "re-admission restores the SAME gap-window entry to recognized — ADR 0035's \
+             documented consequence, not a bug: recognition is derived from the live \
+             keyring, not stamped on the entry, so the cutoff it was written under no \
+             longer exists once any grant for the email is active again"
+        );
+    }
+
     /// Task 3 (`docs/adr/0035`) — the strongest guard: revoking a member
     /// must not rewrite the history they already made. An assertion they
     /// wrote before the cutoff keeps its standing, and a ratification they
