@@ -169,6 +169,28 @@ impl LiveDoc {
         self.doc.get_movable_list(CONVERSATION).len()
     }
 
+    /// Every event currently in `conversation`, in order, parsed back from
+    /// the JSON text [`LiveDoc::push_conversation`] stored each entry as —
+    /// how a remote watcher (the iced client's live-websocket stream,
+    /// `crates/junto-iced`) turns an imported snapshot/update back into
+    /// render-able events. An entry that fails to parse is skipped, not
+    /// errored, same stance as [`LiveDoc::annotations`]: a malformed write
+    /// from a future producer must not poison reads of the entries around
+    /// it.
+    #[must_use]
+    pub fn conversation_events(&self) -> Vec<serde_json::Value> {
+        let LoroValue::List(items) = self.doc.get_movable_list(CONVERSATION).get_value() else {
+            return Vec::new();
+        };
+        items
+            .iter()
+            .filter_map(|item| match item {
+                LoroValue::String(text) => serde_json::from_str(text).ok(),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Number of events pushed to `worktree` so far.
     #[must_use]
     pub fn worktree_len(&self) -> usize {
@@ -483,6 +505,36 @@ mod tests {
         // The two lists are independent containers: worktree activity must
         // not show up as a conversation event or vice versa.
         assert_eq!(b.conversation_len(), 0);
+    }
+
+    #[test]
+    fn conversation_events_reads_back_in_order_and_skips_malformed() {
+        let live = LiveDoc::new();
+        live.push_conversation(&serde_json::json!({"seq": 1, "text": "hi"}));
+        live.push_conversation(&serde_json::json!({"seq": 2, "text": "there"}));
+        // A non-JSON entry landing in the same container — the only
+        // realistic way this path fires, since this crate's own writer
+        // (`push_conversation`) always pushes `serde_json::Value::to_string`
+        // output. Written directly through the private `doc` field (this
+        // module's own test, not a public API) rather than a merged peer
+        // document, so the append lands deterministically at the end
+        // instead of wherever a genuinely concurrent CRDT merge resolves it.
+        live.doc
+            .get_movable_list(CONVERSATION)
+            .push("not json at all")
+            .unwrap();
+        live.doc.commit();
+        assert_eq!(live.conversation_len(), 3, "the garbage entry still counts");
+
+        let events = live.conversation_events();
+        assert_eq!(
+            events,
+            vec![
+                serde_json::json!({"seq": 1, "text": "hi"}),
+                serde_json::json!({"seq": 2, "text": "there"}),
+            ],
+            "malformed entries are skipped, not errored, and order is preserved"
+        );
     }
 
     #[test]

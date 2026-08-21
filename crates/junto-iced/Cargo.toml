@@ -19,6 +19,21 @@ serde_json = "1"
 rfd = "0.15"
 # Open clicked Markdown links in the OS default browser (MIT, cross-platform).
 open = "5"
+# Remote live-session watching (Task 9, live-session-plane): the
+# authenticated websocket client, the shared wire/CRDT/presence types, and
+# the signing-key/keys.toml plumbing. Pinned to 0.29 — the version the host
+# side (`crates/junto`) resolves to via axum's `ws` feature; 0.24 was tried
+# first and produced a duplicate-version resolution, so this pin is load-bearing.
+tokio-tungstenite = "0.29"
+# `iced`'s own "tokio" feature already runs the app on a tokio runtime and
+# pulls the `tokio` crate in transitively (also required by
+# `tokio-tungstenite`'s "connect" feature) — named directly here only for
+# the heartbeat timer (`time`) and the connection's `select!` loop (`macros`).
+tokio = { version = "1", default-features = false, features = ["time", "macros"] }
+junto-kernel = { path = "../junto-kernel" }
+junto-live = { path = "../junto-live" }
+toml = "0.9"
+base64 = "0.22"
 
 [workspace]
 # standalone — see the header comment
