@@ -3394,13 +3394,20 @@ mod tests {
     }
 
     /// Task 9c (`docs/adr/0035`) — the defect this fix closes. Alice holds
-    /// two grants: she retires her laptop (grant A) at T1 while her desktop
-    /// (grant B) is still active — no cutoff yet, matching
-    /// `a_partially_retired_member_is_not_revoked` — and keeps working from
-    /// the desktop until it, too, is retired at T2 (T1 < T2). Under the
-    /// defective `.min()` fold the cutoff would land on T1 and
-    /// retroactively unrecognize everything she wrote on the desktop
-    /// between T1 and T2; the corrected latest-retirement rule must not.
+    /// two grants: she retires grant B (enrolled *second*, at ts 3) at T1
+    /// while grant A (enrolled *first*, at ts 2) is still active — no
+    /// cutoff yet, matching `a_partially_retired_member_is_not_revoked` —
+    /// and keeps working from grant A until it, too, is retired at T2
+    /// (T1 < T2). Grant A sits *first* in the keyring's per-email
+    /// `Vec<KeyGrant>` (canonical entry order, `docs/adr/0033`) yet
+    /// carries the *later* retirement — deliberately: a fold that
+    /// regressed to "whichever grant the loop visits last wins" instead
+    /// of the true maximum would compute grant B's earlier T1 here (the
+    /// last-visited grant), the same wrong answer the original
+    /// earliest-wins defect gave, and this test would still catch it.
+    /// Under the defective `.min()` fold the cutoff would land on T1 and
+    /// retroactively unrecognize everything she wrote between T1 and T2;
+    /// the corrected latest-retirement rule must not.
     #[tokio::test]
     async fn entries_between_two_distinct_grant_retirements_still_count() {
         let founder_key = crate::SigningKey::from_secret_bytes([1; 32]);
@@ -3438,14 +3445,14 @@ mod tests {
                 member: member.clone().with_key(k2.public_key()),
             },
         );
-        let park_device_a = entry(
+        let park_device_b = entry(
             EntryId::new(),
             channel,
             dan.clone(),
             4,
             EntryPayload::Park {
-                target: device_a_id,
-                rationale: "laptop retired".into(),
+                target: device_b_id,
+                rationale: "grant B retired first, earlier".into(),
             },
         );
         let between_id = EntryId::new();
@@ -3454,16 +3461,16 @@ mod tests {
             channel,
             member.clone(),
             5,
-            assertion("written from the desktop, between the two retirements"),
+            assertion("written from grant A, between the two retirements"),
         );
-        let park_device_b = entry(
+        let park_device_a = entry(
             EntryId::new(),
             channel,
             dan.clone(),
             6,
             EntryPayload::Park {
-                target: device_b_id,
-                rationale: "desktop retired".into(),
+                target: device_a_id,
+                rationale: "grant A retired second, later".into(),
             },
         );
 
@@ -3471,9 +3478,9 @@ mod tests {
             genesis_entry,
             device_a,
             device_b,
-            park_device_a,
-            between,
             park_device_b,
+            between,
+            park_device_a,
         ] {
             ledger.append(e).await.unwrap();
         }
@@ -3481,8 +3488,8 @@ mod tests {
         let view = ledger.project(&channel).await.unwrap();
         assert!(
             !view.unrecognized.contains(&between_id),
-            "written while the desktop grant was still active — the laptop's earlier \
-             retirement must not retroactively unrecognize it"
+            "written while grant A was still active — grant B's earlier retirement must not \
+             retroactively unrecognize it"
         );
     }
 
@@ -3493,7 +3500,10 @@ mod tests {
     /// `.min()` fold already got right by accident (it happened to also
     /// treat post-T2 entries as unrecognized) — kept as an explicit
     /// regression guard against a fix that swings too far the other way and
-    /// stops enforcing any cutoff at all.
+    /// stops enforcing any cutoff at all. Uses the same non-degenerate
+    /// ordering as its companion — grant A is enrolled first but retired
+    /// second (later) — so the maximum is not merely whichever grant the
+    /// fold visits last.
     #[tokio::test]
     async fn an_entry_after_the_latest_of_two_retirements_is_unrecognized() {
         let founder_key = crate::SigningKey::from_secret_bytes([1; 32]);
@@ -3531,24 +3541,24 @@ mod tests {
                 member: member.clone().with_key(k2.public_key()),
             },
         );
-        let park_device_a = entry(
+        let park_device_b = entry(
             EntryId::new(),
             channel,
             dan.clone(),
             4,
             EntryPayload::Park {
-                target: device_a_id,
-                rationale: "laptop retired".into(),
+                target: device_b_id,
+                rationale: "grant B retired first, earlier".into(),
             },
         );
-        let park_device_b = entry(
+        let park_device_a = entry(
             EntryId::new(),
             channel,
             dan.clone(),
             6,
             EntryPayload::Park {
-                target: device_b_id,
-                rationale: "desktop retired".into(),
+                target: device_a_id,
+                rationale: "grant A retired second, later".into(),
             },
         );
         let after_id = EntryId::new();
@@ -3557,15 +3567,15 @@ mod tests {
             channel,
             member.clone(),
             7,
-            assertion("written after both devices are retired"),
+            assertion("written after both grants are retired"),
         );
 
         for e in [
             genesis_entry,
             device_a,
             device_b,
-            park_device_a,
             park_device_b,
+            park_device_a,
             after,
         ] {
             ledger.append(e).await.unwrap();
@@ -3584,7 +3594,9 @@ mod tests {
     /// `revoked_members_post_cutoff_entries_are_unrecognized`'s
     /// single-grant boundary case but exercised across two grants so a
     /// regression back to the earlier retirement as the boundary would be
-    /// caught here even though it is the same email.
+    /// caught here even though it is the same email. Same non-degenerate
+    /// ordering as the other two-grant fixtures: grant A is enrolled first
+    /// but retired second (later).
     #[tokio::test]
     async fn at_cutoff_boundary_holds_against_the_latest_of_two_retirements() {
         let founder_key = crate::SigningKey::from_secret_bytes([1; 32]);
@@ -3622,24 +3634,24 @@ mod tests {
                 member: member.clone().with_key(k2.public_key()),
             },
         );
-        let park_device_a = entry(
+        let park_device_b = entry(
             EntryId::new(),
             channel,
             dan.clone(),
             4,
             EntryPayload::Park {
-                target: device_a_id,
-                rationale: "laptop retired".into(),
+                target: device_b_id,
+                rationale: "grant B retired first, earlier".into(),
             },
         );
-        let park_device_b = entry(
+        let park_device_a = entry(
             EntryId::new(),
             channel,
             dan.clone(),
             6,
             EntryPayload::Park {
-                target: device_b_id,
-                rationale: "desktop retired".into(),
+                target: device_a_id,
+                rationale: "grant A retired second, later".into(),
             },
         );
         let at_cutoff_id = EntryId::new();
@@ -3655,8 +3667,8 @@ mod tests {
             genesis_entry,
             device_a,
             device_b,
-            park_device_a,
             park_device_b,
+            park_device_a,
             at_cutoff,
         ] {
             ledger.append(e).await.unwrap();
