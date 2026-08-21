@@ -71,8 +71,12 @@ use crate::LiveDoc;
 /// 3. Every annotation id `doc` already has must still hold byte-identical
 ///    stored content in the fork (see the module docs).
 /// 4. Every id new to the fork must (a) parse as an [`Annotation`], (b)
-///    have `author.email == sender_email`, (c) be signed, and (d) verify
-///    against `keyring[sender_email]`.
+///    carry an `id` equal to the map key it is stored under — otherwise a
+///    sender could write a fresh key whose *own* id field aliases another
+///    member's existing annotation, displacing it for any consumer that
+///    keys by `id` rather than by map key — (c) have `author.email ==
+///    sender_email`, (d) be signed, and (e) verify against
+///    `keyring[sender_email]`.
 ///
 /// Any single failure rejects the **whole frame** — there is no partial
 /// acceptance. A frame that adds no annotations and touches nothing else is
@@ -84,7 +88,7 @@ use crate::LiveDoc;
 /// — if `bytes` fails to import into the fork, if `sender_email` has no key
 /// on file, if a driver-only container was touched, if an existing
 /// annotation id's content changed, or if any new annotation fails one of
-/// its four checks.
+/// its five checks.
 pub fn validate_annotation_update(
     doc: &LiveDoc,
     bytes: &[u8],
@@ -143,6 +147,12 @@ pub fn validate_annotation_update(
             .annotation_raw(id)
             .and_then(|raw| Annotation::from_canonical_bytes(raw.as_bytes()).ok())
             .ok_or_else(|| format!("annotation {id} does not parse as an Annotation"))?;
+        if annotation.id.to_string() != *id {
+            return Err(format!(
+                "annotation stored under key {id} carries id {}; the map key must equal the annotation's own id",
+                annotation.id
+            ));
+        }
         if annotation.author.email != sender_email {
             return Err(format!(
                 "annotation {id} is authored by '{}' but the frame was sent by '{sender_email}'",
@@ -344,7 +354,10 @@ mod tests {
         let err =
             validate_annotation_update(&server, &update, "w@x.com", &keyring_of("w@x.com", &key))
                 .unwrap_err();
-        assert!(!err.is_empty());
+        assert!(
+            err.contains("modified or removed"),
+            "unexpected reason: {err}"
+        );
         assert_eq!(server.annotations().len(), 1);
         assert_eq!(server.annotations()[0].body, "original");
     }
@@ -372,9 +385,59 @@ mod tests {
         let err =
             validate_annotation_update(&server, &update, "w@x.com", &keyring_of("w@x.com", &key))
                 .unwrap_err();
-        assert!(!err.is_empty());
+        assert!(
+            err.contains("modified or removed"),
+            "unexpected reason: {err}"
+        );
         assert_eq!(server.annotations().len(), 1);
         assert_eq!(server.annotation_ids().len(), 1);
+    }
+
+    #[test]
+    fn annotation_id_aliasing_an_existing_id_rejects() {
+        let victim_key = junto_kernel::SigningKey::from_secret_bytes([9; 32]);
+        let attacker_key = junto_kernel::SigningKey::from_secret_bytes([10; 32]);
+        let server = LiveDoc::new();
+        let mut victim = test_annotation_by("victim@x.com", "original");
+        victim.sign(&victim_key).unwrap();
+        server.insert_annotation(&victim).unwrap();
+
+        // The attacker crafts an annotation authored by, and signed by,
+        // themselves — so all three per-annotation checks would pass — but
+        // whose internal `id` field aliases the victim's *existing* id,
+        // written under a DIFFERENT, brand-new map key.
+        // `LiveDoc::insert_annotation` can never produce this shape (it
+        // always keys by the annotation's own id), so simulate it with a
+        // raw peer sharing causal history.
+        let mut forged = test_annotation_by("w@x.com", "attacker's note");
+        forged.id = victim.id;
+        forged.sign(&attacker_key).unwrap();
+        let forged_json = String::from_utf8(forged.to_canonical_bytes().unwrap()).unwrap();
+
+        let peer = loro::LoroDoc::new();
+        peer.import(&server.export_snapshot()).unwrap();
+        peer.get_map("annotations")
+            .insert(
+                "attacker-chosen-key-not-the-annotations-own-id",
+                forged_json,
+            )
+            .unwrap();
+        peer.commit();
+        let update = peer.export(loro::ExportMode::snapshot()).unwrap();
+
+        let err = validate_annotation_update(
+            &server,
+            &update,
+            "w@x.com",
+            &keyring_of("w@x.com", &attacker_key),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("must equal the annotation's own id"),
+            "unexpected reason: {err}"
+        );
+        assert_eq!(server.annotations().len(), 1);
+        assert_eq!(server.annotations()[0].body, "original");
     }
 
     #[test]
