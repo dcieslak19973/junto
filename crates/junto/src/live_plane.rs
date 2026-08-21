@@ -33,24 +33,24 @@ use tokio::sync::broadcast;
 /// `Send + Sync`, so this type is shared as `Arc<SessionLive>` between the
 /// session loop and (later) watcher connections; it is never wrapped in its
 /// own `Mutex`.
-pub struct SessionLive {
+pub(crate) struct SessionLive {
     /// The session's live CRDT document: `conversation`, `worktree`, and
     /// `annotations` containers (`junto_live::doc`).
     pub doc: LiveDoc,
     /// Who is currently watching this session (`junto_live::presence`).
-    /// Unread by this task's taps — the watcher-presence heartbeat lands in
-    /// a later task.
-    #[allow(dead_code)]
+    /// Set on successful auth and applied/rebroadcast from inbound
+    /// `Ephemeral` frames by [`crate::live_ws`].
     pub presence: Presence,
     /// Every [`Frame`] this session produces, for connected watchers to
-    /// subscribe to (the websocket handler, a later task). Capacity 256: a
-    /// slow watcher drops frames rather than backing up the sender — joining
-    /// from a fresh snapshot is the recovery path, not replay.
+    /// subscribe to ([`crate::live_ws`]). Capacity 256: a slow watcher
+    /// drops frames rather than backing up the sender — joining from a
+    /// fresh snapshot is the recovery path, not replay.
     pub outbound: broadcast::Sender<Frame>,
     /// Watcher annotations validated but not yet delivered to the driving
-    /// agent as steering context (the annotation→steer bridge, a later
-    /// task). Unread by this task's taps.
-    #[allow(dead_code)]
+    /// agent as steering context. Appended by [`crate::live_ws`] (via
+    /// [`crate::live_bridge::deliver`]) after
+    /// `junto_live::validate_annotation_update` accepts them; drained by
+    /// the steering bridge (a later task — this task only appends).
     pub pending: Mutex<Vec<junto_kernel::Annotation>>,
     /// The session's workspace path, for re-anchoring annotations before
     /// they're delivered as steering context (the annotation→steer bridge,
@@ -110,7 +110,7 @@ impl SessionLive {
 /// snapshot bytes for the caller to archive as an Artifact — this module
 /// never touches the ledger itself.
 #[derive(Default)]
-pub struct LivePlane {
+pub(crate) struct LivePlane {
     sessions: Mutex<HashMap<EntryId, Arc<SessionLive>>>,
 }
 
@@ -126,7 +126,7 @@ impl LivePlane {
     /// as `finish` would have: a watcher still holding that old
     /// `broadcast::Receiver` must learn its stream is over rather than
     /// silently hang on a sender nothing will ever send through again.
-    pub fn begin(&self, session: EntryId) -> Arc<SessionLive> {
+    pub(crate) fn begin(&self, session: EntryId) -> Arc<SessionLive> {
         let doc = LiveDoc::new();
         let (outbound, _rx) = broadcast::channel(256);
         let forward = outbound.clone();
@@ -158,7 +158,7 @@ impl LivePlane {
     /// The live state for a running session, or `None` if it isn't live
     /// (finished already, or never began).
     #[must_use]
-    pub fn get(&self, session: EntryId) -> Option<Arc<SessionLive>> {
+    pub(crate) fn get(&self, session: EntryId) -> Option<Arc<SessionLive>> {
         self.sessions
             .lock()
             .expect("live plane registry lock")

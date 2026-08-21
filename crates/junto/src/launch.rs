@@ -1537,7 +1537,7 @@ fn snippet(text: &str, limit: usize) -> String {
 /// Launch a new Agent Session: append `SessionStarted` (authored as the
 /// harness member), then run the first turn in the background. Returns the
 /// new session's entry id immediately — the page shows the live state.
-pub(crate) async fn launch(
+pub async fn launch(
     host: std::sync::Arc<Host>,
     channel: ChannelId,
     channel_ref: String,
@@ -1907,7 +1907,7 @@ pub(crate) const PR_OPEN_GATE_KIND: &str = "code-pr.open-pr";
 /// findings feed back until the Outcome is satisfied or the iteration budget
 /// runs out, at which point it escalates to a human Gate. Returns the new
 /// session id immediately; the loop runs in the background.
-pub(crate) async fn launch_outcome(
+pub async fn launch_outcome(
     host: std::sync::Arc<Host>,
     channel: ChannelId,
     channel_ref: String,

@@ -316,7 +316,7 @@ impl Host {
     /// [`crate::launch::LiveSessions`]'s own plane field rather than adding
     /// a second field to `Host`, since `LiveSessions`' `begin`/`publish`/
     /// `finish` are the taps that populate it.
-    pub fn live_plane(&self) -> &Arc<crate::live_plane::LivePlane> {
+    pub(crate) fn live_plane(&self) -> &Arc<crate::live_plane::LivePlane> {
         &self.live.plane
     }
 
