@@ -33,6 +33,7 @@ The live plane converted a soft, near-invisible degradation into a hard one. Tha
 | 4 | **Revocation is in scope**, expressed by parking granting entries | deferring it (multi-key members make a lost device strictly harder to reason about than when one key meant one person) |
 | 5 | Revocation is **member-level by default**, with per-device retirement available on the same mechanism | per-grant only (serves a lost laptop but makes offboarding N manual acts); member-level only (leaves the lost-laptop case needing a full revoke-and-re-enroll) |
 | 6 | A retired grant stops verifying **as of the park's timestamp** | excluding the key outright (would retroactively un-verify legitimate history when a device is honestly retired) |
+| 7 | Revoking a member also makes their **post-cutoff entries unrecognized**, so they stop counting — but the member is **not** removed from the party | retiring keys only (unverified entries still project: they carry standings, close gates, appear in sessions — so a revoked member could keep contributing entries that count); removing from the party (recognition is party-set membership, so removal marks *every* entry that author ever wrote unrecognized and erases their history from every projection) |
 
 ## The keyring becomes a projection of its own
 
@@ -121,7 +122,19 @@ Revoking a member is the common case and must be one act, not N. Retiring a devi
 
 The harsher semantics — *distrust everything this key ever signed*, which is what a confirmed key compromise wants — is deliberately **not** in this design. It is a different act with different consequences and deserves its own decision rather than being conflated with retirement.
 
-Only founder-authored parks count, matching the grant rule. Note the asymmetry this creates and accepts: revoking a member removes their signing authority but does **not** remove them from the party projection, which is `MemberAdded`-driven and first-write-wins. Party membership and signing authority are now separately revocable, and only the latter is in scope here.
+Only founder-authored parks count, matching the grant rule.
+
+### Revoking a member stops their future contributions counting (decision 7)
+
+Retiring keys alone is **not** sufficient for offboarding. Recognition today is party-set membership: `Ledger::project` marks an entry `unrecognized` iff its author's email is absent from the party, and the comment at `ledger.rs:290-292` states the rule is deliberately *"set-based, not temporal (`docs/adr/0017`)"*. Unverified entries are still **recognized**, so they still project — they carry standings, close gates, and appear in sessions and lineage. A member whose keys were all retired could therefore keep contributing entries that count, merely flagged.
+
+So a member revocation carries a **cutoff timestamp**, and recognition becomes temporal *for revoked members only*: an entry from a revoked member is recognized iff it is stamped at or before the cutoff. Everything before the cutoff is untouched; nothing after it counts. This is the same shape as the key-retirement rule above, which is why the two compose into one concept — one revocation, one timestamp, governing both verification and recognition.
+
+**This amends ADR 0017's set-based membership rule** and must be recorded as such rather than slipped in as a projection change. The amendment is narrow: membership stays set-based for everyone who has not been revoked.
+
+### What revocation deliberately does NOT do
+
+It does not remove the member from the party projection. That was considered and rejected on evidence: because recognition is party-set membership, dropping an email from the party marks **every** entry that author ever wrote as `unrecognized`, and `Ledger::project` feeds only recognized entries to standings, gates, gate executions, sessions, lineage, and genesis/name resolution. Removal would therefore erase a person's entire contribution history from the channel view — assertions lose their standing, ratifications they gave stop counting, sessions they ran disappear. A revoked member stays visible in the party, with no valid keys and no post-cutoff contributions, which is the honest record of what happened.
 
 ## Consumers
 
@@ -135,12 +148,13 @@ Only founder-authored parks count, matching the grant rule. Note the asymmetry t
 - **Existing channels are unaffected.** A member with one key is a keyring of one; no migration, no re-signing, and every existing entry deserializes byte-identically.
 - **The party stays human-readable.** Devices never appear in it.
 - **A second data structure now derives from `MemberAdded` entries.** The party and the keyring must not drift apart; they are tested together.
-- **Signing authority and party membership diverge.** After a revoke, a member is still in the party with no valid keys. Every surface that reads one should be checked against the other.
+- **Signing authority and party membership diverge.** After a revoke, a member is still in the party, with no valid keys and nothing counted after the cutoff. Every surface that reads one should be checked against the other — a UI listing "the party" now means "people who were admitted", not "people who can currently write".
+- **Recognition is no longer purely set-based.** Decision 7 makes it temporal for revoked members, amending ADR 0017's stated rule. The amendment must be recorded in an ADR; it is narrow (membership stays set-based for everyone not revoked) but it is a change to a documented invariant, and `ledger.rs:290-292` currently asserts the opposite in a comment that must be corrected with it.
 
 ## Non-goals
 
 - Retroactive distrust of a compromised key (see Revocation).
-- Removing a member from the party projection. Revocation here retires keys, not membership.
+- Removing a member from the party projection — rejected on evidence, not deferred: recognition is party-set membership, so removal would erase that author's entire history from every projection.
 - Any transport of private key material, by any path, ever.
 - Device naming or a management UI beyond `junto keys list`. `invites.toml` and the keyring are inspectable; a device manager is a later product question.
 - Delegation or certificate chains (decision 1's rejected alternative).
@@ -148,7 +162,7 @@ Only founder-authored parks count, matching the grant rule. Note the asymmetry t
 
 ## Testing
 
-- **Kernel:** keyring unions multiple grants per email; an entry verifies against any non-retired grant; a non-founder-authored `MemberAdded` contributes no key; a retired grant stops verifying after the park's timestamp and still verifies before it; revoking a member retires every grant for that email in one act; party projection is byte-for-byte unchanged by the new keyring code.
+- **Kernel:** keyring unions multiple grants per email; an entry verifies against any non-retired grant; a non-founder-authored `MemberAdded` contributes no key; a retired grant stops verifying after the park's timestamp and still verifies before it; revoking a member retires every grant for that email in one act; a revoked member's post-cutoff entries are `unrecognized` while their pre-cutoff entries stay recognized AND keep their standings/gates/sessions/lineage contributions; an unrevoked member's recognition is unchanged (still set-based); party projection is byte-for-byte unchanged by the new keyring code, including for a revoked member (they remain in it).
 - **Envelope:** round-trip both payloads; reject over-long input *before* parsing; reject an expired `expires_at`; accept one inside the skew allowance; reject a bad version.
 - **Invite store:** single-use enforcement; replay of a consumed token refused; the token itself never written to disk (assert the file contains no preimage).
 - **Flow:** end-to-end invite → enroll → add-member producing a `MemberAdded` whose key verifies a subsequent entry from the new device.
