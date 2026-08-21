@@ -443,14 +443,21 @@ impl<S: SubstrateProvider> Ledger<S> {
     /// every key ever granted signing authority, keyed by email. Distinct
     /// from [`Self::project_party`] on purpose — see [`Keyring`]'s doc
     /// comment. The genesis author's key is granted by the canonically
-    /// *first* `ChannelOpened` entry only — a second, concurrent genesis is
-    /// `unrecognized` (`Self::project`) and must not seed a grant, or any
-    /// peer could inject a signing key for an arbitrary email by appending
-    /// one. After that, a `MemberAdded` contributes a grant iff its author
-    /// is the founder (grant authority is the founder's alone) and the
-    /// added member carries a key (keyless members stay keyless). Grants
-    /// accumulate in the caller's entry order, which is canonical, so a
-    /// member's grant list is deterministic on every replica.
+    /// *first* `ChannelOpened` entry, and by that entry alone — mirroring
+    /// `project_party`'s founder, which is fixed the same way. Any later
+    /// `ChannelOpened` grants nothing, full stop; this does **not** rest on
+    /// whether that later entry ends up `unrecognized` (`Self::project`) —
+    /// a second genesis re-authored by an email already on the roster (the
+    /// founder's own re-open, or an added member's) is *recognized*, since
+    /// `unrecognized` is computed purely by email-set membership, yet must
+    /// still not grant. Without a hard first-genesis-only rule, any peer
+    /// could inject a signing key for an arbitrary email by appending a
+    /// `ChannelOpened`. After the genesis, a `MemberAdded` contributes a
+    /// grant iff its author is the founder (grant authority is the
+    /// founder's alone) and the added member carries a key (keyless
+    /// members stay keyless). Grants accumulate in the caller's entry
+    /// order, which is canonical, so a member's grant list is
+    /// deterministic on every replica.
     fn project_keyring(entries: &[LedgerEntry], founder_email: &str) -> Keyring {
         let mut keyring: Keyring = HashMap::new();
         let mut genesis_seen = false;
