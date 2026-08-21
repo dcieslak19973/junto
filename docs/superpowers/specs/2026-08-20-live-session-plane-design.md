@@ -187,10 +187,14 @@ sessions) is a later projection over the same type. Built once here.
 1. **Record the unpark:** new assertions in `junto-dev` citing `1d9cf9b1`
    (prerequisites landed; Delta as use-case evidence) and `b405a1cb` (this
    design as its rung-1 realization) — the record shows the resurrection.
+   Drafted, exact wording in [ADR 0034](../../adr/0034-crdt-confined-to-the-live-plane.md)'s
+   appendix, pending recording.
 2. **ADR:** scope hard constraint #3's "zero CRDT / presence" to the durable
    record; CRDT confined to the ephemeral live plane / versioned artifacts.
+   Done: [ADR 0034](../../adr/0034-crdt-confined-to-the-live-plane.md).
 3. **License verification at adoption:** loro (MIT expected); iroh only if/when
-   the p2p rung is climbed.
+   the p2p rung is climbed. Done for loro: MIT, confirmed at adoption
+   (transitive MPL-2.0 deps named in ADR 0034's Consequences).
 
 ## Risks
 

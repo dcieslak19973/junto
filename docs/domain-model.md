@@ -75,6 +75,19 @@
 | **Policy Version** | A versioned snapshot of skills/workflows/agent-defs — for the self-improvement loop's provenance + rollback. |
 | **Eval** | A held-out measure of "better" — the Verifier for the self-improvement playbook. |
 
+## Live plane nouns (the ephemeral CRDT plane — [ADR 0034](adr/0034-crdt-confined-to-the-live-plane.md))
+
+A separate, ephemeral plane beside the Record, permitted narrowly by ADR 0034: it scopes hard constraint #3 ("no CRDT") to the durable record, so this plane is where the constraint does *not* apply. Never synced through `refs/junto/*`; never itself a Ledger entry. `junto-live` owns it.
+
+| Noun | Meaning |
+|---|---|
+| **Live plane** | The ephemeral, per-Session CRDT plane: presence + a watched conversation/worktree stream + Annotations, none of it durable on its own. Distinct from the Session plane (the ACP loop, steer/interrupt) and the Record (append-only entries) — see ADR 0034's three-plane diagram. |
+| **LiveDoc** | One [loro](https://github.com/loro-dev/loro) CRDT document per live Session, four containers: `conversation`/`worktree` (driver-only, seq-keyed replace-in-place — the Session's event stream and derived edit/diff events), `annotations` (multi-actor, add-only, keyed by Annotation id), and Presence. Archived as a versioned session Artifact (`turn-{n}-live.loro`) when the turn ends; the document itself is never a Ledger entry. |
+| **Annotation** | A span-anchored, signed, add-only comment any authenticated Party member may attach to a running Session — `{id, author, anchor, body, ts, signature}`, signed over its own canonical bytes the way an entry is (ADR 0033). A revision is a new Annotation superseding the old by reference, never an edit. Delivered to the driving agent as steering context at the next turn boundary, or immediately if flagged urgent. **Not** a **Message** (a Conversation entry is durable and unsigned; an Annotation is ephemeral-plane and signed) and not a **Ledger entry** (only a ratified *outcome* of a live session folds into one). |
+| **Anchor** | Where an Annotation points. `CodeAnchor { commit, path, blob, span }` pins "what it was" at a commit; re-anchored across code motion by `junto-substrate-git` into `Exact \| Moved \| Orphaned` (three-state, degrading honestly rather than silently). `StreamAnchor { session, op_id }` pins a position in the live stream and needs no re-anchoring — LiveDoc op ids are stable by construction. Also the type the parked "decision blame" projection (file/line → entries + Sessions) will read later — built once, here. |
+| **Presence** | Who is watching a live Session right now — a loro `EphemeralStore`, 30s timeout, never persisted, never an Artifact. |
+| **watcher** | An authenticated Party member connected to a Session's live WebSocket to view it and attach Annotations, without owning the Session or writing its `conversation`/`worktree` — that stays the driving Member's alone (policy, not the data model; ADR 0034). |
+
 ## Verbs (operations & channel transitions)
 
 - **open** a channel (of a playbook) — an explicit, recorded act: mints the channel's id and writes a `ChannelOpened` genesis entry binding name → id in the home substrate (ADRs 0014/0016; never implicit on first write). Possibly **triggered** by an inbound Connector (alert/ticket → channel). Siblings, same recorded-act treatment: **close** (ADR 0016) · **diverge** / **converge** (lineage edges — see below).

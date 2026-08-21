@@ -50,6 +50,7 @@ A channel is a **unit of inquiry** — a question — and a code change is only 
 - **Terminal-less** human surface.
 - **Workflow-general** — built for many kinds of work, not only coding.
 - **A verified, reproducible record** as the durable output.
+- **Watch a session live.** Join a running agent session mid-flight — see its conversation and worktree evolve, see who else is watching, attach span-anchored comments that steer the driving agent — over an ephemeral per-session plane; the durable record stays append-only and CRDT-free ([ADR 0034](docs/adr/0034-crdt-confined-to-the-live-plane.md)).
 
 It shares one good idea with GitHub Next's **Ace** — the *channel* — but Ace is GitHub-locked, cloud-fixed, and terminal-centric; junto is vendor-neutral, deployment-flexible, and terminal-less.
 

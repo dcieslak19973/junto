@@ -19,7 +19,9 @@ junto is **one surface where people and agents take a piece of work to a verifie
 ```
 crates/junto-kernel/        # the generic, playbook-agnostic core (lib) — no vendor names, no playbook logic
 crates/junto-substrate-git/ # git-refs SubstrateProvider adapter (shells out to system git)
+crates/junto-live/          # the ephemeral live-plane crate (lib) — owns the loro CRDT dependency; ADR 0034
 crates/junto/               # the host/app entry (bin) — terminal-less for humans; not a CLI UI
+crates/junto-iced/          # the watcher/human GUI surface (bin, iced) — remote live-session viewing
 docs/                       # the design corpus (vision, domain model, architecture, pluggability, worked examples)
 docs/adr/                   # one settled architectural decision per file
 ```
@@ -75,7 +77,7 @@ The substrate is **`git push`/`fetch` of custom `refs/junto/*` over the standard
 
 1. ✅ **MIT, greenfield, no copyleft *source*.** Reuse *ideas/patterns* (git-refs-as-record, forge-as-hub sync, pty-capture-to-artifact) clean-room; never copy copyleft source. Linking a permissively- or linking-exception-licensed library is fine (see git note); vendoring GPL source is not.
 2. ✅ **Terminal-less for humans.** The point (Dan, 2026-06-09): humans don't *work* through a terminal agent harness (Claude Code, OpenCode, Gemini CLI, Goose…) — junto's human surface is a GUI (think Mux's UI). One-time CLI setup plumbing (`junto init` / `junto serve`) is acceptable, especially dogfood-era. **Agents do** run shells under the hood — their output is **captured as verifiable Artifacts (diffs, logs, charts), never rendered as scrollback.** This is why cross-platform PTY capture matters.
-3. ✅ **Durable record = git refs** (`refs/junto/*`, partitioned by author). Append-only; **no CRDT** — concurrent writes interleave by `(ts, author)`. Dedicated refs, never working-tree files (no `git status` pollution). The record holds **decisions/intent + provenance + digests, not raw agent transcripts** (those live outside the repo).
+3. ✅ **Durable record = git refs** (`refs/junto/*`, partitioned by author). Append-only; **no CRDT** — concurrent writes interleave by `(ts, author)`. Dedicated refs, never working-tree files (no `git status` pollution). The record holds **decisions/intent + provenance + digests, not raw agent transcripts** (those live outside the repo). **Scope:** this governs the durable record only — an ephemeral, per-session CRDT live plane is permitted beside it, never inside it ([ADR 0034](docs/adr/0034-crdt-confined-to-the-live-plane.md)).
 4. ✅ **Vendor-neutral by adapters.** Every external dependency sits behind a swappable adapter; **no vendor name reaches the kernel** — branch on **capability flags, not vendor identity**.
 5. ✅ **Kernel ↔ Playbook seam.** **No playbook-specific logic in the kernel.** The kernel is generic (Channel · Member/Party · Message · Artifact · Provenance · Session · Gate engine · Ledger · Deliverable · Event). A Playbook *supplies* its Lifecycle, **Routing Policy** (gate-routing — the single most playbook-specific thing), **Outcome + Rubric** (what verified means; a Grader evaluates), offered tools/agents, and artifact renderers. (Terminology per ADR 0025.)
 
