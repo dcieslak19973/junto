@@ -581,16 +581,24 @@ impl<S: SubstrateProvider> Ledger<S> {
     /// every entry that author ever wrote unrecognized and erase their
     /// history from every downstream projection. Instead, for each email
     /// with at least one grant: if *every* grant for it is retired, the
-    /// email's cutoff is the *earliest* [`KeyGrant::retired_at`] among
-    /// them; if any grant is still active, there is no cutoff — partial
-    /// retirement (one lost device among several) must not offboard the
-    /// person. An email with no grant at all (a keyless member) likewise
-    /// has no cutoff: there is nothing for a founder to park, so this
-    /// mechanism cannot revoke them. An entry from a cutoff email is
-    /// unrecognized iff its `timestamp` is *strictly after* the cutoff —
-    /// mirroring [`KeyGrant::active_at`]'s inclusive boundary, an entry
-    /// stamped exactly at the cutoff still counts, and nothing stamped at
-    /// or before it is rewritten.
+    /// email's cutoff is the *latest* [`KeyGrant::retired_at`] among
+    /// them — the moment after which the email held **no** valid key at
+    /// all, across any of its devices — and if any grant is still active,
+    /// there is no cutoff — partial retirement (one lost device among
+    /// several) must not offboard the person. Using the earliest
+    /// retirement instead would be wrong: a member who retires one device
+    /// and keeps working from another (still no cutoff, by the rule
+    /// above) would have that dormant early retirement reach back and
+    /// unrecognize the legitimate work once their *other* device is later
+    /// retired too — the boundary is supposed to mark when the person
+    /// actually went dark, not when they first lost any one device. An
+    /// email with no grant at all (a keyless member) likewise has no
+    /// cutoff: there is nothing for a founder to park, so this mechanism
+    /// cannot revoke them. An entry from a cutoff email is unrecognized
+    /// iff its `timestamp` is *strictly after* the cutoff — mirroring
+    /// [`KeyGrant::active_at`]'s inclusive boundary, an entry stamped
+    /// exactly at the cutoff still counts, and nothing stamped at or
+    /// before it is rewritten.
     ///
     /// This closes the gap [`Self::project_unverified`] leaves open on its
     /// own: an unverified entry is still *recognized*, so it still carries
@@ -610,19 +618,25 @@ impl<S: SubstrateProvider> Ledger<S> {
         }
         let member_emails: HashSet<&str> =
             party.iter().map(|member| member.email.as_str()).collect();
-        // `Option<Timestamp>`'s derived `Ord` places `None` before every
-        // `Some`, so `.min()` over each grant's `retired_at` yields `None`
-        // (no grants, or at least one still active — no cutoff either
-        // way) unless every grant is `Some`, in which case it yields the
-        // earliest of them — exactly the decision above, panic-free and
-        // without a second traversal.
+        // Single traversal, panic-free: `try_fold` short-circuits to
+        // `None` (via the inner `Option::map` yielding `None`) the moment
+        // it meets a grant that is still active, giving "no cutoff" for
+        // that email exactly as intended — partial retirement must not
+        // offboard the person. Otherwise the accumulator tracks the
+        // *latest* `retired_at` seen so far, so once every grant has been
+        // folded (none of them active) the result is the latest retirement
+        // across all of the email's grants — the moment it lost its last
+        // valid key.
         let cutoffs: HashMap<&str, Timestamp> = keyring
             .iter()
             .filter_map(|(email, grants)| {
                 let cutoff = grants
                     .iter()
-                    .map(|grant| grant.retired_at)
-                    .min()
+                    .try_fold(None::<Timestamp>, |latest, grant| {
+                        grant.retired_at.map(|retired_at| {
+                            Some(latest.map_or(retired_at, |l| l.max(retired_at)))
+                        })
+                    })
                     .flatten()?;
                 Some((email.as_str(), cutoff))
             })
@@ -3376,6 +3390,355 @@ mod tests {
         assert!(
             !view.unrecognized.contains(&later_id),
             "one retired device must not offboard the person"
+        );
+    }
+
+    /// Task 9c (`docs/adr/0035`) — the defect this fix closes. Alice holds
+    /// two grants: she retires her laptop (grant A) at T1 while her desktop
+    /// (grant B) is still active — no cutoff yet, matching
+    /// `a_partially_retired_member_is_not_revoked` — and keeps working from
+    /// the desktop until it, too, is retired at T2 (T1 < T2). Under the
+    /// defective `.min()` fold the cutoff would land on T1 and
+    /// retroactively unrecognize everything she wrote on the desktop
+    /// between T1 and T2; the corrected latest-retirement rule must not.
+    #[tokio::test]
+    async fn entries_between_two_distinct_grant_retirements_still_count() {
+        let founder_key = crate::SigningKey::from_secret_bytes([1; 32]);
+        let k1 = crate::SigningKey::from_secret_bytes([2; 32]);
+        let k2 = crate::SigningKey::from_secret_bytes([3; 32]);
+        let dan = Member::human("Dan", "dan@example.com").with_key(founder_key.public_key());
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+
+        let genesis_entry = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            1,
+            EntryPayload::ChannelOpened { name: "ch".into() },
+        );
+        let member = Member::human("Alice", "alice@example.com");
+        let device_a_id = EntryId::new();
+        let device_a = entry(
+            device_a_id,
+            channel,
+            dan.clone(),
+            2,
+            EntryPayload::MemberAdded {
+                member: member.clone().with_key(k1.public_key()),
+            },
+        );
+        let device_b_id = EntryId::new();
+        let device_b = entry(
+            device_b_id,
+            channel,
+            dan.clone(),
+            3,
+            EntryPayload::MemberAdded {
+                member: member.clone().with_key(k2.public_key()),
+            },
+        );
+        let park_device_a = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            4,
+            EntryPayload::Park {
+                target: device_a_id,
+                rationale: "laptop retired".into(),
+            },
+        );
+        let between_id = EntryId::new();
+        let between = entry(
+            between_id,
+            channel,
+            member.clone(),
+            5,
+            assertion("written from the desktop, between the two retirements"),
+        );
+        let park_device_b = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            6,
+            EntryPayload::Park {
+                target: device_b_id,
+                rationale: "desktop retired".into(),
+            },
+        );
+
+        for e in [
+            genesis_entry,
+            device_a,
+            device_b,
+            park_device_a,
+            between,
+            park_device_b,
+        ] {
+            ledger.append(e).await.unwrap();
+        }
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert!(
+            !view.unrecognized.contains(&between_id),
+            "written while the desktop grant was still active — the laptop's earlier \
+             retirement must not retroactively unrecognize it"
+        );
+    }
+
+    /// Task 9c (`docs/adr/0035`) — companion to
+    /// `entries_between_two_distinct_grant_retirements_still_count`: once
+    /// the *later* of the two grants (T2) is also retired, an entry stamped
+    /// after T2 is unrecognized. This is the half of the rule the old
+    /// `.min()` fold already got right by accident (it happened to also
+    /// treat post-T2 entries as unrecognized) — kept as an explicit
+    /// regression guard against a fix that swings too far the other way and
+    /// stops enforcing any cutoff at all.
+    #[tokio::test]
+    async fn an_entry_after_the_latest_of_two_retirements_is_unrecognized() {
+        let founder_key = crate::SigningKey::from_secret_bytes([1; 32]);
+        let k1 = crate::SigningKey::from_secret_bytes([2; 32]);
+        let k2 = crate::SigningKey::from_secret_bytes([3; 32]);
+        let dan = Member::human("Dan", "dan@example.com").with_key(founder_key.public_key());
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+
+        let genesis_entry = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            1,
+            EntryPayload::ChannelOpened { name: "ch".into() },
+        );
+        let member = Member::human("Alice", "alice@example.com");
+        let device_a_id = EntryId::new();
+        let device_a = entry(
+            device_a_id,
+            channel,
+            dan.clone(),
+            2,
+            EntryPayload::MemberAdded {
+                member: member.clone().with_key(k1.public_key()),
+            },
+        );
+        let device_b_id = EntryId::new();
+        let device_b = entry(
+            device_b_id,
+            channel,
+            dan.clone(),
+            3,
+            EntryPayload::MemberAdded {
+                member: member.clone().with_key(k2.public_key()),
+            },
+        );
+        let park_device_a = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            4,
+            EntryPayload::Park {
+                target: device_a_id,
+                rationale: "laptop retired".into(),
+            },
+        );
+        let park_device_b = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            6,
+            EntryPayload::Park {
+                target: device_b_id,
+                rationale: "desktop retired".into(),
+            },
+        );
+        let after_id = EntryId::new();
+        let after = entry(
+            after_id,
+            channel,
+            member.clone(),
+            7,
+            assertion("written after both devices are retired"),
+        );
+
+        for e in [
+            genesis_entry,
+            device_a,
+            device_b,
+            park_device_a,
+            park_device_b,
+            after,
+        ] {
+            ledger.append(e).await.unwrap();
+        }
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert!(
+            view.unrecognized.contains(&after_id),
+            "both grants are retired and this entry is stamped after the later of the two"
+        );
+    }
+
+    /// Task 9c (`docs/adr/0035`) — the at-cutoff boundary must hold against
+    /// the *later* of two retirements, not the earlier one: an entry
+    /// stamped exactly at T2 still counts, mirroring
+    /// `revoked_members_post_cutoff_entries_are_unrecognized`'s
+    /// single-grant boundary case but exercised across two grants so a
+    /// regression back to the earlier retirement as the boundary would be
+    /// caught here even though it is the same email.
+    #[tokio::test]
+    async fn at_cutoff_boundary_holds_against_the_latest_of_two_retirements() {
+        let founder_key = crate::SigningKey::from_secret_bytes([1; 32]);
+        let k1 = crate::SigningKey::from_secret_bytes([2; 32]);
+        let k2 = crate::SigningKey::from_secret_bytes([3; 32]);
+        let dan = Member::human("Dan", "dan@example.com").with_key(founder_key.public_key());
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+
+        let genesis_entry = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            1,
+            EntryPayload::ChannelOpened { name: "ch".into() },
+        );
+        let member = Member::human("Alice", "alice@example.com");
+        let device_a_id = EntryId::new();
+        let device_a = entry(
+            device_a_id,
+            channel,
+            dan.clone(),
+            2,
+            EntryPayload::MemberAdded {
+                member: member.clone().with_key(k1.public_key()),
+            },
+        );
+        let device_b_id = EntryId::new();
+        let device_b = entry(
+            device_b_id,
+            channel,
+            dan.clone(),
+            3,
+            EntryPayload::MemberAdded {
+                member: member.clone().with_key(k2.public_key()),
+            },
+        );
+        let park_device_a = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            4,
+            EntryPayload::Park {
+                target: device_a_id,
+                rationale: "laptop retired".into(),
+            },
+        );
+        let park_device_b = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            6,
+            EntryPayload::Park {
+                target: device_b_id,
+                rationale: "desktop retired".into(),
+            },
+        );
+        let at_cutoff_id = EntryId::new();
+        let at_cutoff = entry(
+            at_cutoff_id,
+            channel,
+            member.clone(),
+            6,
+            assertion("stamped exactly at the later retirement"),
+        );
+
+        for e in [
+            genesis_entry,
+            device_a,
+            device_b,
+            park_device_a,
+            park_device_b,
+            at_cutoff,
+        ] {
+            ledger.append(e).await.unwrap();
+        }
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert!(
+            !view.unrecognized.contains(&at_cutoff_id),
+            "stamped at exactly the later retirement — the boundary is inclusive, still counts"
+        );
+    }
+
+    /// Task 9c (`docs/adr/0035`) — guards the half of the fold that was
+    /// already right: with two grants and only one retired, there is still
+    /// no cutoff at all, not merely a cutoff pinned to the active grant.
+    /// Distinct from `a_partially_retired_member_is_not_revoked` (which
+    /// this complements) only in being written explicitly for Task 9c's
+    /// fold change, so a future edit to the "any grant active ⇒ no cutoff"
+    /// branch is caught by more than one test.
+    #[tokio::test]
+    async fn partial_retirement_across_two_grants_still_yields_no_cutoff() {
+        let founder_key = crate::SigningKey::from_secret_bytes([1; 32]);
+        let k1 = crate::SigningKey::from_secret_bytes([2; 32]);
+        let k2 = crate::SigningKey::from_secret_bytes([3; 32]);
+        let dan = Member::human("Dan", "dan@example.com").with_key(founder_key.public_key());
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+
+        let genesis_entry = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            1,
+            EntryPayload::ChannelOpened { name: "ch".into() },
+        );
+        let member = Member::human("Alice", "alice@example.com");
+        let device_a_id = EntryId::new();
+        let device_a = entry(
+            device_a_id,
+            channel,
+            dan.clone(),
+            2,
+            EntryPayload::MemberAdded {
+                member: member.clone().with_key(k1.public_key()),
+            },
+        );
+        let device_b = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            3,
+            EntryPayload::MemberAdded {
+                member: member.clone().with_key(k2.public_key()),
+            },
+        );
+        let park_device_a = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            4,
+            EntryPayload::Park {
+                target: device_a_id,
+                rationale: "laptop retired".into(),
+            },
+        );
+        let after_id = EntryId::new();
+        let after = entry(
+            after_id,
+            channel,
+            member.clone(),
+            5,
+            assertion("written after the laptop's retirement, desktop still active"),
+        );
+
+        for e in [genesis_entry, device_a, device_b, park_device_a, after] {
+            ledger.append(e).await.unwrap();
+        }
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert!(
+            !view.unrecognized.contains(&after_id),
+            "one active grant among two must still mean no cutoff"
         );
     }
 
