@@ -88,13 +88,25 @@ A separate, ephemeral plane beside the Record, permitted narrowly by ADR 0034: i
 | **Presence** | Who is watching a live Session right now — a loro `EphemeralStore`, 30s timeout, never persisted, never an Artifact. |
 | **watcher** | An authenticated Party member connected to a Session's live WebSocket to view it and attach Annotations, without owning the Session or writing its `conversation`/`worktree` — that stays the driving Member's alone (policy, not the data model; ADR 0034). |
 
+## Device-key nouns (per-device signing, revocation — [ADR 0035](adr/0035-membership-is-set-based-except-after-revocation.md))
+
+A member's signing authority is no longer one key per email; it's a per-device projection layered beside the Party, amending [ADR 0017](adr/0017-party-is-a-projection-membership-is-founder-granted.md)'s set-based membership check for revoked members only. `junto-kernel` owns the projection; `crates/junto/src/{enroll,invites,keys,host}.rs` own the enrollment exchange and CLI.
+
+| Noun | Meaning |
+|---|---|
+| **Key grant** | One key ever granted signing authority for an email (`KeyGrant`): the public key, the entry that authorized it (`granted_by` — a `ChannelOpened` genesis or founder-authored `MemberAdded`), and when it was retired (`retired_at`, `None` until a founder parks it). A member has one Party row but can hold many grants, one per device. |
+| **Keyring** | The per-email projection of every Key grant (`Keyring = HashMap<email, Vec<KeyGrant>>`), distinct from the **Party**: the Party answers "who is on the roster", the Keyring answers "which keys may sign for them right now". |
+| **Device enrollment** | The three-step exchange that lets a member add a device's key without moving the private half across a wire: **`junto invite`** (founder-only, resolves the channel to its canonical id, mints a single-use code) → **`junto enroll`** (runs on the new device; it mints its own keypair locally and echoes back only the public key) → **`junto add-member --enroll`** (founder-only; burns the invite code and records the grant). |
+| **Retirement** | A founder-authored `Park` targeting the entry that granted a device's key (no new entry kind). Retires that one grant as of the park's own timestamp — inclusive at the boundary, so nothing signed at or before the park is affected. Two parks on the same grant: the **earliest** wins. |
+| **Revocation cutoff** | An email-level, not grant-level, consequence: exists only once **every** grant for that email is retired, at the **latest** of their retirement timestamps — the moment the person held no valid key at all. While any grant stays active, there is no cutoff. Entries stamped strictly after the cutoff are *unrecognized*; the member is never removed from the Party, so their pre-cutoff history is untouched. |
+
 ## Verbs (operations & channel transitions)
 
 - **open** a channel (of a playbook) — an explicit, recorded act: mints the channel's id and writes a `ChannelOpened` genesis entry binding name → id in the home substrate (ADRs 0014/0016; never implicit on first write). Possibly **triggered** by an inbound Connector (alert/ticket → channel). Siblings, same recorded-act treatment: **close** (ADR 0016) · **diverge** / **converge** (lineage edges — see below).
 - **diverge** — a *child* channel departs from a *point* in a parent (the common case: a side-quest). Recorded as a pair of entries, one in each ledger (the child's `DivergedFrom`, the parent's `ChildDiverged`); the parent flows on. The verb is settled as **diverge**, never "fork" (which implies copying history — exactly wrong; entries are channel-scoped and immutable). See `attention.md`.
 - **converge** — two channels merge by *recorded act*, never a history mutation: either a child closes back into its parent, or both close into a new continuation channel whose genesis names its predecessors. Recorded as a pair of entries (`ConvergedInto` on the source, `ConvergenceReceived` on the target). Forces honest disposal of the converging channel's open gates.
 - **frame** — the deliberation step: *plan* (code) / *pre-register* (research) / *triage* (incident). ⚠️ kernel stage or per-playbook?
-- **join / invite** — manage the Party.
+- **join / invite** — manage the Party. Adding a device (not just a member) is **device enrollment**, above: `junto invite` → `junto enroll` → `junto add-member --enroll` (ADR 0035).
 - **run** (act) — execute work in an **Agent Session** → Artifacts (+ Provenance + Events).
 - **propose** — surface a change/finding for a Gate.
 - **route** — the Gate decides the path (auto / approve / review / hard-gate), per the playbook's **Routing Policy**. The `auto` path is the **autonomy envelope** (ADR 0026): a human ratifies the Routing Policy for a region, and inside it a Grader-`satisfied` Deliverable auto-resolves the Gate **and emits a notification** (release notes) instead of pausing — outside it the Gate still waits for a human. Two invariants: editing a Routing Policy never routes to `auto` (no self-widening), and the grade is *read*, never *grants* autonomy (grade ≠ consent).
