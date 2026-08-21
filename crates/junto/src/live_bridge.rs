@@ -52,9 +52,15 @@ use crate::launch::NotLive;
 /// sibling excerpt fields, [`MAX_ANCHOR_LOCATION_BYTES`] bounds the anchor
 /// fields named in the block header, and [`MAX_STEER_MESSAGE_BYTES`]
 /// bounds the whole rendered batch. Only all four together bound every
-/// remote-controlled byte on this path — stating that any one of them
-/// alone keeps the rendered message finite would be the same overclaim
-/// again.
+/// remote-CHOSEN byte on this path — the one exception is
+/// `annotation.author.email`, also rendered into the header: it carries no
+/// cap of its own because it needs none. `validate_annotation_update`
+/// requires it to equal the authenticated sender's own email, which must
+/// already be a key in the channel's keyring built from the party
+/// projection — so its length is fixed at member admission, by the gate,
+/// not chosen per annotation the way every capped field here is. Stating
+/// that any one of the four caps alone keeps the rendered message finite
+/// would be the same overclaim again.
 const MAX_ANNOTATION_BODY_BYTES: usize = 4096;
 
 /// Hard cap, independent of [`MAX_ANNOTATION_BODY_BYTES`], on any single
@@ -106,11 +112,17 @@ const MAX_STEER_MESSAGE_BYTES: usize = 16384;
 /// own withheld-count marker, so the FINISHED message (rendered blocks
 /// *plus* the marker, when one is appended) never exceeds the budget —
 /// only the blocks portion would if the marker were appended on top of a
-/// full budget instead of carved out of it. The marker's only variable
-/// content is the withheld count and the (fixed, 5-digit) budget number
-/// itself; even an absurd withheld count of one billion renders under 200
-/// bytes, so 300 leaves comfortable headroom without meaningfully
-/// shrinking the room left for actual comment content.
+/// full budget instead of carved out of it. This guarantee holds as long
+/// as every individual block stays under the reduced (budget minus this
+/// reserve) block budget, which is exactly what the FIRST-block clause in
+/// [`assemble_batch`]'s doc comment exists to survive losing — today the
+/// field caps ensure it with the measured ~5.4 KB margin documented
+/// there, but that margin, not this reservation alone, is what makes the
+/// guarantee hold. The marker's own variable content is just the withheld
+/// count and the (fixed, 5-digit) budget number; even an absurd withheld
+/// count of one billion renders under 200 bytes, so 300 leaves
+/// comfortable headroom without meaningfully shrinking the room left for
+/// actual comment content.
 const MARKER_RESERVE_BYTES: usize = 300;
 
 /// Shared truncation: cut `value` to at most `max` bytes on a UTF-8 char
