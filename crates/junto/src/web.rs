@@ -3232,6 +3232,7 @@ mod tests {
             gate_executions: Default::default(),
             entries: vec![entry.clone()],
             party: Vec::new(),
+            keyring: Default::default(),
             unrecognized: Default::default(),
             unverified: Default::default(),
             sessions: Default::default(),

@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    EntryId, EntryPayload, GateStatus, LedgerEntry, Member, Result, SubstrateProvider,
+    EntryId, EntryPayload, GateStatus, LedgerEntry, Member, Result, SubstrateProvider, Timestamp,
     gate::ApprovalRequirement,
     ids::ChannelId,
     session::{SessionState, SessionView},
@@ -91,6 +91,44 @@ pub struct LineageEdge {
     pub point: Option<EntryId>,
 }
 
+/// One key ever granted signing authority for an email, folded from a
+/// membership-granting entry (`docs/adr/0033`). Distinct from [`Member`]:
+/// a `Member` answers "who is on the roster", a `KeyGrant` answers "which
+/// keys may sign for them" — a member has exactly one roster row but can
+/// hold many grants, one per machine/device it enrolled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyGrant {
+    /// The granted public key.
+    pub key: crate::PublicKey,
+    /// The entry that authorized this key — the `ChannelOpened` genesis for
+    /// the founder's own key, or the founder-authored `MemberAdded` that
+    /// enrolled it.
+    pub granted_by: EntryId,
+    /// When this grant was retired (Task 2: founder-authored Park of the
+    /// grant). `None` in this task — nothing retires yet.
+    pub retired_at: Option<Timestamp>,
+}
+
+impl KeyGrant {
+    /// Whether this grant was live at `ts`: granted (always true here, grants
+    /// have no start bound of their own) and not yet retired as of `ts`.
+    #[must_use]
+    pub fn active_at(&self, ts: Timestamp) -> bool {
+        self.retired_at.is_none_or(|retired| ts <= retired)
+    }
+}
+
+/// Every key ever granted signing authority, keyed by email
+/// (`docs/adr/0033`). Deliberately **separate** from [`ChannelView::party`]:
+/// the Party is the human-facing roster (one row per member, first-write-wins
+/// on email) while the keyring is the machine-facing authorization list (any
+/// number of grants per email, one per enrolled device). Folding them into
+/// one structure — as the pre-multi-device projection did — forces a choice
+/// between "one key per member" and "devices pollute the roster"; keeping
+/// them apart avoids that choice entirely. A member's grants are in
+/// canonical entry order, so replay is deterministic on every replica.
+pub type Keyring = std::collections::HashMap<String, Vec<KeyGrant>>;
+
 /// A point-in-time projection of a Channel's Ledger: the entries in canonical
 /// order, plus the derived [`Standing`] of each assertion and
 /// [`GateStatus`] of each proposal.
@@ -113,6 +151,13 @@ pub struct ChannelView {
     /// record synced before its genesis arrived) — in which case membership is
     /// not enforced and every entry projects.
     pub party: Vec<Member>,
+    /// Every key ever granted signing authority, keyed by email
+    /// ([`Keyring`]). **Not** derived from `party`: the Party answers "who is
+    /// a member" (one row per email) while this answers "which keys may sign
+    /// for them" (any number of grants per email, one per enrolled device).
+    /// Empty exactly when `party` is empty — no genesis, no founder, no
+    /// grants.
+    pub keyring: Keyring,
     /// Entries whose author is not in the [`party`](ChannelView::party) —
     /// retained and surfaced, but excluded from standings and gate folding
     /// (`docs/adr/0017`: visibility beats mystery). Always empty when `party`
@@ -287,6 +332,10 @@ impl<S: SubstrateProvider> Ledger<S> {
         entries.retain(|entry| seen.insert(entry.id));
 
         let party = Self::project_party(&entries);
+        let keyring = match party.first() {
+            Some(founder) => Self::project_keyring(&entries, &founder.email),
+            None => Keyring::new(),
+        };
         // The membership check is set-based, not temporal (`docs/adr/0017`):
         // an entry counts iff its author is in the Party, wherever the grant
         // falls in canonical order. No genesis ⇒ no Party ⇒ no enforcement.
@@ -346,6 +395,7 @@ impl<S: SubstrateProvider> Ledger<S> {
             name,
             entries,
             party,
+            keyring,
             unrecognized,
             unverified,
             standings,
@@ -388,18 +438,66 @@ impl<S: SubstrateProvider> Ledger<S> {
         party
     }
 
+    /// Fold the **keyring** out of an ordered entry list (`docs/adr/0033`):
+    /// every key ever granted signing authority, keyed by email. Distinct
+    /// from [`Self::project_party`] on purpose — see [`Keyring`]'s doc
+    /// comment. The genesis author's key is granted by the `ChannelOpened`
+    /// entry itself (the founder's key never appears in a `MemberAdded`);
+    /// after that, a `MemberAdded` contributes a grant iff its author is the
+    /// founder (grant authority is the founder's alone) and the added member
+    /// carries a key (keyless members stay keyless). Grants accumulate in
+    /// the caller's entry order, which is canonical, so a member's grant
+    /// list is deterministic on every replica.
+    fn project_keyring(entries: &[LedgerEntry], founder_email: &str) -> Keyring {
+        let mut keyring: Keyring = HashMap::new();
+        for entry in entries {
+            match &entry.payload {
+                EntryPayload::ChannelOpened { .. } => {
+                    if let Some(key) = entry.author.public_key.clone() {
+                        keyring
+                            .entry(entry.author.email.clone())
+                            .or_default()
+                            .push(KeyGrant {
+                                key,
+                                granted_by: entry.id,
+                                retired_at: None,
+                            });
+                    }
+                }
+                EntryPayload::MemberAdded { member } => {
+                    if entry.author.email == founder_email
+                        && let Some(key) = member.public_key.clone()
+                    {
+                        keyring
+                            .entry(member.email.clone())
+                            .or_default()
+                            .push(KeyGrant {
+                                key,
+                                granted_by: entry.id,
+                                retired_at: None,
+                            });
+                    }
+                }
+                _ => {}
+            }
+        }
+        keyring
+    }
+
     /// Which recognized entries fail authorship verification
-    /// (`docs/adr/0033`): the keyring is the Party's projected public keys
-    /// (the membership-granting entries carry them), and an entry is
-    /// **unverified** when its author has no key on the roster or its
-    /// signature does not verify against that key. With an empty Party
-    /// (no genesis) there is no keyring and nothing is marked — consistent
-    /// with membership not being enforced there either.
+    /// (`docs/adr/0033`): authorship verifies against the Party's own
+    /// projected public key (one per member — deliberately *not* the
+    /// [`Keyring`], which can hold several keys per email; verification
+    /// authority stays scoped to a member's current roster key until a later
+    /// task widens it). An entry is **unverified** when its author has no
+    /// key on the roster or its signature does not verify against that key.
+    /// With an empty Party (no genesis) nothing is marked — consistent with
+    /// membership not being enforced there either.
     fn project_unverified(party: &[Member], recognized: &[&LedgerEntry]) -> HashSet<EntryId> {
         if party.is_empty() {
             return HashSet::new();
         }
-        let keyring: HashMap<&str, &crate::PublicKey> = party
+        let roster_keys: HashMap<&str, &crate::PublicKey> = party
             .iter()
             .filter_map(|member| {
                 member
@@ -411,7 +509,7 @@ impl<S: SubstrateProvider> Ledger<S> {
         recognized
             .iter()
             .filter(|entry| {
-                keyring
+                roster_keys
                     .get(entry.author.email.as_str())
                     .is_none_or(|key| !entry.verifies_with(key))
             })
@@ -616,8 +714,8 @@ impl<S: SubstrateProvider> Ledger<S> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        ApprovalRequirement, EntryId, EntryPayload, GateStatus, InMemorySubstrate, Ledger,
-        LedgerEntry, LineageDirection, LineageEdge, LineageRelation, Member, SessionState,
+        ApprovalRequirement, EntryId, EntryPayload, GateStatus, InMemorySubstrate, KeyGrant,
+        Ledger, LedgerEntry, LineageDirection, LineageEdge, LineageRelation, Member, SessionState,
         Standing, Timestamp, ids::ChannelId,
     };
 
@@ -780,6 +878,206 @@ mod tests {
         let view = ledger.project(&channel).await.unwrap();
         assert!(!view.unverified.contains(&own_id));
         assert!(view.unverified.contains(&crossed_id));
+    }
+
+    /// The keyring accumulates every key ever granted for an email, not just
+    /// the latest — the founder's genesis key plus a second device key
+    /// enrolled later via `MemberAdded` both land in `dan@x.com`'s grants.
+    #[tokio::test]
+    async fn keyring_unions_multiple_grants_for_one_email() {
+        let k1 = crate::SigningKey::from_secret_bytes([1; 32]);
+        let k2 = crate::SigningKey::from_secret_bytes([2; 32]);
+        let dan = Member::human("Dan", "dan@x.com").with_key(k1.public_key());
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+
+        let genesis_id = EntryId::new();
+        let genesis = entry(
+            genesis_id,
+            channel,
+            dan.clone(),
+            1,
+            EntryPayload::ChannelOpened { name: "ch".into() },
+        );
+        // The founder's own second device, enrolled via a self-authored
+        // MemberAdded carrying k2 (see spec "Enrollment flow").
+        let grant_id = EntryId::new();
+        let grant = entry(
+            grant_id,
+            channel,
+            dan.clone(),
+            2,
+            EntryPayload::MemberAdded {
+                member: dan.clone().with_key(k2.public_key()),
+            },
+        );
+
+        for e in [genesis, grant] {
+            ledger.append(e).await.unwrap();
+        }
+
+        let view = ledger.project(&channel).await.unwrap();
+        let grants = view.keyring.get("dan@x.com").expect("dan has grants");
+        assert_eq!(grants.len(), 2, "genesis key plus the enrolled device key");
+        assert!(
+            grants
+                .iter()
+                .any(|g| g.key == k1.public_key() && g.granted_by == genesis_id)
+        );
+        assert!(
+            grants
+                .iter()
+                .any(|g| g.key == k2.public_key() && g.granted_by == grant_id)
+        );
+    }
+
+    /// A `MemberAdded` authored by a non-founder member carrying a key must
+    /// not appear in the keyring — grant authority is the founder's alone.
+    #[tokio::test]
+    async fn non_founder_member_added_contributes_no_key() {
+        let founder_key = crate::SigningKey::from_secret_bytes([1; 32]);
+        let outsider_key = crate::SigningKey::from_secret_bytes([2; 32]);
+        let smuggled_key = crate::SigningKey::from_secret_bytes([3; 32]);
+        let dan = Member::human("Dan", "dan@example.com").with_key(founder_key.public_key());
+        let outsider =
+            Member::human("Outsider", "outsider@example.com").with_key(outsider_key.public_key());
+        let smuggled =
+            Member::human("Smuggled", "smuggled@example.com").with_key(smuggled_key.public_key());
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+
+        let genesis = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            1,
+            EntryPayload::ChannelOpened { name: "ch".into() },
+        );
+        // First, the founder legitimately adds the outsider to the roster...
+        let add_outsider = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            2,
+            EntryPayload::MemberAdded {
+                member: outsider.clone(),
+            },
+        );
+        // ...then the outsider (not the founder) tries to grant a key to a
+        // third party. Grant authority is the founder's alone.
+        let smuggled_grant = entry(
+            EntryId::new(),
+            channel,
+            outsider.clone(),
+            3,
+            EntryPayload::MemberAdded {
+                member: smuggled.clone(),
+            },
+        );
+
+        for e in [genesis, add_outsider, smuggled_grant] {
+            ledger.append(e).await.unwrap();
+        }
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert!(!view.keyring.contains_key("smuggled@example.com"));
+    }
+
+    /// `member.public_key == None` means no grant for that email, even
+    /// though the founder authored the `MemberAdded`.
+    #[tokio::test]
+    async fn keyless_member_added_contributes_no_grant() {
+        let founder_key = crate::SigningKey::from_secret_bytes([1; 32]);
+        let dan = Member::human("Dan", "dan@example.com").with_key(founder_key.public_key());
+        let keyless = Member::human("Keyless", "keyless@example.com"); // no key
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+
+        let genesis = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            1,
+            EntryPayload::ChannelOpened { name: "ch".into() },
+        );
+        let add_keyless = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            2,
+            EntryPayload::MemberAdded {
+                member: keyless.clone(),
+            },
+        );
+
+        for e in [genesis, add_keyless] {
+            ledger.append(e).await.unwrap();
+        }
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert!(!view.keyring.contains_key("keyless@example.com"));
+        // Still on the roster — keyless is a party fact, not a keyring one.
+        assert!(view.party.iter().any(|m| m.email == "keyless@example.com"));
+    }
+
+    /// Two `MemberAdded` entries for the SAME email: the party still holds
+    /// ONE row (first-write-wins, ledger.rs `project_party`) while the
+    /// keyring holds two grants. This is the decision that keeps devices out
+    /// of the roster.
+    #[tokio::test]
+    async fn party_projection_is_unchanged_by_the_keyring() {
+        let founder_key = crate::SigningKey::from_secret_bytes([1; 32]);
+        let k1 = crate::SigningKey::from_secret_bytes([2; 32]);
+        let k2 = crate::SigningKey::from_secret_bytes([3; 32]);
+        let dan = Member::human("Dan", "dan@example.com").with_key(founder_key.public_key());
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+
+        let genesis = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            1,
+            EntryPayload::ChannelOpened { name: "ch".into() },
+        );
+        // Same email, two different devices, both authored by the founder.
+        let member = Member::human("Mia", "mia@example.com");
+        let first_device = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            2,
+            EntryPayload::MemberAdded {
+                member: member.clone().with_key(k1.public_key()),
+            },
+        );
+        let second_device = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            3,
+            EntryPayload::MemberAdded {
+                member: member.clone().with_key(k2.public_key()),
+            },
+        );
+
+        for e in [genesis, first_device, second_device] {
+            ledger.append(e).await.unwrap();
+        }
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert_eq!(
+            view.party
+                .iter()
+                .filter(|m| m.email == "mia@example.com")
+                .count(),
+            1,
+            "party dedups by email, first-write-wins"
+        );
+        let grants: &Vec<KeyGrant> = view.keyring.get("mia@example.com").expect("grants");
+        assert_eq!(grants.len(), 2, "keyring holds a grant per device");
+        assert!(grants.iter().any(|g| g.key == k1.public_key()));
+        assert!(grants.iter().any(|g| g.key == k2.public_key()));
     }
 
     #[tokio::test]
