@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 junto-kernel.workspace = true
+junto-live.workspace = true
 junto-substrate-git.workspace = true
 anyhow.workspace = true
 # the MCP write surface (`junto serve`): streamable HTTP over axum

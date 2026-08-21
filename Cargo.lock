@@ -1154,6 +1154,7 @@ dependencies = [
  "clap",
  "dunce",
  "junto-kernel",
+ "junto-live",
  "junto-substrate-git",
  "pulldown-cmark",
  "rmcp",

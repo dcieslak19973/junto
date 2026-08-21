@@ -309,6 +309,17 @@ impl Host {
         &self.live
     }
 
+    /// The live plane registry (`crate::live_plane`) for this host's
+    /// running Agent Sessions — one CRDT document + presence + frame
+    /// broadcast per live session, tapped alongside [`Host::live`]'s SSE
+    /// feed and archived when a session ends. Delegates to
+    /// [`crate::launch::LiveSessions`]'s own plane field rather than adding
+    /// a second field to `Host`, since `LiveSessions`' `begin`/`publish`/
+    /// `finish` are the taps that populate it.
+    pub(crate) fn live_plane(&self) -> &Arc<crate::live_plane::LivePlane> {
+        &self.live.plane
+    }
+
     /// Where this host's member-code store lives (`docs/adr/0017`): the
     /// machine registry's junto home, unless overridden (tests).
     fn member_home(&self) -> Result<PathBuf> {

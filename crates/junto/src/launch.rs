@@ -1,4 +1,4 @@
-﻿//! Launching Agent Sessions from the surface (`docs/adr/0023`).
+//! Launching Agent Sessions from the surface (`docs/adr/0023`).
 //!
 //! The **Workspace** is the machine-local mapping channel → repo(s) — where a
 //! channel's Agent Sessions execute (`~/.junto/workspaces.toml`). Paths never
@@ -733,6 +733,13 @@ struct LiveFeed {
 #[derive(Default)]
 pub struct LiveSessions {
     inner: Mutex<HashMap<EntryId, LiveFeed>>,
+    /// The live plane registry (`crate::live_plane`) — one CRDT document +
+    /// presence + frame broadcast per session, tapped from `begin`/
+    /// `publish`/`finish` below alongside the SSE feed above. `Host`
+    /// exposes it via `Host::live_plane`, delegating to this field rather
+    /// than duplicating a registry on `Host` itself (`LiveSessions`'
+    /// methods, not `Host`'s, are what see every session lifecycle event).
+    pub(crate) plane: std::sync::Arc<crate::live_plane::LivePlane>,
 }
 
 impl LiveSessions {
@@ -752,6 +759,10 @@ impl LiveSessions {
                 control,
             },
         );
+        drop(map);
+        // Live-plane tap: start this session's CRDT document alongside the
+        // SSE feed above (docs/superpowers/specs/2026-08-20-live-session-plane-design.md).
+        self.plane.begin(session);
         control_rx
     }
 
@@ -769,20 +780,42 @@ impl LiveSessions {
     /// sees one rendered block, not every intermediate frame), which also keeps
     /// a long Markdown stream from blowing the bound. Live subscribers still
     /// receive every frame.
+    ///
+    /// Also taps the live plane (fire-and-forget, never propagated — see
+    /// `crate::live_plane`'s module docs): every event feeds the session's
+    /// CRDT `conversation` container, and a tool event whose label
+    /// (`acp::tool_label`) indicates a file edit or write also lands in
+    /// `worktree`, so watchers see file activity without waiting for the
+    /// turn-end diff snapshot.
     pub(crate) fn publish(&self, session: EntryId, event: LiveEvent) {
-        let mut map = self.inner.lock().expect("live sessions registry lock");
-        if let Some(feed) = map.get_mut(&session) {
-            let coalesce =
-                event.seq != 0 && feed.buffer.last().is_some_and(|last| last.seq == event.seq);
-            if coalesce {
-                if let Some(last) = feed.buffer.last_mut() {
-                    *last = event.clone();
+        {
+            let mut map = self.inner.lock().expect("live sessions registry lock");
+            if let Some(feed) = map.get_mut(&session) {
+                let coalesce =
+                    event.seq != 0 && feed.buffer.last().is_some_and(|last| last.seq == event.seq);
+                if coalesce {
+                    if let Some(last) = feed.buffer.last_mut() {
+                        *last = event.clone();
+                    }
+                } else if feed.buffer.len() < 1000 {
+                    feed.buffer.push(event.clone());
                 }
-            } else if feed.buffer.len() < 1000 {
-                feed.buffer.push(event.clone());
+                // Err just means no one is watching right now — fine.
+                let _ = feed.sender.send(event.clone());
             }
-            // Err just means no one is watching right now — fine.
-            let _ = feed.sender.send(event);
+        }
+        if let Some(live) = self.plane.get(session) {
+            live.publish_conversation(&event);
+            let is_edit_or_write =
+                event.text.starts_with("Edit") || event.text.starts_with("Write");
+            if event.kind == "tool" && is_edit_or_write {
+                match serde_json::to_value(&event) {
+                    Ok(value) => live.doc.push_worktree(value),
+                    Err(err) => tracing::warn!(
+                        "live plane: failed to serialize worktree tool event: {err:#}"
+                    ),
+                }
+            }
         }
     }
 
@@ -798,10 +831,15 @@ impl LiveSessions {
     }
 
     /// Close a session's feed — dropping the sender, so any live subscriber
-    /// sees the stream end and reloads to the now-persisted outcome.
-    fn finish(&self, session: EntryId) {
+    /// sees the stream end and reloads to the now-persisted outcome. Also
+    /// taps the live plane: removes its `SessionLive` and returns the
+    /// session's final CRDT snapshot bytes for the caller to archive as an
+    /// artifact (`None` if the live plane wasn't tracking the session).
+    fn finish(&self, session: EntryId) -> Option<Vec<u8>> {
         let mut map = self.inner.lock().expect("live sessions registry lock");
         map.remove(&session);
+        drop(map);
+        self.plane.finish(session)
     }
 }
 
@@ -1228,6 +1266,44 @@ fn store_artifact(
     Ok(ProvenanceRef::with_digest(uri, digest))
 }
 
+/// Archive a finished session's live-plane snapshot (`LivePlane::finish`'s
+/// return value) as an artifact, using the exact `store_artifact` +
+/// `ArtifactAttached` shape [`record_outcome`] uses for `diff.patch` — same
+/// signing, same append path (see the taps in `LiveSessions::finish`).
+/// `store_artifact` only writes text, so the binary snapshot is hex-encoded
+/// first — the durable ledger never carries CRDT bytes verbatim, only their
+/// provenance-tracked artifact.
+async fn archive_live_snapshot(
+    host: &Host,
+    channel_ref: &str,
+    channel: ChannelId,
+    session: EntryId,
+    agent: &crate::agent::Agent,
+    snapshot: &[u8],
+) -> Result<()> {
+    let junto_home = crate::host::junto_home()?;
+    let hex: String = snapshot.iter().map(|byte| format!("{byte:02x}")).collect();
+    let stored = store_artifact(&junto_home, &session, "live.loro", &hex)?;
+    append(
+        host,
+        channel_ref,
+        LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel,
+            author: agent.member(),
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::ArtifactAttached {
+                target: session,
+                kind: "live-snapshot".into(),
+                description: format!("live session plane snapshot ({} bytes)", snapshot.len()),
+                provenance: vec![stored],
+            },
+        },
+    )
+    .await
+}
+
 /// Suppress the console window Windows flashes when a GUI-hosted process
 /// spawns a console child. CLAUDE.md (terminal-less): agent and tool output
 /// is captured as Artifacts, never rendered as scrollback — and never as a
@@ -1368,6 +1444,22 @@ fn current_branch(workspace: &Path) -> Option<String> {
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
         .filter(|b| !b.is_empty() && b != "HEAD")
+}
+
+/// The workspace's current `HEAD` commit oid, or `None` if git can't say
+/// (not a repo, or an initial repo with no commits yet). The live plane's
+/// worktree diff event (`spawn_turn`) only ever carries a commit oid it got
+/// from here — never a fabricated one, since watcher UIs anchor code
+/// comments on it.
+fn workspace_head_commit(workspace: &Path) -> Option<String> {
+    let mut command = std::process::Command::new("git");
+    command.arg("-C").arg(workspace).args(["rev-parse", "HEAD"]);
+    no_console_window(&mut command);
+    let out = command.output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|sha| !sha.is_empty())
 }
 
 /// Push `branch` to `origin` (setting upstream) — inherits the user's git auth,
@@ -1608,9 +1700,35 @@ fn spawn_turn(
         {
             tracing::warn!("recording session {session} outcome failed: {err:#}");
         }
+        // Live-plane worktree tap, v1 scope: one diff snapshot per turn,
+        // pushed while the session's `SessionLive` still exists (turn-end is
+        // the periodic floor for v1 — no in-turn ticker, no filesystem
+        // watcher). Fire-and-forget: never lets a live-plane hiccup affect
+        // the outcome already recorded above. The commit oid only ever
+        // comes from git — never fabricated, since watcher UIs anchor code
+        // comments on it.
+        if let Some(live) = host.live_plane().get(session)
+            && let (Some(diff), Some(commit)) = (
+                workspace_diff(&workspace),
+                workspace_head_commit(&workspace),
+            )
+        {
+            live.doc.push_worktree(serde_json::json!({
+                "kind": "diff",
+                "text": diff,
+                "commit": commit,
+            }));
+        }
         // Close the live feed only after the outcome is recorded, so a watcher
         // reloading on stream-end sees the landed memo + diff, not "working".
-        host.live().finish(session);
+        // Also archives the live plane's final snapshot as an artifact.
+        if let Some(snapshot) = host.live().finish(session)
+            && let Err(err) =
+                archive_live_snapshot(&host, &channel_ref, channel, session, &agent, &snapshot)
+                    .await
+        {
+            tracing::warn!("archiving live snapshot for session {session} failed: {err:#}");
+        }
         // Best-effort sync so the session's record leaves this machine.
         if let Ok(resolution) = host.resolve(&channel_ref).await
             && let crate::host::Resolution::Resolved { ledger, id, .. } = resolution
@@ -1850,7 +1968,13 @@ fn spawn_outcome_loop(
         {
             tracing::warn!("recording outcome terminal for session {session} failed: {err:#}");
         }
-        host.live().finish(session);
+        if let Some(snapshot) = host.live().finish(session)
+            && let Err(err) =
+                archive_live_snapshot(&host, &channel_ref, channel, session, &agent, &snapshot)
+                    .await
+        {
+            tracing::warn!("archiving live snapshot for session {session} failed: {err:#}");
+        }
         if let Ok(crate::host::Resolution::Resolved { ledger, id, .. }) =
             host.resolve(&channel_ref).await
         {

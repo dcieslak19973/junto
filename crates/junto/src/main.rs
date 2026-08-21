@@ -16,6 +16,7 @@ mod host;
 mod init;
 mod keys;
 mod launch;
+mod live_plane;
 mod mcp;
 mod members;
 mod outcome;
