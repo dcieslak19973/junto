@@ -349,9 +349,10 @@ graduated ladder — each rung ships value alone, climb in order:
 Rungs 1–2 shipped as designed: **the record stayed append-only ratified
 entries** (ADR 0011 untouched throughout) and CRDT stayed confined to the
 live plane, scoped by [ADR 0034](adr/0034-crdt-confined-to-the-live-plane.md)
-— never the durable record. The unpark itself (drafted assertions citing
-`1d9cf9b1` and `b405a1cb`) is recorded in ADR 0034's appendix, pending
-Dan recording it in `junto-dev`.
+— never the durable record. The unpark itself is **drafted, not yet
+recorded**: [ADR 0034](adr/0034-crdt-confined-to-the-live-plane.md)'s
+appendix carries the exact wording, citing `1d9cf9b1`, `b405a1cb`, and
+`032da77f`, for Dan to record in `junto-dev`.
 
 ### Tradeoffs, stated honestly
 

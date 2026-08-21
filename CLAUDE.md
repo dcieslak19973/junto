@@ -21,7 +21,6 @@ crates/junto-kernel/        # the generic, playbook-agnostic core (lib) — no v
 crates/junto-substrate-git/ # git-refs SubstrateProvider adapter (shells out to system git)
 crates/junto-live/          # the ephemeral live-plane crate (lib) — owns the loro CRDT dependency; ADR 0034
 crates/junto/               # the host/app entry (bin) — terminal-less for humans; not a CLI UI
-crates/junto-iced/          # the watcher/human GUI surface (bin, iced) — remote live-session viewing
 docs/                       # the design corpus (vision, domain model, architecture, pluggability, worked examples)
 docs/adr/                   # one settled architectural decision per file
 ```
