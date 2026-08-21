@@ -71,3 +71,11 @@ loro = "1.13"
 # base64 encoding for loro update bytes riding inside the JSON websocket
 # frame envelope (`junto-live`'s `Frame`); MIT/Apache-2.0.
 base64 = "0.22"
+# dev-only: the live websocket integration test's client side
+# (crates/junto/tests/live_ws.rs); MIT.
+tokio-tungstenite = "0.24"
+# dev-only: `Sink`/`Stream` ext traits for driving `tokio-tungstenite`'s
+# `WebSocketStream` in that same test; already fully resolved in the
+# dependency tree via axum/tokio, so this is a direct-import path, not a new
+# crate (MIT/Apache-2.0).
+futures-util = "0.3"

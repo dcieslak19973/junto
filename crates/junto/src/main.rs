@@ -7,23 +7,7 @@
 //! surfaces) connect to. Binary/`main` code may use `anyhow` and may
 //! `?`-propagate — unlike the library crates.
 
-mod acp;
-mod agent;
-mod binding;
-mod forge;
-mod grader;
-mod host;
-mod init;
-mod keys;
-mod launch;
-mod live_plane;
-mod mcp;
-mod members;
-mod outcome;
-mod pending_lineage;
-mod render;
-mod verify;
-mod web;
+use junto::{binding, host, init, mcp, members, render, web};
 
 use std::path::PathBuf;
 

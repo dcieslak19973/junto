@@ -33,7 +33,7 @@ use tokio::sync::broadcast;
 /// `Send + Sync`, so this type is shared as `Arc<SessionLive>` between the
 /// session loop and (later) watcher connections; it is never wrapped in its
 /// own `Mutex`.
-pub(crate) struct SessionLive {
+pub struct SessionLive {
     /// The session's live CRDT document: `conversation`, `worktree`, and
     /// `annotations` containers (`junto_live::doc`).
     pub doc: LiveDoc,
@@ -110,7 +110,7 @@ impl SessionLive {
 /// snapshot bytes for the caller to archive as an Artifact — this module
 /// never touches the ledger itself.
 #[derive(Default)]
-pub(crate) struct LivePlane {
+pub struct LivePlane {
     sessions: Mutex<HashMap<EntryId, Arc<SessionLive>>>,
 }
 
@@ -126,7 +126,7 @@ impl LivePlane {
     /// as `finish` would have: a watcher still holding that old
     /// `broadcast::Receiver` must learn its stream is over rather than
     /// silently hang on a sender nothing will ever send through again.
-    pub(crate) fn begin(&self, session: EntryId) -> Arc<SessionLive> {
+    pub fn begin(&self, session: EntryId) -> Arc<SessionLive> {
         let doc = LiveDoc::new();
         let (outbound, _rx) = broadcast::channel(256);
         let forward = outbound.clone();
@@ -158,7 +158,7 @@ impl LivePlane {
     /// The live state for a running session, or `None` if it isn't live
     /// (finished already, or never began).
     #[must_use]
-    pub(crate) fn get(&self, session: EntryId) -> Option<Arc<SessionLive>> {
+    pub fn get(&self, session: EntryId) -> Option<Arc<SessionLive>> {
         self.sessions
             .lock()
             .expect("live plane registry lock")

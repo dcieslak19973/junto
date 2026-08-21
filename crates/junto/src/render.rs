@@ -1248,7 +1248,7 @@ pub fn new_html(nav: &[ChannelSummary], substrates: &[std::path::PathBuf]) -> St
 /// The "/settings" page — machine-local preferences & status behind the
 /// sidebar's ⚙. Read-only for now: how the harness runs (protocol + backend,
 /// `docs/adr/0023`/`0024`), the registered substrates, and identity/about.
-pub fn settings_html(
+pub(crate) fn settings_html(
     nav: &[ChannelSummary],
     substrates: &[std::path::PathBuf],
     status: &crate::launch::HarnessStatus,
@@ -1328,7 +1328,7 @@ pub fn settings_html(
 /// a named config over a harness; it is what the launch picker offers. Each
 /// existing agent carries an inline edit form (in a `<details>`) and a delete
 /// button; a blank create form sits at the bottom, mirroring `/new`.
-pub fn agents_html(nav: &[ChannelSummary], agents: &[crate::agent::Agent]) -> String {
+pub(crate) fn agents_html(nav: &[ChannelSummary], agents: &[crate::agent::Agent]) -> String {
     let mut cards = String::new();
     for agent in agents {
         let harness_label = crate::launch::all_harnesses()
