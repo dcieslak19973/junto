@@ -29,6 +29,8 @@
 //! what the no-CRDT design promised. Forge capability flags (the Bitbucket
 //! `refs/heads/junto/*` fallback) remain deferred (`docs/adr/0009`).
 
+pub mod reanchor;
+
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::{Output, Stdio};
