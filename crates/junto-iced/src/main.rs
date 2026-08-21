@@ -895,7 +895,8 @@ impl App {
             }
             Message::RemoteChanged(pane, value) => {
                 if let Some(state) = self.panes.get_mut(pane) {
-                    state.remote = (!value.trim().is_empty()).then_some(value);
+                    let value = value.trim().to_string();
+                    state.remote = (!value.is_empty()).then_some(value);
                 }
                 Task::none()
             }
@@ -2076,7 +2077,7 @@ fn title_row(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
 /// this machine's `keys.toml`). Always visible, not just while watching a
 /// session — set before picking a session chip.
 fn remote_row(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
-    row![
+    let inputs = row![
         text("remote ▸").size(11).color(MUTED),
         text_input("host (blank = local)", pane.remote.as_deref().unwrap_or(""))
             .on_input(move |v| Message::RemoteChanged(id, v))
@@ -2090,8 +2091,20 @@ fn remote_row(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
             .width(Length::FillPortion(1)),
     ]
     .spacing(6)
-    .align_y(Center)
-    .into()
+    .align_y(Center);
+    let mut col = column![inputs].spacing(2);
+    // The live subscription's id is keyed on (session, stream_nonce) — not on
+    // these fields — so it keeps a keystroke from tearing down and
+    // reconnecting the socket on every character. The cost is that editing
+    // either field has no effect on an already-running watch.
+    if pane.streaming {
+        col = col.push(
+            text("applies on next watch — doesn't affect the running connection")
+                .size(10)
+                .color(MUTED),
+        );
+    }
+    col.into()
 }
 
 /// One channel pane as a bordered column (custom Columns layout).
@@ -3878,28 +3891,63 @@ fn live_ws_stream(
             return;
         };
         let url = ws_url(&base, &channel, &session);
-        let Ok((socket, _response)) = tokio_tungstenite::connect_async(&url).await else {
-            let _ = output.send(Message::LiveEnded(session)).await;
-            return;
+        let socket = match tokio_tungstenite::connect_async(&url).await {
+            Ok((socket, _response)) => socket,
+            Err(err) => {
+                let _ = output
+                    .send(Message::Live(
+                        session.clone(),
+                        error_event(format!("connect failed: {err}")),
+                    ))
+                    .await;
+                let _ = output.send(Message::LiveEnded(session)).await;
+                return;
+            }
         };
         let (mut write, mut read) = socket.split();
 
         // Handshake: Challenge → Auth → AuthOk (or Rejected/anything else).
-        let Some(Ok(WsMessage::Text(text))) = read.next().await else {
-            let _ = output.send(Message::LiveEnded(session)).await;
-            return;
-        };
-        let Ok(WireFrame::Challenge { nonce }) = serde_json::from_str::<WireFrame>(text.as_str())
-        else {
-            let _ = output.send(Message::LiveEnded(session)).await;
-            return;
+        let nonce = match read.next().await {
+            Some(Ok(WsMessage::Text(text))) => {
+                match serde_json::from_str::<WireFrame>(text.as_str()) {
+                    Ok(WireFrame::Challenge { nonce }) => nonce,
+                    _ => {
+                        let _ = output
+                            .send(Message::Live(
+                                session.clone(),
+                                error_event("handshake failed: expected a challenge".into()),
+                            ))
+                            .await;
+                        let _ = output.send(Message::LiveEnded(session)).await;
+                        return;
+                    }
+                }
+            }
+            _ => {
+                let _ = output
+                    .send(Message::Live(
+                        session.clone(),
+                        error_event(
+                            "handshake failed: connection closed before a challenge arrived".into(),
+                        ),
+                    ))
+                    .await;
+                let _ = output.send(Message::LiveEnded(session)).await;
+                return;
+            }
         };
         let signature = signing_key.sign_bytes(nonce.as_bytes());
         let auth = WireFrame::Auth {
             email: email.clone(),
             signature: signature.into(),
         };
-        if send_frame(&mut write, &auth).await.is_err() {
+        if let Err(err) = send_frame(&mut write, &auth).await {
+            let _ = output
+                .send(Message::Live(
+                    session.clone(),
+                    error_event(format!("failed to send auth: {err}")),
+                ))
+                .await;
             let _ = output.send(Message::LiveEnded(session)).await;
             return;
         }
@@ -3963,17 +4011,29 @@ fn live_ws_stream(
                                     if doc.import_update(&bytes).is_err() {
                                         continue;
                                     }
-                                    let events = doc.conversation_events();
+                                    let len = doc.conversation_len();
+                                    // The already-emitted last entry may have grown in
+                                    // place (the host's replace-in-place coalescing,
+                                    // `LiveDoc` module docs) — re-emit it if it
+                                    // changed, so the app's own seq-keyed coalescing
+                                    // lands the final text, not a stale mid-growth one.
                                     if emitted > 0
-                                        && let Some(current) = events.get(emitted - 1)
-                                        && Some(current) != last_seen.as_ref()
-                                        && let Ok(event) =
-                                            serde_json::from_value::<LiveEvent>(current.clone())
+                                        && let Some(current) = doc.conversation_event(emitted - 1)
+                                        && Some(&current) != last_seen.as_ref()
                                     {
-                                        let _ =
-                                            output.send(Message::Live(session.clone(), event)).await;
+                                        if let Ok(event) =
+                                            serde_json::from_value::<LiveEvent>(current.clone())
+                                        {
+                                            let _ = output
+                                                .send(Message::Live(session.clone(), event))
+                                                .await;
+                                        }
+                                        last_seen = Some(current);
                                     }
-                                    for value in events.iter().skip(emitted) {
+                                    for i in emitted..len {
+                                        let Some(value) = doc.conversation_event(i) else {
+                                            continue;
+                                        };
                                         if let Ok(event) =
                                             serde_json::from_value::<LiveEvent>(value.clone())
                                         {
@@ -3981,9 +4041,9 @@ fn live_ws_stream(
                                                 .send(Message::Live(session.clone(), event))
                                                 .await;
                                         }
+                                        last_seen = Some(value);
                                     }
-                                    emitted = events.len();
-                                    last_seen = events.last().cloned();
+                                    emitted = len;
                                 }
                                 WireFrame::Ephemeral { .. } => {
                                     let Some(bytes) = frame.ephemeral_bytes() else { continue };
@@ -4026,8 +4086,7 @@ fn live_ws_stream(
                         return;
                     }
                 }
-                outgoing = annotate_rx.next() => {
-                    let Some(frame) = outgoing else { continue };
+                Some(frame) = annotate_rx.next() => {
                     if send_frame(&mut write, &frame).await.is_err() {
                         let _ = output.send(Message::LiveEnded(session)).await;
                         return;

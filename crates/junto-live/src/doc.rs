@@ -191,6 +191,24 @@ impl LiveDoc {
             .collect()
     }
 
+    /// The single event at `index` in `conversation`, if present, parsed
+    /// back from the JSON text [`LiveDoc::push_conversation`] stored it as
+    /// — `None` for an out-of-range index or an entry that fails to parse
+    /// (same skip-not-error stance as [`LiveDoc::conversation_events`]).
+    ///
+    /// The point-read counterpart of [`LiveDoc::conversation_events`]: an
+    /// incremental watcher only ever needs the entries past its own
+    /// high-water mark plus a possibly-changed last one, not the whole
+    /// container re-parsed on every inbound update.
+    #[must_use]
+    pub fn conversation_event(&self, index: usize) -> Option<serde_json::Value> {
+        let item = self.doc.get_movable_list(CONVERSATION).get(index)?;
+        let LoroValue::String(text) = item.into_value().ok()? else {
+            return None;
+        };
+        serde_json::from_str(&text).ok()
+    }
+
     /// Number of events pushed to `worktree` so far.
     #[must_use]
     pub fn worktree_len(&self) -> usize {
@@ -534,6 +552,39 @@ mod tests {
                 serde_json::json!({"seq": 2, "text": "there"}),
             ],
             "malformed entries are skipped, not errored, and order is preserved"
+        );
+    }
+
+    #[test]
+    fn conversation_event_point_reads_by_index_and_skips_malformed() {
+        let live = LiveDoc::new();
+        live.push_conversation(&serde_json::json!({"seq": 1, "text": "hi"}));
+        live.push_conversation(&serde_json::json!({"seq": 2, "text": "there"}));
+        // Same directly-through-the-private-field technique as
+        // `conversation_events_reads_back_in_order_and_skips_malformed`.
+        live.doc
+            .get_movable_list(CONVERSATION)
+            .push("not json at all")
+            .unwrap();
+        live.doc.commit();
+
+        assert_eq!(
+            live.conversation_event(0),
+            Some(serde_json::json!({"seq": 1, "text": "hi"}))
+        );
+        assert_eq!(
+            live.conversation_event(1),
+            Some(serde_json::json!({"seq": 2, "text": "there"}))
+        );
+        assert_eq!(
+            live.conversation_event(2),
+            None,
+            "a malformed entry is skipped, not errored"
+        );
+        assert_eq!(
+            live.conversation_event(99),
+            None,
+            "an out-of-range index is None, not a panic"
         );
     }
 

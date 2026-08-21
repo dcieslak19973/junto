@@ -24,7 +24,10 @@ open = "5"
 # the signing-key/keys.toml plumbing. Pinned to 0.29 — the version the host
 # side (`crates/junto`) resolves to via axum's `ws` feature; 0.24 was tried
 # first and produced a duplicate-version resolution, so this pin is load-bearing.
-tokio-tungstenite = "0.29"
+# `rustls-tls-webpki-roots` matches reqwest's own `rustls-tls` feature above
+# (which expands to the same webpki-roots + ring pairing) — without it,
+# `wss://` (an https-fronted remote host) fails to connect at all.
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 # `iced`'s own "tokio" feature already runs the app on a tokio runtime and
 # pulls the `tokio` crate in transitively (also required by
 # `tokio-tungstenite`'s "connect" feature) — named directly here only for
@@ -33,7 +36,6 @@ tokio = { version = "1", default-features = false, features = ["time", "macros"]
 junto-kernel = { path = "../junto-kernel" }
 junto-live = { path = "../junto-live" }
 toml = "0.9"
-base64 = "0.22"
 
 [workspace]
 # standalone — see the header comment
