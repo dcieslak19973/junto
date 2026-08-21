@@ -346,20 +346,13 @@ impl<S: SubstrateProvider> Ledger<S> {
             Some(founder) => Self::project_keyring(&entries, &founder.email),
             None => Keyring::new(),
         };
-        // The membership check is set-based, not temporal (`docs/adr/0017`):
-        // an entry counts iff its author is in the Party, wherever the grant
-        // falls in canonical order. No genesis ⇒ no Party ⇒ no enforcement.
-        let unrecognized: HashSet<EntryId> = if party.is_empty() {
-            HashSet::new()
-        } else {
-            let member_emails: HashSet<&str> =
-                party.iter().map(|member| member.email.as_str()).collect();
-            entries
-                .iter()
-                .filter(|entry| !member_emails.contains(entry.author.email.as_str()))
-                .map(|entry| entry.id)
-                .collect()
-        };
+        // Membership is set-based, not temporal (`docs/adr/0017`): an
+        // entry's author being in the Party does not depend on where the
+        // granting entry falls in canonical order. But membership alone is
+        // no longer sufficient — a revoked member's post-cutoff entries
+        // stop counting even though they remain in the Party
+        // (`docs/adr/0035`, Task 3; see `Self::project_unrecognized`).
+        let unrecognized = Self::project_unrecognized(&party, &keyring, &entries);
         let recognized: Vec<&LedgerEntry> = entries
             .iter()
             .filter(|entry| !unrecognized.contains(&entry.id))
@@ -550,6 +543,71 @@ impl<S: SubstrateProvider> Ledger<S> {
         }
 
         keyring
+    }
+
+    /// Fold which entries are **unrecognized** out of an ordered entry list
+    /// (`docs/adr/0017`, amended by `docs/adr/0035`, Task 3): an entry
+    /// counts iff its author is in the Party — set-based, not temporal,
+    /// wherever the grant falls in canonical order — **and** its author
+    /// has not been revoked as of the entry's own `timestamp`. No genesis
+    /// ⇒ empty Party ⇒ no enforcement.
+    ///
+    /// Revocation is derived from the keyring, never from Party
+    /// membership: the member is **never** removed from
+    /// [`ChannelView::party`] here, or anywhere — doing so would mark
+    /// every entry that author ever wrote unrecognized and erase their
+    /// history from every downstream projection. Instead, for each email
+    /// with at least one grant: if *every* grant for it is retired, the
+    /// email's cutoff is the *earliest* [`KeyGrant::retired_at`] among
+    /// them; if any grant is still active, there is no cutoff — partial
+    /// retirement (one lost device among several) must not offboard the
+    /// person. An email with no grant at all (a keyless member) likewise
+    /// has no cutoff: there is nothing for a founder to park, so this
+    /// mechanism cannot revoke them. An entry from a cutoff email is
+    /// unrecognized iff its `timestamp` is *strictly after* the cutoff —
+    /// mirroring [`KeyGrant::active_at`]'s inclusive boundary, an entry
+    /// stamped exactly at the cutoff still counts, and nothing stamped at
+    /// or before it is rewritten.
+    ///
+    /// This closes the gap [`Self::project_unverified`] leaves open on its
+    /// own: an unverified entry is still *recognized*, so it still carries
+    /// standings, closes gates, and appears in sessions and lineage.
+    /// Retiring every one of a member's keys would, without this, leave
+    /// them merely flagged rather than actually offboarded.
+    fn project_unrecognized(
+        party: &[Member],
+        keyring: &Keyring,
+        entries: &[LedgerEntry],
+    ) -> HashSet<EntryId> {
+        if party.is_empty() {
+            return HashSet::new();
+        }
+        let member_emails: HashSet<&str> =
+            party.iter().map(|member| member.email.as_str()).collect();
+        let cutoffs: HashMap<&str, Timestamp> = keyring
+            .iter()
+            .filter_map(|(email, grants)| {
+                if grants.is_empty() || grants.iter().any(|grant| grant.retired_at.is_none()) {
+                    return None;
+                }
+                let cutoff = grants
+                    .iter()
+                    .filter_map(|grant| grant.retired_at)
+                    .min()
+                    .expect("checked non-empty and all-retired above");
+                Some((email.as_str(), cutoff))
+            })
+            .collect();
+        entries
+            .iter()
+            .filter(|entry| {
+                !member_emails.contains(entry.author.email.as_str())
+                    || cutoffs
+                        .get(entry.author.email.as_str())
+                        .is_some_and(|&cutoff| entry.timestamp > cutoff)
+            })
+            .map(|entry| entry.id)
+            .collect()
     }
 
     /// Which recognized entries fail authorship verification
@@ -1215,10 +1273,18 @@ mod tests {
     /// exactly the park's own timestamp (`KeyGrant::active_at` is
     /// inclusive at the boundary), and fails to verify only once stamped
     /// strictly after it. Retiring a device does not rewrite history.
+    ///
+    /// The agent carries a *second*, never-parked device so the person as
+    /// a whole is never fully revoked (`docs/adr/0035`, Task 3) — with one
+    /// grant still active there is no cutoff (decision: partial retirement
+    /// must not offboard the person), which keeps this test isolated to
+    /// the verification-layer boundary it is named for, rather than
+    /// entries silently moving from `unverified` to `unrecognized`.
     #[tokio::test]
     async fn a_retired_grant_verifies_before_its_park_and_not_after() {
         let founder_key = crate::SigningKey::from_secret_bytes([1; 32]);
         let agent_key = crate::SigningKey::from_secret_bytes([2; 32]);
+        let agent_key2 = crate::SigningKey::from_secret_bytes([3; 32]);
         let dan = Member::human("Dan", "dan@example.com").with_key(founder_key.public_key());
         let agent = Member::agent("Worker", "worker@agents.junto").with_key(agent_key.public_key());
         let mut ledger = Ledger::new(InMemorySubstrate::new());
@@ -1245,12 +1311,25 @@ mod tests {
         );
         grant.sign(&founder_key).unwrap();
 
+        // A second device, never parked, so the person keeps an active
+        // grant throughout — no revocation cutoff applies to them.
+        let mut second_device = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            3,
+            EntryPayload::MemberAdded {
+                member: agent.clone().with_key(agent_key2.public_key()),
+            },
+        );
+        second_device.sign(&founder_key).unwrap();
+
         let before_id = EntryId::new();
         let mut before = entry(
             before_id,
             channel,
             agent.clone(),
-            3,
+            4,
             assertion("before park"),
         );
         before.sign(&agent_key).unwrap();
@@ -1259,7 +1338,7 @@ mod tests {
             EntryId::new(),
             channel,
             dan.clone(),
-            4,
+            5,
             EntryPayload::Park {
                 target: grant_id,
                 rationale: "device lost".into(),
@@ -1267,14 +1346,14 @@ mod tests {
         );
 
         let at_park_id = EntryId::new();
-        let mut at_park = entry(at_park_id, channel, agent.clone(), 4, assertion("at park"));
+        let mut at_park = entry(at_park_id, channel, agent.clone(), 5, assertion("at park"));
         at_park.sign(&agent_key).unwrap();
 
         let after_id = EntryId::new();
-        let mut after = entry(after_id, channel, agent.clone(), 5, assertion("after park"));
+        let mut after = entry(after_id, channel, agent.clone(), 6, assertion("after park"));
         after.sign(&agent_key).unwrap();
 
-        for e in [genesis, grant, before, park, at_park, after] {
+        for e in [genesis, grant, second_device, before, park, at_park, after] {
             ledger.append(e).await.unwrap();
         }
 
@@ -1285,7 +1364,7 @@ mod tests {
             .expect("agent has a grant");
         assert_eq!(
             grants[0].retired_at,
-            Some(Timestamp::from_millis(4)),
+            Some(Timestamp::from_millis(5)),
             "the grant is retired at the park's own timestamp"
         );
         assert!(
@@ -1376,10 +1455,18 @@ mod tests {
     /// (ts 6) instead of the earlier one (ts 4), and an entry stamped at ts
     /// 5 — after the earlier park but before the later one — would wrongly
     /// still verify.
+    ///
+    /// The agent carries a *second*, never-parked device so the person as
+    /// a whole is never fully revoked (`docs/adr/0035`, Task 3) — with one
+    /// grant still active there is no cutoff, which keeps this test
+    /// isolated to the verification-layer earliest-wins fold it is named
+    /// for, rather than `between_id` moving from `unverified` to
+    /// `unrecognized`.
     #[tokio::test]
     async fn earliest_park_wins_when_two_target_the_same_grant() {
         let founder_key = crate::SigningKey::from_secret_bytes([1; 32]);
         let agent_key = crate::SigningKey::from_secret_bytes([2; 32]);
+        let agent_key2 = crate::SigningKey::from_secret_bytes([3; 32]);
         let dan = Member::human("Dan", "dan@example.com").with_key(founder_key.public_key());
         let agent = Member::agent("Worker", "worker@agents.junto").with_key(agent_key.public_key());
         let mut ledger = Ledger::new(InMemorySubstrate::new());
@@ -1405,6 +1492,19 @@ mod tests {
             },
         );
         grant.sign(&founder_key).unwrap();
+
+        // A second device, never parked, so the person keeps an active
+        // grant throughout — no revocation cutoff applies to them.
+        let mut second_device = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            3,
+            EntryPayload::MemberAdded {
+                member: agent.clone().with_key(agent_key2.public_key()),
+            },
+        );
+        second_device.sign(&founder_key).unwrap();
 
         let earlier_park = entry(
             EntryId::new(),
@@ -1433,7 +1533,14 @@ mod tests {
         let mut between = entry(between_id, channel, agent.clone(), 5, assertion("between"));
         between.sign(&agent_key).unwrap();
 
-        for e in [genesis, grant, earlier_park, later_park, between] {
+        for e in [
+            genesis,
+            grant,
+            second_device,
+            earlier_park,
+            later_park,
+            between,
+        ] {
             ledger.append(e).await.unwrap();
         }
 
@@ -2991,5 +3098,358 @@ mod tests {
         assert!(view.party.is_empty());
         assert!(view.unrecognized.is_empty());
         assert_eq!(view.standing(&claim), Some(Standing::Provisional));
+    }
+
+    /// Task 3 (`docs/adr/0035`) — retiring a member's only key must stop
+    /// their later entries from *counting*, not just from verifying: an
+    /// entry stamped strictly after the retirement of the author's last
+    /// active grant is unrecognized, mirroring `KeyGrant::active_at`'s
+    /// inclusive boundary (at-or-before the park still counts).
+    #[tokio::test]
+    async fn revoked_members_post_cutoff_entries_are_unrecognized() {
+        let founder_key = crate::SigningKey::from_secret_bytes([1; 32]);
+        let agent_key = crate::SigningKey::from_secret_bytes([2; 32]);
+        let dan = Member::human("Dan", "dan@example.com").with_key(founder_key.public_key());
+        let agent = Member::agent("Worker", "worker@agents.junto").with_key(agent_key.public_key());
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+
+        let genesis_entry = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            1,
+            EntryPayload::ChannelOpened { name: "ch".into() },
+        );
+        let grant_id = EntryId::new();
+        let grant = entry(
+            grant_id,
+            channel,
+            dan.clone(),
+            2,
+            EntryPayload::MemberAdded {
+                member: agent.clone(),
+            },
+        );
+        let before_id = EntryId::new();
+        let before = entry(
+            before_id,
+            channel,
+            agent.clone(),
+            3,
+            assertion("before cutoff"),
+        );
+        let park = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            4,
+            EntryPayload::Park {
+                target: grant_id,
+                rationale: "device lost".into(),
+            },
+        );
+        let after_id = EntryId::new();
+        let after = entry(
+            after_id,
+            channel,
+            agent.clone(),
+            5,
+            assertion("after cutoff"),
+        );
+
+        for e in [genesis_entry, grant, before, park, after] {
+            ledger.append(e).await.unwrap();
+        }
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert!(
+            !view.unrecognized.contains(&before_id),
+            "stamped before the cutoff, still counts"
+        );
+        assert!(
+            view.unrecognized.contains(&after_id),
+            "stamped after the cutoff, no longer counts"
+        );
+    }
+
+    /// Task 3 (`docs/adr/0035`) — the strongest guard: revoking a member
+    /// must not rewrite the history they already made. An assertion they
+    /// wrote before the cutoff keeps its standing, and a ratification they
+    /// gave before the cutoff still resolves its target, even though by the
+    /// time the projection is built the author is fully revoked.
+    #[tokio::test]
+    async fn a_revoked_members_pre_cutoff_contributions_still_count() {
+        let founder_key = crate::SigningKey::from_secret_bytes([1; 32]);
+        let agent_key = crate::SigningKey::from_secret_bytes([2; 32]);
+        let dan = Member::human("Dan", "dan@example.com").with_key(founder_key.public_key());
+        let agent = Member::agent("Worker", "worker@agents.junto").with_key(agent_key.public_key());
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+
+        let genesis_entry = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            1,
+            EntryPayload::ChannelOpened { name: "ch".into() },
+        );
+        let grant_id = EntryId::new();
+        let grant = entry(
+            grant_id,
+            channel,
+            dan.clone(),
+            2,
+            EntryPayload::MemberAdded {
+                member: agent.clone(),
+            },
+        );
+        let agent_claim_id = EntryId::new();
+        let agent_claim = entry(
+            agent_claim_id,
+            channel,
+            agent.clone(),
+            3,
+            assertion("agent's own claim"),
+        );
+        let claim_id = EntryId::new();
+        let claim = entry(
+            claim_id,
+            channel,
+            dan.clone(),
+            4,
+            assertion("needs ratification"),
+        );
+        let ratification_id = EntryId::new();
+        let ratification = entry(
+            ratification_id,
+            channel,
+            agent.clone(),
+            5,
+            EntryPayload::Ratification {
+                target: claim_id,
+                rationale: "looks right".into(),
+            },
+        );
+        let park = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            6,
+            EntryPayload::Park {
+                target: grant_id,
+                rationale: "offboarded".into(),
+            },
+        );
+
+        for e in [genesis_entry, grant, agent_claim, claim, ratification, park] {
+            ledger.append(e).await.unwrap();
+        }
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert!(
+            !view.unrecognized.contains(&agent_claim_id),
+            "an assertion made before the cutoff keeps counting"
+        );
+        assert_eq!(
+            view.standing(&agent_claim_id),
+            Some(Standing::Provisional),
+            "and keeps its standing"
+        );
+        assert!(
+            !view.unrecognized.contains(&ratification_id),
+            "a ratification given before the cutoff still counts"
+        );
+        assert_eq!(
+            view.standing(&claim_id),
+            Some(Standing::Ratified),
+            "and still resolves its target — revocation did not rewrite history"
+        );
+    }
+
+    /// Task 3 (`docs/adr/0035`) — two grants, one retired: retiring one
+    /// device must not offboard the person. With an active grant remaining
+    /// there is no cutoff, so entries stamped long after the partial
+    /// retirement still count.
+    #[tokio::test]
+    async fn a_partially_retired_member_is_not_revoked() {
+        let founder_key = crate::SigningKey::from_secret_bytes([1; 32]);
+        let k1 = crate::SigningKey::from_secret_bytes([2; 32]);
+        let k2 = crate::SigningKey::from_secret_bytes([3; 32]);
+        let dan = Member::human("Dan", "dan@example.com").with_key(founder_key.public_key());
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+
+        let genesis_entry = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            1,
+            EntryPayload::ChannelOpened { name: "ch".into() },
+        );
+        let member = Member::human("Mia", "mia@example.com");
+        let device1_id = EntryId::new();
+        let device1 = entry(
+            device1_id,
+            channel,
+            dan.clone(),
+            2,
+            EntryPayload::MemberAdded {
+                member: member.clone().with_key(k1.public_key()),
+            },
+        );
+        let device2 = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            3,
+            EntryPayload::MemberAdded {
+                member: member.clone().with_key(k2.public_key()),
+            },
+        );
+        let park_device1 = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            4,
+            EntryPayload::Park {
+                target: device1_id,
+                rationale: "lost device 1".into(),
+            },
+        );
+        let later_id = EntryId::new();
+        let later = entry(
+            later_id,
+            channel,
+            member.clone(),
+            100,
+            assertion("long after the partial retirement"),
+        );
+
+        for e in [genesis_entry, device1, device2, park_device1, later] {
+            ledger.append(e).await.unwrap();
+        }
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert!(
+            !view.unrecognized.contains(&later_id),
+            "one retired device must not offboard the person"
+        );
+    }
+
+    /// Task 3 (`docs/adr/0035`) — regression guard on `docs/adr/0017` for
+    /// everyone who is *not* revoked: with no founder-authored `Park`
+    /// against any of their grants, recognition stays purely set-based —
+    /// membership, not timing, still decides. Neither clock skew before the
+    /// grant nor a much later timestamp introduces a cutoff.
+    #[tokio::test]
+    async fn an_unrevoked_members_recognition_is_still_set_based() {
+        let founder_key = crate::SigningKey::from_secret_bytes([1; 32]);
+        let agent_key = crate::SigningKey::from_secret_bytes([2; 32]);
+        let dan = Member::human("Dan", "dan@example.com").with_key(founder_key.public_key());
+        let agent = Member::agent("Worker", "worker@agents.junto").with_key(agent_key.public_key());
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+
+        let early_id = EntryId::new();
+        let early = entry(
+            early_id,
+            channel,
+            agent.clone(),
+            1,
+            assertion("written before the grant"),
+        );
+        let genesis_entry = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            2,
+            EntryPayload::ChannelOpened { name: "ch".into() },
+        );
+        let grant = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            3,
+            EntryPayload::MemberAdded {
+                member: agent.clone(),
+            },
+        );
+        let late_id = EntryId::new();
+        let late = entry(
+            late_id,
+            channel,
+            agent.clone(),
+            1000,
+            assertion("much later, still no cutoff"),
+        );
+
+        for e in [early, genesis_entry, grant, late] {
+            ledger.append(e).await.unwrap();
+        }
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert!(
+            !view.unrecognized.contains(&early_id),
+            "clock skew before the grant still counts (docs/adr/0017)"
+        );
+        assert!(
+            !view.unrecognized.contains(&late_id),
+            "an active, never-parked grant imposes no cutoff"
+        );
+    }
+
+    /// Task 3 (`docs/adr/0035`) — the rejected alternative, pinned so
+    /// nobody "fixes" this later: recognition is party-set membership, so
+    /// removing a revoked member from the party would mark every entry
+    /// they ever authored unrecognized and erase their history from every
+    /// downstream projection. Revocation retires keys; it never touches
+    /// the roster.
+    #[tokio::test]
+    async fn a_revoked_member_remains_in_the_party() {
+        let founder_key = crate::SigningKey::from_secret_bytes([1; 32]);
+        let agent_key = crate::SigningKey::from_secret_bytes([2; 32]);
+        let dan = Member::human("Dan", "dan@example.com").with_key(founder_key.public_key());
+        let agent = Member::agent("Worker", "worker@agents.junto").with_key(agent_key.public_key());
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+
+        let genesis_entry = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            1,
+            EntryPayload::ChannelOpened { name: "ch".into() },
+        );
+        let grant_id = EntryId::new();
+        let grant = entry(
+            grant_id,
+            channel,
+            dan.clone(),
+            2,
+            EntryPayload::MemberAdded {
+                member: agent.clone(),
+            },
+        );
+        let park = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            3,
+            EntryPayload::Park {
+                target: grant_id,
+                rationale: "offboarded".into(),
+            },
+        );
+
+        for e in [genesis_entry, grant, park] {
+            ledger.append(e).await.unwrap();
+        }
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert!(
+            view.party.iter().any(|m| m.email == "worker@agents.junto"),
+            "revocation retires keys; it must never remove the member from the party"
+        );
     }
 }
