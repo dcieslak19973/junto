@@ -39,32 +39,125 @@ use crate::launch::NotLive;
 /// and, from there, verbatim into the DURABLE ledger: [`deliver_batch`] ->
 /// `crate::launch::steer_live` -> `record_steer_note` -> `append` writes
 /// `SessionUpdated { note: format!("steer: {message}") }` to
-/// `refs/junto/*`. Nothing else bounds this: not the composer, not
-/// `validate_annotation_update` (only the 8 MiB websocket frame limit
-/// does, and only per *frame*, not per body) — so this is the one path in
-/// the branch by which a remote peer's own bytes reach an unbounded,
-/// immutable, permanently-synced-to-every-remote entry with no delete
-/// (IMPORTANT 3 of the final branch review). 4 KiB is generous for real
-/// prose (several long paragraphs) while keeping one oversized or
-/// malicious comment from becoming a multi-megabyte permanent record.
+/// `refs/junto/*`. Nothing in `validate_annotation_update` bounds this
+/// field (only the 8 MiB websocket frame limit does, and only per
+/// *frame*, not per body). 4 KiB is generous for real prose (several long
+/// paragraphs) while keeping one oversized or malicious comment's `body`
+/// from dominating the record.
+///
+/// `body` is only ONE of the inputs [`format_steer`] renders into that
+/// same durable string. This cap alone does NOT make the rendered message
+/// bounded — that overclaim is what the final branch review's residual
+/// caught (IMPORTANT 3): [`MAX_ANNOTATION_EXCERPT_BYTES`] bounds the
+/// sibling excerpt fields on the same path, and
+/// [`MAX_STEER_MESSAGE_BYTES`] bounds the whole rendered batch. Only all
+/// three together make the guarantee true.
 const MAX_ANNOTATION_BODY_BYTES: usize = 4096;
 
-/// `body`, truncated to at most [`MAX_ANNOTATION_BODY_BYTES`] (respecting
-/// UTF-8 character boundaries) with an explicit marker appended when it
-/// was — a truncated comment must never silently read as complete.
-fn capped_body(body: &str) -> std::borrow::Cow<'_, str> {
-    if body.len() <= MAX_ANNOTATION_BODY_BYTES {
-        return std::borrow::Cow::Borrowed(body);
+/// Hard cap, independent of [`MAX_ANNOTATION_BODY_BYTES`], on any single
+/// remote-supplied excerpt quoted into the steer message. [`format_steer`]
+/// applies this uniformly to whichever excerpt source it ends up quoting:
+/// `annotation.excerpt` (attacker-signed, on the same struct as `body`,
+/// travelling the exact same path to the ledger) or the host-resolved
+/// stream excerpt from [`resolve_stream_excerpt`] (the watcher picks the
+/// index; the host supplies the referenced conversation event's own text,
+/// which can itself be arbitrarily large — a remote-chosen index reaching
+/// into host-side data is not "just metadata"). 2 KiB is generous for
+/// quoted supporting context — an excerpt is not the message itself —
+/// while keeping either source from reaching the ledger unbounded.
+const MAX_ANNOTATION_EXCERPT_BYTES: usize = 2048;
+
+/// Hard cap on the TOTAL bytes of one rendered steer message.
+/// [`MAX_ANNOTATION_BODY_BYTES`] and [`MAX_ANNOTATION_EXCERPT_BYTES`]
+/// bound a single annotation's contribution, but [`deliver_batch`] renders
+/// an entire batch into ONE ledger note, and an accepted (already
+/// individually-legal) 8 MiB websocket frame can still carry an unbounded
+/// NUMBER of annotations — roughly 2000 individually-legal 4 KiB bodies in
+/// one frame would otherwise still produce one multi-megabyte immutable
+/// ledger entry, because nothing bounded the *batch*, only each annotation
+/// inside it. 16 KiB keeps a genuinely busy review's worth of comments in
+/// one steer message while keeping the ledger entry itself finite
+/// regardless of batch size. See [`assemble_batch`] for how blocks beyond
+/// the budget are withheld from THIS message — never dropped, since they
+/// are already durable in the `LiveDoc`.
+const MAX_STEER_MESSAGE_BYTES: usize = 16384;
+
+/// Shared truncation: cut `value` to at most `max` bytes on a UTF-8 char
+/// boundary and append an explicit marker naming what was cut. A silently
+/// shortened comment is worse than a visibly truncated one — the agent
+/// must always be able to tell.
+fn truncate_with_marker(value: &str, max: usize) -> std::borrow::Cow<'_, str> {
+    if value.len() <= max {
+        return std::borrow::Cow::Borrowed(value);
     }
-    let mut end = MAX_ANNOTATION_BODY_BYTES;
-    while !body.is_char_boundary(end) {
+    let mut end = max;
+    while !value.is_char_boundary(end) {
         end -= 1;
     }
     std::borrow::Cow::Owned(format!(
         "{}\n…[truncated: {end} of {} bytes shown]",
-        &body[..end],
-        body.len()
+        &value[..end],
+        value.len()
     ))
+}
+
+/// `body`, truncated to at most [`MAX_ANNOTATION_BODY_BYTES`] — see
+/// [`truncate_with_marker`].
+fn capped_body(body: &str) -> std::borrow::Cow<'_, str> {
+    truncate_with_marker(body, MAX_ANNOTATION_BODY_BYTES)
+}
+
+/// An excerpt (`annotation.excerpt` or a resolved stream excerpt),
+/// truncated to at most [`MAX_ANNOTATION_EXCERPT_BYTES`] — see
+/// [`truncate_with_marker`]. Applied by [`format_steer`] to whichever
+/// source it ends up quoting, so neither can smuggle an unbounded quote
+/// block into the ledger note under cover of "just the excerpt".
+fn capped_excerpt(excerpt: &str) -> std::borrow::Cow<'_, str> {
+    truncate_with_marker(excerpt, MAX_ANNOTATION_EXCERPT_BYTES)
+}
+
+/// Assemble already-rendered, in-order per-annotation `blocks` (each one
+/// already bounded by [`MAX_ANNOTATION_BODY_BYTES`] /
+/// [`MAX_ANNOTATION_EXCERPT_BYTES`] before it ever reaches this function)
+/// into one steer message capped at [`MAX_STEER_MESSAGE_BYTES`] total.
+///
+/// Renders whole blocks, in order, until adding the next one would exceed
+/// the budget, then stops — a block is never partially rendered here. The
+/// FIRST block always renders in full regardless of its own size: a batch
+/// must never render as nothing but a withheld-count, and in practice a
+/// lone block's own field caps have already bounded it (their sum is well
+/// under this budget), so letting it through here unconditionally keeps
+/// the message finite either way.
+///
+/// Any blocks left over are never silently lost: they are already durable
+/// in the session's `LiveDoc` and, at turn end, in that turn's archived
+/// `turn-<n>-live.loro` snapshot artifact (see
+/// `crate::launch::archive_live_snapshot`) — only THIS steer message is
+/// bounded, not the record of the annotations themselves. The withheld
+/// count and that fact are both stated in an explicit trailing line.
+fn assemble_batch(blocks: Vec<String>) -> String {
+    let mut out = String::new();
+    let mut included = 0usize;
+    for (i, block) in blocks.iter().enumerate() {
+        if i > 0 {
+            let projected = out.len() + 1 + block.len();
+            if projected > MAX_STEER_MESSAGE_BYTES {
+                break;
+            }
+            out.push('\n');
+        }
+        out.push_str(block);
+        included += 1;
+    }
+    let withheld = blocks.len() - included;
+    if withheld > 0 {
+        out.push_str(&format!(
+            "\n[{withheld} further comment(s) withheld from this steer message to stay \
+             within the {MAX_STEER_MESSAGE_BYTES}-byte budget — not lost: they remain in \
+             the live document and its archived turn-<n>-live.loro artifact.]\n"
+        ));
+    }
+    out
 }
 
 /// Resolve a [`junto_kernel::StreamAnchor`]'s `op_id` back to the
@@ -113,81 +206,95 @@ fn resolve_stream_excerpt(live_doc: Option<&LiveDoc>, op_id: &str) -> Option<Str
 /// rather than pointing at a line range that no longer corresponds to
 /// anything the watcher commented on; an unresolvable stream anchor says so
 /// plainly too, rather than emitting a bare, meaningless event number.
+///
+/// Whichever excerpt wins is capped by [`capped_excerpt`] and `body` by
+/// [`capped_body`] before either reaches the block; the finished blocks are
+/// then handed to [`assemble_batch`], which bounds the WHOLE rendered
+/// batch at [`MAX_STEER_MESSAGE_BYTES`] — the three caps together are what
+/// keep this function's output finite, not any one of them alone.
 pub(crate) fn format_steer(
     annotations: &[Annotation],
     reanchored: &[Option<Reanchor>],
     live_doc: Option<&LiveDoc>,
 ) -> String {
-    let mut out = String::new();
-    for (i, annotation) in annotations.iter().enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        let current = reanchored.get(i).copied().flatten();
-        // Resolved once per annotation: it doubles as the location note
-        // (whether the referenced event could be found at all) and, absent
-        // a pinned `excerpt`, as the excerpt itself.
-        let stream_excerpt = match &annotation.anchor {
-            Anchor::Stream(stream) => resolve_stream_excerpt(live_doc, &stream.op_id),
-            Anchor::Code(_) => None,
-        };
-        let location = match &annotation.anchor {
-            Anchor::Code(code) => {
-                let pinned = format!("{}:{}-{}", code.path, code.span.start, code.span.end);
-                match current {
-                    None | Some(Reanchor::Exact { .. }) => pinned,
-                    Some(Reanchor::Moved { span }) => {
-                        format!("{pinned} (moved to {}-{})", span.start, span.end)
+    let blocks: Vec<String> = annotations
+        .iter()
+        .enumerate()
+        .map(|(i, annotation)| {
+            let mut block = String::new();
+            let current = reanchored.get(i).copied().flatten();
+            // Resolved once per annotation: it doubles as the location note
+            // (whether the referenced event could be found at all) and, absent
+            // a pinned `excerpt`, as the excerpt itself.
+            let stream_excerpt = match &annotation.anchor {
+                Anchor::Stream(stream) => resolve_stream_excerpt(live_doc, &stream.op_id),
+                Anchor::Code(_) => None,
+            };
+            let location = match &annotation.anchor {
+                Anchor::Code(code) => {
+                    let pinned = format!("{}:{}-{}", code.path, code.span.start, code.span.end);
+                    match current {
+                        None | Some(Reanchor::Exact { .. }) => pinned,
+                        Some(Reanchor::Moved { span }) => {
+                            format!("{pinned} (moved to {}-{})", span.start, span.end)
+                        }
+                        Some(Reanchor::Orphaned) => format!(
+                            "{pinned} (code has changed since — excerpt shows the commented version)"
+                        ),
                     }
-                    Some(Reanchor::Orphaned) => format!(
-                        "{pinned} (code has changed since — excerpt shows the commented version)"
-                    ),
+                }
+                // LiveDoc op ids are stable by construction (CRDT positions
+                // don't drift the way line numbers do), so a stream anchor has
+                // no re-anchored *position* to report — but the referenced
+                // event itself can still fail to resolve (unparseable `op_id`,
+                // no `LiveDoc` in hand, or an out-of-range index), and that
+                // must be said plainly rather than left implicit in a bare
+                // number the agent has no way to act on.
+                Anchor::Stream(stream) if stream_excerpt.is_some() => {
+                    format!("on conversation event {}", stream.op_id)
+                }
+                Anchor::Stream(stream) => format!(
+                    "on conversation event {} (could not resolve — the event is unavailable)",
+                    stream.op_id
+                ),
+            };
+            let on = if matches!(annotation.anchor, Anchor::Stream(_)) {
+                location
+            } else {
+                format!("on {location}")
+            };
+            block.push_str(&format!(
+                "[watcher comment — {} {on}]\n",
+                annotation.author.email
+            ));
+            // The annotation's own pinned excerpt wins when present — it
+            // travels with the comment because the current file content may no
+            // longer match what the watcher was actually looking at. A
+            // resolved stream event is the fallback, not a replacement. Either
+            // way it is capped by `capped_excerpt` — a remote peer's pinned
+            // excerpt and a host-resolved event's text are equally capable of
+            // being unbounded.
+            let excerpt = annotation.excerpt.as_deref().or(stream_excerpt.as_deref());
+            if let Some(excerpt) = excerpt {
+                let excerpt = capped_excerpt(excerpt);
+                // Every line quoted, not just the first: a `CodeAnchor`'s span
+                // is a line *range* (the excerpt is normally multi-line), and
+                // an unmarked line reads to the model as the start of the
+                // comment body rather than still-quoted code. This also quotes
+                // a truncation marker's own line when one was appended, which
+                // is correct: it is part of the excerpt block being shown.
+                for line in excerpt.lines() {
+                    block.push_str("> ");
+                    block.push_str(line);
+                    block.push('\n');
                 }
             }
-            // LiveDoc op ids are stable by construction (CRDT positions
-            // don't drift the way line numbers do), so a stream anchor has
-            // no re-anchored *position* to report — but the referenced
-            // event itself can still fail to resolve (unparseable `op_id`,
-            // no `LiveDoc` in hand, or an out-of-range index), and that
-            // must be said plainly rather than left implicit in a bare
-            // number the agent has no way to act on.
-            Anchor::Stream(stream) if stream_excerpt.is_some() => {
-                format!("on conversation event {}", stream.op_id)
-            }
-            Anchor::Stream(stream) => format!(
-                "on conversation event {} (could not resolve — the event is unavailable)",
-                stream.op_id
-            ),
-        };
-        let on = if matches!(annotation.anchor, Anchor::Stream(_)) {
-            location
-        } else {
-            format!("on {location}")
-        };
-        out.push_str(&format!(
-            "[watcher comment — {} {on}]\n",
-            annotation.author.email
-        ));
-        // The annotation's own pinned excerpt wins when present — it
-        // travels with the comment because the current file content may no
-        // longer match what the watcher was actually looking at. A
-        // resolved stream event is the fallback, not a replacement.
-        let excerpt = annotation.excerpt.as_deref().or(stream_excerpt.as_deref());
-        if let Some(excerpt) = excerpt {
-            // Every line quoted, not just the first: a `CodeAnchor`'s span
-            // is a line *range* (the excerpt is normally multi-line), and
-            // an unmarked line reads to the model as the start of the
-            // comment body rather than still-quoted code.
-            for line in excerpt.lines() {
-                out.push_str("> ");
-                out.push_str(line);
-                out.push('\n');
-            }
-        }
-        out.push_str(&capped_body(&annotation.body));
-        out.push('\n');
-    }
-    out
+            block.push_str(&capped_body(&annotation.body));
+            block.push('\n');
+            block
+        })
+        .collect();
+    assemble_batch(blocks)
 }
 
 /// Re-anchor each of `annotations`' [`Anchor::Code`] anchors against
@@ -610,6 +717,33 @@ mod tests {
     }
 
     #[test]
+    fn oversized_excerpt_is_truncated_with_a_marker() {
+        // Residual from the final branch review: `annotation.excerpt` is a
+        // remote-supplied, attacker-signed field on the same struct as
+        // `body`, travelling the exact same path to the ledger — the body
+        // cap alone left this one unbounded.
+        let huge_excerpt = "e".repeat(MAX_ANNOTATION_EXCERPT_BYTES + 500);
+        let ann = code_annotation("a@x.com", "a.rs", 1, 1, Some(&huge_excerpt), "short body");
+        let out = format_steer(&[ann], &[None], None);
+        assert!(
+            out.len() < huge_excerpt.len(),
+            "the rendered output must be shorter than the oversized excerpt alone"
+        );
+        assert!(
+            out.contains("truncated"),
+            "a truncated excerpt must carry an explicit marker: {out}"
+        );
+        assert!(
+            out.contains(&format!("> {}", "e".repeat(MAX_ANNOTATION_EXCERPT_BYTES))),
+            "exactly the cap's worth of the original excerpt bytes must survive, quoted: {out}"
+        );
+        assert!(
+            out.contains("short body"),
+            "the body must still render: {out}"
+        );
+    }
+
+    #[test]
     fn body_within_the_cap_is_rendered_verbatim_and_unmarked() {
         let body = "well within the cap";
         let ann = code_annotation("a@x.com", "a.rs", 1, 1, None, body);
@@ -648,6 +782,47 @@ mod tests {
             out.contains("> hi there"),
             "the resolved event's own text must be quoted as the excerpt: {out}"
         );
+    }
+
+    #[test]
+    fn oversized_resolved_stream_excerpt_is_truncated_with_a_marker() {
+        // The annotation carries no `excerpt` of its own; the referenced
+        // conversation event's own text is huge. This excerpt is
+        // host-resolved, not remote-supplied directly, but the index
+        // choosing which event to resolve IS remote-chosen, and the
+        // resulting text still reaches the ledger the same way a pinned
+        // excerpt would — it must be capped identically.
+        let huge_text = "s".repeat(MAX_ANNOTATION_EXCERPT_BYTES + 500);
+        let doc = LiveDoc::new();
+        doc.push_conversation(&serde_json::json!({
+            "kind": "assistant",
+            "text": huge_text.clone(),
+            "markdown": huge_text.clone(),
+        }));
+        let ann = Annotation {
+            id: AnnotationId::new(),
+            author: Member::human("Watcher", "dan@x.com"),
+            anchor: Anchor::Stream(junto_kernel::StreamAnchor {
+                session: EntryId::new(),
+                op_id: "0".into(),
+            }),
+            body: "what's this doing?".into(),
+            excerpt: None,
+            supersedes: None,
+            urgent: false,
+            timestamp: Timestamp::from_millis(1_700_000_000_000),
+            signature: None,
+        };
+        let out = format_steer(&[ann], &[None], Some(&doc));
+        assert!(
+            out.len() < huge_text.len(),
+            "the rendered output must be shorter than the oversized resolved excerpt alone"
+        );
+        assert!(
+            out.contains("truncated"),
+            "a truncated resolved stream excerpt must carry an explicit marker: {out}"
+        );
+        assert!(out.contains("on conversation event 0"));
     }
 
     #[test]
@@ -714,6 +889,75 @@ mod tests {
             !crate::keys::has_signing_key(member_home.path(), "unknown@remote.example.com")
                 .unwrap(),
             "an unidentified remote watcher must never get a locally-minted signing key"
+        );
+    }
+
+    #[test]
+    fn batch_of_many_legal_annotations_stays_within_the_message_budget() {
+        // Per-annotation caps are per-annotation; the ledger note is
+        // per-batch. A frame can carry an unbounded NUMBER of
+        // individually-legal annotations, and `deliver_batch` renders the
+        // whole vector into ONE message — this must stay bounded, and
+        // nothing withheld may vanish silently.
+        let n = 40;
+        let annotations: Vec<Annotation> = (0..n)
+            .map(|i| {
+                code_annotation(
+                    "a@x.com",
+                    "a.rs",
+                    1,
+                    1,
+                    None,
+                    &format!("legal body #{i}: {}", "y".repeat(1000)),
+                )
+            })
+            .collect();
+        let reanchored = vec![None; n];
+        let out = format_steer(&annotations, &reanchored, None);
+
+        let included = out.matches("[watcher comment").count();
+        assert!(
+            included < n,
+            "a large-enough legal batch must not all fit within the message budget: {included} of {n} rendered"
+        );
+        assert!(included >= 1, "at least one comment must always render");
+
+        let withheld = n - included;
+        assert!(
+            out.contains(&format!("{withheld} further comment")),
+            "the exact withheld count must be stated explicitly: {out}"
+        );
+        assert!(
+            out.contains("live document") && out.contains("archived"),
+            "withheld comments must be stated as retained, not lost: {out}"
+        );
+        assert!(
+            out.len() <= MAX_STEER_MESSAGE_BYTES + 500,
+            "the assembled message must stay close to the byte budget, plus only the \
+             withheld-count marker's own small overhead: {} bytes",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn single_block_over_budget_still_renders_whole() {
+        // Decision 4: a batch must never render as nothing but a
+        // withheld-count. A lone block's own field caps have already
+        // bounded it in practice (their sum is well under the message
+        // budget), but the assembler itself must not further truncate or
+        // drop a lone block even if it were somehow to exceed the budget.
+        let huge_block = format!(
+            "[watcher comment — a@x.com on a.rs:1-1]\n{}\n",
+            "z".repeat(MAX_STEER_MESSAGE_BYTES + 1000)
+        );
+        let out = assemble_batch(vec![huge_block.clone()]);
+        assert_eq!(
+            out, huge_block,
+            "the sole block must render in full, unmodified by the batch assembler"
+        );
+        assert!(
+            !out.contains("withheld"),
+            "nothing was withheld when it is the only block: {out}"
         );
     }
 }
