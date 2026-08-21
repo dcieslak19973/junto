@@ -26,7 +26,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use junto_kernel::{EntryId, PublicKey, Signature};
+use junto_kernel::{ChannelView, EntryId, PublicKey, Signature};
 use junto_live::{Frame, validate_annotation_update};
 use tokio::sync::broadcast;
 
@@ -75,26 +75,17 @@ pub(crate) async fn live_session(
     let Ok(session) = session.parse::<EntryId>() else {
         return (StatusCode::BAD_REQUEST, "not a session id").into_response();
     };
-    // The channel keyring (`docs/adr/0033`): every member who can be
-    // authenticated is one who was granted a key on a membership-granting
-    // entry (genesis or `MemberAdded`) — one key per member from the
-    // Party, deliberately not `junto_kernel::ledger::Keyring` (which can
-    // hold several grants per email, one per enrolled device); widening
-    // this handshake to multi-device grants is a later task's. Members
-    // without a key are simply absent, not admitted some other way.
-    let keyring: HashMap<String, PublicKey> = view
-        .party
-        .iter()
-        .filter_map(|member| {
-            member
-                .public_key
-                .clone()
-                .map(|key| (member.email.clone(), key))
-        })
-        .collect();
+    // The channel view, moved into `serve` whole (Task 10,
+    // `docs/adr/0033`): the handshake now authenticates against
+    // `view.keyring`'s active grants — any of a member's enrolled devices,
+    // not just the first one on the Party — so `authenticate` needs both
+    // `view.party` (is this email a member at all?) and `view.keyring`
+    // (which of their grants are still active?) to do that and to tell a
+    // failed handshake apart into one of three reasons (`authenticate`,
+    // `classify_auth_failure`).
     ws.max_message_size(MAX_MESSAGE_BYTES)
         .max_frame_size(MAX_MESSAGE_BYTES)
-        .on_upgrade(move |socket| serve(socket, host, channel, session, keyring))
+        .on_upgrade(move |socket| serve(socket, host, channel, session, view))
 }
 
 /// Everything one authenticated connection needs to handle steady-state
@@ -123,7 +114,7 @@ async fn serve(
     host: Arc<Host>,
     channel: String,
     session: EntryId,
-    keyring: HashMap<String, PublicKey>,
+    view: ChannelView,
 ) {
     // Step 1 (cont'd): no live document for this session — tell the watcher
     // the session is over and close, rather than erroring the upgrade (see
@@ -171,7 +162,7 @@ async fn serve(
     // this connection's socket and `Arc<SessionLive>`.
     let email = match tokio::time::timeout(HANDSHAKE_TIMEOUT, recv(&mut socket)).await {
         Ok(Some(Frame::Auth { email, signature })) => {
-            match authenticate(&keyring, &email, &nonce, &signature) {
+            match authenticate(&view, &email, &nonce, &signature) {
                 Ok(()) => email,
                 Err(reason) => {
                     let _ = send(&mut socket, &Frame::Rejected { reason }).await;
@@ -227,6 +218,24 @@ async fn serve(
     // Steps 6-7: the connection's steady state. `outbound` is this session's
     // shared broadcast (`crate::live_plane::SessionLive::outbound`) — every
     // watcher, including this one, sees every accepted write.
+    //
+    // The keyring `Connection::handle_inbound` hands to
+    // `validate_annotation_update` is deliberately still the Party's one
+    // key per email, not `view.keyring`'s per-device grants: multi-device
+    // *handshake* authentication is this task's whole point, but an
+    // annotation's own embedded signature is a separate, later-task
+    // concern (`docs/adr/0033`), and `sender_email` here is always this
+    // connection's own authenticated email, never another party member's.
+    let keyring: HashMap<String, PublicKey> = view
+        .party
+        .iter()
+        .filter_map(|member| {
+            member
+                .public_key
+                .clone()
+                .map(|key| (member.email.clone(), key))
+        })
+        .collect();
     let connection = Connection {
         host,
         channel,
@@ -386,23 +395,91 @@ impl Connection {
     }
 }
 
-/// Verify a `Frame::Auth` response against the challenge nonce and the
-/// channel keyring. `Err` carries the human-readable rejection reason.
+/// Verify a `Frame::Auth` response against the challenge nonce and every
+/// active grant on `view.keyring` for the claimed email (`docs/adr/0033`):
+/// any of a member's enrolled devices may sign, not just the first one
+/// ever granted. `Err` carries the human-readable rejection reason,
+/// classified by [`classify_auth_failure`] into one of three distinct
+/// causes — the diagnosis this handshake exists to give an operator stuck
+/// on "signature does not verify", the message that used to collapse a
+/// stranger, an unenrolled device, and a revoked member into one dead end.
 fn authenticate(
-    keyring: &HashMap<String, PublicKey>,
+    view: &ChannelView,
     email: &str,
     nonce: &str,
     signature: &str,
 ) -> Result<(), String> {
-    let key = keyring
-        .get(email)
-        .ok_or_else(|| format!("no verifying key on file for '{email}'"))?;
     let signature =
         Signature::new(signature).map_err(|err| format!("malformed signature: {err}"))?;
-    if key.verify_bytes(nonce.as_bytes(), &signature) {
+    let verifies = view
+        .keyring
+        .get(email)
+        .into_iter()
+        .flatten()
+        .filter(|grant| grant.retired_at.is_none())
+        .any(|grant| grant.key.verify_bytes(nonce.as_bytes(), &signature));
+    if verifies {
         Ok(())
     } else {
-        Err("signature does not verify against the key on file".to_string())
+        Err(render_auth_failure(
+            classify_auth_failure(view, email),
+            email,
+        ))
+    }
+}
+
+/// Why a claimed email's presented signature failed to verify against
+/// every active grant on file — computed from the projected party and
+/// keyring alone, and only ever consulted once [`authenticate`] has
+/// already failed that check. Three genuinely different situations that a
+/// bare "does not verify" cannot tell apart (`docs/adr/0033`):
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthFailure {
+    /// This email never joined the channel at all — not on the Party.
+    NotAMember,
+    /// A member, but no active grant matches: either they never enrolled a
+    /// device, or the device that just tried is not the one(s) on file.
+    Unenrolled,
+    /// A member with grants on record, every one of them retired — a
+    /// revoked member's old device(s) trying to reconnect, not a stranger
+    /// who never enrolled.
+    Revoked,
+}
+
+/// Classify why `email` has no active grant that verifies, from `view`
+/// alone (see [`AuthFailure`]). Membership is checked against the Party,
+/// never the keyring directly: the keyring can be empty for a genuine
+/// member who simply never enrolled a device, which is `Unenrolled`, not
+/// `NotAMember`.
+fn classify_auth_failure(view: &ChannelView, email: &str) -> AuthFailure {
+    if !view.party.iter().any(|member| member.email == email) {
+        return AuthFailure::NotAMember;
+    }
+    match view.keyring.get(email) {
+        Some(grants) if !grants.is_empty() && grants.iter().all(|g| g.retired_at.is_some()) => {
+            AuthFailure::Revoked
+        }
+        _ => AuthFailure::Unenrolled,
+    }
+}
+
+/// Render an [`AuthFailure`] as the text a real human on the other end of
+/// the socket reads. `email` is echoed back in every case: the caller
+/// already sent it in the `Auth` frame, so echoing it leaks nothing an
+/// attacker didn't already supply, and it is what makes cases 2 and 3
+/// actionable rather than generic. What's withheld instead is *why* a
+/// party lookup found nothing for `NotAMember` — that would let a stranger
+/// probe distinct emails to enumerate the roster by response shape; here
+/// all three messages differ only in content the sender's own claimed
+/// email already justifies.
+fn render_auth_failure(failure: AuthFailure, email: &str) -> String {
+    match failure {
+        AuthFailure::NotAMember => format!("'{email}' is not a member of this channel"),
+        AuthFailure::Unenrolled => format!(
+            "this device's key is not enrolled for '{email}' — run `junto enroll --invite …`, \
+             then have the founder run `junto add-member --enroll …`"
+        ),
+        AuthFailure::Revoked => format!("signing access for '{email}' has been revoked"),
     }
 }
 
@@ -446,7 +523,7 @@ mod tests {
     use futures_util::{SinkExt, StreamExt};
     use junto_kernel::{
         Anchor, Annotation, AnnotationId, CodeAnchor, CommitOid, ContentDigest, EntryPayload,
-        Member, Span, Timestamp,
+        LedgerEntry, Member, Span, Timestamp,
     };
     use junto_live::LiveDoc;
     use sha2::Digest as _;
@@ -799,6 +876,291 @@ mod tests {
         assert!(
             reason.contains("stranger@example.com"),
             "unexpected reason: {reason}"
+        );
+    }
+
+    /// Fetch this channel's current [`ChannelView`] — the same projection
+    /// `live_session` builds a handshake keyring from — for asserting on
+    /// `keyring`/`party` state a test just set up.
+    async fn view_of(host: &Host, channel: &junto_kernel::ChannelId) -> ChannelView {
+        let crate::host::Resolution::Resolved { ledger, .. } =
+            host.resolve(&channel.to_string()).await.expect("resolve")
+        else {
+            panic!("channel resolves");
+        };
+        ledger.lock().await.project(channel).await.expect("project")
+    }
+
+    /// Retire one key grant: a founder-authored `Park` targeting
+    /// `grant_id`, exactly what `junto revoke-member`/`retire-device`
+    /// construct (`main.rs`) and `Host::add_member`'s doc comment on
+    /// re-granting after revocation describes. `at` is the park's
+    /// timestamp — callers give two retirements distinct `at` values so a
+    /// "some grant retired" shortcut cannot masquerade as "every grant
+    /// retired".
+    async fn retire_grant(
+        host: &Host,
+        channel: &junto_kernel::ChannelId,
+        founder: &Member,
+        grant_id: EntryId,
+        at: Timestamp,
+    ) {
+        let mut park = LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel: *channel,
+            author: founder.clone(),
+            timestamp: at,
+            payload: EntryPayload::Park {
+                target: grant_id,
+                rationale: "device lost".into(),
+            },
+        };
+        host.sign_entry(&mut park);
+        let crate::host::Resolution::Resolved { ledger, .. } =
+            host.resolve(&channel.to_string()).await.expect("resolve")
+        else {
+            panic!("channel resolves");
+        };
+        ledger.lock().await.append(park).await.expect("append park");
+    }
+
+    #[tokio::test]
+    async fn a_second_enrolled_device_authenticates() {
+        let (host, channel, session, key_a, _dir, _member_home, _control_rx) = fixture().await;
+        let key_b = junto_kernel::SigningKey::from_secret_bytes([42; 32]);
+        assert_ne!(
+            key_a.public_key(),
+            key_b.public_key(),
+            "the two devices must be genuinely distinct keypairs"
+        );
+        host.add_member(
+            &channel.to_string(),
+            &Member::human("Dan", "dan@x.com"),
+            Member::human("Dan", "dan@x.com"),
+            Some(key_b.public_key()),
+        )
+        .await
+        .expect("enroll dan's second device");
+
+        let addr = serve_router(host).await;
+        let url = format!("ws://{addr}/channels/{channel}/sessions/{session}/live");
+        let (mut ws, _response) = tokio_tungstenite::connect_async(url)
+            .await
+            .expect("connect");
+
+        let nonce = match recv_until(&mut ws, |f| matches!(f, Frame::Challenge { .. })).await {
+            Frame::Challenge { nonce } => nonce,
+            _ => unreachable!(),
+        };
+        // Signed with the SECOND device's key only. The Party projection
+        // keeps carrying just the first device's key
+        // (`add_member_second_device_leaves_party_row_unchanged` in
+        // `host.rs`), so this can only authenticate if the handshake
+        // consults `view.keyring`'s active grants, never `view.party`.
+        let signature = key_b.sign_bytes(nonce.as_bytes());
+        send_frame(
+            &mut ws,
+            &Frame::Auth {
+                email: "dan@x.com".to_string(),
+                signature: signature.into(),
+            },
+        )
+        .await;
+        let response = recv_until(&mut ws, |f| {
+            matches!(f, Frame::AuthOk | Frame::Rejected { .. })
+        })
+        .await;
+        assert_eq!(
+            response,
+            Frame::AuthOk,
+            "a second enrolled device's key must authenticate: {response:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unenrolled_device_is_told_how_to_enroll() {
+        let (host, channel, session, _signing_key, _dir, _member_home, _control_rx) =
+            fixture().await;
+        let addr = serve_router(host).await;
+
+        let url = format!("ws://{addr}/channels/{channel}/sessions/{session}/live");
+        let (mut ws, _response) = tokio_tungstenite::connect_async(url)
+            .await
+            .expect("connect");
+
+        let nonce = match recv_until(&mut ws, |f| matches!(f, Frame::Challenge { .. })).await {
+            Frame::Challenge { nonce } => nonce,
+            _ => unreachable!(),
+        };
+        // A real member (dan@x.com is the founder), but a device that was
+        // never granted a key at all — distinct from
+        // `a_signature_over_the_wrong_bytes_is_rejected_without_auth_ok`,
+        // which signs the wrong bytes with the ENROLLED key; this signs
+        // the right bytes with a key that has no grant whatsoever.
+        let unenrolled_device = junto_kernel::SigningKey::from_secret_bytes([99; 32]);
+        let signature = unenrolled_device.sign_bytes(nonce.as_bytes());
+        send_frame(
+            &mut ws,
+            &Frame::Auth {
+                email: "dan@x.com".to_string(),
+                signature: signature.into(),
+            },
+        )
+        .await;
+
+        let rejected = recv_until(&mut ws, |f| matches!(f, Frame::Rejected { .. })).await;
+        let Frame::Rejected { reason } = rejected else {
+            unreachable!()
+        };
+        assert!(
+            reason.contains("enroll"),
+            "the rejection must name enrollment, not just \"does not verify\": {reason}"
+        );
+        assert!(
+            !reason.to_lowercase().contains("revoked"),
+            "an unenrolled device must never be told it was revoked: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_revoked_member_is_refused() {
+        let (host, channel, session, _signing_key, _dir, _member_home, _control_rx) =
+            fixture().await;
+        let founder = Member::human("Dan", "dan@x.com");
+        let key_a = junto_kernel::SigningKey::from_secret_bytes([11; 32]);
+        let key_b = junto_kernel::SigningKey::from_secret_bytes([22; 32]);
+        host.add_member(
+            &channel.to_string(),
+            &founder,
+            Member::human("Alice", "alice@example.com"),
+            Some(key_a.public_key()),
+        )
+        .await
+        .expect("enroll alice's first device");
+        host.add_member(
+            &channel.to_string(),
+            &founder,
+            Member::human("Alice", "alice@example.com"),
+            Some(key_b.public_key()),
+        )
+        .await
+        .expect("enroll alice's second device");
+
+        let grant_ids: Vec<EntryId> = {
+            let view = view_of(&host, &channel).await;
+            let grants = view
+                .keyring
+                .get("alice@example.com")
+                .expect("alice has grants");
+            assert_eq!(
+                grants.len(),
+                2,
+                "the fixture must give alice two distinct grants, not one, or this test could \
+                 pass on a single-grant shortcut"
+            );
+            grants.iter().map(|g| g.granted_by).collect()
+        };
+
+        // Retire alice's FIRST device only, and prove she can still connect
+        // on her SECOND (still active) device — a classifier that shortcuts
+        // "revoked" to "this member's first grant is retired" (instead of
+        // "every grant is") would already misreport her as revoked here,
+        // before she is.
+        retire_grant(
+            &host,
+            &channel,
+            &founder,
+            grant_ids[0],
+            Timestamp::from_millis(1_700_000_000_000),
+        )
+        .await;
+
+        let addr = serve_router(host.clone()).await;
+        let url = format!("ws://{addr}/channels/{channel}/sessions/{session}/live");
+
+        // Present the RETIRED key while alice still has key_b active
+        // elsewhere: since not every grant is retired yet, this must be
+        // diagnosed as "wrong/unenrolled device" (case 2), never "revoked"
+        // (case 3) — a classifier that only inspects the first grant on
+        // the keyring (instead of requiring every grant retired) would
+        // wrongly call this Revoked, because grant_ids[0] genuinely is.
+        let (mut partial, _r1) = tokio_tungstenite::connect_async(url.clone())
+            .await
+            .expect("connect");
+        let nonce = match recv_until(&mut partial, |f| matches!(f, Frame::Challenge { .. })).await {
+            Frame::Challenge { nonce } => nonce,
+            _ => unreachable!(),
+        };
+        let signature = key_a.sign_bytes(nonce.as_bytes());
+        send_frame(
+            &mut partial,
+            &Frame::Auth {
+                email: "alice@example.com".to_string(),
+                signature: signature.into(),
+            },
+        )
+        .await;
+        let rejected = recv_until(&mut partial, |f| matches!(f, Frame::Rejected { .. })).await;
+        let Frame::Rejected {
+            reason: partial_reason,
+        } = rejected
+        else {
+            unreachable!()
+        };
+        assert!(
+            !partial_reason.contains("revoked"),
+            "alice still has an active device (key_b); her retired key_a must not be reported \
+             as revoked yet: {partial_reason}"
+        );
+
+        // Now retire the second device too, at a further distinct
+        // timestamp — only now is alice genuinely, fully revoked.
+        retire_grant(
+            &host,
+            &channel,
+            &founder,
+            grant_ids[1],
+            Timestamp::from_millis(1_700_000_100_000),
+        )
+        .await;
+
+        let alice_grants = view_of(&host, &channel).await.keyring["alice@example.com"].clone();
+        assert!(
+            alice_grants.iter().all(|g| g.retired_at.is_some()),
+            "both of alice's grants must be retired before the auth attempt, or this test \
+             exercises nothing: {alice_grants:?}"
+        );
+
+        let (mut ws, _response) = tokio_tungstenite::connect_async(url)
+            .await
+            .expect("connect");
+
+        let nonce = match recv_until(&mut ws, |f| matches!(f, Frame::Challenge { .. })).await {
+            Frame::Challenge { nonce } => nonce,
+            _ => unreachable!(),
+        };
+        let signature = key_a.sign_bytes(nonce.as_bytes());
+        send_frame(
+            &mut ws,
+            &Frame::Auth {
+                email: "alice@example.com".to_string(),
+                signature: signature.into(),
+            },
+        )
+        .await;
+
+        let rejected = recv_until(&mut ws, |f| matches!(f, Frame::Rejected { .. })).await;
+        let Frame::Rejected { reason } = rejected else {
+            unreachable!()
+        };
+        assert!(
+            reason.contains("revoked"),
+            "a revoked member must be told so, not something generic: {reason}"
+        );
+        assert!(
+            !reason.contains("enroll"),
+            "telling a revoked member to enroll would be wrong and cruel: {reason}"
         );
     }
 
