@@ -77,8 +77,10 @@ pub(crate) async fn live_session(
     };
     // The channel keyring (`docs/adr/0033`): every member who can be
     // authenticated is one who was granted a key on a membership-granting
-    // entry (genesis or `MemberAdded`) — mirrors the party-projection
-    // keyring build in `junto_kernel::ledger::project_unverified`. Members
+    // entry (genesis or `MemberAdded`) — one key per member from the
+    // Party, deliberately not `junto_kernel::ledger::Keyring` (which can
+    // hold several grants per email, one per enrolled device); widening
+    // this handshake to multi-device grants is a later task's. Members
     // without a key are simply absent, not admitted some other way.
     let keyring: HashMap<String, PublicKey> = view
         .party

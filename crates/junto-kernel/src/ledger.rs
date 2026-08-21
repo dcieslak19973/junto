@@ -112,8 +112,10 @@ pub struct KeyGrant {
 }
 
 impl KeyGrant {
-    /// Whether this grant was live at `ts`: granted (always true here, grants
-    /// have no start bound of their own) and not yet retired as of `ts`.
+    /// Whether this grant was live at `ts`: granted (always true here,
+    /// grants have no start bound of their own) and, if retired, not
+    /// retired *before* `ts` — `ts` equal to `retired_at` still counts as
+    /// active; only a `ts` strictly after `retired_at` does not.
     #[must_use]
     pub fn active_at(&self, ts: Timestamp) -> bool {
         self.retired_at.is_none_or(|retired| ts <= retired)
@@ -167,11 +169,16 @@ pub struct ChannelView {
     /// is empty.
     pub unrecognized: HashSet<EntryId>,
     /// Recognized entries whose signature is absent, malformed, or does not
-    /// verify against the author's projected public key (`docs/adr/0033`).
-    /// A surfaced **fact**, never a drop and never a gate: standings, gates
-    /// and sessions fold identically — authorship verification is independent
-    /// of authority (`docs/adr/0004`). Entries by a keyless member land here
-    /// too (nothing to verify against), so legacy unsigned history reads as
+    /// verify against any grant in the [`keyring`](ChannelView::keyring)
+    /// that was active at the entry's own timestamp (`docs/adr/0033`,
+    /// `Self::project_unverified`) — any of a member's devices may sign,
+    /// but a device's grant stops covering entries stamped after that
+    /// device was retired via a founder `Park`, even though the signature
+    /// itself is still cryptographically valid. A surfaced **fact**, never
+    /// a drop and never a gate: standings, gates and sessions fold
+    /// identically — authorship verification is independent of authority
+    /// (`docs/adr/0004`). Entries by a keyless member land here too
+    /// (nothing to verify against), so legacy unsigned history reads as
     /// unverified rather than silently trusted.
     pub unverified: HashSet<EntryId>,
     /// Current standing per assertion [`EntryId`].
@@ -464,13 +471,19 @@ impl<S: SubstrateProvider> Ledger<S> {
     /// A second pass retires grants: a founder-authored [`EntryPayload::Park`]
     /// whose `target` is a grant's [`KeyGrant::granted_by`] retires that
     /// grant as of the park's own `timestamp` — [`Self::project_unverified`]
-    /// then stops it from verifying entries stamped later, while entries
-    /// stamped before are unaffected. A park authored by anyone but the
-    /// founder, or whose `target` granted no key, matches no `granted_by`
-    /// below and so has no effect — the same leniency dangling targets
-    /// already get elsewhere in this file. Several parks on the same grant:
-    /// the *earliest* timestamp wins, so a grant's retirement can only move
-    /// earlier, never later, regardless of entry-append order.
+    /// then stops it from verifying entries stamped after that timestamp;
+    /// entries stamped at or before are unaffected. A `Park` fails to
+    /// retire for one of two distinct reasons: authored by anyone but the
+    /// founder, it is dropped by the `entry.author.email == founder_email`
+    /// guard below *before* the retirement map is ever consulted — that
+    /// guard is load-bearing, not redundant, since its `target` is very
+    /// often a real `granted_by` (a member parking its own device); or,
+    /// authored by the founder but targeting an entry that granted no key,
+    /// it reaches the map but matches no `granted_by` there, the same
+    /// leniency dangling targets get elsewhere in this file. Several parks
+    /// on the same grant: the *earliest* timestamp wins, so a grant's
+    /// retirement can only move earlier, never later, regardless of
+    /// entry-append order.
     fn project_keyring(entries: &[LedgerEntry], founder_email: &str) -> Keyring {
         let mut keyring: Keyring = HashMap::new();
         let mut genesis_seen = false;
@@ -545,7 +558,8 @@ impl<S: SubstrateProvider> Ledger<S> {
     /// ([`KeyGrant::active_at`]) and the entry's signature matches that
     /// grant's key ([`LedgerEntry::verifies_with`]) — any of a member's
     /// devices may sign, and a retired device stops verifying only entries
-    /// stamped after its retirement; entries stamped before are unaffected.
+    /// stamped after its retirement; entries stamped at or before are
+    /// unaffected (`KeyGrant::active_at` is inclusive at the boundary).
     /// An entry is **unverified** when its author's email has no such
     /// grant. With an empty Party (no genesis) nothing is marked —
     /// consistent with membership not being enforced there either.
@@ -1197,9 +1211,10 @@ mod tests {
     /// `docs/adr/0033` (Task 2) — a founder-authored `Park` targeting the
     /// entry that granted a key retires that grant *at the park's own
     /// timestamp*, not from the beginning of time: an entry signed with the
-    /// retired key still verifies if it is stamped before the park, and
-    /// fails to verify only once stamped after it. Retiring a device does
-    /// not rewrite history.
+    /// retired key still verifies if it is stamped before the park or at
+    /// exactly the park's own timestamp (`KeyGrant::active_at` is
+    /// inclusive at the boundary), and fails to verify only once stamped
+    /// strictly after it. Retiring a device does not rewrite history.
     #[tokio::test]
     async fn a_retired_grant_verifies_before_its_park_and_not_after() {
         let founder_key = crate::SigningKey::from_secret_bytes([1; 32]);
@@ -1251,11 +1266,15 @@ mod tests {
             },
         );
 
+        let at_park_id = EntryId::new();
+        let mut at_park = entry(at_park_id, channel, agent.clone(), 4, assertion("at park"));
+        at_park.sign(&agent_key).unwrap();
+
         let after_id = EntryId::new();
         let mut after = entry(after_id, channel, agent.clone(), 5, assertion("after park"));
         after.sign(&agent_key).unwrap();
 
-        for e in [genesis, grant, before, park, after] {
+        for e in [genesis, grant, before, park, at_park, after] {
             ledger.append(e).await.unwrap();
         }
 
@@ -1272,6 +1291,10 @@ mod tests {
         assert!(
             !view.unverified.contains(&before_id),
             "signed before the park, the grant was still active"
+        );
+        assert!(
+            !view.unverified.contains(&at_park_id),
+            "signed at exactly the park's timestamp, active_at is inclusive"
         );
         assert!(
             view.unverified.contains(&after_id),
@@ -1343,6 +1366,91 @@ mod tests {
             "a non-founder park has no authority to retire a grant"
         );
         assert!(!view.unverified.contains(&later_id));
+    }
+
+    /// `docs/adr/0033` (Task 2) — several parks can target the same grant;
+    /// the *earliest* park's timestamp is the retirement point, never a
+    /// later one. This is the discriminating regression test: under a
+    /// last-write-wins fold (`retirements.insert` unconditionally,
+    /// dropping the `.min()`), `retired_at` would land on the later park
+    /// (ts 6) instead of the earlier one (ts 4), and an entry stamped at ts
+    /// 5 — after the earlier park but before the later one — would wrongly
+    /// still verify.
+    #[tokio::test]
+    async fn earliest_park_wins_when_two_target_the_same_grant() {
+        let founder_key = crate::SigningKey::from_secret_bytes([1; 32]);
+        let agent_key = crate::SigningKey::from_secret_bytes([2; 32]);
+        let dan = Member::human("Dan", "dan@example.com").with_key(founder_key.public_key());
+        let agent = Member::agent("Worker", "worker@agents.junto").with_key(agent_key.public_key());
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+
+        let mut genesis = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            1,
+            EntryPayload::ChannelOpened { name: "ch".into() },
+        );
+        genesis.sign(&founder_key).unwrap();
+
+        let grant_id = EntryId::new();
+        let mut grant = entry(
+            grant_id,
+            channel,
+            dan.clone(),
+            2,
+            EntryPayload::MemberAdded {
+                member: agent.clone(),
+            },
+        );
+        grant.sign(&founder_key).unwrap();
+
+        let earlier_park = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            4,
+            EntryPayload::Park {
+                target: grant_id,
+                rationale: "device lost".into(),
+            },
+        );
+        let later_park = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            6,
+            EntryPayload::Park {
+                target: grant_id,
+                rationale: "redundant, filed twice".into(),
+            },
+        );
+
+        // Stamped between the two parks: unverified iff the earlier (ts 4)
+        // one, not the later (ts 6) one, decides the retirement.
+        let between_id = EntryId::new();
+        let mut between = entry(between_id, channel, agent.clone(), 5, assertion("between"));
+        between.sign(&agent_key).unwrap();
+
+        for e in [genesis, grant, earlier_park, later_park, between] {
+            ledger.append(e).await.unwrap();
+        }
+
+        let view = ledger.project(&channel).await.unwrap();
+        let grants = view
+            .keyring
+            .get("worker@agents.junto")
+            .expect("agent has a grant");
+        assert_eq!(
+            grants[0].retired_at,
+            Some(Timestamp::from_millis(4)),
+            "the earlier park decides retirement, not the later one"
+        );
+        assert!(
+            view.unverified.contains(&between_id),
+            "stamped after the earlier park, before the later one: unverified under earliest-wins"
+        );
     }
 
     /// `docs/adr/0033` (Task 2) — an email can hold several active grants
