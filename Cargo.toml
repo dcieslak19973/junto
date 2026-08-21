@@ -3,7 +3,7 @@
 # adapter crates; the `junto` binary is the host/app entry (not a human terminal).
 [workspace]
 resolver = "3"
-members = ["crates/junto-kernel", "crates/junto", "crates/junto-substrate-git"]
+members = ["crates/junto-kernel", "crates/junto", "crates/junto-substrate-git", "crates/junto-live"]
 # junto-desktop (the Tauri shell, docs/adr/0018) is its own workspace: Tauri's
 # dependency tree would slow every kernel `cargo check --workspace`/CI run.
 # It has a dedicated CI job; build it via --manifest-path.
@@ -19,6 +19,7 @@ authors = ["Dan Cieslak <dcieslak@hotmail.com>"]
 # internal
 junto-kernel = { path = "crates/junto-kernel" }
 junto-substrate-git = { path = "crates/junto-substrate-git" }
+junto-live = { path = "crates/junto-live" }
 # external (latest as of 2026-06-08)
 thiserror = "2.0.18"
 anyhow = "1.0.102"
@@ -57,3 +58,8 @@ sha2 = "0.10"
 async-stream = "0.3"
 # CommonMark rendering for agent memos on the human surface (docs/adr/0023; MIT)
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+# CRDT for the ephemeral live-session plane (docs/adr live-session-plane
+# proposal): one loro::LoroDoc per running agent session, holding its
+# conversation stream, worktree events, and multi-author annotations. Never
+# used for the durable ledger record (MIT; see crates/loro/Cargo.toml).
+loro = "1.13"

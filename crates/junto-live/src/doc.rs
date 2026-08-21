@@ -1,0 +1,290 @@
+//! [`LiveDoc`] — one loro CRDT document per live agent session.
+//!
+//! junto's durable record is the append-only, signed [`junto_kernel::LedgerEntry`]
+//! ledger (`docs/adr/0001`-`0011`): no CRDT, ever — hard constraint #3. That
+//! record is settled history, written once and never mutated. A live agent
+//! session is a different kind of thing: while it runs, its conversation and
+//! worktree activity change many times a second and multiple watchers on
+//! different machines want to follow along and comment *before* anything is
+//! settled. A CRDT is the right tool for exactly that in-flight window — and
+//! only that window: [`LiveDoc`] is thrown away (after being archived as one
+//! final snapshot, a later slice) once the session ends. Nothing in this
+//! crate touches `refs/junto/*` or the ledger; the live plane and the durable
+//! record are deliberately kept apart.
+//!
+//! A [`LiveDoc`] holds three root containers:
+//! - `conversation` (`LoroList`) — the session's live event stream.
+//! - `worktree` (`LoroList`) — file-edit/diff events observed during the run.
+//! - `annotations` (`LoroMap`) — the one container **any** authenticated
+//!   member may write into, keyed by annotation id.
+//!
+//! Only `annotations` is genuinely multi-writer; `conversation` and
+//! `worktree` are driver-writes-only in practice. That restriction is
+//! deliberately **not** encoded in this data model — it is enforced as
+//! policy by a later task, one layer up. Baking a single-writer assumption
+//! into the CRDT itself would defeat the reason a CRDT was chosen here
+//! rather than a plain log: a future rung of this project (letting a
+//! second driver take over, or replaying a merged session) needs that door
+//! left open.
+//!
+//! (Presence — who is watching right now — is not part of this document; it
+//! rides on loro's separate `EphemeralStore` in a later task.)
+
+use std::collections::HashSet;
+
+use junto_kernel::Annotation;
+use loro::{ExportMode, LoroDoc, LoroValue, Subscription};
+
+/// Root container name for the session's live event stream.
+const CONVERSATION: &str = "conversation";
+
+/// Root container name for file-edit/diff events observed in the worktree
+/// while the session runs.
+const WORKTREE: &str = "worktree";
+
+/// Root container name for the multi-author annotation map: key is an
+/// [`junto_kernel::AnnotationId`]'s string form, value is that annotation's
+/// own canonical-JSON bytes (see [`LiveDoc::insert_annotation`]).
+const ANNOTATIONS: &str = "annotations";
+
+/// One loro CRDT document for a single live agent session — see the module
+/// docs for what it holds and why it exists apart from the ledger.
+///
+/// Every [`LiveDoc`] carries a fresh, random loro peer id, minted by
+/// [`LoroDoc::new`]. That id is never derived from — or asserted to equal —
+/// any member identity: two documents sharing a peer id corrupt each other's
+/// history on merge, so identity here is deliberately a throwaway. The
+/// authority for *who wrote an annotation* is the ed25519 signature carried
+/// inside [`Annotation::signature`], verified independently of loro
+/// (verification is a later task); the peer id is not, and must never
+/// become, a proxy for authorship.
+///
+/// This struct is the only place in the crate — indeed, in the whole
+/// workspace — that may name a `loro` type in a public signature, aside from
+/// the [`Subscription`] handle callers must hold to keep a subscription
+/// alive. Keeping `loro` otherwise absent from this type's public API is
+/// what keeps a future CRDT-library swap confined to this one crate.
+#[derive(Debug)]
+pub struct LiveDoc {
+    doc: LoroDoc,
+}
+
+impl Default for LiveDoc {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LiveDoc {
+    /// Start a new, empty live session document with a fresh random peer id
+    /// (see the struct docs — never call `set_peer_id`).
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            doc: LoroDoc::new(),
+        }
+    }
+
+    /// Append a conversation event and commit. `event` is stored as its own
+    /// JSON text, not decomposed into loro fields — the watcher UI parses it
+    /// back on read, so the wire shape lives with the event's own producer,
+    /// not with this crate.
+    pub fn push_conversation(&self, event: serde_json::Value) {
+        self.push_event(CONVERSATION, event);
+    }
+
+    /// Append a worktree (file-edit/diff) event and commit. Same shape and
+    /// policy as [`LiveDoc::push_conversation`], distinct container.
+    pub fn push_worktree(&self, event: serde_json::Value) {
+        self.push_event(WORKTREE, event);
+    }
+
+    /// Number of events pushed to `conversation` so far.
+    #[must_use]
+    pub fn conversation_len(&self) -> usize {
+        self.doc.get_list(CONVERSATION).len()
+    }
+
+    /// Number of events pushed to `worktree` so far.
+    #[must_use]
+    pub fn worktree_len(&self) -> usize {
+        self.doc.get_list(WORKTREE).len()
+    }
+
+    /// Insert (or overwrite) a signed annotation and commit. The map value is
+    /// the annotation's own canonical-JSON bytes ([`Annotation::to_canonical_bytes`])
+    /// stored **verbatim as a string**, never decomposed into loro fields:
+    /// the signature covers exactly those bytes, so they must round-trip
+    /// through the CRDT unmodified for [`Annotation::verifies_with`] to mean
+    /// anything on the far side.
+    ///
+    /// # Errors
+    /// Returns [`junto_kernel::Error::Serialization`] if `a` cannot be
+    /// canonicalized (its own JCS encoding failed) or its canonical bytes are
+    /// not valid UTF-8.
+    pub fn insert_annotation(&self, a: &Annotation) -> junto_kernel::Result<()> {
+        let bytes = a.to_canonical_bytes()?;
+        let json = String::from_utf8(bytes)
+            .map_err(|e| junto_kernel::Error::Serialization(e.to_string()))?;
+        self.doc
+            .get_map(ANNOTATIONS)
+            .insert(&a.id.to_string(), json)
+            .expect("LiveDoc never checks out a historical version, so editing cannot hit EditWhenDetached");
+        self.doc.commit();
+        Ok(())
+    }
+
+    /// Every annotation currently in the map, parsed back from its canonical
+    /// bytes. Entries that fail to parse are **skipped, not errored** — a
+    /// malformed value from a future annotation-schema version must not
+    /// poison reads of the annotations that are still valid. Signature
+    /// verification is not this method's job (a later task's concern).
+    #[must_use]
+    pub fn annotations(&self) -> Vec<Annotation> {
+        let mut out = Vec::new();
+        self.doc.get_map(ANNOTATIONS).for_each(|_key, value| {
+            let Ok(LoroValue::String(json)) = value.into_value() else {
+                return;
+            };
+            if let Ok(annotation) = Annotation::from_canonical_bytes(json.as_bytes()) {
+                out.push(annotation);
+            }
+        });
+        out
+    }
+
+    /// The keys of the annotation map — every id that has an entry,
+    /// regardless of whether its value currently parses. Two documents with
+    /// equal [`LiveDoc::annotation_ids`] have converged on the same set of
+    /// annotation writes, independent of read-time parsing.
+    #[must_use]
+    pub fn annotation_ids(&self) -> HashSet<String> {
+        self.doc
+            .get_map(ANNOTATIONS)
+            .keys()
+            .map(|k| k.to_string())
+            .collect()
+    }
+
+    /// Export the full current state as a self-contained snapshot — how a
+    /// watcher joins a session already in progress (see the module docs) and
+    /// how a driver would archive a finished one.
+    #[must_use]
+    pub fn export_snapshot(&self) -> Vec<u8> {
+        self.doc
+            .export(ExportMode::snapshot())
+            .expect("exporting a snapshot of a live, non-shallow LoroDoc cannot fail")
+    }
+
+    /// Merge in a snapshot or update produced by [`LiveDoc::export_snapshot`]
+    /// (or a future incremental export). Importing is commutative,
+    /// associative, and idempotent — the same bytes may be imported more
+    /// than once, and two documents that import each other's exports
+    /// converge regardless of order (see the `concurrent_annotations_converge`
+    /// test).
+    ///
+    /// # Errors
+    /// Returns the loro import error, stringified — this crate's public API
+    /// keeps `loro::LoroError` out of its own error types (see the struct
+    /// docs on confining `loro` to this crate).
+    pub fn import_update(&self, bytes: &[u8]) -> Result<(), String> {
+        self.doc
+            .import(bytes)
+            .map(|_status| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Subscribe to this document's local updates (edits made through this
+    /// handle, not imports). The returned [`Subscription`] must be held by
+    /// the caller — dropping it cancels the subscription — which is why it
+    /// is the one `loro` type this crate's public API cannot avoid naming.
+    pub fn subscribe_local_update(
+        &self,
+        f: impl Fn(&Vec<u8>) -> bool + Send + Sync + 'static,
+    ) -> Subscription {
+        self.doc.subscribe_local_update(Box::new(f))
+    }
+
+    /// Fork this document: an independent copy sharing full history up to
+    /// now, with its own fresh random peer id (loro's `fork` mints one, the
+    /// same as [`LiveDoc::new`]) so the two never collide if both keep
+    /// editing.
+    #[must_use]
+    pub fn fork(&self) -> Self {
+        Self {
+            doc: self.doc.fork(),
+        }
+    }
+
+    /// Shared body of [`LiveDoc::push_conversation`] and
+    /// [`LiveDoc::push_worktree`]: push `event`'s JSON text onto the named
+    /// list and commit.
+    fn push_event(&self, container: &str, event: serde_json::Value) {
+        // `serde_json::Value::to_string` cannot fail: `event` is already a
+        // parsed value, not raw input being (re)validated.
+        self.doc.get_list(container).push(event.to_string()).expect(
+            "LiveDoc never checks out a historical version, so editing cannot hit EditWhenDetached",
+        );
+        self.doc.commit();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use junto_kernel::{
+        Anchor, Annotation, AnnotationId, CodeAnchor, CommitOid, ContentDigest, Member, Span,
+        Timestamp,
+    };
+
+    use super::*;
+
+    fn test_annotation(body: &str) -> Annotation {
+        Annotation {
+            id: AnnotationId::new(),
+            author: Member::human("Dan", "dan@example.com"),
+            anchor: Anchor::Code(CodeAnchor {
+                commit: CommitOid::new("a".repeat(40)).unwrap(),
+                path: "src/anchor.rs".into(),
+                blob: ContentDigest::new("sha256:deadbeef").unwrap(),
+                span: Span::new(3, 5).unwrap(),
+            }),
+            body: body.into(),
+            excerpt: None,
+            supersedes: None,
+            urgent: false,
+            timestamp: Timestamp::from_millis(1_700_000_000_000),
+            signature: None,
+        }
+    }
+
+    #[test]
+    fn concurrent_annotations_converge() {
+        let key_a = junto_kernel::SigningKey::from_secret_bytes([1; 32]);
+        let key_b = junto_kernel::SigningKey::from_secret_bytes([2; 32]);
+        let a = LiveDoc::new();
+        let b = LiveDoc::new();
+        // Seed b from a's snapshot (watchers join from a snapshot).
+        b.import_update(&a.export_snapshot()).unwrap();
+        let mut ann_a = test_annotation("from a");
+        ann_a.sign(&key_a).unwrap();
+        let mut ann_b = test_annotation("from b");
+        ann_b.sign(&key_b).unwrap();
+        a.insert_annotation(&ann_a).unwrap();
+        b.insert_annotation(&ann_b).unwrap();
+        // Cross-import full snapshots (idempotent, order-free).
+        b.import_update(&a.export_snapshot()).unwrap();
+        a.import_update(&b.export_snapshot()).unwrap();
+        assert_eq!(a.annotation_ids(), b.annotation_ids());
+        assert_eq!(a.annotations().len(), 2);
+    }
+
+    #[test]
+    fn conversation_events_survive_snapshot() {
+        let a = LiveDoc::new();
+        a.push_conversation(serde_json::json!({"kind": "assistant", "text": "hi", "seq": 1}));
+        let b = LiveDoc::new();
+        b.import_update(&a.export_snapshot()).unwrap();
+        // Read back via the doc's deep value; one list entry.
+        assert_eq!(b.conversation_len(), 1);
+    }
+}
