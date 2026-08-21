@@ -225,6 +225,21 @@ pub(crate) async fn deliver(
 /// own return value — actually get selected on by the fresh turn loop
 /// before a steer lands on it, the same margin `steer_live` implicitly
 /// relies on when called well after a turn is confirmed running.
+///
+/// **Known gap:** for a session `begin` opened non-steerable
+/// (`LiveSessions::begin`'s `steerable` flag — currently only the Outcome
+/// loop, `crate::launch::spawn_outcome_loop`) every flush this function
+/// runs still calls `deliver_batch`, which still calls `steer_live`, which
+/// still reports `NotLive` for a non-steerable session exactly as it would
+/// for a truly idle one — so the batch is drained and immediately requeued,
+/// every time, and never actually reaches the agent. A watcher's comment on
+/// a running, un-steered Outcome-loop turn queues until a human steers that
+/// session from the web UI (which resumes it over the *steerable*
+/// `spawn_turn` path instead); inside a pure, never-steered loop it may
+/// never be delivered. Accepted trade-off, not an oversight: the
+/// alternative — a real control sender for a turn that never reads it —
+/// makes `steer_live` fake-succeed and write a false ledger note, which is
+/// worse than an honest queue that doesn't drain (Task 8 fix round finding 2).
 pub(crate) fn flush_pending(host: Arc<Host>, channel: String, session: EntryId) {
     if !host.live_plane().has_pending(session) {
         return;

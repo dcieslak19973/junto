@@ -807,6 +807,22 @@ impl LiveSessions {
             .map_err(|_| NotLive)
     }
 
+    /// Whether `session` currently has a registered live feed — regardless
+    /// of whether it is steerable (`begin`'s `steerable` flag). Distinct
+    /// from [`Self::control`] succeeding: an outcome-loop session is live
+    /// but not steerable, so `control` reports [`NotLive`] for it even
+    /// while a turn is genuinely still running. [`crate::launch::steer`]
+    /// uses this to refuse resuming a session the host still considers
+    /// live, rather than treating `control`'s `NotLive` as "safe to start
+    /// a second, concurrent turn".
+    #[must_use]
+    pub(crate) fn is_live(&self, session: EntryId) -> bool {
+        self.inner
+            .lock()
+            .expect("live sessions registry lock")
+            .contains_key(&session)
+    }
+
     /// Also taps the live plane first (fire-and-forget, never propagated —
     /// see `crate::live_plane`'s module docs): every event feeds the
     /// session's CRDT `conversation` container, and a tool event whose
@@ -1615,6 +1631,18 @@ pub async fn launch(
 /// Steer an existing session: record the human's instruction as a
 /// `SessionUpdated` note (the record keeps the steering — docs/adr/0023),
 /// flip the session back to working, and run a `--resume` turn.
+///
+/// Refuses (`Err`) when the session currently has a registered live feed
+/// ([`LiveSessions::is_live`]) — this is the between-turns resume path,
+/// only correct when nothing is already running; a live but non-steerable
+/// session (an Outcome-loop turn — `crate::launch::spawn_outcome_loop`'s
+/// `steerable: false`) makes `steer_live` report `NotLive` the same way a
+/// truly idle session does, and without this guard `steer_session`'s
+/// `NotLive` fallback would resume it here anyway: `harness_session_for`
+/// already has a mapping recorded from the loop's own first turn, so
+/// `spawn_turn` would succeed in starting a *second*, concurrent agent
+/// process over the same workspace, and its `begin`/`finish` would steal
+/// and archive the loop's own live snapshot out from under it.
 pub async fn steer(
     host: std::sync::Arc<Host>,
     channel: ChannelId,
@@ -1624,6 +1652,12 @@ pub async fn steer(
     steered_by: Member,
     message: String,
 ) -> Result<()> {
+    if host.live().is_live(session) {
+        bail!(
+            "session {session} still has a live turn running — steer it in place instead of \
+             starting a second one"
+        );
+    }
     let junto_home = crate::host::junto_home()?;
     let Some(harness_session) = harness_session_for(&junto_home, &session)? else {
         bail!(
@@ -2008,9 +2042,14 @@ fn spawn_outcome_loop(
         // drives its own inert control channel via `run_worker_turn`'s
         // local `mpsc::channel`, never the receiver `begin` hands back
         // here, so a real registered control sender would let `steer_live`
-        // report success for a steer nobody will ever act on. `begin` still
-        // does the live-plane/SSE bookkeeping (and flushes any pending
-        // annotations) — only the control channel itself is unsteerable.
+        // report success for a steer nobody will ever act on. `begin`
+        // still does the live-plane/SSE bookkeeping — but the pending
+        // annotations it flushes never actually reach this loop while it
+        // stays non-steerable: `flush_pending`'s delivery still calls
+        // `steer_live`, which still reports `NotLive` for a non-steerable
+        // session, so every flush attempt just requeues. See
+        // `crate::live_bridge::flush_pending`'s doc for the accepted
+        // known-gap trade-off this implies.
         let _control_rx = host.live().begin(
             std::sync::Arc::clone(&host),
             channel_ref.clone(),
@@ -2984,6 +3023,49 @@ mod tests {
             .expect("a steer SessionUpdated was recorded");
         assert_eq!(recorded.0, SessionState::Working);
         assert!(recorded.1.contains("focus on the parser"));
+    }
+
+    #[tokio::test]
+    async fn steer_refuses_to_resume_a_session_with_a_live_feed() {
+        // Round 2, finding 1: making the outcome loop non-steerable turned
+        // `steer_live`'s `NotLive` into the *first*-steer outcome for a
+        // live-but-non-steerable session, not just a second-steer race —
+        // so `steer_session`'s `NotLive` fallback would resume it here
+        // every time without this guard, starting a second, concurrent
+        // turn over the same workspace. `is_live` must refuse regardless
+        // of whether the feed is steerable — a live but non-steerable
+        // feed (`begin(steerable: false)`, the outcome-loop shape) must
+        // be refused exactly like a steerable one.
+        let repo = git_repo();
+        let member_home = tempfile::tempdir().unwrap();
+        let host = crate::host::Host::fixed_with_member_home(
+            vec![repo.path().to_path_buf()],
+            Some(member_home.path().to_path_buf()),
+        );
+        let dan = Member::human("Dan", "dan@example.com");
+        let channel = host
+            .open_channel(None, "c", dan.clone(), None)
+            .await
+            .unwrap()
+            .id;
+        let session = EntryId::new();
+        let _rx = host.live().begin(host.clone(), "c".into(), session, false);
+
+        let err = steer(
+            host.clone(),
+            channel,
+            "c".into(),
+            repo.path().to_path_buf(),
+            session,
+            dan,
+            "keep going".into(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("live turn running"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

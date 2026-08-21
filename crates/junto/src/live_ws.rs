@@ -967,20 +967,26 @@ mod tests {
         local.insert_annotation(&annotation).expect("insert");
         send_frame(&mut ws, &Frame::update(&local.export_snapshot())).await;
 
-        // Wait for it to land in the real document (same pattern as the
-        // existing acceptance test).
+        // Wait for the annotation to be *queued* (not merely imported into
+        // the document): `deliver` runs as a spawned task (finding 10 of
+        // the Task 8 fix round), so document-import and queuing are not
+        // causally ordered from this test's perspective — polling
+        // `doc.annotations().len()` can observe "imported" before the
+        // spawned `deliver` task has even run, which would let this test
+        // race ahead to `finish`/`begin` before anything actually landed
+        // in `LivePlane`'s pending queue (the state this test exists to
+        // exercise). Poll `has_pending` instead — the exact state
+        // `flush_pending` itself checks.
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if let Some(live) = host.live_plane().get(session)
-                    && live.doc.annotations().len() == 1
-                {
+                if host.live_plane().has_pending(session) {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
-        .expect("the accepted annotation lands in the real document");
+        .expect("the accepted annotation lands in the pending queue");
 
         drop(ws);
 
