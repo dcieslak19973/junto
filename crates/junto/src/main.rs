@@ -15,6 +15,7 @@ mod forge;
 mod grader;
 mod host;
 mod init;
+mod invites;
 mod keys;
 mod launch;
 mod live_bridge;
