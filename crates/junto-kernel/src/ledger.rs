@@ -155,8 +155,9 @@ pub struct ChannelView {
     /// ([`Keyring`]). **Not** derived from `party`: the Party answers "who is
     /// a member" (one row per email) while this answers "which keys may sign
     /// for them" (any number of grants per email, one per enrolled device).
-    /// Empty exactly when `party` is empty — no genesis, no founder, no
-    /// grants.
+    /// Empty when `party` is empty (no genesis, no founder, no grants), and
+    /// also when the party is non-empty but no member on it has ever carried
+    /// a key — a keyless founder yields a non-empty roster with no grants.
     pub keyring: Keyring,
     /// Entries whose author is not in the [`party`](ChannelView::party) —
     /// retained and surfaced, but excluded from standings and gate folding
@@ -441,18 +442,29 @@ impl<S: SubstrateProvider> Ledger<S> {
     /// Fold the **keyring** out of an ordered entry list (`docs/adr/0033`):
     /// every key ever granted signing authority, keyed by email. Distinct
     /// from [`Self::project_party`] on purpose — see [`Keyring`]'s doc
-    /// comment. The genesis author's key is granted by the `ChannelOpened`
-    /// entry itself (the founder's key never appears in a `MemberAdded`);
-    /// after that, a `MemberAdded` contributes a grant iff its author is the
-    /// founder (grant authority is the founder's alone) and the added member
-    /// carries a key (keyless members stay keyless). Grants accumulate in
-    /// the caller's entry order, which is canonical, so a member's grant
-    /// list is deterministic on every replica.
+    /// comment. The genesis author's key is granted by the canonically
+    /// *first* `ChannelOpened` entry only — a second, concurrent genesis is
+    /// `unrecognized` (`Self::project`) and must not seed a grant, or any
+    /// peer could inject a signing key for an arbitrary email by appending
+    /// one. After that, a `MemberAdded` contributes a grant iff its author
+    /// is the founder (grant authority is the founder's alone) and the
+    /// added member carries a key (keyless members stay keyless). Grants
+    /// accumulate in the caller's entry order, which is canonical, so a
+    /// member's grant list is deterministic on every replica.
     fn project_keyring(entries: &[LedgerEntry], founder_email: &str) -> Keyring {
         let mut keyring: Keyring = HashMap::new();
+        let mut genesis_seen = false;
         for entry in entries {
             match &entry.payload {
                 EntryPayload::ChannelOpened { .. } => {
+                    // Only the canonically first genesis grants a key —
+                    // regardless of whether *it* carries one, so a keyless
+                    // first genesis can't let a later, keyed one claim
+                    // founder authority.
+                    if genesis_seen {
+                        continue;
+                    }
+                    genesis_seen = true;
                     if let Some(key) = entry.author.public_key.clone() {
                         keyring
                             .entry(entry.author.email.clone())
@@ -919,16 +931,14 @@ mod tests {
         let view = ledger.project(&channel).await.unwrap();
         let grants = view.keyring.get("dan@x.com").expect("dan has grants");
         assert_eq!(grants.len(), 2, "genesis key plus the enrolled device key");
-        assert!(
-            grants
-                .iter()
-                .any(|g| g.key == k1.public_key() && g.granted_by == genesis_id)
+        assert_eq!(
+            grants[0].key,
+            k1.public_key(),
+            "grants accumulate in canonical entry order"
         );
-        assert!(
-            grants
-                .iter()
-                .any(|g| g.key == k2.public_key() && g.granted_by == grant_id)
-        );
+        assert_eq!(grants[0].granted_by, genesis_id);
+        assert_eq!(grants[1].key, k2.public_key());
+        assert_eq!(grants[1].granted_by, grant_id);
     }
 
     /// A `MemberAdded` authored by a non-founder member carrying a key must
@@ -1076,8 +1086,69 @@ mod tests {
         );
         let grants: &Vec<KeyGrant> = view.keyring.get("mia@example.com").expect("grants");
         assert_eq!(grants.len(), 2, "keyring holds a grant per device");
-        assert!(grants.iter().any(|g| g.key == k1.public_key()));
-        assert!(grants.iter().any(|g| g.key == k2.public_key()));
+        assert_eq!(grants[0].key, k1.public_key());
+        assert_eq!(grants[1].key, k2.public_key());
+    }
+
+    /// `docs/adr/0011` union-merge can leave two `ChannelOpened` entries in
+    /// the log; `project_party` resolves that to the canonically first
+    /// author as founder, and the second genesis is `unrecognized`
+    /// (`Self::project`). The keyring must track that exactly: only the
+    /// first genesis's key is granted. A naive implementation that grants
+    /// from every `ChannelOpened` would let any peer inject a signing key
+    /// for an arbitrary email by appending a second genesis — this is the
+    /// regression that guards against it.
+    #[tokio::test]
+    async fn only_the_canonically_first_genesis_grants_a_key() {
+        let alice_key = crate::SigningKey::from_secret_bytes([1; 32]);
+        let bob_key = crate::SigningKey::from_secret_bytes([2; 32]);
+        let alice = Member::human("Alice", "alice@example.com").with_key(alice_key.public_key());
+        let bob = Member::human("Bob", "bob@example.com").with_key(bob_key.public_key());
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+
+        // Bob's genesis is appended first but sorts canonically second
+        // (later timestamp) — the same pattern as
+        // `duplicate_geneses_resolve_to_the_canonically_first`.
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                bob.clone(),
+                2,
+                EntryPayload::ChannelOpened {
+                    name: "later".into(),
+                },
+            ))
+            .await
+            .unwrap();
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                alice.clone(),
+                1,
+                EntryPayload::ChannelOpened {
+                    name: "first".into(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert_eq!(
+            view.party.first().map(|m| m.email.as_str()),
+            Some("alice@example.com"),
+            "alice's genesis is canonically first"
+        );
+        assert!(
+            view.keyring.contains_key("alice@example.com"),
+            "the canonical founder's key is granted"
+        );
+        assert!(
+            !view.keyring.contains_key("bob@example.com"),
+            "the rejected second genesis must not seed a grant"
+        );
     }
 
     #[tokio::test]
