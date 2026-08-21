@@ -138,6 +138,10 @@ pub(crate) async fn project_fresh(
     Ok((id, view, substrate))
 }
 
+// Same Response-as-error idiom, same cold Err path, and both callers above
+// already carry this allow — boxing here would only add a deref at each of
+// them. See the rationale above `project`.
+#[allow(clippy::result_large_err)]
 async fn resolve_for_projection(
     host: &Host,
     channel: &str,
