@@ -796,7 +796,7 @@ impl LiveSessions {
                 && event.kind == "tool"
                 && is_edit_or_write
             {
-                live.doc.push_worktree(value);
+                live.doc.push_worktree(&value);
             }
         }
         let mut map = self.inner.lock().expect("live sessions registry lock");
@@ -1743,7 +1743,7 @@ fn spawn_turn(
             && let Some(diff) = workspace_diff(&workspace)
             && let Some(commit) = diff.commit
         {
-            live.doc.push_worktree(serde_json::json!({
+            live.doc.push_worktree(&serde_json::json!({
                 "kind": "diff",
                 "text": diff.text,
                 "commit": commit,
@@ -2092,6 +2092,17 @@ async fn run_worker_turn(
         &mut control,
     )
     .await;
+    // Live-plane segment-boundary reset: this session's `LiveDoc` (if any)
+    // is shared across every iteration of the Outcome loop under one
+    // `begin`/`finish` pair (unlike `spawn_turn`'s one-document-per-turn
+    // case), and `run_turn`'s `acp::FeedState` mints a fresh segment
+    // counter starting at 1 on every call — without this, the next
+    // iteration's first `seq: 1` push would silently overwrite this turn's
+    // own `seq: 1` entry (see `LiveDoc::reset_segment_state`'s doc
+    // comment). Fire-and-forget, same as every other tap.
+    if let Some(live) = host.live_plane().get(session) {
+        live.doc.reset_segment_state();
+    }
     if outcome.harness_session.is_some() {
         *harness_session = outcome.harness_session.clone();
     }
@@ -2159,6 +2170,13 @@ async fn verify_one(
         &mut control,
     )
     .await;
+    // Same segment-boundary reset as `run_worker_turn` — the grader turn is
+    // another `run_turn` call sharing this session's one `LiveDoc` across
+    // the whole Outcome loop, and its own `acp::FeedState` also restarts
+    // its segment counter at 1.
+    if let Some(live) = host.live_plane().get(session) {
+        live.doc.reset_segment_state();
+    }
 
     if let Err(err) =
         store_grader_report(host, channel_ref, channel, session, &graded.result, agent).await

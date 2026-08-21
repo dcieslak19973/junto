@@ -86,12 +86,19 @@ pub struct LiveDoc {
     /// entry in place instead of appending (see the module docs). `0`
     /// means "no active growing segment" — the sentinel a discrete,
     /// non-growing event's own `seq` always carries, and a value a real
-    /// segment id never takes (the host's segment-id counter starts at 1).
-    /// Local bookkeeping only, never part of the CRDT itself: a fresh
-    /// [`LiveDoc::fork`] starts this back at `0`, even though it may
-    /// inherit a `conversation` container whose last entry has a nonzero
-    /// `seq` — a fork is read for validation, never locally pushed to (see
-    /// `crate::validate`), so this never observably diverges.
+    /// segment id never takes *within one producer's run* (the host's
+    /// segment-id counter starts at 1 each time). That per-run promise is
+    /// exactly why a caller that reuses one `LiveDoc` across more than one
+    /// producer run (the Outcome loop's worker/grader turns, all sharing
+    /// one `begin`/`finish` pair) **must** call
+    /// [`LiveDoc::reset_segment_state`] between runs: without it, a new
+    /// run's own `seq: 1` would collide with, and silently overwrite, an
+    /// unrelated entry an earlier run left at `seq: 1`. Local bookkeeping
+    /// only, never part of the CRDT itself: a fresh [`LiveDoc::fork`]
+    /// starts this back at `0`, even though it may inherit a `conversation`
+    /// container whose last entry has a nonzero `seq` — a fork is read for
+    /// validation, never locally pushed to (see `crate::validate`), so this
+    /// never observably diverges.
     conversation_seq: Mutex<u64>,
     /// Same contract as `conversation_seq`, for `worktree`.
     worktree_seq: Mutex<u64>,
@@ -120,15 +127,40 @@ impl LiveDoc {
     /// [`LiveDoc::push_event`]. `event` is stored as its own JSON text, not
     /// decomposed into loro fields — the watcher UI parses it back on read,
     /// so the wire shape lives with the event's own producer, not with this
-    /// crate.
-    pub fn push_conversation(&self, event: serde_json::Value) {
+    /// crate. Takes `event` by reference: this never consumes it, so a
+    /// caller that also needs the same value elsewhere (e.g.
+    /// `crate::launch::LiveSessions::publish`, pushing one already-built
+    /// value to both `conversation` and `worktree`) never has to clone it.
+    pub fn push_conversation(&self, event: &serde_json::Value) {
         self.push_event(CONVERSATION, &self.conversation_seq, event);
     }
 
     /// Push a worktree (file-edit/diff) event. Same shape, replace-in-place,
-    /// and policy as [`LiveDoc::push_conversation`], distinct container.
-    pub fn push_worktree(&self, event: serde_json::Value) {
+    /// reference-not-owned, and policy as [`LiveDoc::push_conversation`],
+    /// distinct container.
+    pub fn push_worktree(&self, event: &serde_json::Value) {
         self.push_event(WORKTREE, &self.worktree_seq, event);
+    }
+
+    /// Reset the growing-segment coalescing state for both `conversation`
+    /// and `worktree` back to "no active segment". Call this at a producer
+    /// boundary — after one `run_turn` returns and before the next one
+    /// starts pushing — whenever more than one producer run shares this
+    /// `LiveDoc` (the Outcome loop's `begin`/`finish` pair spans every
+    /// worker and grader turn in the loop). See the `conversation_seq`
+    /// field docs for what happens if this is skipped: a later run's first
+    /// `seq: 1` silently overwrites an earlier run's own `seq: 1` entry,
+    /// and that loss is permanent once the document is archived. Never
+    /// touches the CRDT content itself — only this bookkeeping.
+    pub fn reset_segment_state(&self) {
+        *self
+            .conversation_seq
+            .lock()
+            .expect("LiveDoc coalescing-state lock") = 0;
+        *self
+            .worktree_seq
+            .lock()
+            .expect("LiveDoc coalescing-state lock") = 0;
     }
 
     /// Number of events pushed to `conversation` so far.
@@ -305,7 +337,7 @@ impl LiveDoc {
     /// equals `last_seq`'s current value, `set()` the list's last entry in
     /// place instead of appending (see the module docs and the
     /// `conversation_seq`/`worktree_seq` field docs).
-    fn push_event(&self, container: &str, last_seq: &Mutex<u64>, event: serde_json::Value) {
+    fn push_event(&self, container: &str, last_seq: &Mutex<u64>, event: &serde_json::Value) {
         let seq = event
             .get("seq")
             .and_then(serde_json::Value::as_u64)
@@ -434,7 +466,7 @@ mod tests {
     #[test]
     fn conversation_events_survive_snapshot() {
         let a = LiveDoc::new();
-        a.push_conversation(serde_json::json!({"kind": "assistant", "text": "hi", "seq": 1}));
+        a.push_conversation(&serde_json::json!({"kind": "assistant", "text": "hi", "seq": 1}));
         let b = LiveDoc::new();
         b.import_update(&a.export_snapshot()).unwrap();
         // Read back via the doc's deep value; one list entry.
@@ -444,7 +476,7 @@ mod tests {
     #[test]
     fn worktree_events_survive_snapshot() {
         let a = LiveDoc::new();
-        a.push_worktree(serde_json::json!({"kind": "edit", "path": "src/lib.rs"}));
+        a.push_worktree(&serde_json::json!({"kind": "edit", "path": "src/lib.rs"}));
         let b = LiveDoc::new();
         b.import_update(&a.export_snapshot()).unwrap();
         assert_eq!(b.worktree_len(), 1);
@@ -456,9 +488,9 @@ mod tests {
     #[test]
     fn same_seq_conversation_pushes_replace_in_place() {
         let live = LiveDoc::new();
-        live.push_conversation(serde_json::json!({"seq": 1, "text": "a"}));
-        live.push_conversation(serde_json::json!({"seq": 1, "text": "ab"}));
-        live.push_conversation(serde_json::json!({"seq": 1, "text": "abc"}));
+        live.push_conversation(&serde_json::json!({"seq": 1, "text": "a"}));
+        live.push_conversation(&serde_json::json!({"seq": 1, "text": "ab"}));
+        live.push_conversation(&serde_json::json!({"seq": 1, "text": "abc"}));
         assert_eq!(
             live.conversation_len(),
             1,
@@ -468,16 +500,16 @@ mod tests {
         // (or a stale middle) write — conversation_matches compares content,
         // not just length.
         let expected = LiveDoc::new();
-        expected.push_conversation(serde_json::json!({"seq": 1, "text": "abc"}));
+        expected.push_conversation(&serde_json::json!({"seq": 1, "text": "abc"}));
         assert!(live.conversation_matches(&expected));
 
         // A different nonzero seq starts a fresh entry.
-        live.push_conversation(serde_json::json!({"seq": 2, "text": "next"}));
+        live.push_conversation(&serde_json::json!({"seq": 2, "text": "next"}));
         assert_eq!(live.conversation_len(), 2);
         // `seq: 0` (discrete lines, `LiveEvent::new`'s default) never
         // coalesces, even against another `seq: 0` right behind it.
-        live.push_conversation(serde_json::json!({"seq": 0, "text": "line"}));
-        live.push_conversation(serde_json::json!({"seq": 0, "text": "line2"}));
+        live.push_conversation(&serde_json::json!({"seq": 0, "text": "line"}));
+        live.push_conversation(&serde_json::json!({"seq": 0, "text": "line2"}));
         assert_eq!(live.conversation_len(), 4);
     }
 
@@ -487,19 +519,60 @@ mod tests {
         // under one stable seq (`acp::FeedState::tools`) must land as one
         // `worktree` entry, not two, or every Edit/Write lands twice.
         let live = LiveDoc::new();
-        live.push_worktree(serde_json::json!({"seq": 7, "text": "Edit: x.rs"}));
-        live.push_worktree(serde_json::json!({"seq": 7, "text": "Edit: x.rs [completed]"}));
+        live.push_worktree(&serde_json::json!({"seq": 7, "text": "Edit: x.rs"}));
+        live.push_worktree(&serde_json::json!({"seq": 7, "text": "Edit: x.rs [completed]"}));
         assert_eq!(live.worktree_len(), 1);
         let expected = LiveDoc::new();
-        expected.push_worktree(serde_json::json!({"seq": 7, "text": "Edit: x.rs [completed]"}));
+        expected.push_worktree(&serde_json::json!({"seq": 7, "text": "Edit: x.rs [completed]"}));
         assert!(live.worktree_matches(&expected));
+    }
+
+    #[test]
+    fn reset_segment_state_prevents_a_new_turns_seq_from_clobbering_the_prior_turns_entry() {
+        // Simulates two producer runs sharing one `LiveDoc` (the Outcome
+        // loop's worker/grader turns, all under one `begin`/`finish` pair —
+        // see `crate::launch::run_worker_turn`/`verify_one`), each minting
+        // its own segment ids starting at 1 (`acp::FeedState::fresh_seq`).
+        // Without a reset between them, the second run's `seq: 1` would
+        // silently replace the first run's `seq: 1` entry.
+        let live = LiveDoc::new();
+        live.push_conversation(&serde_json::json!({"seq": 1, "text": "turn one result"}));
+        live.reset_segment_state();
+        live.push_conversation(&serde_json::json!({"seq": 1, "text": "turn two result"}));
+        assert_eq!(
+            live.conversation_len(),
+            2,
+            "reset must let a new run's seq 1 append, not replace, the prior run's seq 1 entry"
+        );
+        let expected = LiveDoc::new();
+        expected.push_conversation(&serde_json::json!({"seq": 1, "text": "turn one result"}));
+        expected.reset_segment_state();
+        expected.push_conversation(&serde_json::json!({"seq": 1, "text": "turn two result"}));
+        assert!(
+            live.conversation_matches(&expected),
+            "both entries must keep their own original content, not one overwriting the other"
+        );
+
+        // The negative case, proven directly: the same two pushes with NO
+        // reset in between really do collide — this is the exact failure
+        // mode `reset_segment_state` exists to prevent, not a hypothetical.
+        let unreset = LiveDoc::new();
+        unreset.push_conversation(&serde_json::json!({"seq": 1, "text": "turn one result"}));
+        unreset.push_conversation(&serde_json::json!({"seq": 1, "text": "turn two result"}));
+        assert_eq!(
+            unreset.conversation_len(),
+            1,
+            "without a reset, a same-seq push from an unrelated run still coalesces \
+             (that's the growing-segment case this coalescing is for) — silently \
+             losing the first run's entry"
+        );
     }
 
     #[test]
     fn fork_produces_an_independently_editable_replica_that_still_converges() {
         let key = junto_kernel::SigningKey::from_secret_bytes([4; 32]);
         let original = LiveDoc::new();
-        original.push_conversation(serde_json::json!({"seq": 1}));
+        original.push_conversation(&serde_json::json!({"seq": 1}));
 
         let forked = original.fork();
 
@@ -508,7 +581,7 @@ mod tests {
         // (the exact hazard the struct docs warn about), these concurrent
         // edits would corrupt one side's op history instead of merging
         // cleanly below.
-        original.push_conversation(serde_json::json!({"seq": 2}));
+        original.push_conversation(&serde_json::json!({"seq": 2}));
         let mut ann = test_annotation("from fork");
         ann.sign(&key).unwrap();
         forked.insert_annotation(&ann).unwrap();
@@ -539,7 +612,7 @@ mod tests {
             true
         });
 
-        live.push_conversation(serde_json::json!({"seq": 1}));
+        live.push_conversation(&serde_json::json!({"seq": 1}));
 
         assert_eq!(
             fire_count.load(Ordering::SeqCst),

@@ -288,7 +288,7 @@ mod tests {
         let server = LiveDoc::new();
         let watcher = LiveDoc::new();
         watcher.import_update(&server.export_snapshot()).unwrap();
-        watcher.push_conversation(serde_json::json!({"kind": "fake"}));
+        watcher.push_conversation(&serde_json::json!({"kind": "fake"}));
         let err = validate_annotation_update(
             &server,
             &watcher.export_snapshot(),
@@ -309,8 +309,8 @@ mod tests {
     fn rejected_frame_leaves_server_document_unchanged() {
         let key = junto_kernel::SigningKey::from_secret_bytes([5; 32]);
         let server = LiveDoc::new();
-        server.push_conversation(serde_json::json!({"seq": 1}));
-        server.push_worktree(serde_json::json!({"path": "src/lib.rs"}));
+        server.push_conversation(&serde_json::json!({"seq": 1}));
+        server.push_worktree(&serde_json::json!({"path": "src/lib.rs"}));
         let watcher = LiveDoc::new();
         watcher.import_update(&server.export_snapshot()).unwrap();
         let ann = test_annotation_by("w@x.com", "looks wrong"); // unsigned -> rejected
@@ -444,7 +444,7 @@ mod tests {
     fn conversation_splice_with_equal_length_rejects() {
         let key = junto_kernel::SigningKey::from_secret_bytes([5; 32]);
         let server = LiveDoc::new();
-        server.push_conversation(serde_json::json!({"seq": 1}));
+        server.push_conversation(&serde_json::json!({"seq": 1}));
 
         // A hand-rolled peer that shares the server's causal history (so it
         // can target the existing element's position), then deletes it and
@@ -476,7 +476,7 @@ mod tests {
     fn worktree_splice_with_equal_length_rejects() {
         let key = junto_kernel::SigningKey::from_secret_bytes([5; 32]);
         let server = LiveDoc::new();
-        server.push_worktree(serde_json::json!({"path": "src/lib.rs"}));
+        server.push_worktree(&serde_json::json!({"path": "src/lib.rs"}));
 
         let peer = loro::LoroDoc::new();
         peer.import(&server.export_snapshot()).unwrap();

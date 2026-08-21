@@ -74,8 +74,10 @@ impl SessionLive {
     /// Returns the event's serialized JSON value on success, so a caller
     /// that also needs to push the same event into `worktree` (a tool
     /// event whose label indicates a file edit or write — see
-    /// `crate::launch::LiveSessions::publish`) can hand that value straight
-    /// to `doc.push_worktree` instead of serializing `event` a second time.
+    /// `crate::launch::LiveSessions::publish`) can pass that same value by
+    /// reference to `doc.push_worktree` instead of serializing `event` a
+    /// second time — `LiveDoc::push_conversation`/`push_worktree` both take
+    /// `&serde_json::Value`, so no clone is needed for either push.
     ///
     /// Fire-and-forget: a serialization failure is logged and dropped, never
     /// propagated — see the module docs on the never-block invariant. In
@@ -87,7 +89,7 @@ impl SessionLive {
     ) -> Option<serde_json::Value> {
         match serde_json::to_value(event) {
             Ok(value) => {
-                self.doc.push_conversation(value.clone());
+                self.doc.push_conversation(&value);
                 Some(value)
             }
             Err(err) => {
