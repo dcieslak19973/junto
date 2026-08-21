@@ -104,8 +104,10 @@ pub struct KeyGrant {
     /// the founder's own key, or the founder-authored `MemberAdded` that
     /// enrolled it.
     pub granted_by: EntryId,
-    /// When this grant was retired (Task 2: founder-authored Park of the
-    /// grant). `None` in this task — nothing retires yet.
+    /// When this grant was retired: the timestamp of the earliest
+    /// founder-authored [`EntryPayload::Park`] whose `target` is
+    /// [`Self::granted_by`] (`Self::project_keyring`). `None` if no such
+    /// park exists.
     pub retired_at: Option<Timestamp>,
 }
 
@@ -355,7 +357,7 @@ impl<S: SubstrateProvider> Ledger<S> {
             .iter()
             .filter(|entry| !unrecognized.contains(&entry.id))
             .collect();
-        let unverified = Self::project_unverified(&party, &recognized);
+        let unverified = Self::project_unverified(&party, &keyring, &recognized);
 
         let standings = Self::project_standings(&recognized);
         let gate_status = Self::project_gates(&recognized);
@@ -440,24 +442,35 @@ impl<S: SubstrateProvider> Ledger<S> {
     }
 
     /// Fold the **keyring** out of an ordered entry list (`docs/adr/0033`):
-    /// every key ever granted signing authority, keyed by email. Distinct
-    /// from [`Self::project_party`] on purpose — see [`Keyring`]'s doc
-    /// comment. The genesis author's key is granted by the canonically
-    /// *first* `ChannelOpened` entry, and by that entry alone — mirroring
-    /// `project_party`'s founder, which is fixed the same way. Any later
-    /// `ChannelOpened` grants nothing, full stop; this does **not** rest on
-    /// whether that later entry ends up `unrecognized` (`Self::project`) —
-    /// a second genesis re-authored by an email already on the roster (the
-    /// founder's own re-open, or an added member's) is *recognized*, since
-    /// `unrecognized` is computed purely by email-set membership, yet must
-    /// still not grant. Without a hard first-genesis-only rule, any peer
-    /// could inject a signing key for an arbitrary email by appending a
-    /// `ChannelOpened`. After the genesis, a `MemberAdded` contributes a
-    /// grant iff its author is the founder (grant authority is the
-    /// founder's alone) and the added member carries a key (keyless
-    /// members stay keyless). Grants accumulate in the caller's entry
-    /// order, which is canonical, so a member's grant list is
-    /// deterministic on every replica.
+    /// every key ever granted signing authority, keyed by email, together
+    /// with when each grant was retired. Distinct from [`Self::project_party`]
+    /// on purpose — see [`Keyring`]'s doc comment. The genesis author's key
+    /// is granted by the canonically *first* `ChannelOpened` entry, and by
+    /// that entry alone — mirroring `project_party`'s founder, which is
+    /// fixed the same way. Any later `ChannelOpened` grants nothing, full
+    /// stop; this does **not** rest on whether that later entry ends up
+    /// `unrecognized` (`Self::project`) — a second genesis re-authored by an
+    /// email already on the roster (the founder's own re-open, or an added
+    /// member's) is *recognized*, since `unrecognized` is computed purely by
+    /// email-set membership, yet must still not grant. Without a hard
+    /// first-genesis-only rule, any peer could inject a signing key for an
+    /// arbitrary email by appending a `ChannelOpened`. After the genesis, a
+    /// `MemberAdded` contributes a grant iff its author is the founder
+    /// (grant authority is the founder's alone) and the added member
+    /// carries a key (keyless members stay keyless). Grants accumulate in
+    /// the caller's entry order, which is canonical, so a member's grant
+    /// list is deterministic on every replica.
+    ///
+    /// A second pass retires grants: a founder-authored [`EntryPayload::Park`]
+    /// whose `target` is a grant's [`KeyGrant::granted_by`] retires that
+    /// grant as of the park's own `timestamp` — [`Self::project_unverified`]
+    /// then stops it from verifying entries stamped later, while entries
+    /// stamped before are unaffected. A park authored by anyone but the
+    /// founder, or whose `target` granted no key, matches no `granted_by`
+    /// below and so has no effect — the same leniency dangling targets
+    /// already get elsewhere in this file. Several parks on the same grant:
+    /// the *earliest* timestamp wins, so a grant's retirement can only move
+    /// earlier, never later, regardless of entry-append order.
     fn project_keyring(entries: &[LedgerEntry], founder_email: &str) -> Keyring {
         let mut keyring: Keyring = HashMap::new();
         let mut genesis_seen = false;
@@ -500,37 +513,60 @@ impl<S: SubstrateProvider> Ledger<S> {
                 _ => {}
             }
         }
+
+        // Earliest founder-authored Park per targeted grant. A park
+        // targeting a non-granting entry never matches any `granted_by`
+        // below, so it is ignored without a separate dangling-target check.
+        let mut retirements: HashMap<EntryId, Timestamp> = HashMap::new();
+        for entry in entries {
+            if let EntryPayload::Park { target, .. } = &entry.payload
+                && entry.author.email == founder_email
+            {
+                retirements
+                    .entry(*target)
+                    .and_modify(|earliest| *earliest = (*earliest).min(entry.timestamp))
+                    .or_insert(entry.timestamp);
+            }
+        }
+        if !retirements.is_empty() {
+            for grant in keyring.values_mut().flatten() {
+                if let Some(&retired_at) = retirements.get(&grant.granted_by) {
+                    grant.retired_at = Some(retired_at);
+                }
+            }
+        }
+
         keyring
     }
 
     /// Which recognized entries fail authorship verification
-    /// (`docs/adr/0033`): authorship verifies against the Party's own
-    /// projected public key (one per member — deliberately *not* the
-    /// [`Keyring`], which can hold several keys per email; verification
-    /// authority stays scoped to a member's current roster key until a later
-    /// task widens it). An entry is **unverified** when its author has no
-    /// key on the roster or its signature does not verify against that key.
-    /// With an empty Party (no genesis) nothing is marked — consistent with
-    /// membership not being enforced there either.
-    fn project_unverified(party: &[Member], recognized: &[&LedgerEntry]) -> HashSet<EntryId> {
+    /// (`docs/adr/0033`, Task 2): an entry verifies iff **some** grant for
+    /// its author's email is active at the entry's own `timestamp`
+    /// ([`KeyGrant::active_at`]) and the entry's signature matches that
+    /// grant's key ([`LedgerEntry::verifies_with`]) — any of a member's
+    /// devices may sign, and a retired device stops verifying only entries
+    /// stamped after its retirement; entries stamped before are unaffected.
+    /// An entry is **unverified** when its author's email has no such
+    /// grant. With an empty Party (no genesis) nothing is marked —
+    /// consistent with membership not being enforced there either.
+    fn project_unverified(
+        party: &[Member],
+        keyring: &Keyring,
+        recognized: &[&LedgerEntry],
+    ) -> HashSet<EntryId> {
         if party.is_empty() {
             return HashSet::new();
         }
-        let roster_keys: HashMap<&str, &crate::PublicKey> = party
-            .iter()
-            .filter_map(|member| {
-                member
-                    .public_key
-                    .as_ref()
-                    .map(|key| (member.email.as_str(), key))
-            })
-            .collect();
         recognized
             .iter()
             .filter(|entry| {
-                roster_keys
+                !keyring
                     .get(entry.author.email.as_str())
-                    .is_none_or(|key| !entry.verifies_with(key))
+                    .is_some_and(|grants| {
+                        grants.iter().any(|grant| {
+                            grant.active_at(entry.timestamp) && entry.verifies_with(&grant.key)
+                        })
+                    })
             })
             .map(|entry| entry.id)
             .collect()
@@ -1156,6 +1192,218 @@ mod tests {
             !view.keyring.contains_key("bob@example.com"),
             "the rejected second genesis must not seed a grant"
         );
+    }
+
+    /// `docs/adr/0033` (Task 2) — a founder-authored `Park` targeting the
+    /// entry that granted a key retires that grant *at the park's own
+    /// timestamp*, not from the beginning of time: an entry signed with the
+    /// retired key still verifies if it is stamped before the park, and
+    /// fails to verify only once stamped after it. Retiring a device does
+    /// not rewrite history.
+    #[tokio::test]
+    async fn a_retired_grant_verifies_before_its_park_and_not_after() {
+        let founder_key = crate::SigningKey::from_secret_bytes([1; 32]);
+        let agent_key = crate::SigningKey::from_secret_bytes([2; 32]);
+        let dan = Member::human("Dan", "dan@example.com").with_key(founder_key.public_key());
+        let agent = Member::agent("Worker", "worker@agents.junto").with_key(agent_key.public_key());
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+
+        let mut genesis = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            1,
+            EntryPayload::ChannelOpened { name: "ch".into() },
+        );
+        genesis.sign(&founder_key).unwrap();
+
+        let grant_id = EntryId::new();
+        let mut grant = entry(
+            grant_id,
+            channel,
+            dan.clone(),
+            2,
+            EntryPayload::MemberAdded {
+                member: agent.clone(),
+            },
+        );
+        grant.sign(&founder_key).unwrap();
+
+        let before_id = EntryId::new();
+        let mut before = entry(
+            before_id,
+            channel,
+            agent.clone(),
+            3,
+            assertion("before park"),
+        );
+        before.sign(&agent_key).unwrap();
+
+        let park = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            4,
+            EntryPayload::Park {
+                target: grant_id,
+                rationale: "device lost".into(),
+            },
+        );
+
+        let after_id = EntryId::new();
+        let mut after = entry(after_id, channel, agent.clone(), 5, assertion("after park"));
+        after.sign(&agent_key).unwrap();
+
+        for e in [genesis, grant, before, park, after] {
+            ledger.append(e).await.unwrap();
+        }
+
+        let view = ledger.project(&channel).await.unwrap();
+        let grants = view
+            .keyring
+            .get("worker@agents.junto")
+            .expect("agent has a grant");
+        assert_eq!(
+            grants[0].retired_at,
+            Some(Timestamp::from_millis(4)),
+            "the grant is retired at the park's own timestamp"
+        );
+        assert!(
+            !view.unverified.contains(&before_id),
+            "signed before the park, the grant was still active"
+        );
+        assert!(
+            view.unverified.contains(&after_id),
+            "signed after the park, the grant is retired"
+        );
+    }
+
+    /// `docs/adr/0033` (Task 2) — only the founder may retire a grant,
+    /// mirroring the grant rule itself (`project_keyring`'s `MemberAdded`
+    /// branch). A `Park` from anyone else targeting a granting entry has no
+    /// effect on the keyring.
+    #[tokio::test]
+    async fn a_non_founder_park_does_not_retire_a_grant() {
+        let founder_key = crate::SigningKey::from_secret_bytes([1; 32]);
+        let agent_key = crate::SigningKey::from_secret_bytes([2; 32]);
+        let dan = Member::human("Dan", "dan@example.com").with_key(founder_key.public_key());
+        let agent = Member::agent("Worker", "worker@agents.junto").with_key(agent_key.public_key());
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+
+        let mut genesis = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            1,
+            EntryPayload::ChannelOpened { name: "ch".into() },
+        );
+        genesis.sign(&founder_key).unwrap();
+
+        let grant_id = EntryId::new();
+        let mut grant = entry(
+            grant_id,
+            channel,
+            dan.clone(),
+            2,
+            EntryPayload::MemberAdded {
+                member: agent.clone(),
+            },
+        );
+        grant.sign(&founder_key).unwrap();
+
+        // The agent — not the founder — tries to park its own grant.
+        let non_founder_park = entry(
+            EntryId::new(),
+            channel,
+            agent.clone(),
+            3,
+            EntryPayload::Park {
+                target: grant_id,
+                rationale: "not my call".into(),
+            },
+        );
+
+        let later_id = EntryId::new();
+        let mut later = entry(later_id, channel, agent.clone(), 4, assertion("still mine"));
+        later.sign(&agent_key).unwrap();
+
+        for e in [genesis, grant, non_founder_park, later] {
+            ledger.append(e).await.unwrap();
+        }
+
+        let view = ledger.project(&channel).await.unwrap();
+        let grants = view
+            .keyring
+            .get("worker@agents.junto")
+            .expect("agent has a grant");
+        assert_eq!(
+            grants[0].retired_at, None,
+            "a non-founder park has no authority to retire a grant"
+        );
+        assert!(!view.unverified.contains(&later_id));
+    }
+
+    /// `docs/adr/0033` (Task 2) — an email can hold several active grants
+    /// (one per enrolled device); an entry verifies if its signature
+    /// matches ANY of them, not just the first.
+    #[tokio::test]
+    async fn an_entry_verifies_against_any_active_grant() {
+        let k1 = crate::SigningKey::from_secret_bytes([1; 32]);
+        let k2 = crate::SigningKey::from_secret_bytes([2; 32]);
+        let dan = Member::human("Dan", "dan@x.com").with_key(k1.public_key());
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+
+        let mut genesis = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            1,
+            EntryPayload::ChannelOpened { name: "ch".into() },
+        );
+        genesis.sign(&k1).unwrap();
+
+        // Dan's own second device, enrolled via a self-authored MemberAdded
+        // carrying k2.
+        let second_device = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            2,
+            EntryPayload::MemberAdded {
+                member: dan.clone().with_key(k2.public_key()),
+            },
+        );
+
+        let via_k1_id = EntryId::new();
+        let mut via_k1 = entry(
+            via_k1_id,
+            channel,
+            dan.clone(),
+            3,
+            assertion("from device one"),
+        );
+        via_k1.sign(&k1).unwrap();
+
+        let via_k2_id = EntryId::new();
+        let mut via_k2 = entry(
+            via_k2_id,
+            channel,
+            dan.clone(),
+            4,
+            assertion("from device two"),
+        );
+        via_k2.sign(&k2).unwrap();
+
+        for e in [genesis, second_device, via_k1, via_k2] {
+            ledger.append(e).await.unwrap();
+        }
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert!(!view.unverified.contains(&via_k1_id));
+        assert!(!view.unverified.contains(&via_k2_id));
     }
 
     #[tokio::test]
