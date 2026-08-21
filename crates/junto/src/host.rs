@@ -309,9 +309,26 @@ impl Host {
         &self.live
     }
 
+    /// The live plane registry (`crate::live_plane`) for this host's
+    /// running Agent Sessions — one CRDT document + presence + frame
+    /// broadcast per live session, tapped alongside [`Host::live`]'s SSE
+    /// feed and archived when a session ends. Delegates to
+    /// [`crate::launch::LiveSessions`]'s own plane field rather than adding
+    /// a second field to `Host`, since `LiveSessions`' `begin`/`publish`/
+    /// `finish` are the taps that populate it.
+    pub(crate) fn live_plane(&self) -> &Arc<crate::live_plane::LivePlane> {
+        &self.live.plane
+    }
+
     /// Where this host's member-code store lives (`docs/adr/0017`): the
-    /// machine registry's junto home, unless overridden (tests).
-    fn member_home(&self) -> Result<PathBuf> {
+    /// machine registry's junto home, unless overridden (tests). Exposed
+    /// crate-wide (not just to [`Host::sign_entry`]) so a caller that needs
+    /// to ask "does this host hold a key for X" — e.g.
+    /// `crate::live_bridge::deliver_batch`'s non-minting lookup — resolves
+    /// the identical path `sign_entry` signs against, including the
+    /// test-only override; asking a *different* home would silently check
+    /// the wrong store.
+    pub(crate) fn member_home(&self) -> Result<PathBuf> {
         if let Some(home) = &self.member_home_override {
             return Ok(home.clone());
         }

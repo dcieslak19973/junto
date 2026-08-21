@@ -1,4 +1,4 @@
-﻿//! The host's web routes — the first human surface.
+//! The host's web routes — the first human surface.
 //!
 //! Three GET endpoints over the same projection (`docs/adr/0013`, `0015`):
 //! - `/` — the channel index: every channel across every registered home
@@ -84,6 +84,10 @@ pub fn router(host: Arc<Host>) -> Router {
         .route("/substrates.json", get(substrates_json))
         .route("/settings.json", get(settings_json))
         .route("/channels/{channel}/entries/{entry}/{act}", post(verify))
+        .route(
+            "/channels/{channel}/sessions/{session}/live",
+            get(crate::live_ws::live_session),
+        )
         .with_state(host)
         // Wrap any plain-text error response in a styled page (so a refused
         // act reads as a calm card, not a bare body on a blank page).
@@ -98,7 +102,7 @@ pub fn router(host: Arc<Host>) -> Router {
 // (result_large_err) costs nothing per-request, and boxing it would add
 // deref noise at every callsite.
 #[allow(clippy::result_large_err)]
-async fn project(
+pub(crate) async fn project(
     host: &Host,
     channel: &str,
 ) -> Result<(ChannelId, ChannelView, std::path::PathBuf), Response> {
@@ -2282,7 +2286,10 @@ mod tests {
 
         // With a live feed (receiver kept alive), the interrupt is delivered
         // and the card redirects.
-        let _rx = fx.host.live().begin(fx.target);
+        let _rx = fx
+            .host
+            .live()
+            .begin(fx.host.clone(), "web-test".into(), fx.target, true);
         let live = interrupt_session(
             State(fx.host.clone()),
             Path(("web-test".into(), fx.target.to_string())),

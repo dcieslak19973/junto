@@ -1,4 +1,4 @@
-﻿//! Launching Agent Sessions from the surface (`docs/adr/0023`).
+//! Launching Agent Sessions from the surface (`docs/adr/0023`).
 //!
 //! The **Workspace** is the machine-local mapping channel → repo(s) — where a
 //! channel's Agent Sessions execute (`~/.junto/workspaces.toml`). Paths never
@@ -721,11 +721,23 @@ pub(crate) struct NotLive;
 
 /// Per-session live feed: a bounded replay buffer (for a page that loads
 /// mid-turn), a broadcast sender for the live tail (host → human), and a
-/// control sender for mid-turn signals (human → turn).
+/// control sender for mid-turn signals (human → turn) — `None` for a
+/// session `begin` opened as non-steerable (`LiveSessions::begin`'s
+/// `steerable` flag), so [`LiveSessions::control`] reports [`NotLive`] for
+/// it even while the feed itself is registered. This is deliberately
+/// *not* the same thing as no feed existing at all: an autonomous Outcome
+/// loop turn (`crate::launch::spawn_outcome_loop`) drives itself with its
+/// own inert control channel and never reads the one `begin` would hand
+/// back, so a real, always-succeeding `try_send` into that channel would
+/// make `steer_live` report success for a steer nobody will ever act on —
+/// and `record_steer_note` would then write a `SessionUpdated` entry
+/// asserting a steer that never happened. `control: None` makes that
+/// failure mode structurally unreachable instead of relying on every
+/// caller to remember not to steer an unsteerable session.
 struct LiveFeed {
     buffer: Vec<LiveEvent>,
     sender: broadcast::Sender<LiveEvent>,
-    control: mpsc::Sender<TurnControl>,
+    control: Option<mpsc::Sender<TurnControl>>,
 }
 
 /// The host's in-memory registry of running sessions' live feeds. Ephemeral —
@@ -733,13 +745,35 @@ struct LiveFeed {
 #[derive(Default)]
 pub struct LiveSessions {
     inner: Mutex<HashMap<EntryId, LiveFeed>>,
+    /// The live plane registry (`crate::live_plane`) — one CRDT document +
+    /// presence + frame broadcast per session, tapped from `begin`/
+    /// `publish`/`finish` below alongside the SSE feed above. `Host`
+    /// exposes it via `Host::live_plane`, delegating to this field rather
+    /// than duplicating a registry on `Host` itself (`LiveSessions`'
+    /// methods, not `Host`'s, are what see every session lifecycle event).
+    pub(crate) plane: std::sync::Arc<crate::live_plane::LivePlane>,
 }
 
 impl LiveSessions {
     /// Open a fresh feed for a session about to run (replaces any stale one),
     /// returning the control receiver the running turn selects on (human →
-    /// turn).
-    pub(crate) fn begin(&self, session: EntryId) -> mpsc::Receiver<TurnControl> {
+    /// turn). `steerable` is `false` for an autonomous Outcome-loop turn
+    /// (`crate::launch::spawn_outcome_loop`) that never reads its own
+    /// control receiver — see [`LiveFeed`]'s doc for why that must not
+    /// register a real control sender.
+    ///
+    /// Also flushes `session`'s pending annotation queue (any watcher
+    /// comments queued while no turn was running) at the end, once the
+    /// fresh feed and live-plane document both exist: wired in here
+    /// directly, not left to the caller, so a future `begin` call site
+    /// cannot silently skip it (`crate::live_bridge::flush_pending`'s docs).
+    pub(crate) fn begin(
+        &self,
+        host: std::sync::Arc<Host>,
+        channel: String,
+        session: EntryId,
+        steerable: bool,
+    ) -> mpsc::Receiver<TurnControl> {
         let (sender, _rx) = broadcast::channel(256);
         // Capacity 1: one human, one in-flight signal at a time.
         let (control, control_rx) = mpsc::channel(1);
@@ -749,27 +783,71 @@ impl LiveSessions {
             LiveFeed {
                 buffer: Vec::new(),
                 sender,
-                control,
+                control: steerable.then_some(control),
             },
         );
+        drop(map);
+        // Live-plane tap: start this session's CRDT document alongside the
+        // SSE feed above (docs/superpowers/specs/2026-08-20-live-session-plane-design.md).
+        self.plane.begin(session);
+        crate::live_bridge::flush_pending(host, channel, session);
         control_rx
     }
 
     /// Deliver a human's control signal to the running turn, or `Err(NotLive)`
-    /// if no turn is currently streaming for the session.
+    /// if no turn is currently streaming for the session, or the session's
+    /// feed was opened non-steerable (`begin`'s `steerable` flag).
     pub(crate) fn control(&self, session: EntryId, signal: TurnControl) -> Result<(), NotLive> {
         let map = self.inner.lock().expect("live sessions registry lock");
         let feed = map.get(&session).ok_or(NotLive)?;
-        feed.control.try_send(signal).map_err(|_| NotLive)
+        feed.control
+            .as_ref()
+            .ok_or(NotLive)?
+            .try_send(signal)
+            .map_err(|_| NotLive)
     }
 
-    /// Append an event: into the replay buffer (bounded) and to live tails.
-    /// A non-zero `seq` marks a growing segment — successive same-`seq` events
-    /// **coalesce** in the replay buffer (the last one wins, so a late joiner
-    /// sees one rendered block, not every intermediate frame), which also keeps
-    /// a long Markdown stream from blowing the bound. Live subscribers still
-    /// receive every frame.
+    /// Whether `session` currently has a registered live feed — regardless
+    /// of whether it is steerable (`begin`'s `steerable` flag). Distinct
+    /// from [`Self::control`] succeeding: an outcome-loop session is live
+    /// but not steerable, so `control` reports [`NotLive`] for it even
+    /// while a turn is genuinely still running. [`crate::launch::steer`]
+    /// uses this to refuse resuming a session the host still considers
+    /// live, rather than treating `control`'s `NotLive` as "safe to start
+    /// a second, concurrent turn".
+    #[must_use]
+    pub(crate) fn is_live(&self, session: EntryId) -> bool {
+        self.inner
+            .lock()
+            .expect("live sessions registry lock")
+            .contains_key(&session)
+    }
+
+    /// Also taps the live plane first (fire-and-forget, never propagated —
+    /// see `crate::live_plane`'s module docs): every event feeds the
+    /// session's CRDT `conversation` container, and a tool event whose
+    /// label (`acp::tool_label`) indicates a file edit or write also lands
+    /// in `worktree` (reusing the same serialized value — see
+    /// [`SessionLive::publish_conversation`]), so watchers see file
+    /// activity without waiting for the turn-end diff snapshot.
+    ///
+    /// Then: into the replay buffer (bounded) and to live tails. A
+    /// non-zero `seq` marks a growing segment — successive same-`seq`
+    /// events **coalesce** in the replay buffer (the last one wins, so a
+    /// late joiner sees one rendered block, not every intermediate frame),
+    /// which also keeps a long Markdown stream from blowing the bound.
+    /// Live subscribers still receive every frame.
     pub(crate) fn publish(&self, session: EntryId, event: LiveEvent) {
+        if let Some(live) = self.plane.get(session) {
+            let is_edit_or_write =
+                event.text.starts_with("Edit") || event.text.starts_with("Write");
+            if let Some(value) = live.publish_conversation(&event)
+                && event.kind == "tool"
+                && is_edit_or_write
+            {
+                live.doc.push_worktree(&value);
+            }
+        }
         let mut map = self.inner.lock().expect("live sessions registry lock");
         if let Some(feed) = map.get_mut(&session) {
             let coalesce =
@@ -798,10 +876,15 @@ impl LiveSessions {
     }
 
     /// Close a session's feed — dropping the sender, so any live subscriber
-    /// sees the stream end and reloads to the now-persisted outcome.
-    fn finish(&self, session: EntryId) {
+    /// sees the stream end and reloads to the now-persisted outcome. Also
+    /// taps the live plane: removes its `SessionLive` and returns the
+    /// session's final CRDT snapshot bytes for the caller to archive as an
+    /// artifact (`None` if the live plane wasn't tracking the session).
+    pub(crate) fn finish(&self, session: EntryId) -> Option<Vec<u8>> {
         let mut map = self.inner.lock().expect("live sessions registry lock");
         map.remove(&session);
+        drop(map);
+        self.plane.finish(session)
     }
 }
 
@@ -1228,6 +1311,66 @@ fn store_artifact(
     Ok(ProvenanceRef::with_digest(uri, digest))
 }
 
+/// Archive a finished session's live-plane snapshot (`LivePlane::finish`'s
+/// return value) as an artifact named `name`, using the exact
+/// `store_artifact` + `ArtifactAttached` shape [`record_outcome`] uses for
+/// `diff.patch` — same signing, same append path (see the taps in
+/// `LiveSessions::finish`). `name` must be collision-free per session — a
+/// constant name would let a later turn's archive silently overwrite an
+/// earlier turn's already-appended `ArtifactAttached` entry's `file://`
+/// target, corrupting that entry's recorded digest; callers use the same
+/// `turn-{turn}-*`-numbered convention `record_outcome`'s own artifacts use,
+/// falling back to an id-suffixed name where no single turn number applies.
+/// `store_artifact` only writes text, so the binary snapshot is hex-encoded
+/// first — the durable ledger never carries CRDT bytes verbatim, only their
+/// provenance-tracked artifact.
+/// `pub(crate)` (not private) so `crate::live_ws`'s end-to-end smoke test
+/// (Task 11 of the live-session-plane plan) can archive a real finished
+/// session the same way `spawn_turn`/`capture_turn` do — this is the only
+/// path that proves the archived artifact is genuinely re-importable and
+/// that the durable `ArtifactAttached` ledger entry actually lands, not a
+/// hand-rolled substitute. Crate-internal only: do not re-tighten this back
+/// to private without moving or duplicating that test.
+pub(crate) async fn archive_live_snapshot(
+    host: &Host,
+    channel_ref: &str,
+    channel: ChannelId,
+    session: EntryId,
+    agent: &crate::agent::Agent,
+    name: &str,
+    snapshot: &[u8],
+) -> Result<()> {
+    let junto_home = crate::host::junto_home()?;
+    // One allocation for the whole string, not one `format!` heap `String`
+    // per byte: a real turn's snapshot runs hundreds of KB to a few MB, so
+    // the old `.map(|byte| format!(...)).collect()` was millions of
+    // allocations on a tokio worker with no yield point in between.
+    use std::fmt::Write as _;
+    let mut hex = String::with_capacity(snapshot.len() * 2);
+    for byte in snapshot {
+        write!(hex, "{byte:02x}").expect("writing hex digits into a String never fails");
+    }
+    let stored = store_artifact(&junto_home, &session, name, &hex)?;
+    append(
+        host,
+        channel_ref,
+        LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel,
+            author: agent.member(),
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::ArtifactAttached {
+                target: session,
+                kind: "live-snapshot".into(),
+                description: format!("live session plane snapshot ({} bytes)", snapshot.len()),
+                provenance: vec![stored],
+            },
+        },
+    )
+    .await
+}
+
 /// Suppress the console window Windows flashes when a GUI-hosted process
 /// spawns a console child. CLAUDE.md (terminal-less): agent and tool output
 /// is captured as Artifacts, never rendered as scrollback — and never as a
@@ -1242,9 +1385,29 @@ pub(crate) fn no_console_window(command: &mut std::process::Command) {
     let _ = command;
 }
 
+/// A workspace's uncommitted-changes diff (`git diff` against the right
+/// base, plus untracked file names), paired with the commit oid that diff
+/// is relative to.
+#[derive(Default)]
+struct WorkspaceDiff {
+    text: String,
+    /// The commit oid `text` is relative to: the recorded PR-branch base
+    /// commit (`branch.<branch>.juntoBaseSha`) when on a `junto/<session>`
+    /// branch, otherwise `HEAD`'s own oid — resolved together with `text`
+    /// itself so the two can never drift to different commits between two
+    /// separate git invocations. `None` only when the workspace has no
+    /// commits at all yet (nothing for `HEAD` to name); `text` may still be
+    /// non-empty in that case (untracked files in a brand-new repo), so
+    /// callers that only want the diff text must not treat `None` here as
+    /// "no diff" — only a caller that needs a real oid to anchor against
+    /// (the live plane's worktree-diff tap) may skip on `None`, and must
+    /// never fabricate one.
+    commit: Option<String>,
+}
+
 /// The workspace's uncommitted changes (`git diff HEAD` + untracked names),
-/// or `None` when clean.
-fn workspace_diff(workspace: &Path) -> Option<String> {
+/// or `None` when clean — see [`WorkspaceDiff`] for the paired commit oid.
+fn workspace_diff(workspace: &Path) -> Option<WorkspaceDiff> {
     let run = |args: &[&str]| -> Option<String> {
         let mut command = std::process::Command::new("git");
         command.arg("-C").arg(workspace).args(args);
@@ -1260,6 +1423,7 @@ fn workspace_diff(workspace: &Path) -> Option<String> {
     if status.trim().is_empty() && base.is_none() {
         return None;
     }
+    let commit = workspace_commit(workspace);
     let diff = match &base {
         Some(base_sha) => run(&["diff", base_sha]).unwrap_or_default(),
         None => run(&["diff", "HEAD"]).unwrap_or_default(),
@@ -1271,15 +1435,65 @@ fn workspace_diff(workspace: &Path) -> Option<String> {
         .lines()
         .filter(|line| line.starts_with("??"))
         .collect();
-    let mut out = diff;
+    let mut text = diff;
     if !untracked.is_empty() {
-        out.push_str("\n# untracked files:\n");
+        text.push_str("\n# untracked files:\n");
         for line in untracked {
-            out.push_str(line);
-            out.push('\n');
+            text.push_str(line);
+            text.push('\n');
         }
     }
-    Some(out)
+    Some(WorkspaceDiff { text, commit })
+}
+
+/// Resolve the workspace's real commit oid, independent of whether there
+/// happens to be a diff right now: the recorded PR-branch base commit
+/// (`branch.<branch>.juntoBaseSha`) when on a `junto/<session>` branch,
+/// otherwise `HEAD`'s own oid. The one oid-resolution codepath —
+/// [`workspace_diff`] uses it for [`WorkspaceDiff::commit`], and the
+/// live-plane begin-time worktree tap (`spawn_turn`, `spawn_outcome_loop`)
+/// calls it directly, because "no diff yet" (`workspace_diff`'s own
+/// gating condition — it returns `None` on a clean workspace even when a
+/// commit is perfectly resolvable) is not the same fact as "no commit to
+/// anchor against": a freshly connected watcher on an otherwise-clean
+/// workspace still has a real `HEAD` to anchor a `CodeAnchor` comment on.
+/// `None` only when the workspace has no commits at all yet; never
+/// fabricated.
+fn workspace_commit(workspace: &Path) -> Option<String> {
+    match pr_branch_base(workspace) {
+        Some(base_sha) => Some(base_sha),
+        None => workspace_head_commit(workspace),
+    }
+}
+
+/// Push a `{"kind":"diff", ...}` worktree entry carrying the workspace's
+/// current commit oid into `session`'s live-plane document, if one exists
+/// and a commit resolves — the begin-time half of the live plane's
+/// worktree tap (BLOCKER 2 of the final branch review). Before this
+/// existed, the only worktree push happened after the turn finished, in
+/// the same statement that torn the live connection down
+/// (`host.live().finish`), so the commit oid and the connection's end
+/// always arrived together and the composer's `CodeAnchor` path could
+/// never be exercised on a running session; `spawn_outcome_loop` pushed no
+/// worktree entry at all. Shared by both `spawn_turn`'s and
+/// `spawn_outcome_loop`'s `begin` sequence so a watcher connecting at any
+/// point during the run has a commit to anchor against, not only once the
+/// turn (or the whole Outcome loop) ends. No-op when `session` has no live
+/// plane entry or the workspace has no commits yet — never fabricates an
+/// oid (see [`workspace_commit`]).
+fn push_begin_worktree_diff(host: &Host, session: EntryId, workspace: &Path) {
+    if let Some(live) = host.live_plane().get(session)
+        && let Some(commit) = workspace_commit(workspace)
+    {
+        let text = workspace_diff(workspace)
+            .map(|diff| diff.text)
+            .unwrap_or_default();
+        live.doc.push_worktree(&serde_json::json!({
+            "kind": "diff",
+            "text": text,
+            "commit": commit,
+        }));
+    }
 }
 
 /// The PR branch junto prepared for an Outcome session: a fresh `junto/<session>`
@@ -1368,6 +1582,22 @@ fn current_branch(workspace: &Path) -> Option<String> {
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
         .filter(|b| !b.is_empty() && b != "HEAD")
+}
+
+/// The workspace's current `HEAD` commit oid, or `None` if git can't say
+/// (not a repo, or an initial repo with no commits yet). [`workspace_diff`]
+/// uses this as the non-PR-branch case of [`WorkspaceDiff::commit`] — never
+/// a fabricated oid, since the live plane's worktree-diff tap anchors
+/// watcher code comments on it.
+fn workspace_head_commit(workspace: &Path) -> Option<String> {
+    let mut command = std::process::Command::new("git");
+    command.arg("-C").arg(workspace).args(["rev-parse", "HEAD"]);
+    no_console_window(&mut command);
+    let out = command.output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|sha| !sha.is_empty())
 }
 
 /// Push `branch` to `origin` (setting upstream) — inherits the user's git auth,
@@ -1463,6 +1693,18 @@ pub async fn launch(
 /// Steer an existing session: record the human's instruction as a
 /// `SessionUpdated` note (the record keeps the steering — docs/adr/0023),
 /// flip the session back to working, and run a `--resume` turn.
+///
+/// Refuses (`Err`) when the session currently has a registered live feed
+/// ([`LiveSessions::is_live`]) — this is the between-turns resume path,
+/// only correct when nothing is already running; a live but non-steerable
+/// session (an Outcome-loop turn — `crate::launch::spawn_outcome_loop`'s
+/// `steerable: false`) makes `steer_live` report `NotLive` the same way a
+/// truly idle session does, and without this guard `steer_session`'s
+/// `NotLive` fallback would resume it here anyway: `harness_session_for`
+/// already has a mapping recorded from the loop's own first turn, so
+/// `spawn_turn` would succeed in starting a *second*, concurrent agent
+/// process over the same workspace, and its `begin`/`finish` would steal
+/// and archive the loop's own live snapshot out from under it.
 pub async fn steer(
     host: std::sync::Arc<Host>,
     channel: ChannelId,
@@ -1472,6 +1714,12 @@ pub async fn steer(
     steered_by: Member,
     message: String,
 ) -> Result<()> {
+    if host.live().is_live(session) {
+        bail!(
+            "session {session} still has a live turn running — steer it in place instead of \
+             starting a second one"
+        );
+    }
     let junto_home = crate::host::junto_home()?;
     let Some(harness_session) = harness_session_for(&junto_home, &session)? else {
         bail!(
@@ -1555,7 +1803,13 @@ pub(crate) async fn steer_live(
 /// slug, falling back to the stock agent for the recorded harness (its slug
 /// equals the harness id), and finally the default harness. Seed-on-read means
 /// a stock slug always resolves; only a deleted custom agent falls through.
-fn resume_agent(junto_home: &Path, session: &EntryId) -> Result<crate::agent::Agent> {
+///
+/// Also reused by `crate::live_bridge` (IMPORTANT 4 of the final branch
+/// review) to author a steer note as the session's own driving agent when
+/// the sender's identity has no local signing key on file — the same
+/// "which agent runs this session" question, asked from a different
+/// caller.
+pub(crate) fn resume_agent(junto_home: &Path, session: &EntryId) -> Result<crate::agent::Agent> {
     let slug = agent_slug_for(junto_home, session)?
         .or(harness_id_for(junto_home, session)?)
         .unwrap_or_else(|| HARNESSES[0].id.to_string());
@@ -1583,8 +1837,35 @@ fn spawn_turn(
     // Open the live feed *before* spawning, so it exists the moment this
     // function returns — a client that subscribes right after the launch/steer
     // HTTP call lands on the running turn instead of an immediate "end".
-    let mut control_rx = host.live().begin(session);
+    // Steerable: an interactive session's turn selects on this receiver
+    // (`run_turn`, below) and acts on a delivered `TurnControl::Steer`.
+    // `begin` also flushes any annotations queued while no turn was running
+    // for this session (e.g. between turns) now that the fresh control
+    // channel is up.
+    let mut control_rx = host.live().begin(
+        std::sync::Arc::clone(&host),
+        channel_ref.clone(),
+        session,
+        true,
+    );
+    // Populate the live plane's workspace so `crate::live_bridge` can
+    // re-anchor annotations against it; this is the one place a running
+    // turn's workspace path is in hand at `begin` time.
+    if let Some(live) = host.live_plane().get(session) {
+        *live.workspace.lock().expect("live plane workspace lock") = Some(workspace.clone());
+    }
     tokio::spawn(async move {
+        // Live-plane worktree tap, begin-time half (BLOCKER 2 of the final
+        // branch review): the only other worktree push used to happen
+        // after the turn finished, whose very next statement tears the
+        // live connection down (`host.live().finish`, below) — so the
+        // commit oid and the connection's end always arrived in the same
+        // instant, and the composer's `CodeAnchor` path could never be
+        // exercised on a running session. Push once, here, before the turn
+        // even starts, so a watcher connecting mid-turn has a commit to
+        // anchor against immediately. See `push_begin_worktree_diff`'s
+        // docs for the oid-resolution guarantee.
+        push_begin_worktree_diff(&host, session, &workspace);
         let outcome = run_turn(
             &workspace,
             &prompt,
@@ -1595,7 +1876,7 @@ fn spawn_turn(
             &mut control_rx,
         )
         .await;
-        if let Err(err) = record_outcome(
+        let turn = match record_outcome(
             &host,
             &channel_ref,
             channel,
@@ -1606,11 +1887,58 @@ fn spawn_turn(
         )
         .await
         {
-            tracing::warn!("recording session {session} outcome failed: {err:#}");
+            Ok(turn) => Some(turn),
+            Err(err) => {
+                tracing::warn!("recording session {session} outcome failed: {err:#}");
+                None
+            }
+        };
+        // Live-plane worktree tap, turn-end half (see the begin-time push
+        // above, in this same task, for the other half): one more diff
+        // snapshot pushed while the session's `SessionLive` still exists
+        // (turn-end is the periodic floor for v1 — no in-turn ticker, no
+        // filesystem watcher). Fire-and-forget: never lets a live-plane
+        // hiccup affect the outcome already recorded above. Pushed only
+        // when `workspace_diff` resolved a real commit oid to pair with
+        // the diff — never a fabricated one, since watcher UIs anchor
+        // code comments on it (see `WorkspaceDiff::commit`).
+        if let Some(live) = host.live_plane().get(session)
+            && let Some(diff) = workspace_diff(&workspace)
+            && let Some(commit) = diff.commit
+        {
+            live.doc.push_worktree(&serde_json::json!({
+                "kind": "diff",
+                "text": diff.text,
+                "commit": commit,
+            }));
         }
-        // Close the live feed only after the outcome is recorded, so a watcher
-        // reloading on stream-end sees the landed memo + diff, not "working".
-        host.live().finish(session);
+        // Close the live feed only after the outcome is recorded, so a
+        // watcher reloading on stream-end sees the landed memo + diff, not
+        // "working". Also archives the live plane's final snapshot as an
+        // artifact, named per turn (like `record_outcome`'s own
+        // `turn-{turn}-*` artifacts) so a later steered turn on the same
+        // session never overwrites an earlier turn's archived snapshot;
+        // falls back to a collision-safe id (the `grade-{}.md` precedent)
+        // when the turn number itself couldn't be recorded above.
+        if let Some(snapshot) = host.live().finish(session) {
+            let name = match turn {
+                Some(turn) => format!("turn-{turn}-live.loro"),
+                None => format!("live-{}.loro", EntryId::new()),
+            };
+            if let Err(err) = archive_live_snapshot(
+                &host,
+                &channel_ref,
+                channel,
+                session,
+                &agent,
+                &name,
+                &snapshot,
+            )
+            .await
+            {
+                tracing::warn!("archiving live snapshot for session {session} failed: {err:#}");
+            }
+        }
         // Best-effort sync so the session's record leaves this machine.
         if let Ok(resolution) = host.resolve(&channel_ref).await
             && let crate::host::Resolution::Resolved { ledger, id, .. } = resolution
@@ -1625,6 +1953,11 @@ fn spawn_turn(
     });
 }
 
+/// Record a finished turn's outcome: the result memo + workspace diff
+/// Artifacts and the final session state, authored as the harness member.
+/// Returns the recorded turn number ([`record_turn`]'s own counter) so the
+/// caller can name a same-turn artifact (the live-plane snapshot) without
+/// calling `record_turn` a second time, which would double-increment it.
 async fn record_outcome(
     host: &Host,
     channel_ref: &str,
@@ -1633,7 +1966,7 @@ async fn record_outcome(
     workspace: &Path,
     outcome: &TurnOutcome,
     agent: &crate::agent::Agent,
-) -> Result<()> {
+) -> Result<u32> {
     let junto_home = crate::host::junto_home()?;
     let harness = harness_by_id(&agent.harness);
     let turn = record_turn(
@@ -1676,7 +2009,7 @@ async fn record_outcome(
             &junto_home,
             &session,
             &format!("turn-{turn}-diff.patch"),
-            &diff,
+            &diff.text,
         )?;
         append(
             host,
@@ -1718,7 +2051,8 @@ async fn record_outcome(
             },
         },
     )
-    .await
+    .await?;
+    Ok(turn)
 }
 
 // ---- the Outcome loop: the code-PR push-gate (docs/adr/0025) ----
@@ -1784,7 +2118,39 @@ fn spawn_outcome_loop(
     agent: crate::agent::Agent,
 ) {
     tokio::spawn(async move {
-        let _control_rx = host.live().begin(session);
+        // Not steerable (finding 2 of the Task 8 fix round): this loop
+        // drives its own inert control channel via `run_worker_turn`'s
+        // local `mpsc::channel`, never the receiver `begin` hands back
+        // here, so a real registered control sender would let `steer_live`
+        // report success for a steer nobody will ever act on. `begin`
+        // still does the live-plane/SSE bookkeeping — but the pending
+        // annotations it flushes never actually reach this loop while it
+        // stays non-steerable: `flush_pending`'s delivery still calls
+        // `steer_live`, which still reports `NotLive` for a non-steerable
+        // session, so every flush attempt just requeues. See
+        // `crate::live_bridge::flush_pending`'s doc for the accepted
+        // known-gap trade-off this implies.
+        let _control_rx = host.live().begin(
+            std::sync::Arc::clone(&host),
+            channel_ref.clone(),
+            session,
+            false,
+        );
+        // Populate the live plane's workspace so `crate::live_bridge` can
+        // re-anchor annotations against it.
+        if let Some(live) = host.live_plane().get(session) {
+            *live.workspace.lock().expect("live plane workspace lock") = Some(workspace.clone());
+        }
+        // Live-plane worktree tap, begin-time (BLOCKER 2 of the final
+        // branch review): before this fix `spawn_outcome_loop` never
+        // pushed a `kind: "diff"` worktree entry at all, so
+        // `worktree_commit` stayed `None` for the whole loop and the
+        // composer's `CodeAnchor` path always refused with "no commit
+        // seen yet". Push once, here, before the PR branch is even
+        // prepared, so a watcher connecting during the loop has a commit
+        // to anchor against immediately. See `push_begin_worktree_diff`'s
+        // docs for the oid-resolution guarantee.
+        push_begin_worktree_diff(&host, session, &workspace);
 
         // Prepare a PR branch the worker commits onto (the push-gate's
         // deliverable). Best-effort: without it, grading falls back to the
@@ -1850,7 +2216,25 @@ fn spawn_outcome_loop(
         {
             tracing::warn!("recording outcome terminal for session {session} failed: {err:#}");
         }
-        host.live().finish(session);
+        // No single turn number describes this snapshot — the outcome loop
+        // spans every iteration's `capture_turn` call under one `begin`/
+        // `finish` pair, unlike `spawn_turn`'s one-turn-per-archive case
+        // (see `archive_live_snapshot`'s doc comment) — so fall back to the
+        // `grade-{}.md` precedent's id-suffixed, collision-free naming.
+        if let Some(snapshot) = host.live().finish(session)
+            && let Err(err) = archive_live_snapshot(
+                &host,
+                &channel_ref,
+                channel,
+                session,
+                &agent,
+                &format!("live-{}.loro", EntryId::new()),
+                &snapshot,
+            )
+            .await
+        {
+            tracing::warn!("archiving live snapshot for session {session} failed: {err:#}");
+        }
         if let Ok(crate::host::Resolution::Resolved { ledger, id, .. }) =
             host.resolve(&channel_ref).await
         {
@@ -1903,6 +2287,17 @@ async fn run_worker_turn(
         &mut control,
     )
     .await;
+    // Live-plane segment-boundary reset: this session's `LiveDoc` (if any)
+    // is shared across every iteration of the Outcome loop under one
+    // `begin`/`finish` pair (unlike `spawn_turn`'s one-document-per-turn
+    // case), and `run_turn`'s `acp::FeedState` mints a fresh segment
+    // counter starting at 1 on every call — without this, the next
+    // iteration's first `seq: 1` push would silently overwrite this turn's
+    // own `seq: 1` entry (see `LiveDoc::reset_segment_state`'s doc
+    // comment). Fire-and-forget, same as every other tap.
+    if let Some(live) = host.live_plane().get(session) {
+        live.doc.reset_segment_state();
+    }
     if outcome.harness_session.is_some() {
         *harness_session = outcome.harness_session.clone();
     }
@@ -1953,7 +2348,7 @@ async fn verify_one(
 
     // Mechanical green → the Grader judges the diff in a fresh session.
     let diff = workspace_diff(workspace).unwrap_or_default();
-    let prompt = crate::grader::grader_prompt(crate::grader::default_code_pr_rubric(), &diff);
+    let prompt = crate::grader::grader_prompt(crate::grader::default_code_pr_rubric(), &diff.text);
     host.live().publish(
         session,
         LiveEvent::new("status", "checks green — grading the diff"),
@@ -1970,6 +2365,13 @@ async fn verify_one(
         &mut control,
     )
     .await;
+    // Same segment-boundary reset as `run_worker_turn` — the grader turn is
+    // another `run_turn` call sharing this session's one `LiveDoc` across
+    // the whole Outcome loop, and its own `acp::FeedState` also restarts
+    // its segment counter at 1.
+    if let Some(live) = host.live_plane().get(session) {
+        live.doc.reset_segment_state();
+    }
 
     if let Err(err) =
         store_grader_report(host, channel_ref, channel, session, &graded.result, agent).await
@@ -2034,7 +2436,7 @@ async fn capture_turn(
             &junto_home,
             &session,
             &format!("turn-{turn}-diff.patch"),
-            &diff,
+            &diff.text,
         )?;
         append(
             host,
@@ -2176,7 +2578,7 @@ async fn finish_outcome(
                     &junto_home,
                     &session,
                     "deliverable-diff.patch",
-                    &diff,
+                    &diff.text,
                 )?);
             }
             append(
@@ -2239,7 +2641,7 @@ async fn finish_outcome(
                     &junto_home,
                     &session,
                     "escalation-diff.patch",
-                    &diff,
+                    &diff.text,
                 )?);
             }
             append(
@@ -2713,6 +3115,171 @@ mod tests {
         assert!(recorded.1.contains("focus on the parser"));
     }
 
+    #[tokio::test]
+    async fn steer_refuses_to_resume_a_session_with_a_live_feed() {
+        // Round 2, finding 1: making the outcome loop non-steerable turned
+        // `steer_live`'s `NotLive` into the *first*-steer outcome for a
+        // live-but-non-steerable session, not just a second-steer race —
+        // so `steer_session`'s `NotLive` fallback would resume it here
+        // every time without this guard, starting a second, concurrent
+        // turn over the same workspace. `is_live` must refuse regardless
+        // of whether the feed is steerable — a live but non-steerable
+        // feed (`begin(steerable: false)`, the outcome-loop shape) must
+        // be refused exactly like a steerable one.
+        let repo = git_repo();
+        let member_home = tempfile::tempdir().unwrap();
+        let host = crate::host::Host::fixed_with_member_home(
+            vec![repo.path().to_path_buf()],
+            Some(member_home.path().to_path_buf()),
+        );
+        let dan = Member::human("Dan", "dan@example.com");
+        let channel = host
+            .open_channel(None, "c", dan.clone(), None)
+            .await
+            .unwrap()
+            .id;
+        let session = EntryId::new();
+        let _rx = host.live().begin(host.clone(), "c".into(), session, false);
+
+        let err = steer(
+            host.clone(),
+            channel,
+            "c".into(),
+            repo.path().to_path_buf(),
+            session,
+            dan,
+            "keep going".into(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("live turn running"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_time_worktree_tap_publishes_a_commit_before_any_turn_runs() {
+        // BLOCKER 2 of the final branch review: pre-fix, a worktree
+        // `kind: "diff"` entry — the ONLY permitted source of a
+        // `CodeAnchor`'s commit — was pushed exactly once, after the turn
+        // finished, in the statement right before the live connection
+        // tore down. So the commit oid and the connection's end always
+        // arrived together, and the composer's code-anchor path could
+        // never be exercised on a running session. This proves the fix:
+        // a commit is visible in the worktree container immediately after
+        // `begin`, well before any turn (let alone turn-end work) runs.
+        let repo = git_repo_with_commit();
+        let member_home = tempfile::tempdir().unwrap();
+        let host = crate::host::Host::fixed_with_member_home(
+            vec![repo.path().to_path_buf()],
+            Some(member_home.path().to_path_buf()),
+        );
+        let session = EntryId::new();
+        let _rx = host.live().begin(host.clone(), "c".into(), session, false);
+        if let Some(live) = host.live_plane().get(session) {
+            *live.workspace.lock().expect("live plane workspace lock") =
+                Some(repo.path().to_path_buf());
+        }
+
+        // The exact call both `spawn_turn` and `spawn_outcome_loop` make
+        // at `begin`, before starting (or, for the loop, even preparing
+        // the PR branch for) any turn.
+        push_begin_worktree_diff(&host, session, repo.path());
+
+        let live = host
+            .live_plane()
+            .get(session)
+            .expect("session registered by begin");
+        assert_eq!(
+            live.doc.worktree_len(),
+            1,
+            "begin-time push must land exactly one worktree entry before any turn-end work runs"
+        );
+        let event = live
+            .doc
+            .worktree_event(0)
+            .expect("worktree entry must parse back as JSON");
+        assert_eq!(event["kind"], "diff");
+        let commit = event["commit"]
+            .as_str()
+            .expect("commit must be present — the composer refuses without one");
+        assert_eq!(
+            commit,
+            workspace_head_commit(repo.path()).expect("HEAD resolves in a committed repo"),
+            "must carry the real resolved oid, never a fabricated one"
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_live_snapshot_records_a_named_artifact() {
+        let home = HomeGuard::new();
+        let repo = git_repo();
+        let host = crate::host::Host::fixed_with_member_home(
+            vec![repo.path().to_path_buf()],
+            Some(home.path().to_path_buf()),
+        );
+        let dan = Member::human("Dan", "dan@example.com");
+        let channel = host
+            .open_channel(None, "c", dan.clone(), None)
+            .await
+            .unwrap()
+            .id;
+        let session = EntryId::new();
+        let agent = crate::agent::Agent {
+            slug: "claude".into(),
+            name: "Claude".into(),
+            harness: "claude".into(),
+            email: "claude@junto.local".into(),
+            role: None,
+            model: None,
+            mcp_servers: Vec::new(),
+            skills: Vec::new(),
+            plugins: Vec::new(),
+        };
+
+        archive_live_snapshot(
+            &host,
+            "c",
+            channel,
+            session,
+            &agent,
+            "turn-1-live.loro",
+            b"snapshot-bytes",
+        )
+        .await
+        .unwrap();
+
+        let ledger = host.ledger_for(repo.path()).await.unwrap();
+        let view = ledger.lock().await.project(&channel).await.unwrap();
+        let recorded = view
+            .entries
+            .iter()
+            .find_map(|e| match &e.payload {
+                EntryPayload::ArtifactAttached {
+                    target,
+                    kind,
+                    provenance,
+                    ..
+                } if *target == session && kind == "live-snapshot" => Some(provenance.clone()),
+                _ => None,
+            })
+            .expect("a live-snapshot artifact was recorded");
+        assert_eq!(recorded.len(), 1);
+        assert!(recorded[0].uri.as_str().ends_with("turn-1-live.loro"));
+
+        // `store_artifact` only writes text, so the archived content is the
+        // hex encoding of the snapshot bytes, not the raw bytes.
+        let stored = std::fs::read_to_string(
+            home.path()
+                .join("artifacts")
+                .join(session.to_string())
+                .join("turn-1-live.loro"),
+        )
+        .unwrap();
+        assert_eq!(stored, "736e617073686f742d6279746573"); // hex("snapshot-bytes")
+    }
+
     #[test]
     fn pr_branch_makes_committed_work_show_in_the_base_relative_diff() {
         let repo = git_repo_with_commit();
@@ -2742,8 +3309,14 @@ mod tests {
         // `git diff HEAD` is now empty (the work is committed), but the
         // base-relative diff still shows it — so the Grader sees the change.
         let diff = workspace_diff(repo.path()).expect("committed work shows base-relative");
-        assert!(diff.contains("feature.rs"), "{diff}");
-        assert!(diff.contains("fn added"), "{diff}");
+        assert!(diff.text.contains("feature.rs"), "{}", diff.text);
+        assert!(diff.text.contains("fn added"), "{}", diff.text);
+        // The paired commit must be the PR-branch base, not the new "add
+        // feature" commit — otherwise a watcher would anchor this diff's
+        // line numbers against the wrong blob, which is exactly the bug
+        // pairing the two together in one call is meant to prevent.
+        let base_sha = pr_branch_base(repo.path()).expect("base sha recorded");
+        assert_eq!(diff.commit.as_deref(), Some(base_sha.as_str()));
     }
 
     #[test]
@@ -2890,11 +3463,12 @@ mod tests {
     #[test]
     fn live_registry_replays_buffer_and_tails() {
         let live = LiveSessions::default();
+        let host = crate::host::Host::fixed(vec![]);
         let session = EntryId::new();
         // No feed yet → no subscription.
         assert!(live.subscribe(session).is_none());
 
-        let _ = live.begin(session);
+        let _ = live.begin(std::sync::Arc::clone(&host), "c".into(), session, true);
         live.publish(session, LiveEvent::new("assistant", "first"));
         let (buffer, mut receiver) = live.subscribe(session).expect("feed is live");
         assert_eq!(buffer.len(), 1, "late joiner replays what already happened");
@@ -2917,8 +3491,9 @@ mod tests {
     #[test]
     fn segment_events_coalesce_in_the_replay_buffer() {
         let live = LiveSessions::default();
+        let host = crate::host::Host::fixed(vec![]);
         let session = EntryId::new();
-        let _rx = live.begin(session);
+        let _rx = live.begin(std::sync::Arc::clone(&host), "c".into(), session, true);
         // Two frames of the same growing segment (seq 1) keep only the latest.
         let frame1 = LiveEvent::segment("assistant", "hel", "<p>hel</p>", 1);
         let frame2 = LiveEvent::segment("assistant", "hello", "<p>hello</p>", 1);
@@ -2936,6 +3511,65 @@ mod tests {
         assert!(buffer[0].html);
         assert_eq!(buffer[0].seq, 1);
         assert_eq!(buffer[1].kind, "tool");
+    }
+
+    #[test]
+    fn worktree_tap_gates_on_edit_and_write_tool_labels() {
+        let live = LiveSessions::default();
+        let host = crate::host::Host::fixed(vec![]);
+        let session = EntryId::new();
+        let _rx = live.begin(std::sync::Arc::clone(&host), "c".into(), session, true);
+        let plane = live.plane.get(session).expect("plane session began");
+
+        // A non-tool event, and a tool event whose label is neither `Edit`
+        // nor `Write` (`acp::tool_label`'s shapes), must never land in
+        // `worktree` — only feed `conversation`.
+        live.publish(session, LiveEvent::new("assistant", "hello"));
+        live.publish(session, LiveEvent::new("tool", "Bash: cargo test"));
+        assert_eq!(plane.doc.worktree_len(), 0);
+        assert_eq!(
+            plane.doc.conversation_len(),
+            2,
+            "both still feed conversation"
+        );
+
+        // Edit/Write-labeled tool events land in both containers.
+        live.publish(session, LiveEvent::new("tool", "Edit: src/x.rs"));
+        live.publish(session, LiveEvent::new("tool", "Write: src/y.rs"));
+        assert_eq!(plane.doc.worktree_len(), 2);
+        assert_eq!(plane.doc.conversation_len(), 4);
+    }
+
+    #[test]
+    fn finish_broadcasts_frame_end_to_connected_watchers() {
+        let live = LiveSessions::default();
+        let host = crate::host::Host::fixed(vec![]);
+        let session = EntryId::new();
+        let _rx = live.begin(std::sync::Arc::clone(&host), "c".into(), session, true);
+        let plane = live.plane.get(session).expect("plane session began");
+        let mut watcher = plane.outbound.subscribe();
+
+        live.finish(session);
+        assert!(matches!(watcher.try_recv(), Ok(junto_live::Frame::End)));
+    }
+
+    #[test]
+    fn begin_ends_a_stale_session_before_replacing_it() {
+        let live = LiveSessions::default();
+        let host = crate::host::Host::fixed(vec![]);
+        let session = EntryId::new();
+        let _rx1 = live.begin(std::sync::Arc::clone(&host), "c".into(), session, true);
+        let stale = live.plane.get(session).expect("plane session began");
+        let mut stale_watcher = stale.outbound.subscribe();
+
+        // Re-`begin` without an intervening `finish` (the prior turn's task
+        // never got there — a panic, or a process restart mid-turn) must
+        // still end the stale watcher's stream, exactly as `finish` would.
+        let _rx2 = live.begin(std::sync::Arc::clone(&host), "c".into(), session, true);
+        assert!(matches!(
+            stale_watcher.try_recv(),
+            Ok(junto_live::Frame::End)
+        ));
     }
 
     #[test]
@@ -2962,12 +3596,13 @@ mod tests {
     #[tokio::test]
     async fn control_channel_delivers_to_live_turn_and_errors_when_idle() {
         let live = LiveSessions::default();
+        let host = crate::host::Host::fixed(vec![]);
         let session = EntryId::new();
 
         // No feed yet → control reports NotLive.
         assert!(live.control(session, TurnControl::Interrupt).is_err());
 
-        let mut control_rx = live.begin(session);
+        let mut control_rx = live.begin(std::sync::Arc::clone(&host), "c".into(), session, true);
         live.control(session, TurnControl::Steer("focus on the parser".into()))
             .expect("delivered to the live turn");
         match control_rx.recv().await {
@@ -2978,6 +3613,24 @@ mod tests {
         // After finish, control is NotLive again.
         live.finish(session);
         assert!(live.control(session, TurnControl::Interrupt).is_err());
+    }
+
+    #[test]
+    fn non_steerable_feed_never_accepts_control() {
+        // The Outcome loop's autonomous turn (`spawn_outcome_loop`) drives
+        // itself with its own inert control channel and never reads the one
+        // `begin` hands back; `steerable: false` must make `control` report
+        // `NotLive` regardless, or a "successful" steer would silently go
+        // nowhere while `steer_live` still records a ledger note claiming
+        // it landed (finding 2 of the Task 8 fix round).
+        let live = LiveSessions::default();
+        let host = crate::host::Host::fixed(vec![]);
+        let session = EntryId::new();
+        let _rx = live.begin(std::sync::Arc::clone(&host), "c".into(), session, false);
+        assert!(
+            live.control(session, TurnControl::Interrupt).is_err(),
+            "a non-steerable feed must never accept a control signal"
+        );
     }
 
     #[test]

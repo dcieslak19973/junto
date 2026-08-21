@@ -17,9 +17,13 @@
 //! lets [`junto_kernel::Ledger::project`] impose the `(timestamp, author)` order.
 //!
 //! All git access shells out to the system `git` CLI (the assessed substrate
-//! decision in CLAUDE.md) and touches **only the object DB and refs** — never a
-//! working tree — so there is no `git status` pollution and Windows file
-//! locking is sidestepped (git owns its own ref locks; we hold no files open).
+//! decision in CLAUDE.md) and touches only the object DB and refs — never a
+//! working tree — with one deliberate exception: [`reanchor`] reads (never
+//! writes) whatever is checked out, to answer "where do these pinned lines
+//! live now?" against the live-session-plane's worktree (see that module's
+//! own doc for the read-only guarantee). Everywhere else in this crate,
+//! there is no `git status` pollution and Windows file locking is
+//! sidestepped (git owns its own ref locks; we hold no files open).
 //!
 //! Beyond local storage, [`GitRefsSubstrate::sync`] exchanges a channel's refs
 //! with any git remote (the forge-as-hub model, `docs/adr/0011`): fetch every
@@ -28,6 +32,8 @@
 //! entries deduplicated by id is the whole reconciliation, which is exactly
 //! what the no-CRDT design promised. Forge capability flags (the Bitbucket
 //! `refs/heads/junto/*` fallback) remain deferred (`docs/adr/0009`).
+
+pub mod reanchor;
 
 use std::collections::HashSet;
 use std::path::PathBuf;

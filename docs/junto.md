@@ -107,7 +107,7 @@ Not scope creep: `architecture.md` already treats the channel as a unit of inqui
 ✅ Carry the *ideas*, not the original mesh-centric implementation. ⚠️ **Reframed 2026-06-08** (see that doc's status banner): the peer-to-peer **git-mesh is deferred** — durable record syncs via **forge-as-hub** (OSS) or **central SoR** (regulated); realtime conversation comes from **chat connectors**, not a mesh. What carries forward:
 - `channel = conversation fused to the work unit` — the core abstraction (ACE got this right).
 - **Durable record as git refs** (`refs/junto/*`, partition-by-author, git-bug prior art) — kept, but synced through a **hub**, not meshed peer-to-peer.
-- **No CRDT** — append-only log, interleave by `(ts, author)`; conversation realtime is delegated, not built.
+- **No CRDT** — append-only log, interleave by `(ts, author)`; conversation realtime is delegated, not built. *(Scoped to the durable record — the ephemeral live-session plane is a later, deliberate exception: [ADR 0034](adr/0034-crdt-confined-to-the-live-plane.md).)*
 - Identity = git author; authZ per substrate (roster pubkey for OSS; SSO/entitlements for regulated).
 - Forge-agnostic (git worktrees, no forge-API coupling).
 - 📚 Larger explorations (each stands alone): AI-PR-flood prevent/constrain/triage · commissioner first-pass · multi-forge `ForgeAdapter` · pre-remote in-channel review + risk-routing · **channels as research/inquiry spaces** · pluggable **Playbooks** · **Connector** abstraction (chat / tracker / knowledge) · provenance binding + hypothesis ledger.

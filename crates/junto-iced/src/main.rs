@@ -8,7 +8,9 @@
 //! whether native (Iced) beats the webview as the desktop power-surface.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
+use iced::futures::channel::mpsc;
 use iced::widget::canvas::{self, Canvas, Frame, Geometry, Path, Stroke};
 use iced::widget::pane_grid;
 use iced::widget::{
@@ -19,6 +21,11 @@ use iced::{
     Background, Border, Center, Color, Element, Fill, Length, Point, Rectangle, Renderer, Size,
     Task, Theme, mouse,
 };
+use junto_kernel::{
+    Anchor, Annotation, AnnotationId, CodeAnchor, CommitOid, ContentDigest, EntryId, Member,
+    SigningKey, Span, StreamAnchor, Timestamp,
+};
+use junto_live::{Frame as WireFrame, LiveDoc, Presence};
 use serde::Deserialize;
 
 const HOST: &str = "http://127.0.0.1:1727";
@@ -118,6 +125,57 @@ struct Pane {
     streaming: bool,
     /// Accumulated live events (with parsed Markdown) for the current turn.
     feed: Vec<FeedItem>,
+    /// A base URL override for this pane's REST calls and live subscription
+    /// (`Pane::base`); `None` uses the local `HOST`. Set from the pane's
+    /// remote-watch text input — this is how a pane watches a session on
+    /// ANOTHER machine's host.
+    remote: Option<String>,
+    /// The member email this pane authenticates the live websocket as (the
+    /// signing key comes from this machine's `keys.toml`, `load_signing_key`).
+    watch_email: String,
+    /// Who else is watching the currently-streamed remote session, from the
+    /// live websocket's presence — empty when not remote-watching.
+    watchers: Vec<String>,
+    /// The write half of the live websocket, wired up once the connection
+    /// authenticates — the annotation composer sends signed `Frame`s
+    /// through it (Task 10).
+    annotate_tx: Option<mpsc::Sender<WireFrame>>,
+    /// The email the live websocket actually authenticated as, captured
+    /// once at `Message::LiveConnected` time. The composer signs and
+    /// authors with THIS, never a live re-read of `watch_email`: the
+    /// subscription id deliberately excludes `watch_email` (`remote_row`'s
+    /// "applies on next watch" caption), so a mid-watch edit to that field
+    /// would otherwise sign as an identity the socket was never
+    /// authenticated as, which the host's `validate_annotation_update`
+    /// rejects outright.
+    annotate_email: Option<String>,
+    /// The live doc's current `conversation` container length, mirrored
+    /// from the stream task (`Message::ConversationLen`). The composer's
+    /// `StreamAnchor` (an empty `path`) anchors at `conversation_len - 1`
+    /// — the most recent event's own CONTAINER index, which is not
+    /// necessarily `feed.len() - 1` (the feed also carries synthetic,
+    /// non-document error lines). An empty container (`conversation_len
+    /// == 0`, nothing has arrived yet) is refused outright rather than
+    /// saturating to a nonexistent index 0 — see the composer's
+    /// `AnnotateSubmit` handler.
+    conversation_len: usize,
+    /// The most recent commit oid seen in a `{"kind":"diff","commit":…}`
+    /// worktree event on this pane's live doc (`Message::WorktreeDiff`) —
+    /// the ONLY source a `CodeAnchor`'s commit may come from. `None` means
+    /// the composer must emit a `StreamAnchor`, never a fabricated oid.
+    worktree_commit: Option<String>,
+    /// The annotation composer's typed file path; empty comments on the
+    /// live stream itself instead of a code span.
+    annotate_path: String,
+    /// The annotation composer's typed line range (`"12"` or `"12-14"`,
+    /// `parse_span`).
+    annotate_lines: String,
+    /// The annotation composer's comment body — cleared after a successful
+    /// send, but `annotate_path`/`annotate_lines` persist (a reviewer
+    /// usually comments repeatedly on the same region).
+    annotate_body: String,
+    /// The annotation composer's "urgent" checkbox.
+    annotate_urgent: bool,
     launch_intent: String,
     steer_text: String,
     /// Which configured Agent runs the next launch (None → host default).
@@ -472,6 +530,35 @@ enum Message {
     CloseSession(pane_grid::Pane),
     Live(String, LiveEvent),
     LiveEnded(String),
+    /// The pane's remote-watch base URL text input changed (empty → local).
+    RemoteChanged(pane_grid::Pane, String),
+    /// The pane's "watch as (email)" text input changed.
+    WatchEmailChanged(pane_grid::Pane, String),
+    /// A live websocket's presence updated (session, sorted watcher emails).
+    Watchers(String, Vec<String>),
+    /// A live websocket authenticated and is ready to carry outbound frames
+    /// (session, the write-half sender, the email it actually
+    /// authenticated as) — stored as `Pane::annotate_tx`/`annotate_email`
+    /// for the annotation composer.
+    LiveConnected(String, mpsc::Sender<WireFrame>, String),
+    /// The live doc's `conversation` container grew (session, new length) —
+    /// mirrored into `Pane::conversation_len` so the composer's
+    /// `StreamAnchor` can point at a real CONTAINER index.
+    ConversationLen(String, usize),
+    /// A worktree `{"kind":"diff","commit":…}` event arrived (session,
+    /// commit oid) — mirrored into `Pane::worktree_commit`, the only source
+    /// the composer's `CodeAnchor` may ever take a commit from.
+    WorktreeDiff(String, String),
+    /// The annotation composer's `path` text input changed.
+    AnnotatePathChanged(pane_grid::Pane, String),
+    /// The annotation composer's `lines` text input changed.
+    AnnotateLinesChanged(pane_grid::Pane, String),
+    /// The annotation composer's comment body text input changed.
+    AnnotateBodyChanged(pane_grid::Pane, String),
+    /// The annotation composer's "urgent" checkbox toggled.
+    AnnotateUrgentToggled(pane_grid::Pane, bool),
+    /// Submit the annotation composer: sign and send the comment.
+    AnnotateSubmit(pane_grid::Pane),
     LaunchIntentChanged(pane_grid::Pane, String),
     LaunchAgentPicked(pane_grid::Pane, AgentDto),
     LaunchModeChanged(pane_grid::Pane, bool),
@@ -593,7 +680,7 @@ impl App {
         (
             app,
             Task::batch([
-                fetch(first, "junto-dev"),
+                fetch(first, HOST.to_string(), "junto-dev"),
                 fetch_channels(),
                 fetch_lineage_graph(),
                 fetch_focus(),
@@ -626,7 +713,7 @@ impl App {
         {
             self.order.push(new_pane);
             self.focus = Some(new_pane);
-            return (Some(new_pane), fetch(new_pane, name));
+            return (Some(new_pane), fetch(new_pane, HOST.to_string(), name));
         }
         (None, Task::none())
     }
@@ -689,14 +776,15 @@ impl App {
                 let Some(state) = self.panes.get_mut(pane) else {
                     return Task::none();
                 };
+                let base = state.base().to_string();
                 let channel = state.channel.clone();
                 state.act_errors.remove(&entry_id); // clear any stale error
                 state.act_pending.insert(entry_id.clone()); // show "recording…"
-                post_verify(pane, channel, entry_id, act, rationale)
+                post_verify(pane, base, channel, entry_id, act, rationale)
             }
             Message::Acted(pane, entry_id, result) => match result {
                 Ok(()) => {
-                    let channel = self.panes.get_mut(pane).map(|state| {
+                    let target = self.panes.get_mut(pane).map(|state| {
                         state.act_pending.remove(&entry_id);
                         state.act_errors.remove(&entry_id);
                         state.act_drafts.remove(&entry_id);
@@ -705,12 +793,12 @@ impl App {
                         if state.highlight_entry.as_deref() == Some(entry_id.as_str()) {
                             state.highlight_entry = None;
                         }
-                        state.channel.clone()
+                        (state.base().to_string(), state.channel.clone())
                     });
                     // Refetch the pane AND the focus board (so the resolved item
                     // leaves the top shelf) and the lineage.
-                    channel.map_or_else(Task::none, |c| {
-                        Task::batch([fetch(pane, &c), fetch_focus(), fetch_lineage_graph()])
+                    target.map_or_else(Task::none, |(base, c)| {
+                        Task::batch([fetch(pane, base, &c), fetch_focus(), fetch_lineage_graph()])
                     })
                 }
                 Err(err) => {
@@ -753,9 +841,15 @@ impl App {
                                 state.streaming = true;
                                 state.stream_nonce += 1;
                                 state.feed.clear();
+                                state.watchers.clear();
+                                state.annotate_tx = None;
+                                state.annotate_email = None;
+                                state.conversation_len = 0;
+                                state.worktree_commit = None;
                             }
                         }
                         state.content = Content::Loaded(dto);
+                        let base = state.base().to_string();
                         let channel = state.channel.clone();
                         // Jump to the newest entry (bottom) and refresh the brief.
                         Task::batch([
@@ -763,7 +857,7 @@ impl App {
                                 state.scroll_id.clone(),
                                 scrollable::RelativeOffset::END,
                             ),
-                            fetch_brief(pane, channel),
+                            fetch_brief(pane, base, channel),
                         ])
                     }
                     Err(err) => {
@@ -774,9 +868,10 @@ impl App {
             }
             Message::Refresh(pane) => {
                 if let Some(state) = self.panes.get_mut(pane) {
+                    let base = state.base().to_string();
                     let channel = state.channel.clone();
                     state.content = Content::Loading;
-                    return fetch(pane, &channel);
+                    return fetch(pane, base, &channel);
                 }
                 Task::none()
             }
@@ -793,6 +888,11 @@ impl App {
                     state.streaming = true; // try to stream; ends fast if not live
                     state.stream_nonce += 1;
                     state.feed.clear();
+                    state.watchers.clear();
+                    state.annotate_tx = None;
+                    state.annotate_email = None;
+                    state.conversation_len = 0;
+                    state.worktree_commit = None;
                 }
                 Task::none()
             }
@@ -801,6 +901,11 @@ impl App {
                     state.watched = None;
                     state.streaming = false;
                     state.feed.clear();
+                    state.watchers.clear();
+                    state.annotate_tx = None;
+                    state.annotate_email = None;
+                    state.conversation_len = 0;
+                    state.worktree_commit = None;
                 }
                 Task::none()
             }
@@ -838,17 +943,241 @@ impl App {
                         // record + steer (resume) box remain. Refetch to pick up
                         // the persisted memo/artifacts.
                         state.streaming = false;
+                        state.watchers.clear();
+                        state.annotate_tx = None;
+                        state.annotate_email = None;
+                        state.conversation_len = 0;
+                        state.worktree_commit = None;
                         to_refresh = Some(*pane);
                         break;
                     }
                 }
                 match to_refresh {
                     Some(pane) => {
-                        let channel = self.panes.get(pane).map(|p| p.channel.clone());
-                        channel.map_or_else(Task::none, |c| fetch(pane, &c))
+                        let target = self
+                            .panes
+                            .get(pane)
+                            .map(|p| (p.base().to_string(), p.channel.clone()));
+                        target.map_or_else(Task::none, |(base, c)| fetch(pane, base, &c))
                     }
                     None => Task::none(),
                 }
+            }
+            Message::RemoteChanged(pane, value) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    let value = value.trim().to_string();
+                    state.remote = (!value.is_empty()).then_some(value);
+                }
+                Task::none()
+            }
+            Message::WatchEmailChanged(pane, value) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    // Trimmed on store, exactly as `remote` already is
+                    // (`Message::RemoteChanged`, above): a pasted email
+                    // with surrounding whitespace must still resolve
+                    // `load_signing_key`'s lookup and match verbatim what
+                    // the `Auth` frame sends.
+                    state.watch_email = value.trim().to_string();
+                }
+                Task::none()
+            }
+            Message::Watchers(session, watchers) => {
+                for (_, state) in self.panes.iter_mut() {
+                    if state.watched.as_deref() == Some(session.as_str()) {
+                        state.watchers = watchers;
+                        break;
+                    }
+                }
+                Task::none()
+            }
+            Message::LiveConnected(session, tx, email) => {
+                for (_, state) in self.panes.iter_mut() {
+                    if state.watched.as_deref() == Some(session.as_str()) {
+                        state.annotate_tx = Some(tx);
+                        state.annotate_email = Some(email);
+                        break;
+                    }
+                }
+                Task::none()
+            }
+            Message::ConversationLen(session, len) => {
+                for (_, state) in self.panes.iter_mut() {
+                    if state.watched.as_deref() == Some(session.as_str()) {
+                        state.conversation_len = len;
+                        break;
+                    }
+                }
+                Task::none()
+            }
+            Message::WorktreeDiff(session, commit) => {
+                for (_, state) in self.panes.iter_mut() {
+                    if state.watched.as_deref() == Some(session.as_str()) {
+                        state.worktree_commit = Some(commit);
+                        break;
+                    }
+                }
+                Task::none()
+            }
+            Message::AnnotatePathChanged(pane, value) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    state.annotate_path = value;
+                }
+                Task::none()
+            }
+            Message::AnnotateLinesChanged(pane, value) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    state.annotate_lines = value;
+                }
+                Task::none()
+            }
+            Message::AnnotateBodyChanged(pane, value) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    state.annotate_body = value;
+                }
+                Task::none()
+            }
+            Message::AnnotateUrgentToggled(pane, on) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    state.annotate_urgent = on;
+                }
+                Task::none()
+            }
+            Message::AnnotateSubmit(pane) => {
+                let identity_name = self
+                    .settings
+                    .as_ref()
+                    .and_then(|s| s.identity.as_ref())
+                    .map(|i| i.name.clone());
+                let Some(state) = self.panes.get_mut(pane) else {
+                    return Task::none();
+                };
+                let push_error = |state: &mut Pane, text: String| {
+                    state.feed.push(FeedItem {
+                        md: None,
+                        event: error_event(text),
+                    });
+                };
+                let body = state.annotate_body.trim().to_string();
+                if body.is_empty() {
+                    return Task::none();
+                }
+                let Some(session_str) = state.watched.clone() else {
+                    return Task::none();
+                };
+                let Some(mut tx) = state.annotate_tx.clone() else {
+                    return Task::none();
+                };
+                let Ok(session) = session_str.parse::<EntryId>() else {
+                    push_error(state, "malformed session id".to_string());
+                    return Task::none();
+                };
+                // The email the socket actually authenticated as — never a
+                // live re-read of `watch_email`, which may have been edited
+                // since the socket connected (see `Pane::annotate_email`'s
+                // docs: doing so would sign as an identity the socket was
+                // never authenticated as, which the host rejects outright).
+                let Some(email) = state.annotate_email.clone() else {
+                    push_error(
+                        state,
+                        "not authenticated yet — wait for the connection to finish".to_string(),
+                    );
+                    return Task::none();
+                };
+                // Sign with the authenticated identity's key on file — never
+                // send unsigned, since the host would reject it anyway.
+                let Some(signing_key) = load_signing_key(&email) else {
+                    push_error(state, format!("no signing key on file for '{email}'"));
+                    return Task::none();
+                };
+                let path = state.annotate_path.trim().to_string();
+                // Anchor-sourcing rule: a `CodeAnchor` may only be built from
+                // a commit oid this pane has actually seen arrive over the
+                // wire (`Pane::worktree_commit`, set only from a real
+                // `{"kind":"diff","commit":…}` worktree event) — never
+                // fabricated, never a placeholder. Anything else, including
+                // an empty path, is a `StreamAnchor` on the most recent
+                // conversation event instead.
+                let anchor = if path.is_empty() {
+                    if state.conversation_len == 0 {
+                        push_error(
+                            state,
+                            "nothing to anchor to yet — wait for the first live event".to_string(),
+                        );
+                        return Task::none();
+                    }
+                    Anchor::Stream(StreamAnchor {
+                        session,
+                        op_id: (state.conversation_len - 1).to_string(),
+                    })
+                } else {
+                    let Some(commit_str) = state.worktree_commit.clone() else {
+                        push_error(
+                            state,
+                            "no commit seen yet for this session's worktree — clear the path to \
+                             comment on the live stream instead"
+                                .to_string(),
+                        );
+                        return Task::none();
+                    };
+                    let Ok(commit) = CommitOid::new(commit_str) else {
+                        push_error(
+                            state,
+                            "malformed commit oid from the worktree feed".to_string(),
+                        );
+                        return Task::none();
+                    };
+                    let Some(span) = parse_span(&state.annotate_lines) else {
+                        push_error(
+                            state,
+                            format!(
+                                "invalid line range '{}' — use \"12\" or \"12-14\"",
+                                state.annotate_lines
+                            ),
+                        );
+                        return Task::none();
+                    };
+                    Anchor::Code(CodeAnchor {
+                        commit,
+                        path,
+                        // Blob pinning is drift *detection* only (v1 doesn't
+                        // do it, and `reanchor` never reads this field) —
+                        // deliberately left unpinned, not forgotten.
+                        blob: ContentDigest::new("sha256:unpinned")
+                            .expect("static digest literal is always valid"),
+                        span,
+                    })
+                };
+                let author_name = identity_name.unwrap_or_else(|| email.clone());
+                let mut annotation = Annotation {
+                    id: AnnotationId::new(),
+                    author: Member::human(author_name, email),
+                    anchor,
+                    body,
+                    excerpt: None,
+                    supersedes: None,
+                    urgent: state.annotate_urgent,
+                    timestamp: Timestamp::now(),
+                    signature: None,
+                };
+                if annotation.sign(&signing_key).is_err() {
+                    push_error(state, "failed to sign annotation".to_string());
+                    return Task::none();
+                }
+                let local = LiveDoc::new();
+                if local.insert_annotation(&annotation).is_err() {
+                    push_error(state, "failed to build annotation update".to_string());
+                    return Task::none();
+                }
+                let frame = WireFrame::update(&local.export_snapshot());
+                if tx.try_send(frame).is_err() {
+                    push_error(
+                        state,
+                        "failed to send annotation — the connection may have dropped".to_string(),
+                    );
+                    return Task::none();
+                }
+                state.annotate_body.clear();
+                Task::none()
             }
             Message::LaunchIntentChanged(pane, value) => {
                 if let Some(state) = self.panes.get_mut(pane) {
@@ -898,6 +1227,7 @@ impl App {
                 if intent.is_empty() || state.launching {
                     return Task::none();
                 }
+                let base = state.base().to_string();
                 let channel = state.channel.clone();
                 let agent = state.launch_agent.as_ref().map(|a| a.slug.clone());
                 let mode = if state.launch_outcome {
@@ -910,7 +1240,7 @@ impl App {
                 // doesn't lose what was typed.
                 state.launching = true;
                 state.launch_error = None;
-                post_launch(pane, channel, intent, agent, mode, workspace)
+                post_launch(pane, base, channel, intent, agent, mode, workspace)
             }
             Message::Launched(pane, result) => {
                 let Some(state) = self.panes.get_mut(pane) else {
@@ -922,8 +1252,9 @@ impl App {
                         state.launch_error = None;
                         state.launch_intent.clear();
                         state.watch_newest = true; // stream the new session on load
+                        let base = state.base().to_string();
                         let channel = state.channel.clone();
-                        fetch(pane, &channel)
+                        fetch(pane, base, &channel)
                     }
                     Err(err) => {
                         state.launch_error = Some(err);
@@ -941,8 +1272,9 @@ impl App {
                 state
                     .artifacts
                     .insert(artifact_id.clone(), ArtifactContent::Loading);
+                let base = state.base().to_string();
                 let channel = state.channel.clone();
-                fetch_artifact(pane, channel, artifact_id)
+                fetch_artifact(pane, base, channel, artifact_id)
             }
             Message::ArtifactLoaded(pane, artifact_id, result) => {
                 if let Some(state) = self.panes.get_mut(pane) {
@@ -980,6 +1312,7 @@ impl App {
                 if text.is_empty() {
                     return Task::none();
                 }
+                let base = state.base().to_string();
                 let channel = state.channel.clone();
                 state.steer_text.clear();
                 // Echo the message immediately so the exchange reads like a chat.
@@ -995,7 +1328,7 @@ impl App {
                 });
                 let scroll = state.scroll_id.clone();
                 Task::batch([
-                    post_steer(pane, channel, session, text),
+                    post_steer(pane, base, channel, session, text),
                     scrollable::snap_to(scroll, scrollable::RelativeOffset::END),
                 ])
             }
@@ -1033,12 +1366,16 @@ impl App {
                 let Some(session) = state.watched.clone() else {
                     return Task::none();
                 };
+                let base = state.base().to_string();
                 let channel = state.channel.clone();
-                post_act(pane, channel, session, "interrupt", None)
+                post_act(pane, base, channel, session, "interrupt", None)
             }
             Message::Posted(pane) => {
-                let channel = self.panes.get(pane).map(|p| p.channel.clone());
-                channel.map_or_else(Task::none, |c| fetch(pane, &c))
+                let target = self
+                    .panes
+                    .get(pane)
+                    .map(|p| (p.base().to_string(), p.channel.clone()));
+                target.map_or_else(Task::none, |(base, c)| fetch(pane, base, &c))
             }
             Message::ToggleLaunchOptions(pane) => {
                 if let Some(state) = self.panes.get_mut(pane) {
@@ -1104,7 +1441,8 @@ impl App {
                 }
                 state.lifecycle_pending = true;
                 state.lifecycle_error = None;
-                post_lifecycle(pane, state.channel.clone(), kind, text, target)
+                let base = state.base().to_string();
+                post_lifecycle(pane, base, state.channel.clone(), kind, text, target)
             }
             Message::LifecycleDone(pane, result) => {
                 let Some(state) = self.panes.get_mut(pane) else {
@@ -1119,9 +1457,10 @@ impl App {
                         if let LifecycleResult::Renamed(new_name) = &outcome {
                             state.channel = new_name.clone();
                         }
+                        let base = state.base().to_string();
                         let channel = state.channel.clone();
                         let mut tasks = vec![
-                            fetch(pane, &channel),
+                            fetch(pane, base, &channel),
                             fetch_lineage_graph(),
                             fetch_channels(),
                         ];
@@ -1205,7 +1544,7 @@ impl App {
                 ];
                 for id in &self.order {
                     if let Some(state) = self.panes.get(*id) {
-                        tasks.push(fetch(*id, &state.channel));
+                        tasks.push(fetch(*id, state.base().to_string(), &state.channel));
                     }
                 }
                 Task::batch(tasks)
@@ -1447,7 +1786,9 @@ impl App {
     }
 
     fn subscription(&self) -> iced::Subscription<Message> {
-        // One SSE subscription per pane that is watching a session.
+        // One live subscription per pane that is watching a session — SSE
+        // against the local `HOST`, or the authenticated websocket when the
+        // pane has a remote host configured (`Pane::remote`).
         let streams: Vec<_> = self
             .panes
             .iter()
@@ -1458,10 +1799,22 @@ impl App {
                     .filter(|_| state.streaming)
                     .map(|session| {
                         // Id includes the nonce so a new turn restarts the stream.
-                        iced::Subscription::run_with_id(
-                            (session.clone(), state.stream_nonce),
-                            session_stream(state.channel.clone(), session.clone()),
-                        )
+                        let id = (session.clone(), state.stream_nonce);
+                        match &state.remote {
+                            Some(remote) => iced::Subscription::run_with_id(
+                                id,
+                                live_ws_stream(
+                                    remote.clone(),
+                                    state.channel.clone(),
+                                    session.clone(),
+                                    state.watch_email.clone(),
+                                ),
+                            ),
+                            None => iced::Subscription::run_with_id(
+                                id,
+                                session_stream(state.channel.clone(), session.clone()),
+                            ),
+                        }
                     })
             })
             .collect();
@@ -1973,26 +2326,69 @@ fn title_row(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
     .into()
 }
 
+/// A pane's remote-watch controls: the host base URL to watch a session on
+/// (blank = this machine, `HOST`) and the member email to authenticate the
+/// live websocket as (`load_signing_key` reads that identity's key from
+/// this machine's `keys.toml`). Always visible, not just while watching a
+/// session — set before picking a session chip.
+fn remote_row(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
+    let inputs = row![
+        text("remote ▸").size(11).color(MUTED),
+        text_input("host (blank = local)", pane.remote.as_deref().unwrap_or(""))
+            .on_input(move |v| Message::RemoteChanged(id, v))
+            .size(11)
+            .padding(4)
+            .width(Length::FillPortion(2)),
+        text_input("watch as (email)", &pane.watch_email)
+            .on_input(move |v| Message::WatchEmailChanged(id, v))
+            .size(11)
+            .padding(4)
+            .width(Length::FillPortion(1)),
+    ]
+    .spacing(6)
+    .align_y(Center);
+    let mut col = column![inputs].spacing(2);
+    // The live subscription's id is keyed on (session, stream_nonce) — not on
+    // these fields — so it keeps a keystroke from tearing down and
+    // reconnecting the socket on every character. The cost is that editing
+    // either field has no effect on an already-running watch.
+    if pane.streaming {
+        col = col.push(
+            text("applies on next watch — doesn't affect the running connection")
+                .size(10)
+                .color(MUTED),
+        );
+    }
+    col.into()
+}
+
 /// One channel pane as a bordered column (custom Columns layout).
 fn column_pane<'a>(
     id: pane_grid::Pane,
     pane: &'a Pane,
     agents: &'a [AgentDto],
 ) -> Element<'a, Message> {
-    container(column![title_row(id, pane), pane_body(id, pane, agents)].spacing(8))
-        .width(Length::FillPortion(1))
-        .height(Fill)
-        .padding(8)
-        .style(|_theme| container::Style {
-            background: Some(Background::Color(Color { a: 0.4, ..SURFACE })),
-            border: Border {
-                color: BORDER,
-                width: 1.0,
-                radius: 6.0.into(),
-            },
-            ..container::Style::default()
-        })
-        .into()
+    container(
+        column![
+            title_row(id, pane),
+            remote_row(id, pane),
+            pane_body(id, pane, agents)
+        ]
+        .spacing(8),
+    )
+    .width(Length::FillPortion(1))
+    .height(Fill)
+    .padding(8)
+    .style(|_theme| container::Style {
+        background: Some(Background::Color(Color { a: 0.4, ..SURFACE })),
+        border: Border {
+            color: BORDER,
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+        ..container::Style::default()
+    })
+    .into()
 }
 
 /// The curated brief (recall bridge) rendered as Markdown in a card at the top
@@ -2107,6 +2503,47 @@ fn lifecycle_form(id: pane_grid::Pane, pane: &Pane, kind: LifecycleKind) -> Elem
             ..container::Style::default()
         })
         .into()
+}
+
+/// The annotation composer: a signed, span-anchored (or stream-anchored)
+/// comment on a remote-watched session. Rendered only while
+/// `pane.annotate_tx.is_some()` — the same condition Task 9's write-half
+/// wiring uses, since a composer has no meaning outside a live, authenticated
+/// watch. Empty `path` comments on the live stream itself (a `StreamAnchor`
+/// on the most recent conversation event); a typed `path` + `lines` comments
+/// on code, but only once `Message::WorktreeDiff` has actually carried a real
+/// commit oid for this session (`Message::AnnotateSubmit`'s anchor-sourcing
+/// rule — never fabricated).
+fn annotate_composer(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
+    let path_input = text_input("path (blank = comment on the stream)", &pane.annotate_path)
+        .on_input(move |v| Message::AnnotatePathChanged(id, v))
+        .size(12)
+        .padding(6)
+        .width(Length::FillPortion(2));
+    let lines_input = text_input("lines (\"12\" or \"12-14\")", &pane.annotate_lines)
+        .on_input(move |v| Message::AnnotateLinesChanged(id, v))
+        .size(12)
+        .padding(6)
+        .width(Length::FillPortion(1));
+    let body_input = text_input("annotate…", &pane.annotate_body)
+        .on_input(move |v| Message::AnnotateBodyChanged(id, v))
+        .on_submit(Message::AnnotateSubmit(id))
+        .size(12)
+        .padding(6);
+    let urgent = checkbox("urgent", pane.annotate_urgent)
+        .on_toggle(move |on| Message::AnnotateUrgentToggled(id, on))
+        .size(14)
+        .text_size(11);
+    let submit = button(text("comment").size(11))
+        .on_press(Message::AnnotateSubmit(id))
+        .padding(6);
+    column![
+        text("annotate ▸").size(11).color(MUTED),
+        row![path_input, lines_input].spacing(6),
+        row![body_input, urgent, submit].spacing(6).align_y(Center),
+    ]
+    .spacing(4)
+    .into()
 }
 
 fn pane_body<'a>(
@@ -2302,6 +2739,15 @@ fn pane_body<'a>(
         // visible after the turn lands until you leave the session.
         if pane.streaming || !pane.feed.is_empty() {
             record = record.push(text("— live turn —").size(11).color(MUTED));
+            // Remote-watch presence (the live websocket's `Ephemeral` frames) —
+            // absent for a local SSE-streamed session, which carries no presence.
+            if !pane.watchers.is_empty() {
+                record = record.push(
+                    text(format!("watching: {}", pane.watchers.join(", ")))
+                        .size(11)
+                        .color(TEAL),
+                );
+            }
             let mut feed = column![].spacing(6);
             for item in &pane.feed {
                 feed = feed.push(feed_line(item));
@@ -2332,13 +2778,16 @@ fn pane_body<'a>(
             interrupt_btn,
         ]
         .spacing(6);
-        column![
+        let mut session_col = column![
             header,
             scrollable(record).id(pane.scroll_id.clone()).height(Fill),
             steer
         ]
-        .spacing(8)
-        .into()
+        .spacing(8);
+        if pane.annotate_tx.is_some() {
+            session_col = session_col.push(annotate_composer(id, pane));
+        }
+        session_col.into()
     } else {
         let highlight = pane.highlight_entry.as_deref();
         // A focus-board jump pins the attention entry above the scroll so it's
@@ -2564,6 +3013,25 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         s.to_string()
     }
+}
+
+/// Parse the annotation composer's "lines" field: `"12"` (a single line) or
+/// `"12-14"` (an inclusive range). Pure delegation to [`Span::new`], which
+/// already enforces 1-indexing and a non-inverted range — this only splits
+/// the string and parses the two halves, never re-implementing those
+/// checks. `None` for anything that doesn't parse as one or two `u32`s
+/// either side of a single `-`, or that `Span::new` then rejects (`"0"`,
+/// `"9-3"`).
+fn parse_span(s: &str) -> Option<Span> {
+    let s = s.trim();
+    let (start, end) = match s.split_once('-') {
+        Some((a, b)) => (a.trim().parse().ok()?, b.trim().parse().ok()?),
+        None => {
+            let n: u32 = s.parse().ok()?;
+            (n, n)
+        }
+    };
+    Span::new(start, end).ok()
 }
 
 fn chip_style(color: Color, active: bool) -> button::Style {
@@ -2992,6 +3460,17 @@ impl Pane {
             watched: None,
             streaming: false,
             feed: Vec::new(),
+            remote: None,
+            watch_email: String::new(),
+            watchers: Vec::new(),
+            annotate_tx: None,
+            annotate_email: None,
+            conversation_len: 0,
+            worktree_commit: None,
+            annotate_path: String::new(),
+            annotate_lines: String::new(),
+            annotate_body: String::new(),
+            annotate_urgent: false,
             launch_intent: String::new(),
             steer_text: String::new(),
             launch_agent: None,
@@ -3018,6 +3497,14 @@ impl Pane {
             brief_md: None,
             brief_text: None,
         }
+    }
+
+    /// This pane's effective REST/websocket base URL: its remote override
+    /// if set, else the local `HOST`. The one place that distinction is
+    /// made — every fetch/post call and the live subscription read this
+    /// instead of touching `remote/HOST` directly.
+    fn base(&self) -> &str {
+        self.remote.as_deref().unwrap_or(HOST)
     }
 }
 
@@ -3331,9 +3818,10 @@ fn draw_tooltip(frame: &mut Frame, tooltip: Option<(Point, String)>, bounds: Rec
     });
 }
 
-/// Fetch a channel's structured view from the host into `pane`.
-fn fetch(pane: pane_grid::Pane, channel: &str) -> Task<Message> {
-    let url = format!("{HOST}/channels/{channel}/view.json");
+/// Fetch a channel's structured view from `base` (the pane's effective host,
+/// `Pane::base`) into `pane`.
+fn fetch(pane: pane_grid::Pane, base: String, channel: &str) -> Task<Message> {
+    let url = format!("{base}/channels/{channel}/view.json");
     Task::perform(
         async move {
             let response = reqwest::get(&url).await.map_err(|e| e.to_string())?;
@@ -3375,8 +3863,13 @@ fn fetch_focus() -> Task<Message> {
 }
 
 /// Fetch one artifact's raw content + format for inline rendering.
-fn fetch_artifact(pane: pane_grid::Pane, channel: String, artifact: String) -> Task<Message> {
-    let url = format!("{HOST}/channels/{channel}/artifacts/{artifact}/content.json");
+fn fetch_artifact(
+    pane: pane_grid::Pane,
+    base: String,
+    channel: String,
+    artifact: String,
+) -> Task<Message> {
+    let url = format!("{base}/channels/{channel}/artifacts/{artifact}/content.json");
     let id = artifact.clone();
     Task::perform(
         async move {
@@ -3499,8 +3992,8 @@ async fn simple_post_result(url: &str, form: &[(&str, String)], what: &str) -> R
 }
 
 /// Fetch a channel's curated brief (recall bridge) as Markdown text.
-fn fetch_brief(pane: pane_grid::Pane, channel: String) -> Task<Message> {
-    let url = format!("{HOST}/channels/{channel}/brief");
+fn fetch_brief(pane: pane_grid::Pane, base: String, channel: String) -> Task<Message> {
+    let url = format!("{base}/channels/{channel}/brief");
     Task::perform(
         async move {
             match reqwest::get(&url).await {
@@ -3608,17 +4101,370 @@ fn session_stream(channel: String, session: String) -> impl iced::futures::Strea
     })
 }
 
+/// A session's live-websocket URL, derived from a pane's REST base URL
+/// (`Pane::base`) by swapping the scheme: `http` → `ws`, `https` → `wss`.
+fn ws_url(base: &str, channel: &str, session: &str) -> String {
+    let base = base.trim_end_matches('/');
+    let (scheme, rest) = base.split_once("://").unwrap_or(("http", base));
+    let ws_scheme = if scheme == "https" { "wss" } else { "ws" };
+    format!("{ws_scheme}://{rest}/channels/{channel}/sessions/{session}/live")
+}
+
+/// A synthetic error line for the live feed — same shape `Message::Steered`'s
+/// error arm already pushes for a failed REST steer.
+fn error_event(text: String) -> LiveEvent {
+    LiveEvent {
+        kind: "error".into(),
+        text,
+        seq: 0,
+        html: false,
+        markdown: None,
+    }
+}
+
+/// The junto machine-local key store's home dir: `$JUNTO_HOME` if set, else
+/// `~/.junto` — the same resolution `crates/junto/src/host.rs::junto_home`
+/// uses.
+fn junto_home() -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("JUNTO_HOME") {
+        return Some(PathBuf::from(home));
+    }
+    std::env::home_dir().map(|home| home.join(".junto"))
+}
+
+/// One record in `<junto-home>/keys.toml` — mirrors `crates/junto/src/keys.rs`'s
+/// own `KeyRecord`. A separate copy, not a shared type: junto-iced is a
+/// standalone workspace that never links against the `junto` binary crate.
+#[derive(Debug, Deserialize)]
+struct KeyRecord {
+    email: String,
+    /// 64 hex chars — the Ed25519 secret seed.
+    secret: String,
+}
+
+/// The serialized shape of `<junto-home>/keys.toml`.
+#[derive(Debug, Default, Deserialize)]
+struct KeysFile {
+    #[serde(default)]
+    keys: Vec<KeyRecord>,
+}
+
+/// The signing key for `email`, read from the host's machine-local key store
+/// (`<junto-home>/keys.toml`, `crates/junto/src/keys.rs`) — `None` if the
+/// home can't be resolved, the file is missing or unparseable, or no record
+/// matches `email`. Never mints one: minting is the host's job (its own
+/// first-use path in `crates/junto/src/keys.rs::signing_key`); a watcher
+/// with no local identity on file simply can't authenticate yet.
+fn load_signing_key(email: &str) -> Option<SigningKey> {
+    let path = junto_home()?.join("keys.toml");
+    let text = std::fs::read_to_string(path).ok()?;
+    let file: KeysFile = toml::from_str(&text).ok()?;
+    let record = file.keys.into_iter().find(|record| record.email == email)?;
+    SigningKey::from_secret_hex(&record.secret).ok()
+}
+
+/// Serialize and send one `WireFrame` over the live websocket's write half.
+async fn send_frame<W>(
+    write: &mut W,
+    frame: &WireFrame,
+) -> Result<(), tokio_tungstenite::tungstenite::Error>
+where
+    W: iced::futures::Sink<
+            tokio_tungstenite::tungstenite::Message,
+            Error = tokio_tungstenite::tungstenite::Error,
+        > + Unpin,
+{
+    use iced::futures::SinkExt;
+    write
+        .send(tokio_tungstenite::tungstenite::Message::text(
+            serde_json::to_string(frame).expect("WireFrame always serializes"),
+        ))
+        .await
+}
+
+/// A long-lived subscription streaming a session's live feed from a REMOTE
+/// host's authenticated live websocket (`/channels/{channel}/sessions/{session}/live`)
+/// into `Message::Live`/`Message::Watchers` — the websocket counterpart of
+/// `session_stream`'s local SSE, used instead of it when a pane has a
+/// `remote` host configured (`App::subscription`).
+///
+/// Handshakes with `load_signing_key(&email)`'s key, then maintains a local
+/// `LiveDoc`/`Presence`: every inbound `Update` is imported and its new or
+/// changed (replace-in-place, `LiveDoc` module docs) conversation entries
+/// are emitted, alongside `Message::ConversationLen` (the container's own
+/// length, for the annotation composer's `StreamAnchor`) and, for any new
+/// `{"kind":"diff","commit":…}` worktree entry, `Message::WorktreeDiff`
+/// (the only source the composer's `CodeAnchor` may take a commit from).
+/// Every inbound `Ephemeral` is applied and re-published as
+/// `Message::Watchers`. Sends a presence heartbeat every 10s, and forwards
+/// anything received on the connected `annotate_tx` straight to the socket
+/// — the annotation composer's outbound path.
+fn live_ws_stream(
+    base: String,
+    channel: String,
+    session: String,
+    email: String,
+) -> impl iced::futures::Stream<Item = Message> {
+    use iced::futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    iced::stream::channel(64, move |mut output| async move {
+        let Some(signing_key) = load_signing_key(&email) else {
+            let _ = output
+                .send(Message::Live(
+                    session.clone(),
+                    error_event(format!("no signing key on file for '{email}'")),
+                ))
+                .await;
+            let _ = output.send(Message::LiveEnded(session)).await;
+            return;
+        };
+        let url = ws_url(&base, &channel, &session);
+        let socket = match tokio_tungstenite::connect_async(&url).await {
+            Ok((socket, _response)) => socket,
+            Err(err) => {
+                let _ = output
+                    .send(Message::Live(
+                        session.clone(),
+                        error_event(format!("connect failed: {err}")),
+                    ))
+                    .await;
+                let _ = output.send(Message::LiveEnded(session)).await;
+                return;
+            }
+        };
+        let (mut write, mut read) = socket.split();
+
+        // Handshake: Challenge → Auth → AuthOk (or Rejected/anything else).
+        let nonce = match read.next().await {
+            Some(Ok(WsMessage::Text(text))) => {
+                match serde_json::from_str::<WireFrame>(text.as_str()) {
+                    Ok(WireFrame::Challenge { nonce }) => nonce,
+                    _ => {
+                        let _ = output
+                            .send(Message::Live(
+                                session.clone(),
+                                error_event("handshake failed: expected a challenge".into()),
+                            ))
+                            .await;
+                        let _ = output.send(Message::LiveEnded(session)).await;
+                        return;
+                    }
+                }
+            }
+            _ => {
+                let _ = output
+                    .send(Message::Live(
+                        session.clone(),
+                        error_event(
+                            "handshake failed: connection closed before a challenge arrived".into(),
+                        ),
+                    ))
+                    .await;
+                let _ = output.send(Message::LiveEnded(session)).await;
+                return;
+            }
+        };
+        let signature = signing_key.sign_bytes(nonce.as_bytes());
+        let auth = WireFrame::Auth {
+            email: email.clone(),
+            signature: signature.into(),
+        };
+        if let Err(err) = send_frame(&mut write, &auth).await {
+            let _ = output
+                .send(Message::Live(
+                    session.clone(),
+                    error_event(format!("failed to send auth: {err}")),
+                ))
+                .await;
+            let _ = output.send(Message::LiveEnded(session)).await;
+            return;
+        }
+        match read.next().await {
+            Some(Ok(WsMessage::Text(text))) => {
+                match serde_json::from_str::<WireFrame>(text.as_str()) {
+                    Ok(WireFrame::AuthOk) => {}
+                    Ok(WireFrame::Rejected { reason }) => {
+                        let _ = output
+                            .send(Message::Live(session.clone(), error_event(reason)))
+                            .await;
+                        let _ = output.send(Message::LiveEnded(session)).await;
+                        return;
+                    }
+                    _ => {
+                        let _ = output.send(Message::LiveEnded(session)).await;
+                        return;
+                    }
+                }
+            }
+            _ => {
+                let _ = output.send(Message::LiveEnded(session)).await;
+                return;
+            }
+        }
+
+        // Wired for Task 10's annotation composer: anything sent here is
+        // forwarded straight to the socket, below.
+        let (annotate_tx, mut annotate_rx) = mpsc::channel::<WireFrame>(16);
+        if output
+            .send(Message::LiveConnected(
+                session.clone(),
+                annotate_tx,
+                email.clone(),
+            ))
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        let doc = LiveDoc::new();
+        let presence = Presence::new();
+        // How many conversation entries have already been emitted, plus the
+        // last of those entries' own value — so a replace-in-place update to
+        // that still-growing last entry (the host's `LiveDoc` coalescing) is
+        // re-emitted instead of missed, while entries before it (frozen once
+        // superseded) are never re-checked.
+        let mut emitted = 0usize;
+        let mut worktree_emitted = 0usize;
+        let mut last_seen: Option<serde_json::Value> = None;
+        let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(10));
+        heartbeat.tick().await; // the first tick fires immediately
+
+        loop {
+            tokio::select! {
+                incoming = read.next() => {
+                    match incoming {
+                        Some(Ok(WsMessage::Text(text))) => {
+                            let Ok(frame) = serde_json::from_str::<WireFrame>(text.as_str()) else {
+                                continue;
+                            };
+                            match frame {
+                                WireFrame::Update { .. } => {
+                                    let Some(bytes) = frame.update_bytes() else { continue };
+                                    if doc.import_update(&bytes).is_err() {
+                                        continue;
+                                    }
+                                    let len = doc.conversation_len();
+                                    // The already-emitted last entry may have grown in
+                                    // place (the host's replace-in-place coalescing,
+                                    // `LiveDoc` module docs) — re-emit it if it
+                                    // changed, so the app's own seq-keyed coalescing
+                                    // lands the final text, not a stale mid-growth one.
+                                    if emitted > 0
+                                        && let Some(current) = doc.conversation_event(emitted - 1)
+                                        && Some(&current) != last_seen.as_ref()
+                                    {
+                                        if let Ok(event) =
+                                            serde_json::from_value::<LiveEvent>(current.clone())
+                                        {
+                                            let _ = output
+                                                .send(Message::Live(session.clone(), event))
+                                                .await;
+                                        }
+                                        last_seen = Some(current);
+                                    }
+                                    for i in emitted..len {
+                                        let Some(value) = doc.conversation_event(i) else {
+                                            continue;
+                                        };
+                                        if let Ok(event) =
+                                            serde_json::from_value::<LiveEvent>(value.clone())
+                                        {
+                                            let _ = output
+                                                .send(Message::Live(session.clone(), event))
+                                                .await;
+                                        }
+                                        last_seen = Some(value);
+                                    }
+                                    emitted = len;
+                                    let _ = output
+                                        .send(Message::ConversationLen(session.clone(), len))
+                                        .await;
+                                    let wt_len = doc.worktree_len();
+                                    for i in worktree_emitted..wt_len {
+                                        let Some(value) = doc.worktree_event(i) else {
+                                            continue;
+                                        };
+                                        if value.get("kind").and_then(|k| k.as_str())
+                                            == Some("diff")
+                                            && let Some(commit) =
+                                                value.get("commit").and_then(|c| c.as_str())
+                                        {
+                                            let _ = output
+                                                .send(Message::WorktreeDiff(
+                                                    session.clone(),
+                                                    commit.to_string(),
+                                                ))
+                                                .await;
+                                        }
+                                    }
+                                    worktree_emitted = wt_len;
+                                }
+                                WireFrame::Ephemeral { .. } => {
+                                    let Some(bytes) = frame.ephemeral_bytes() else { continue };
+                                    if presence.apply(&bytes).is_ok() {
+                                        let _ = output
+                                            .send(Message::Watchers(session.clone(), presence.watchers()))
+                                            .await;
+                                    }
+                                }
+                                WireFrame::Rejected { reason } => {
+                                    let _ = output
+                                        .send(Message::Live(session.clone(), error_event(reason)))
+                                        .await;
+                                }
+                                WireFrame::End => {
+                                    let _ = output.send(Message::LiveEnded(session)).await;
+                                    return;
+                                }
+                                WireFrame::Challenge { .. }
+                                | WireFrame::Auth { .. }
+                                | WireFrame::AuthOk => {}
+                            }
+                        }
+                        Some(Ok(WsMessage::Close(_))) | None => {
+                            let _ = output.send(Message::LiveEnded(session)).await;
+                            return;
+                        }
+                        Some(Ok(_)) => {} // ping/pong/binary: nothing this protocol needs.
+                        Some(Err(_)) => {
+                            let _ = output.send(Message::LiveEnded(session)).await;
+                            return;
+                        }
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    presence.set_watching(&email);
+                    let frame = WireFrame::ephemeral(&presence.encode_all());
+                    if send_frame(&mut write, &frame).await.is_err() {
+                        let _ = output.send(Message::LiveEnded(session)).await;
+                        return;
+                    }
+                }
+                Some(frame) = annotate_rx.next() => {
+                    if send_frame(&mut write, &frame).await.is_err() {
+                        let _ = output.send(Message::LiveEnded(session)).await;
+                        return;
+                    }
+                }
+            }
+        }
+    })
+}
+
 /// POST a launch (a new session) for `channel` — intent plus the agent slug,
 /// mode (`single`/`outcome`), and optional workspace the picker selected.
 fn post_launch(
     pane: pane_grid::Pane,
+    base: String,
     channel: String,
     intent: String,
     agent: Option<String>,
     mode: &'static str,
     workspace: String,
 ) -> Task<Message> {
-    let url = format!("{HOST}/channels/{channel}/sessions");
+    let url = format!("{base}/channels/{channel}/sessions");
     Task::perform(
         async move {
             let mut form = vec![
@@ -3652,12 +4498,13 @@ fn post_launch(
 /// approve/reject (proposals), with the required rationale.
 fn post_verify(
     pane: pane_grid::Pane,
+    base: String,
     channel: String,
     entry: String,
     act: String,
     rationale: String,
 ) -> Task<Message> {
-    let url = format!("{HOST}/channels/{channel}/entries/{entry}/{act}");
+    let url = format!("{base}/channels/{channel}/entries/{entry}/{act}");
     let entry_id = entry.clone();
     Task::perform(
         async move {
@@ -3688,12 +4535,13 @@ fn post_verify(
 /// POST a session act — `steer` (with a message) or `interrupt` (no body).
 fn post_act(
     pane: pane_grid::Pane,
+    base: String,
     channel: String,
     session: String,
     act: &'static str,
     message: Option<String>,
 ) -> Task<Message> {
-    let url = format!("{HOST}/channels/{channel}/sessions/{session}/{act}");
+    let url = format!("{base}/channels/{channel}/sessions/{session}/{act}");
     Task::perform(
         async move {
             let request = reqwest::Client::new().post(&url);
@@ -3711,6 +4559,7 @@ fn post_act(
 /// report the result. Diverge returns the child's name to open.
 fn post_lifecycle(
     pane: pane_grid::Pane,
+    base: String,
     channel: String,
     kind: LifecycleKind,
     text: String,
@@ -3735,7 +4584,7 @@ fn post_lifecycle(
             LifecycleResult::Renamed(target),
         ),
     };
-    let url = format!("{HOST}/channels/{channel}/{path}");
+    let url = format!("{base}/channels/{channel}/{path}");
     Task::perform(
         async move {
             match reqwest::Client::new().post(&url).form(&form).send().await {
@@ -3789,11 +4638,12 @@ fn post_create_channel(name: String, repo: Option<String>) -> Task<Message> {
 /// resumed turn (a landed session) or keep streaming (a live one).
 fn post_steer(
     pane: pane_grid::Pane,
+    base: String,
     channel: String,
     session: String,
     message: String,
 ) -> Task<Message> {
-    let url = format!("{HOST}/channels/{channel}/sessions/{session}/steer");
+    let url = format!("{base}/channels/{channel}/sessions/{session}/steer");
     Task::perform(
         async move {
             match reqwest::Client::new()
@@ -3818,4 +4668,87 @@ fn post_steer(
         },
         move |result| Message::Steered(pane, result),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ws_url_swaps_http_and_https_schemes() {
+        assert_eq!(
+            ws_url("http://h:1727", "c", "s"),
+            "ws://h:1727/channels/c/sessions/s/live"
+        );
+        assert_eq!(
+            ws_url("https://h:1727", "c", "s"),
+            "wss://h:1727/channels/c/sessions/s/live"
+        );
+        // A stray trailing slash on the base is tolerated.
+        assert_eq!(
+            ws_url("http://h:1727/", "c", "s"),
+            "ws://h:1727/channels/c/sessions/s/live"
+        );
+    }
+
+    /// Same shape as `crates/junto/src/keys.rs`'s own tests: a tempdir
+    /// `keys.toml` with a known secret, asserting the derived public key
+    /// matches. `JUNTO_HOME` is process-global; this crate has no other test
+    /// that touches it, so no cross-test lock is needed (unlike
+    /// `crates/junto/src/host.rs::tests::HomeGuard`, which several tests
+    /// share).
+    #[test]
+    fn load_signing_key_reads_the_matching_record_by_email() {
+        let home = std::env::temp_dir().join(format!(
+            "junto-iced-test-keys-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).expect("create temp home");
+        let key = SigningKey::from_secret_bytes([7u8; 32]);
+        std::fs::write(
+            home.join("keys.toml"),
+            format!(
+                "[[keys]]\nemail = \"dan@example.com\"\nsecret = \"{}\"\n",
+                key.to_secret_hex()
+            ),
+        )
+        .expect("write keys.toml");
+
+        let previous = std::env::var_os("JUNTO_HOME");
+        // SAFETY: test-only, single-threaded use of this env var in this crate.
+        unsafe { std::env::set_var("JUNTO_HOME", &home) };
+        let loaded = load_signing_key("dan@example.com");
+        let missing = load_signing_key("nobody@example.com");
+        match previous {
+            Some(value) => unsafe { std::env::set_var("JUNTO_HOME", value) },
+            None => unsafe { std::env::remove_var("JUNTO_HOME") },
+        }
+        std::fs::remove_dir_all(&home).ok();
+
+        assert_eq!(
+            loaded
+                .expect("key on file for dan@example.com")
+                .public_key(),
+            key.public_key(),
+            "the derived public key matches the stored secret"
+        );
+        assert!(missing.is_none(), "no record on file for an unknown email");
+    }
+
+    #[test]
+    fn parse_span_accepts_single_and_range_and_rejects_malformed() {
+        assert_eq!(parse_span("12"), Span::new(12, 12).ok());
+        assert_eq!(parse_span("12-14"), Span::new(12, 14).ok());
+        // Whitespace around either form is tolerated.
+        assert_eq!(parse_span(" 12 - 14 "), Span::new(12, 14).ok());
+        assert_eq!(parse_span("0"), None, "line numbers are 1-indexed");
+        assert_eq!(parse_span("9-3"), None, "an inverted range is rejected");
+        assert_eq!(parse_span("x"), None, "non-numeric input is rejected");
+        assert_eq!(parse_span(""), None, "empty input is rejected");
+        assert_eq!(parse_span("12-"), None, "a dangling range is rejected");
+        assert_eq!(parse_span("-12"), None, "a missing start is rejected");
+    }
 }

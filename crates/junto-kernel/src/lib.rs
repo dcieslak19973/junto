@@ -21,6 +21,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod anchor;
 pub mod entry;
 pub mod error;
 pub mod gate;
@@ -34,6 +35,7 @@ pub mod sign;
 pub mod substrate;
 pub mod time;
 
+pub use anchor::{Anchor, Annotation, AnnotationId, CodeAnchor, CommitOid, Span, StreamAnchor};
 pub use entry::{DecisionFrame, EntryPayload, FrameAct, FrameOption, LedgerEntry};
 pub use error::{Error, Result};
 pub use gate::{ApprovalRequirement, GateStatus};

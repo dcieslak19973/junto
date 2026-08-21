@@ -3,7 +3,7 @@
 # adapter crates; the `junto` binary is the host/app entry (not a human terminal).
 [workspace]
 resolver = "3"
-members = ["crates/junto-kernel", "crates/junto", "crates/junto-substrate-git"]
+members = ["crates/junto-kernel", "crates/junto", "crates/junto-substrate-git", "crates/junto-live"]
 # junto-desktop (the Tauri shell, docs/adr/0018) is its own workspace: Tauri's
 # dependency tree would slow every kernel `cargo check --workspace`/CI run.
 # It has a dedicated CI job; build it via --manifest-path.
@@ -19,6 +19,7 @@ authors = ["Dan Cieslak <dcieslak@hotmail.com>"]
 # internal
 junto-kernel = { path = "crates/junto-kernel" }
 junto-substrate-git = { path = "crates/junto-substrate-git" }
+junto-live = { path = "crates/junto-live" }
 # external (latest as of 2026-06-08)
 thiserror = "2.0.18"
 anyhow = "1.0.102"
@@ -57,3 +58,28 @@ sha2 = "0.10"
 async-stream = "0.3"
 # CommonMark rendering for agent memos on the human surface (docs/adr/0023; MIT)
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+# CRDT for the ephemeral live-session plane (docs/adr live-session-plane
+# proposal): one loro::LoroDoc per running agent session, holding its
+# conversation stream, worktree events, and multi-author annotations. Never
+# used for the durable ledger record. loro itself is MIT (see
+# crates/loro/Cargo.toml); it brings in MPL-2.0 transitives (`im`,
+# `sized-chunks`, `bitmaps`, via loro-internal's normal dependency on `im`) —
+# file-level weak copyleft that permits a Larger Work under other terms
+# (MPL-2.0 §3.3), accepted here by controller ruling; junto's own source
+# stays MIT.
+loro = "1.13"
+# base64 encoding for loro update bytes riding inside the JSON websocket
+# frame envelope (`junto-live`'s `Frame`); MIT/Apache-2.0.
+base64 = "0.22"
+# dev-only: the live websocket module's in-crate test client side
+# (crates/junto/src/live_ws.rs); pinned to the same major.minor axum's own
+# `ws` feature resolves (`tokio-tungstenite 0.29` via axum-core 0.5), so
+# Cargo doesn't carry two copies of tungstenite/tokio-tungstenite/rand in
+# the dependency tree; MIT.
+tokio-tungstenite = "0.29"
+# dev-only: `Sink`/`Stream` ext traits for driving `tokio-tungstenite`'s
+# `WebSocketStream` in that same test; already fully resolved in the
+# dependency tree via axum/tokio, so this is a direct-import path, not a new
+# crate (MIT/Apache-2.0). Controller-accepted (outside the plan's original
+# sanctioned-deps list).
+futures-util = "0.3"

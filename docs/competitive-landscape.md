@@ -305,10 +305,10 @@ The screencast fluidity has four separable causes — only one requires CRDT:
   engineering is enormous (Zed spent years on CRDTs before this), the record
   philosophy is opposed, and DeltaDB is proprietary — nothing to build on.
 
-### The reopening (Dan, 2026-08-20)
+### The reopening (Dan, 2026-08-20) — rungs 1–2 built
 
-Two parked/ratified decisions sit in this territory; per the dead-ends
-convention they are surfaced, not silently retried:
+Two parked/ratified decisions sat in this territory; per the dead-ends
+convention they were surfaced, not silently retried:
 
 - **`1d9cf9b1` (park ratified 2026-06-14):** *"Turn-taking is unsolved and
   worktree isolation is a prerequisite; the human-initiated sequential model
@@ -317,26 +317,42 @@ convention they are surfaced, not silently retried:
 - **`b405a1cb` (ratified 2026-06-13):** the collaborative space stays on the
   roadmap, constrained to a turn-based, append-only versioned artifact.
 
-Conditions have changed: **worktree isolation has since landed** (the
-`185fd301` ratification), **Delta is the real-use-case evidence**, and Dan
-has signaled willingness to reconsider the turn-based approach
-(2026-08-20). The graduated ladder — each rung ships value alone, climb in
-order:
+Conditions had changed: **worktree isolation had landed** (the `185fd301`
+ratification), **Delta is the real-use-case evidence**, and Dan signaled
+willingness to reconsider the turn-based approach (2026-08-20). The
+graduated ladder — each rung ships value alone, climb in order:
 
-1. **Anchored comments + decision blame** — async; no constraint touched.
+1. **Anchored comments** — async; no constraint touched. **Built:**
+   span-anchored, signed `Annotation`s (`CodeAnchor`/`StreamAnchor`,
+   re-anchored across code motion into `Exact | Moved | Orphaned`) —
+   [`docs/superpowers/specs/2026-08-20-live-session-plane-design.md`](superpowers/specs/2026-08-20-live-session-plane-design.md).
+   The **decision-blame back-link** this rung was paired with above (file/line
+   → entries + Sessions) is *not* built — only the `CodeAnchor` type it will
+   read is in place, by design, so that projection is free later.
 2. **Presence + live session viewing** — ephemeral plane over the record;
-   already licensed by the incident worked example.
+   already licensed by the incident worked example. **Built:** a per-session
+   `LiveDoc` (`junto-live`, loro), presence via `EphemeralStore`, and an
+   authenticated WebSocket watcher surface in `junto-iced`.
 3. **A live shared *conversation/plan document*** — CRDT scoped to one
-   ephemeral document (permissive crates exist: loro / yrs / automerge, all
-   MIT — verify at adoption); durable outcomes still fold into entries.
-   Only if rung 2 leaves the itch.
+   ephemeral document (loro adopted, MIT — verified at adoption; see
+   [ADR 0034](adr/0034-crdt-confined-to-the-live-plane.md) for the transitive
+   MPL-2.0 dependencies that came with it); durable outcomes still fold into
+   entries. **Not built:** `conversation`/`worktree` are driver-only by
+   policy in the shipped `LiveDoc` — multi-writer is representable, not
+   authorized. Climbing this rung is an authorization change against the
+   existing representation, not a rewrite; still only *if* rung 2 leaves the
+   itch.
 4. **Replicated worktrees** (DeltaDB territory) — only with evidence that
    rungs 1–3 can't deliver; a new substrate *plane*, never a change to the
-   record.
+   record. **Not built**, not attempted.
 
-Whatever rung is reached: **the record stays append-only ratified entries**
-(ADR 0011 untouched). If CRDT ever enters, it is confined to the live plane
-or a versioned artifact — never the durable record.
+Rungs 1–2 shipped as designed: **the record stayed append-only ratified
+entries** (ADR 0011 untouched throughout) and CRDT stayed confined to the
+live plane, scoped by [ADR 0034](adr/0034-crdt-confined-to-the-live-plane.md)
+— never the durable record. The unpark itself is **drafted, not yet
+recorded**: [ADR 0034](adr/0034-crdt-confined-to-the-live-plane.md)'s
+appendix carries the exact wording, citing `1d9cf9b1`, `b405a1cb`, and
+`032da77f`, for Dan to record in `junto-dev`.
 
 ### Tradeoffs, stated honestly
 

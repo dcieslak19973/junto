@@ -13,11 +13,14 @@ path = "src/main.rs"
 
 [dependencies]
 junto-kernel.workspace = true
+junto-live.workspace = true
 junto-substrate-git.workspace = true
 anyhow.workspace = true
 # the MCP write surface (`junto serve`): streamable HTTP over axum
 rmcp.workspace = true
-axum.workspace = true
+# the `ws` feature is the live-session-plane websocket endpoint
+# (crates/junto/src/live_ws.rs): challenge-response auth + Frame streaming.
+axum = { workspace = true, features = ["ws"] }
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -39,3 +42,12 @@ tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal", "tim
 
 [dev-dependencies]
 tempfile.workspace = true
+# the live websocket module's in-crate integration tests
+# (crates/junto/src/live_ws.rs's `#[cfg(test)] mod tests`); dev-only, per the
+# live-session-plane plan's dependency ruling.
+tokio-tungstenite.workspace = true
+# `WebSocketStream`'s Sink/Stream impls need these traits in scope to call
+# `.send()`/`.next()`; already fully resolved in the workspace's dependency
+# tree via axum/tokio (accepted, controller ruling), so this adds no new
+# crate, only a direct import path.
+futures-util.workspace = true

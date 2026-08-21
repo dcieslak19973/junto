@@ -78,6 +78,23 @@ pub fn signing_key(junto_home: &Path, email: &str) -> Result<SigningKey> {
     Ok(key)
 }
 
+/// Whether `email` already has a signing key on file — **never mints**
+/// one, unlike [`signing_key`]. [`signing_key`] mints because every
+/// caller that reaches it already resolved a LOCAL identity this host has
+/// authority over: an agent it created, or a human logged in through it.
+/// This function exists for callers handed an identity from elsewhere
+/// (e.g. a remote watcher's [`junto_kernel::Member`] over
+/// `crate::live_bridge`), which must be able to ask "do I already hold a
+/// key for this person" without the asking itself silently minting and
+/// persisting a new keypair for someone this host has no authority to
+/// speak for.
+pub fn has_signing_key(junto_home: &Path, email: &str) -> Result<bool> {
+    Ok(load(junto_home)?
+        .keys
+        .iter()
+        .any(|record| record.email == email))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,5 +123,18 @@ mod tests {
         assert!(stored.contains(&key.to_secret_hex()));
         // The public form is derivable, not stored — nothing else to sync.
         assert!(!stored.contains(key.public_key().as_str()));
+    }
+
+    #[test]
+    fn has_signing_key_never_mints() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(!has_signing_key(home.path(), "unknown@elsewhere.com").unwrap());
+        // The lookup itself must not have minted or written anything.
+        assert!(!keys_path(home.path()).exists());
+        assert!(load(home.path()).unwrap().keys.is_empty());
+
+        signing_key(home.path(), "dan@example.com").unwrap();
+        assert!(has_signing_key(home.path(), "dan@example.com").unwrap());
+        assert!(!has_signing_key(home.path(), "unknown@elsewhere.com").unwrap());
     }
 }
