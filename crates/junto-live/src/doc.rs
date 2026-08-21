@@ -169,37 +169,18 @@ impl LiveDoc {
         self.doc.get_movable_list(CONVERSATION).len()
     }
 
-    /// Every event currently in `conversation`, in order, parsed back from
-    /// the JSON text [`LiveDoc::push_conversation`] stored each entry as —
-    /// how a remote watcher (the iced client's live-websocket stream,
-    /// `crates/junto-iced`) turns an imported snapshot/update back into
-    /// render-able events. An entry that fails to parse is skipped, not
-    /// errored, same stance as [`LiveDoc::annotations`]: a malformed write
-    /// from a future producer must not poison reads of the entries around
-    /// it.
-    #[must_use]
-    pub fn conversation_events(&self) -> Vec<serde_json::Value> {
-        let LoroValue::List(items) = self.doc.get_movable_list(CONVERSATION).get_value() else {
-            return Vec::new();
-        };
-        items
-            .iter()
-            .filter_map(|item| match item {
-                LoroValue::String(text) => serde_json::from_str(text).ok(),
-                _ => None,
-            })
-            .collect()
-    }
-
     /// The single event at `index` in `conversation`, if present, parsed
     /// back from the JSON text [`LiveDoc::push_conversation`] stored it as
     /// — `None` for an out-of-range index or an entry that fails to parse
-    /// (same skip-not-error stance as [`LiveDoc::conversation_events`]).
+    /// (a malformed write from a future producer is skipped, not errored,
+    /// same stance as [`LiveDoc::annotations`]).
     ///
-    /// The point-read counterpart of [`LiveDoc::conversation_events`]: an
-    /// incremental watcher only ever needs the entries past its own
-    /// high-water mark plus a possibly-changed last one, not the whole
-    /// container re-parsed on every inbound update.
+    /// The point-read counterpart a remote watcher (the iced client's
+    /// live-websocket stream, `crates/junto-iced`) uses to turn an
+    /// imported snapshot/update back into render-able events: it only
+    /// ever needs the entries past its own high-water mark plus a
+    /// possibly-changed last one, not the whole container re-parsed on
+    /// every inbound update.
     #[must_use]
     pub fn conversation_event(&self, index: usize) -> Option<serde_json::Value> {
         let item = self.doc.get_movable_list(CONVERSATION).get(index)?;
@@ -213,6 +194,27 @@ impl LiveDoc {
     #[must_use]
     pub fn worktree_len(&self) -> usize {
         self.doc.get_movable_list(WORKTREE).len()
+    }
+
+    /// The single event at `index` in `worktree`, if present, parsed back
+    /// from the JSON text [`LiveDoc::push_worktree`] stored it as — `None`
+    /// for an out-of-range index or an entry that fails to parse (skipped,
+    /// not errored, same stance as [`LiveDoc::conversation_event`]).
+    ///
+    /// Lets a remote watcher (the iced client's live-websocket stream,
+    /// `crates/junto-iced`) read back worktree activity — e.g. the
+    /// turn-end `{"kind":"diff","commit":...}` event the annotation
+    /// composer's `CodeAnchor` sourcing depends on (`docs/adr` live
+    /// session plane, Task 10) — the same point-read shape
+    /// [`LiveDoc::conversation_event`] already gives the conversation
+    /// container.
+    #[must_use]
+    pub fn worktree_event(&self, index: usize) -> Option<serde_json::Value> {
+        let item = self.doc.get_movable_list(WORKTREE).get(index)?;
+        let LoroValue::String(text) = item.into_value().ok()? else {
+            return None;
+        };
+        serde_json::from_str(&text).ok()
     }
 
     /// Whether `self` and `other`'s `conversation` containers hold exactly
@@ -526,32 +528,40 @@ mod tests {
     }
 
     #[test]
-    fn conversation_events_reads_back_in_order_and_skips_malformed() {
+    fn worktree_event_point_reads_by_index_and_skips_malformed() {
         let live = LiveDoc::new();
-        live.push_conversation(&serde_json::json!({"seq": 1, "text": "hi"}));
-        live.push_conversation(&serde_json::json!({"seq": 2, "text": "there"}));
+        live.push_worktree(&serde_json::json!({"kind": "diff", "commit": "a".repeat(40)}));
+        live.push_worktree(&serde_json::json!({"kind": "edit", "path": "src/lib.rs"}));
         // A non-JSON entry landing in the same container — the only
         // realistic way this path fires, since this crate's own writer
-        // (`push_conversation`) always pushes `serde_json::Value::to_string`
+        // (`push_worktree`) always pushes `serde_json::Value::to_string`
         // output. Written directly through the private `doc` field (this
         // module's own test, not a public API) rather than a merged peer
         // document, so the append lands deterministically at the end
         // instead of wherever a genuinely concurrent CRDT merge resolves it.
         live.doc
-            .get_movable_list(CONVERSATION)
+            .get_movable_list(WORKTREE)
             .push("not json at all")
             .unwrap();
         live.doc.commit();
-        assert_eq!(live.conversation_len(), 3, "the garbage entry still counts");
 
-        let events = live.conversation_events();
         assert_eq!(
-            events,
-            vec![
-                serde_json::json!({"seq": 1, "text": "hi"}),
-                serde_json::json!({"seq": 2, "text": "there"}),
-            ],
-            "malformed entries are skipped, not errored, and order is preserved"
+            live.worktree_event(0),
+            Some(serde_json::json!({"kind": "diff", "commit": "a".repeat(40)}))
+        );
+        assert_eq!(
+            live.worktree_event(1),
+            Some(serde_json::json!({"kind": "edit", "path": "src/lib.rs"}))
+        );
+        assert_eq!(
+            live.worktree_event(2),
+            None,
+            "a malformed entry is skipped, not errored"
+        );
+        assert_eq!(
+            live.worktree_event(99),
+            None,
+            "an out-of-range index is None, not a panic"
         );
     }
 
@@ -561,7 +571,7 @@ mod tests {
         live.push_conversation(&serde_json::json!({"seq": 1, "text": "hi"}));
         live.push_conversation(&serde_json::json!({"seq": 2, "text": "there"}));
         // Same directly-through-the-private-field technique as
-        // `conversation_events_reads_back_in_order_and_skips_malformed`.
+        // `worktree_event_point_reads_by_index_and_skips_malformed`.
         live.doc
             .get_movable_list(CONVERSATION)
             .push("not json at all")

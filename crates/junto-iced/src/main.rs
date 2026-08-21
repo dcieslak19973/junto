@@ -21,7 +21,10 @@ use iced::{
     Background, Border, Center, Color, Element, Fill, Length, Point, Rectangle, Renderer, Size,
     Task, Theme, mouse,
 };
-use junto_kernel::SigningKey;
+use junto_kernel::{
+    Anchor, Annotation, AnnotationId, CodeAnchor, CommitOid, ContentDigest, EntryId, Member,
+    SigningKey, Span, StreamAnchor, Timestamp,
+};
 use junto_live::{Frame as WireFrame, LiveDoc, Presence};
 use serde::Deserialize;
 
@@ -134,9 +137,33 @@ struct Pane {
     /// live websocket's presence — empty when not remote-watching.
     watchers: Vec<String>,
     /// The write half of the live websocket, wired up once the connection
-    /// authenticates. Not used by this task — left wired for Task 10's
-    /// annotation composer, which sends `Frame`s through it.
+    /// authenticates — the annotation composer sends signed `Frame`s
+    /// through it (Task 10).
     annotate_tx: Option<mpsc::Sender<WireFrame>>,
+    /// The live doc's current `conversation` container length, mirrored
+    /// from the stream task (`Message::ConversationLen`). The composer's
+    /// `StreamAnchor` (an empty `path`) anchors at
+    /// `conversation_len.saturating_sub(1)` — the most recent event's own
+    /// CONTAINER index, which is not necessarily `feed.len() - 1` (the feed
+    /// also carries synthetic, non-document error lines).
+    conversation_len: usize,
+    /// The most recent commit oid seen in a `{"kind":"diff","commit":…}`
+    /// worktree event on this pane's live doc (`Message::WorktreeDiff`) —
+    /// the ONLY source a `CodeAnchor`'s commit may come from. `None` means
+    /// the composer must emit a `StreamAnchor`, never a fabricated oid.
+    worktree_commit: Option<String>,
+    /// The annotation composer's typed file path; empty comments on the
+    /// live stream itself instead of a code span.
+    annotate_path: String,
+    /// The annotation composer's typed line range (`"12"` or `"12-14"`,
+    /// `parse_span`).
+    annotate_lines: String,
+    /// The annotation composer's comment body — cleared after a successful
+    /// send, but `annotate_path`/`annotate_lines` persist (a reviewer
+    /// usually comments repeatedly on the same region).
+    annotate_body: String,
+    /// The annotation composer's "urgent" checkbox.
+    annotate_urgent: bool,
     launch_intent: String,
     steer_text: String,
     /// Which configured Agent runs the next launch (None → host default).
@@ -499,8 +526,26 @@ enum Message {
     Watchers(String, Vec<String>),
     /// A live websocket authenticated and is ready to carry outbound frames
     /// (session, the write-half sender) — stored as `Pane::annotate_tx` for
-    /// Task 10's annotation composer.
+    /// the annotation composer.
     LiveConnected(String, mpsc::Sender<WireFrame>),
+    /// The live doc's `conversation` container grew (session, new length) —
+    /// mirrored into `Pane::conversation_len` so the composer's
+    /// `StreamAnchor` can point at a real CONTAINER index.
+    ConversationLen(String, usize),
+    /// A worktree `{"kind":"diff","commit":…}` event arrived (session,
+    /// commit oid) — mirrored into `Pane::worktree_commit`, the only source
+    /// the composer's `CodeAnchor` may ever take a commit from.
+    WorktreeDiff(String, String),
+    /// The annotation composer's `path` text input changed.
+    AnnotatePathChanged(pane_grid::Pane, String),
+    /// The annotation composer's `lines` text input changed.
+    AnnotateLinesChanged(pane_grid::Pane, String),
+    /// The annotation composer's comment body text input changed.
+    AnnotateBodyChanged(pane_grid::Pane, String),
+    /// The annotation composer's "urgent" checkbox toggled.
+    AnnotateUrgentToggled(pane_grid::Pane, bool),
+    /// Submit the annotation composer: sign and send the comment.
+    AnnotateSubmit(pane_grid::Pane),
     LaunchIntentChanged(pane_grid::Pane, String),
     LaunchAgentPicked(pane_grid::Pane, AgentDto),
     LaunchModeChanged(pane_grid::Pane, bool),
@@ -785,6 +830,8 @@ impl App {
                                 state.feed.clear();
                                 state.watchers.clear();
                                 state.annotate_tx = None;
+                                state.conversation_len = 0;
+                                state.worktree_commit = None;
                             }
                         }
                         state.content = Content::Loaded(dto);
@@ -829,6 +876,8 @@ impl App {
                     state.feed.clear();
                     state.watchers.clear();
                     state.annotate_tx = None;
+                    state.conversation_len = 0;
+                    state.worktree_commit = None;
                 }
                 Task::none()
             }
@@ -839,6 +888,8 @@ impl App {
                     state.feed.clear();
                     state.watchers.clear();
                     state.annotate_tx = None;
+                    state.conversation_len = 0;
+                    state.worktree_commit = None;
                 }
                 Task::none()
             }
@@ -878,6 +929,8 @@ impl App {
                         state.streaming = false;
                         state.watchers.clear();
                         state.annotate_tx = None;
+                        state.conversation_len = 0;
+                        state.worktree_commit = None;
                         to_refresh = Some(*pane);
                         break;
                     }
@@ -922,6 +975,174 @@ impl App {
                         break;
                     }
                 }
+                Task::none()
+            }
+            Message::ConversationLen(session, len) => {
+                for (_, state) in self.panes.iter_mut() {
+                    if state.watched.as_deref() == Some(session.as_str()) {
+                        state.conversation_len = len;
+                        break;
+                    }
+                }
+                Task::none()
+            }
+            Message::WorktreeDiff(session, commit) => {
+                for (_, state) in self.panes.iter_mut() {
+                    if state.watched.as_deref() == Some(session.as_str()) {
+                        state.worktree_commit = Some(commit);
+                        break;
+                    }
+                }
+                Task::none()
+            }
+            Message::AnnotatePathChanged(pane, value) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    state.annotate_path = value;
+                }
+                Task::none()
+            }
+            Message::AnnotateLinesChanged(pane, value) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    state.annotate_lines = value;
+                }
+                Task::none()
+            }
+            Message::AnnotateBodyChanged(pane, value) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    state.annotate_body = value;
+                }
+                Task::none()
+            }
+            Message::AnnotateUrgentToggled(pane, on) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    state.annotate_urgent = on;
+                }
+                Task::none()
+            }
+            Message::AnnotateSubmit(pane) => {
+                let identity_name = self
+                    .settings
+                    .as_ref()
+                    .and_then(|s| s.identity.as_ref())
+                    .map(|i| i.name.clone());
+                let Some(state) = self.panes.get_mut(pane) else {
+                    return Task::none();
+                };
+                let push_error = |state: &mut Pane, text: String| {
+                    state.feed.push(FeedItem {
+                        md: None,
+                        event: error_event(text),
+                    });
+                };
+                let body = state.annotate_body.trim().to_string();
+                if body.is_empty() {
+                    return Task::none();
+                }
+                let Some(session_str) = state.watched.clone() else {
+                    return Task::none();
+                };
+                let Some(mut tx) = state.annotate_tx.clone() else {
+                    return Task::none();
+                };
+                let Ok(session) = session_str.parse::<EntryId>() else {
+                    push_error(state, "malformed session id".to_string());
+                    return Task::none();
+                };
+                let email = state.watch_email.trim().to_string();
+                if email.is_empty() {
+                    push_error(
+                        state,
+                        "set \"watch as (email)\" above before commenting".to_string(),
+                    );
+                    return Task::none();
+                }
+                // Sign with the watch-as identity's key on file — never send
+                // unsigned, since the host would reject it anyway.
+                let Some(signing_key) = load_signing_key(&email) else {
+                    push_error(state, format!("no signing key on file for '{email}'"));
+                    return Task::none();
+                };
+                let path = state.annotate_path.trim().to_string();
+                // Anchor-sourcing rule: a `CodeAnchor` may only be built from
+                // a commit oid this pane has actually seen arrive over the
+                // wire (`Pane::worktree_commit`, set only from a real
+                // `{"kind":"diff","commit":…}` worktree event) — never
+                // fabricated, never a placeholder. Anything else, including
+                // an empty path, is a `StreamAnchor` on the most recent
+                // conversation event instead.
+                let anchor = if path.is_empty() {
+                    Anchor::Stream(StreamAnchor {
+                        session,
+                        op_id: state.conversation_len.saturating_sub(1).to_string(),
+                    })
+                } else {
+                    let Some(commit_str) = state.worktree_commit.clone() else {
+                        push_error(
+                            state,
+                            "no commit seen yet for this session's worktree — clear the path to \
+                             comment on the live stream instead"
+                                .to_string(),
+                        );
+                        return Task::none();
+                    };
+                    let Ok(commit) = CommitOid::new(commit_str) else {
+                        push_error(
+                            state,
+                            "malformed commit oid from the worktree feed".to_string(),
+                        );
+                        return Task::none();
+                    };
+                    let Some(span) = parse_span(&state.annotate_lines) else {
+                        push_error(
+                            state,
+                            format!(
+                                "invalid line range '{}' — use \"12\" or \"12-14\"",
+                                state.annotate_lines
+                            ),
+                        );
+                        return Task::none();
+                    };
+                    Anchor::Code(CodeAnchor {
+                        commit,
+                        path,
+                        // Blob pinning is drift *detection* only (v1 doesn't
+                        // do it, and `reanchor` never reads this field) —
+                        // deliberately left unpinned, not forgotten.
+                        blob: ContentDigest::new("sha256:unpinned")
+                            .expect("static digest literal is always valid"),
+                        span,
+                    })
+                };
+                let author_name = identity_name.unwrap_or_else(|| email.clone());
+                let mut annotation = Annotation {
+                    id: AnnotationId::new(),
+                    author: Member::human(author_name, email),
+                    anchor,
+                    body,
+                    excerpt: None,
+                    supersedes: None,
+                    urgent: state.annotate_urgent,
+                    timestamp: Timestamp::now(),
+                    signature: None,
+                };
+                if annotation.sign(&signing_key).is_err() {
+                    push_error(state, "failed to sign annotation".to_string());
+                    return Task::none();
+                }
+                let local = LiveDoc::new();
+                if local.insert_annotation(&annotation).is_err() {
+                    push_error(state, "failed to build annotation update".to_string());
+                    return Task::none();
+                }
+                let frame = WireFrame::update(&local.export_snapshot());
+                if tx.try_send(frame).is_err() {
+                    push_error(
+                        state,
+                        "failed to send annotation — the connection may have dropped".to_string(),
+                    );
+                    return Task::none();
+                }
+                state.annotate_body.clear();
                 Task::none()
             }
             Message::LaunchIntentChanged(pane, value) => {
@@ -2250,6 +2471,47 @@ fn lifecycle_form(id: pane_grid::Pane, pane: &Pane, kind: LifecycleKind) -> Elem
         .into()
 }
 
+/// The annotation composer: a signed, span-anchored (or stream-anchored)
+/// comment on a remote-watched session. Rendered only while
+/// `pane.annotate_tx.is_some()` — the same condition Task 9's write-half
+/// wiring uses, since a composer has no meaning outside a live, authenticated
+/// watch. Empty `path` comments on the live stream itself (a `StreamAnchor`
+/// on the most recent conversation event); a typed `path` + `lines` comments
+/// on code, but only once `Message::WorktreeDiff` has actually carried a real
+/// commit oid for this session (`Message::AnnotateSubmit`'s anchor-sourcing
+/// rule — never fabricated).
+fn annotate_composer(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
+    let path_input = text_input("path (blank = comment on the stream)", &pane.annotate_path)
+        .on_input(move |v| Message::AnnotatePathChanged(id, v))
+        .size(12)
+        .padding(6)
+        .width(Length::FillPortion(2));
+    let lines_input = text_input("lines (\"12\" or \"12-14\")", &pane.annotate_lines)
+        .on_input(move |v| Message::AnnotateLinesChanged(id, v))
+        .size(12)
+        .padding(6)
+        .width(Length::FillPortion(1));
+    let body_input = text_input("annotate…", &pane.annotate_body)
+        .on_input(move |v| Message::AnnotateBodyChanged(id, v))
+        .on_submit(Message::AnnotateSubmit(id))
+        .size(12)
+        .padding(6);
+    let urgent = checkbox("urgent", pane.annotate_urgent)
+        .on_toggle(move |on| Message::AnnotateUrgentToggled(id, on))
+        .size(14)
+        .text_size(11);
+    let submit = button(text("comment").size(11))
+        .on_press(Message::AnnotateSubmit(id))
+        .padding(6);
+    column![
+        text("annotate ▸").size(11).color(MUTED),
+        row![path_input, lines_input].spacing(6),
+        row![body_input, urgent, submit].spacing(6).align_y(Center),
+    ]
+    .spacing(4)
+    .into()
+}
+
 fn pane_body<'a>(
     id: pane_grid::Pane,
     pane: &'a Pane,
@@ -2482,13 +2744,16 @@ fn pane_body<'a>(
             interrupt_btn,
         ]
         .spacing(6);
-        column![
+        let mut session_col = column![
             header,
             scrollable(record).id(pane.scroll_id.clone()).height(Fill),
             steer
         ]
-        .spacing(8)
-        .into()
+        .spacing(8);
+        if pane.annotate_tx.is_some() {
+            session_col = session_col.push(annotate_composer(id, pane));
+        }
+        session_col.into()
     } else {
         let highlight = pane.highlight_entry.as_deref();
         // A focus-board jump pins the attention entry above the scroll so it's
@@ -2714,6 +2979,25 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         s.to_string()
     }
+}
+
+/// Parse the annotation composer's "lines" field: `"12"` (a single line) or
+/// `"12-14"` (an inclusive range). Pure delegation to [`Span::new`], which
+/// already enforces 1-indexing and a non-inverted range — this only splits
+/// the string and parses the two halves, never re-implementing those
+/// checks. `None` for anything that doesn't parse as one or two `u32`s
+/// either side of a single `-`, or that `Span::new` then rejects (`"0"`,
+/// `"9-3"`).
+fn parse_span(s: &str) -> Option<Span> {
+    let s = s.trim();
+    let (start, end) = match s.split_once('-') {
+        Some((a, b)) => (a.trim().parse().ok()?, b.trim().parse().ok()?),
+        None => {
+            let n: u32 = s.parse().ok()?;
+            (n, n)
+        }
+    };
+    Span::new(start, end).ok()
 }
 
 fn chip_style(color: Color, active: bool) -> button::Style {
@@ -3146,6 +3430,12 @@ impl Pane {
             watch_email: String::new(),
             watchers: Vec::new(),
             annotate_tx: None,
+            conversation_len: 0,
+            worktree_commit: None,
+            annotate_path: String::new(),
+            annotate_lines: String::new(),
+            annotate_body: String::new(),
+            annotate_urgent: false,
             launch_intent: String::new(),
             steer_text: String::new(),
             launch_agent: None,
@@ -3865,11 +4155,15 @@ where
 ///
 /// Handshakes with `load_signing_key(&email)`'s key, then maintains a local
 /// `LiveDoc`/`Presence`: every inbound `Update` is imported and its new or
-/// changed (replace-in-place, `LiveDoc` module docs) conversation entries are
-/// emitted; every inbound `Ephemeral` is applied and re-published as
+/// changed (replace-in-place, `LiveDoc` module docs) conversation entries
+/// are emitted, alongside `Message::ConversationLen` (the container's own
+/// length, for the annotation composer's `StreamAnchor`) and, for any new
+/// `{"kind":"diff","commit":…}` worktree entry, `Message::WorktreeDiff`
+/// (the only source the composer's `CodeAnchor` may take a commit from).
+/// Every inbound `Ephemeral` is applied and re-published as
 /// `Message::Watchers`. Sends a presence heartbeat every 10s, and forwards
-/// anything received on the connected `annotate_tx` straight to the socket —
-/// wiring Task 10's annotation composer needs, unused by this task.
+/// anything received on the connected `annotate_tx` straight to the socket
+/// — the annotation composer's outbound path.
 fn live_ws_stream(
     base: String,
     channel: String,
@@ -3993,6 +4287,7 @@ fn live_ws_stream(
         // re-emitted instead of missed, while entries before it (frozen once
         // superseded) are never re-checked.
         let mut emitted = 0usize;
+        let mut worktree_emitted = 0usize;
         let mut last_seen: Option<serde_json::Value> = None;
         let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(10));
         heartbeat.tick().await; // the first tick fires immediately
@@ -4044,6 +4339,28 @@ fn live_ws_stream(
                                         last_seen = Some(value);
                                     }
                                     emitted = len;
+                                    let _ = output
+                                        .send(Message::ConversationLen(session.clone(), len))
+                                        .await;
+                                    let wt_len = doc.worktree_len();
+                                    for i in worktree_emitted..wt_len {
+                                        let Some(value) = doc.worktree_event(i) else {
+                                            continue;
+                                        };
+                                        if value.get("kind").and_then(|k| k.as_str())
+                                            == Some("diff")
+                                            && let Some(commit) =
+                                                value.get("commit").and_then(|c| c.as_str())
+                                        {
+                                            let _ = output
+                                                .send(Message::WorktreeDiff(
+                                                    session.clone(),
+                                                    commit.to_string(),
+                                                ))
+                                                .await;
+                                        }
+                                    }
+                                    worktree_emitted = wt_len;
                                 }
                                 WireFrame::Ephemeral { .. } => {
                                     let Some(bytes) = frame.ephemeral_bytes() else { continue };
@@ -4380,5 +4697,19 @@ mod tests {
             "the derived public key matches the stored secret"
         );
         assert!(missing.is_none(), "no record on file for an unknown email");
+    }
+
+    #[test]
+    fn parse_span_accepts_single_and_range_and_rejects_malformed() {
+        assert_eq!(parse_span("12"), Span::new(12, 12).ok());
+        assert_eq!(parse_span("12-14"), Span::new(12, 14).ok());
+        // Whitespace around either form is tolerated.
+        assert_eq!(parse_span(" 12 - 14 "), Span::new(12, 14).ok());
+        assert_eq!(parse_span("0"), None, "line numbers are 1-indexed");
+        assert_eq!(parse_span("9-3"), None, "an inverted range is rejected");
+        assert_eq!(parse_span("x"), None, "non-numeric input is rejected");
+        assert_eq!(parse_span(""), None, "empty input is rejected");
+        assert_eq!(parse_span("12-"), None, "a dangling range is rejected");
+        assert_eq!(parse_span("-12"), None, "a missing start is rejected");
     }
 }
