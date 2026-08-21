@@ -1824,4 +1824,539 @@ mod tests {
              artifact's actual on-disk bytes, not merely share its filename"
         );
     }
+
+    /// A fresh git repo with git user `Dan <dan@x.com>` — the founder
+    /// identity `crate::invite`/`crate::add_member`/`crate::retire_device`/
+    /// `crate::revoke_member` resolve via `host::git_user`, matching
+    /// `fixture`'s own founder identity. Standalone (not `fixture`'s own
+    /// repo helper): this test needs a REGISTERED substrate
+    /// (`host::Host::from_registry`), not `fixture`'s `Host::fixed`.
+    fn git_repo_dan() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(dir.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        for (key, value) in [("user.name", "Dan"), ("user.email", "dan@x.com")] {
+            assert!(
+                StdCommand::new("git")
+                    .args(["config", key, value])
+                    .current_dir(dir.path())
+                    .status()
+                    .expect("git config")
+                    .success()
+            );
+        }
+        dir
+    }
+
+    /// A freshly resolved projection of `channel` under `founto_home` —
+    /// deliberately a BRAND NEW `Host::from_registry` every call, never a
+    /// long-held one. `Ledger::project` caches for 15s
+    /// (`junto_kernel::ledger::PROJECTION_TTL`) *per Ledger instance*, and
+    /// `crate::retire_device`/`crate::revoke_member`/`crate::add_member`
+    /// each build their OWN `Host::from_registry` internally (mirroring
+    /// separate real CLI invocations) — a long-held `Host` in this test
+    /// would read its own stale cache after one of those calls appends,
+    /// exactly the multi-process shape the real commands have and a single
+    /// in-process `Host` does not. Reading fresh every time sidesteps that
+    /// entirely, at the cost of one extra substrate read.
+    async fn fresh_view(
+        founder_home: &std::path::Path,
+        channel: junto_kernel::ChannelId,
+    ) -> ChannelView {
+        let host = crate::host::Host::from_registry(founder_home.to_path_buf());
+        let crate::host::Resolution::Resolved { ledger, .. } =
+            host.resolve(&channel.to_string()).await.expect("resolve")
+        else {
+            panic!("channel resolves");
+        };
+        ledger
+            .lock()
+            .await
+            .project(&channel)
+            .await
+            .expect("project")
+    }
+
+    /// Append `entry` through a brand-new `Host::from_registry`, for the
+    /// same reason as [`fresh_view`] — a durable substrate write is correct
+    /// from any instance; only a warm *read* cache is instance-local.
+    async fn fresh_append(
+        founder_home: &std::path::Path,
+        channel: junto_kernel::ChannelId,
+        entry: LedgerEntry,
+    ) {
+        let host = crate::host::Host::from_registry(founder_home.to_path_buf());
+        let crate::host::Resolution::Resolved { ledger, .. } =
+            host.resolve(&channel.to_string()).await.expect("resolve")
+        else {
+            panic!("channel resolves");
+        };
+        ledger.lock().await.append(entry).await.expect("append");
+    }
+
+    /// Drives `crate::invite`/`crate::enroll` in a genuinely separate
+    /// `junto` test-binary PROCESS, `--nocapture`d, so the URL those
+    /// functions print — their only output; neither has a return value —
+    /// is real process stdout this call can read back with
+    /// `Command::output`, rather than something an in-process `#[test]`
+    /// could ever observe. `cargo test`'s default capture intercepts
+    /// `print!`/`println!` via a thread-local `OUTPUT_CAPTURE` override
+    /// BEFORE it reaches any OS-level stream — proven empirically while
+    /// writing this test: even a `println!` from a freshly spawned
+    /// `std::thread` inside the SAME process still lands inside that
+    /// override (it is process-wide-once-armed, not purely per-thread —
+    /// `OUTPUT_CAPTURE_USED` latches for the rest of the process once
+    /// anything installs it), and redirecting the OS `stdout` handle
+    /// itself (`SetStdHandle`) has no effect once `io::stdout()` has
+    /// already been touched once in this process, since std caches the
+    /// underlying handle rather than re-querying it — see
+    /// `task-12-report.md`, finding 1. `set_output_capture` itself, which
+    /// would bypass this cleanly, is `#[unstable]`/nightly-only. A
+    /// genuinely separate process sidesteps all of it: its stdout is a
+    /// pipe this call owns from the start, and nothing in that fresh
+    /// process has touched `io::stdout()` before `--nocapture` disables
+    /// the override entirely.
+    ///
+    /// `output.stdout` mixes libtest's own "running 1 test"/"test result"
+    /// scaffolding with the target function's own `println!` line, since
+    /// `--nocapture` sends both to the same real stream — the caller finds
+    /// its line by the `junto://…` prefix, never by position.
+    fn run_worker(mode: &str, envs: &[(&str, &str)]) -> String {
+        let exe = std::env::current_exe().expect("current test exe");
+        let mut cmd = StdCommand::new(exe);
+        cmd.arg("live_ws::tests::end_to_end_device_enrollment_verification_and_revocation")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env("JUNTO_E2E_WORKER", mode);
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
+        let output = cmd.output().expect("spawn worker process");
+        assert!(
+            output.status.success(),
+            "worker '{mode}' failed (status {:?})\n--- worker stdout ---\n{}\n--- worker stderr ---\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        String::from_utf8(output.stdout).expect("worker stdout is utf8")
+    }
+
+    /// The plan's final proof (Task 12,
+    /// `.superpowers/sdd/2026-08-21-device-key-enrollment`): a scratch
+    /// channel, a founder, and a real device — `invite` → `enroll` →
+    /// `add-member --enroll` driven through the actual
+    /// `crate::invite`/`crate::enroll`/`crate::add_member` functions
+    /// (never re-implemented inline; see [`run_worker`] for how the first
+    /// two hand off their printed-only output), then everything those
+    /// three commands are FOR: the grant lands in the projected keyring
+    /// (a), an entry the device signs verifies (b), the founder's own
+    /// `keys.toml` never minted a key for the remote member (c, checked
+    /// against a same-fixture positive control so the absence is not
+    /// vacuous), the device's key opens a live-plane socket (d) AND can
+    /// actually WRITE through it (g — the exact half Task 10 shipped
+    /// broken, `a_second_enrolled_devices_annotation_lands_in_the_document`
+    /// pinned in isolation; this proves it with a key that arrived through
+    /// the real enrollment flow) — and finally revocation, extended past
+    /// the brief's own (e)/(f) into the operator sequence that motivated
+    /// `7b27008` (h): retiring ONE of alice's two devices must not offboard
+    /// her (only the LATEST retirement across every device does), and once
+    /// every device is retired, everything after that latest cutoff stops
+    /// counting while everything at-or-before it, on ANY of her devices,
+    /// still does.
+    #[tokio::test]
+    async fn end_to_end_device_enrollment_verification_and_revocation() {
+        // ---- worker mode: see `run_worker`'s doc comment. Re-entered by
+        // `run_worker` as a fresh process with `JUNTO_E2E_WORKER` set; a
+        // normal `cargo test` run never sets it, so normal discovery of
+        // this same test name takes the orchestrator branch below.
+        if let Ok(mode) = std::env::var("JUNTO_E2E_WORKER") {
+            match mode.as_str() {
+                "invite" => {
+                    let channel = std::env::var("JUNTO_E2E_CHANNEL").expect("channel env");
+                    let member = std::env::var("JUNTO_E2E_MEMBER").expect("member env");
+                    crate::invite(channel, member)
+                        .await
+                        .expect("worker: invite");
+                }
+                "enroll" => {
+                    let invite_url = std::env::var("JUNTO_E2E_INVITE_URL").expect("invite url env");
+                    let name = std::env::var("JUNTO_E2E_NAME").expect("name env");
+                    crate::enroll(invite_url, Some(name))
+                        .await
+                        .expect("worker: enroll");
+                }
+                other => panic!("unknown JUNTO_E2E_WORKER mode '{other}'"),
+            }
+            return;
+        }
+
+        // ---- orchestrator: "two junto homes on one machine" — the
+        // founder's real ~/.junto stand-in, and alice's, genuinely
+        // separate directories the invite/enroll legs run against as
+        // separate processes (see `run_worker`).
+        let _home = crate::host::test_home::HomeGuard::new();
+        let founder_home = _home.path().to_path_buf();
+        let repo = git_repo_dan();
+        crate::host::register_substrate(&founder_home, repo.path()).expect("register substrate");
+        let bootstrap = crate::host::Host::from_registry(founder_home.clone());
+        let opened = bootstrap
+            .open_channel(
+                Some(repo.path()),
+                "scratch",
+                Member::human("Dan", "dan@x.com"),
+                None,
+            )
+            .await
+            .expect("open channel");
+        let channel = opened.id;
+        let alice_home = tempfile::tempdir().expect("alice's own machine's home");
+
+        // ---- invite → enroll, each through the real CLI function ----
+        let invite_stdout = run_worker(
+            "invite",
+            &[
+                ("JUNTO_HOME", founder_home.to_str().expect("utf8 path")),
+                ("JUNTO_E2E_CHANNEL", &channel.to_string()),
+                ("JUNTO_E2E_MEMBER", "alice@example.com"),
+            ],
+        );
+        let invite_url = invite_stdout
+            .lines()
+            .find(|line| line.starts_with("junto://invite?code="))
+            .unwrap_or_else(|| panic!("no invite URL in worker output:\n{invite_stdout}"))
+            .to_string();
+
+        let enroll_stdout = run_worker(
+            "enroll",
+            &[
+                ("JUNTO_HOME", alice_home.path().to_str().expect("utf8 path")),
+                ("JUNTO_E2E_INVITE_URL", &invite_url),
+                ("JUNTO_E2E_NAME", "Alice's Laptop"),
+            ],
+        );
+        let enroll_url = enroll_stdout
+            .lines()
+            .find(|line| line.starts_with("junto://enroll?code="))
+            .unwrap_or_else(|| panic!("no enroll URL in worker output:\n{enroll_stdout}"))
+            .to_string();
+
+        // ---- add-member --enroll: real function, in-process — its
+        // OBSERVABLE side effect is the ledger append, not its println,
+        // so no worker process is needed for this leg.
+        crate::add_member(
+            channel.to_string(),
+            None,
+            None,
+            None,
+            None, // --author-name/--author-email: default to git_user(&substrate)
+            None,
+            None,
+            Some(enroll_url),
+        )
+        .await
+        .expect("add-member --enroll");
+
+        // Alice's device minted its OWN key on ITS OWN home —
+        // `keys::signing_key` reuses on a second call, so this reads back
+        // the exact key the real `enroll()` worker process minted, never a
+        // fresh one.
+        let alice_key_a = crate::keys::signing_key(alice_home.path(), "alice@example.com")
+            .expect("alice's device key");
+
+        // (a) the new grant appears in the projected keyring. Fails if
+        // add_member's --enroll path never appended MemberAdded, appended
+        // a re-minted key instead of the device's own, or appended it
+        // already retired.
+        let view = fresh_view(&founder_home, channel).await;
+        let grant_a = view
+            .keyring
+            .get("alice@example.com")
+            .and_then(|grants| grants.iter().find(|g| g.key == alice_key_a.public_key()))
+            .expect("alice's device key is on the projected keyring")
+            .clone();
+        assert!(
+            grant_a.retired_at.is_none(),
+            "freshly granted, must be active"
+        );
+
+        // (c) the founder's own keys.toml holds no key for alice — proven
+        // non-vacuous by a same-fixture, same-host positive control: a
+        // KEYLESS grant on this identical host DOES mint locally
+        // (`Host::keyed`'s fallback path), so the absence checked next is
+        // a fact specifically about the --enroll path, not an artifact of
+        // `has_signing_key`/`keys.toml` never working in this fixture.
+        assert!(
+            crate::keys::has_signing_key(&founder_home, "dan@x.com").expect("check"),
+            "sanity: the founder's own key really is on this machine"
+        );
+        assert!(
+            !crate::keys::has_signing_key(&founder_home, "alice@example.com").expect("check"),
+            "an enrolled member's key must come from their own device, never be minted here"
+        );
+        bootstrap
+            .add_member(
+                &channel.to_string(),
+                &Member::human("Dan", "dan@x.com"),
+                Member::agent("Worker", "worker@agents.junto"),
+                None,
+            )
+            .await
+            .expect("keyless control grant");
+        assert!(
+            crate::keys::has_signing_key(&founder_home, "worker@agents.junto").expect("check"),
+            "control: a keyless grant on this SAME host DOES mint locally — proves (c)'s \
+             absence is meaningful, not vacuous"
+        );
+
+        // (b) an entry signed by the new device's key projects as
+        // verified. Fails if the recorded grant's key does not match what
+        // alice's device actually holds, or if `project_unverified` stops
+        // consulting the keyring correctly.
+        let mut verified_entry = LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel,
+            author: Member::human("Alice", "alice@example.com"),
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::Assertion {
+                statement: "the migration lands cleanly".into(),
+                rationale: "ran it twice".into(),
+                provenance: Vec::new(),
+                frame: None,
+            },
+        };
+        verified_entry
+            .sign(&alice_key_a)
+            .expect("sign with alice's real device key");
+        let verified_entry_id = verified_entry.id;
+        fresh_append(&founder_home, channel, verified_entry).await;
+        let view = fresh_view(&founder_home, channel).await;
+        assert!(
+            !view.unverified.contains(&verified_entry_id),
+            "an entry genuinely signed by the enrolled device's key must verify"
+        );
+        assert!(!view.unrecognized.contains(&verified_entry_id));
+
+        // ---- live session: one persistent Arc<Host>, used only for the
+        // in-memory live plane, never touched again for ledger reads
+        // afterward (see `fresh_view`'s doc comment on why).
+        let live_host = crate::host::Host::from_registry(founder_home.clone());
+        let session = EntryId::new();
+        let _control_rx =
+            live_host
+                .live()
+                .begin(Arc::clone(&live_host), channel.to_string(), session, true);
+        let live = live_host
+            .live_plane()
+            .get(session)
+            .expect("live session began");
+        live.doc
+            .push_conversation(&serde_json::json!({"seq": 1, "kind": "status", "text": "hi"}));
+
+        let addr = serve_router(Arc::clone(&live_host)).await;
+        let url = format!("ws://{addr}/channels/{channel}/sessions/{session}/live");
+        let (mut ws, _response) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("connect");
+        let nonce = match recv_until(&mut ws, |f| matches!(f, Frame::Challenge { .. })).await {
+            Frame::Challenge { nonce } => nonce,
+            _ => unreachable!(),
+        };
+        let signature = alice_key_a.sign_bytes(nonce.as_bytes());
+        send_frame(
+            &mut ws,
+            &Frame::Auth {
+                email: "alice@example.com".to_string(),
+                signature: signature.into(),
+            },
+        )
+        .await;
+
+        // (d) the live-plane handshake succeeds with the enrolled
+        // device's key.
+        let response = recv_until(&mut ws, |f| {
+            matches!(f, Frame::AuthOk | Frame::Rejected { .. })
+        })
+        .await;
+        assert_eq!(
+            response,
+            Frame::AuthOk,
+            "the enrolled device's key must authenticate: {response:?}"
+        );
+        recv_until(&mut ws, |f| matches!(f, Frame::Update { .. })).await; // the snapshot
+
+        // (g) — and can actually WRITE: Task 10's silent half-wiring bug.
+        // Signed by the SAME key that just authenticated the socket, but
+        // checked against `Connection.keyring`, built separately — if that
+        // were still sourced from the Party's single first-device map
+        // instead of the real keyring, this write would be silently
+        // dropped even though the socket opened cleanly.
+        let mut annotation =
+            test_annotation("alice@example.com", "from alice's real enrolled device");
+        annotation.sign(&alice_key_a).expect("sign annotation");
+        let local = LiveDoc::new();
+        local.insert_annotation(&annotation).expect("insert");
+        send_frame(&mut ws, &Frame::update(&local.export_snapshot())).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(live) = live_host.live_plane().get(session)
+                    && live.doc.annotations().len() == 1
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the enrolled device's annotation must land in the real document");
+        assert_eq!(
+            live_host
+                .live_plane()
+                .get(session)
+                .unwrap()
+                .doc
+                .annotations()[0]
+                .body,
+            "from alice's real enrolled device"
+        );
+
+        // ---- revocation: a second device for alice (granted directly —
+        // the enrollment protocol itself is already fully proven above by
+        // device A; this device exists only so the kernel's cutoff fold
+        // has two grants to distinguish "one retired" from "all retired"),
+        // then the LATEST-retirement operator sequence that motivated
+        // `7b27008` (h).
+        let key_b = junto_kernel::SigningKey::from_secret_bytes([91; 32]);
+        assert_ne!(
+            alice_key_a.public_key(),
+            key_b.public_key(),
+            "alice's two devices must be genuinely distinct keypairs"
+        );
+        bootstrap
+            .add_member(
+                &channel.to_string(),
+                &Member::human("Dan", "dan@x.com"),
+                Member::human("Alice", "alice@example.com"),
+                Some(key_b.public_key()),
+            )
+            .await
+            .expect("grant alice's second device");
+
+        // step 1: retire-device A at T1 — through the real command.
+        crate::retire_device(
+            channel.to_string(),
+            grant_a.granted_by.to_string(),
+            "device A lost".to_string(),
+        )
+        .await
+        .expect("retire-device");
+        // `retire_device`/`revoke_member` stamp `Timestamp::now()`
+        // internally (no way to inject a value) — sleep between each real
+        // wall-clock-stamped step so T1, the mid entry, and T2 land at
+        // genuinely distinct milliseconds, never collapsing into a
+        // same-instant race that would make "genuinely distinct" false by
+        // accident.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // step 2: an entry from device B, stamped after T1.
+        let mut mid_entry = LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel,
+            author: Member::human("Alice", "alice@example.com"),
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::Assertion {
+                statement: "still working from my other laptop".into(),
+                rationale: "device A is just lost, not me".into(),
+                provenance: Vec::new(),
+                frame: None,
+            },
+        };
+        mid_entry.sign(&key_b).expect("sign with device B");
+        let mid_entry_id = mid_entry.id;
+        fresh_append(&founder_home, channel, mid_entry).await;
+
+        let view = fresh_view(&founder_home, channel).await;
+        assert!(
+            !view.unrecognized.contains(&mid_entry_id),
+            "partial retirement (device A only) must not offboard alice: {:?}",
+            view.unrecognized
+        );
+        assert!(
+            view.standings.contains_key(&mid_entry_id),
+            "a recognized assertion must carry a standing"
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // step 3: revoke-member at T2 — parks every remaining active
+        // grant (device B) — through the real command.
+        crate::revoke_member(
+            channel.to_string(),
+            "alice@example.com".to_string(),
+            "left the project".to_string(),
+        )
+        .await
+        .expect("revoke-member");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // step 4: an entry after T2.
+        let mut after_entry = LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel,
+            author: Member::human("Alice", "alice@example.com"),
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::Assertion {
+                statement: "one more, after leaving".into(),
+                rationale: "should not count".into(),
+                provenance: Vec::new(),
+                frame: None,
+            },
+        };
+        after_entry.sign(&key_b).expect("sign");
+        let after_entry_id = after_entry.id;
+        fresh_append(&founder_home, channel, after_entry).await;
+
+        let view = fresh_view(&founder_home, channel).await;
+
+        // (e): a later entry is unrecognized once every device is retired.
+        assert!(
+            view.unrecognized.contains(&after_entry_id),
+            "an entry after full revocation must be unrecognized"
+        );
+        assert!(!view.standings.contains_key(&after_entry_id));
+
+        // (h)'s crux: the T1..T2 entry from device B (step 2) must STILL
+        // count after the full sequence — the exact assertion that would
+        // have failed before `7b27008`'s earliest-vs-latest fix, when
+        // retiring device A alone would have retroactively unrecognized
+        // this once device B was later retired too.
+        assert!(
+            !view.unrecognized.contains(&mid_entry_id),
+            "the T1..T2 entry from device B must still count after full revocation"
+        );
+        assert!(view.standings.contains_key(&mid_entry_id));
+
+        // (f): the earlier (pre-retirement, criterion-b) entry keeps its
+        // standing — revocation must never retroactively unrecognize
+        // entries written before any cutoff existed at all.
+        assert!(
+            !view.unrecognized.contains(&verified_entry_id),
+            "revocation must never retroactively unrecognize entries written before any cutoff"
+        );
+        assert!(view.standings.contains_key(&verified_entry_id));
+
+        // Revocation must never remove alice from the party (`docs/adr/0035`).
+        assert!(
+            view.party.iter().any(|m| m.email == "alice@example.com"),
+            "a fully revoked member must stay in the party"
+        );
+    }
 }
