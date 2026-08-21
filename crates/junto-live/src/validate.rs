@@ -75,14 +75,17 @@ use crate::LiveDoc;
 /// `sender_email` is the already-authenticated member the bytes claim to
 /// come from (established by the `Challenge`/`Auth` handshake, not by
 /// anything inside `bytes`). `keyring` maps every known member's email to
-/// their [`PublicKey`], the record of authority this function checks
-/// signatures against.
+/// every [`PublicKey`] currently active for them — one per enrolled device
+/// (`docs/adr/0033`) — the record of authority this function checks
+/// signatures against; a new annotation need only verify against **any**
+/// one of them, since any of a member's own devices may sign for that
+/// member.
 ///
 /// Checked, in order, on every call — including one that turns out to add
 /// nothing at all:
-/// 1. `sender_email` must have a key on file. Absence is not permission:
-///    an unrecognized sender is rejected even if the frame's payload would
-///    otherwise be accepted as a no-op.
+/// 1. `sender_email` must have at least one key on file. Absence is not
+///    permission: an unrecognized sender is rejected even if the frame's
+///    payload would otherwise be accepted as a no-op.
 /// 2. `conversation` and `worktree` must be unchanged, content-for-content,
 ///    between `doc` and the fork (see the module docs for why a length
 ///    check is not enough).
@@ -93,8 +96,8 @@ use crate::LiveDoc;
 ///    sender could write a fresh key whose *own* id field aliases another
 ///    member's existing annotation, displacing it for any consumer that
 ///    keys by `id` rather than by map key — (c) have `author.email ==
-///    sender_email`, (d) be signed, and (e) verify against
-///    `keyring[sender_email]`.
+///    sender_email`, (d) be signed, and (e) verify against at least one
+///    key in `keyring[sender_email]`.
 ///
 /// Any single failure rejects the **whole frame** — there is no partial
 /// acceptance. A frame that adds no annotations and touches nothing else is
@@ -111,7 +114,7 @@ pub fn validate_annotation_update(
     doc: &LiveDoc,
     bytes: &[u8],
     sender_email: &str,
-    keyring: &HashMap<String, PublicKey>,
+    keyring: &HashMap<String, Vec<PublicKey>>,
 ) -> Result<Vec<Annotation>, String> {
     // Two forks, both frozen the instant they are taken: the driving turn
     // writes into `doc` concurrently (`LiveSessions::publish` ->
@@ -131,8 +134,9 @@ pub fn validate_annotation_update(
     // Checked first and unconditionally, before any other check can return
     // early: an unrecognized sender must never reach `Ok`, not even via a
     // frame that (superficially) changes nothing.
-    let sender_key = keyring
+    let sender_keys = keyring
         .get(sender_email)
+        .filter(|keys| !keys.is_empty())
         .ok_or_else(|| format!("no verifying key on file for '{sender_email}'"))?;
 
     if !fork.conversation_matches(&baseline) || !fork.worktree_matches(&baseline) {
@@ -190,9 +194,10 @@ pub fn validate_annotation_update(
         if annotation.signature.is_none() {
             return Err(format!("annotation {id} is not signed"));
         }
-        if !annotation.verifies_with(sender_key) {
+        if !sender_keys.iter().any(|key| annotation.verifies_with(key)) {
             return Err(format!(
-                "annotation {id} signature does not verify against the key on file for '{sender_email}'"
+                "annotation {id} signature does not verify against any key on file for \
+                 '{sender_email}'"
             ));
         }
         accepted.push(annotation);
@@ -213,8 +218,8 @@ mod tests {
     fn keyring_of(
         email: &str,
         key: &junto_kernel::SigningKey,
-    ) -> HashMap<String, junto_kernel::PublicKey> {
-        HashMap::from([(email.to_string(), key.public_key())])
+    ) -> HashMap<String, Vec<junto_kernel::PublicKey>> {
+        HashMap::from([(email.to_string(), vec![key.public_key()])])
     }
 
     /// Same shape as `doc::tests::test_annotation`, but with a configurable
@@ -308,6 +313,31 @@ mod tests {
                 .unwrap_err();
         assert!(err.contains("does not verify"), "unexpected reason: {err}");
         assert!(server.annotations().is_empty());
+    }
+
+    /// A sender with TWO active keys on file (one email, several enrolled
+    /// devices, `docs/adr/0033`) — an annotation signed by the SECOND key
+    /// must verify, not just the first. Distinct from
+    /// `signature_by_other_key_rejects`: that key is entirely absent from
+    /// the keyring; this one is present, just not first.
+    #[test]
+    fn signature_by_a_second_active_key_is_accepted() {
+        let key1 = junto_kernel::SigningKey::from_secret_bytes([5; 32]);
+        let key2 = junto_kernel::SigningKey::from_secret_bytes([6; 32]);
+        let server = LiveDoc::new();
+        let watcher = LiveDoc::new();
+        watcher.import_update(&server.export_snapshot()).unwrap();
+        let mut ann = test_annotation_by("w@x.com", "signed by the second device");
+        ann.sign(&key2).unwrap();
+        watcher.insert_annotation(&ann).unwrap();
+        let update = watcher.export_snapshot();
+        let keyring = HashMap::from([(
+            "w@x.com".to_string(),
+            vec![key1.public_key(), key2.public_key()],
+        )]);
+        let got = validate_annotation_update(&server, &update, "w@x.com", &keyring).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].body, "signed by the second device");
     }
 
     #[test]

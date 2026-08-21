@@ -101,7 +101,7 @@ struct Connection {
     /// sole authority [`Connection::handle_inbound`] trusts for *who wrote
     /// this*, never a value carried inside a frame's own payload.
     email: String,
-    keyring: HashMap<String, PublicKey>,
+    keyring: HashMap<String, Vec<PublicKey>>,
 }
 
 /// One connection's whole lifetime: challenge, auth, snapshot sync, then the
@@ -220,20 +220,27 @@ async fn serve(
     // watcher, including this one, sees every accepted write.
     //
     // The keyring `Connection::handle_inbound` hands to
-    // `validate_annotation_update` is deliberately still the Party's one
-    // key per email, not `view.keyring`'s per-device grants: multi-device
-    // *handshake* authentication is this task's whole point, but an
-    // annotation's own embedded signature is a separate, later-task
-    // concern (`docs/adr/0033`), and `sender_email` here is always this
-    // connection's own authenticated email, never another party member's.
-    let keyring: HashMap<String, PublicKey> = view
-        .party
+    // `validate_annotation_update` mirrors the handshake's own widening
+    // (`docs/adr/0033`): every ACTIVE grant per email from `view.keyring`,
+    // never just the Party's first-device key. A second enrolled device
+    // signs its own annotations with its own key, and `sender_email` is
+    // always this connection's own authenticated email — but which of
+    // *that* email's devices produced the signature embedded in a given
+    // annotation is a separate question from which device opened this
+    // socket, so this must offer every active key, not only the one that
+    // authenticated the handshake.
+    let keyring: HashMap<String, Vec<PublicKey>> = view
+        .keyring
         .iter()
-        .filter_map(|member| {
-            member
-                .public_key
-                .clone()
-                .map(|key| (member.email.clone(), key))
+        .map(|(email, grants)| {
+            (
+                email.clone(),
+                grants
+                    .iter()
+                    .filter(|grant| grant.retired_at.is_none())
+                    .map(|grant| grant.key.clone())
+                    .collect(),
+            )
         })
         .collect();
     let connection = Connection {
@@ -411,6 +418,21 @@ fn authenticate(
 ) -> Result<(), String> {
     let signature =
         Signature::new(signature).map_err(|err| format!("malformed signature: {err}"))?;
+    // The Party gate is checked explicitly, before the keyring is
+    // consulted at all — never left to the accident that every grant in
+    // `project_keyring` happens to also be a `project_party` entry today.
+    // Both projections currently apply the identical `entry.author.email
+    // == founder_email` guard to the identical `MemberAdded` entries
+    // (`junto-kernel/src/ledger.rs`'s `project_party`/`project_keyring`),
+    // so a keyring grant for a non-party email cannot be constructed
+    // through the ledger today — but this handshake's accept path should
+    // not *rest* on that cross-crate invariant staying true forever. This
+    // check also makes the accept and [`classify_auth_failure`] paths
+    // agree by construction: it is impossible to authenticate against an
+    // email `classify_auth_failure` would call `NotAMember`.
+    if !view.party.iter().any(|member| member.email == email) {
+        return Err(render_auth_failure(AuthFailure::NotAMember, email));
+    }
     let verifies = view
         .keyring
         .get(email)
@@ -465,13 +487,15 @@ fn classify_auth_failure(view: &ChannelView, email: &str) -> AuthFailure {
 
 /// Render an [`AuthFailure`] as the text a real human on the other end of
 /// the socket reads. `email` is echoed back in every case: the caller
-/// already sent it in the `Auth` frame, so echoing it leaks nothing an
-/// attacker didn't already supply, and it is what makes cases 2 and 3
-/// actionable rather than generic. What's withheld instead is *why* a
-/// party lookup found nothing for `NotAMember` — that would let a stranger
-/// probe distinct emails to enumerate the roster by response shape; here
-/// all three messages differ only in content the sender's own claimed
-/// email already justifies.
+/// already sent it in the `Auth` frame, so echoing it back leaks nothing
+/// beyond what the sender already claimed. This channel's membership is
+/// not confidential to begin with, either: the same unauthenticated
+/// router this socket is mounted on already serves the channel's full
+/// party roster with no login at all
+/// (`GET /channels/{channel}/view.json` → `channel_view_json`,
+/// `ChannelDto::party`, `crate::web`) — so a `NotAMember` vs `Unenrolled`
+/// vs `Revoked` distinction here tells a caller nothing about this
+/// channel they could not already read from that plain `GET`.
 fn render_auth_failure(failure: AuthFailure, email: &str) -> String {
     match failure {
         AuthFailure::NotAMember => format!("'{email}' is not a member of this channel"),
@@ -975,6 +999,86 @@ mod tests {
             response,
             Frame::AuthOk,
             "a second enrolled device's key must authenticate: {response:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_enrolled_devices_annotation_lands_in_the_document() {
+        // The socket opening on a second device's key
+        // (`a_second_enrolled_device_authenticates`) is necessary but not
+        // sufficient: `Connection.keyring` — what
+        // `validate_annotation_update` actually checks a WRITE against —
+        // is built separately from the handshake keyring, and if it were
+        // still sourced from `view.party`'s single first-device key, this
+        // device would authenticate the socket and then have every
+        // annotation it tries to write silently rejected.
+        let (host, channel, session, key_a, _dir, _member_home, _control_rx) = fixture().await;
+        let key_b = junto_kernel::SigningKey::from_secret_bytes([43; 32]);
+        assert_ne!(
+            key_a.public_key(),
+            key_b.public_key(),
+            "the two devices must be genuinely distinct keypairs"
+        );
+        host.add_member(
+            &channel.to_string(),
+            &Member::human("Dan", "dan@x.com"),
+            Member::human("Dan", "dan@x.com"),
+            Some(key_b.public_key()),
+        )
+        .await
+        .expect("enroll dan's second device");
+
+        let addr = serve_router(host.clone()).await;
+        let url = format!("ws://{addr}/channels/{channel}/sessions/{session}/live");
+        let (mut ws, _response) = tokio_tungstenite::connect_async(url)
+            .await
+            .expect("connect");
+
+        let nonce = match recv_until(&mut ws, |f| matches!(f, Frame::Challenge { .. })).await {
+            Frame::Challenge { nonce } => nonce,
+            _ => unreachable!(),
+        };
+        let signature = key_b.sign_bytes(nonce.as_bytes());
+        send_frame(
+            &mut ws,
+            &Frame::Auth {
+                email: "dan@x.com".to_string(),
+                signature: signature.into(),
+            },
+        )
+        .await;
+        assert_eq!(
+            recv_until(&mut ws, |f| matches!(
+                f,
+                Frame::AuthOk | Frame::Rejected { .. }
+            ))
+            .await,
+            Frame::AuthOk
+        );
+        recv_until(&mut ws, |f| matches!(f, Frame::Update { .. })).await; // the snapshot
+
+        // Signed by the SECOND device's key, never the first.
+        let mut annotation = test_annotation("dan@x.com", "from the second device");
+        annotation.sign(&key_b).expect("sign");
+        let local = LiveDoc::new();
+        local.insert_annotation(&annotation).expect("insert");
+        send_frame(&mut ws, &Frame::update(&local.export_snapshot())).await;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(live) = host.live_plane().get(session)
+                    && live.doc.annotations().len() == 1
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the second device's annotation must land in the real document");
+        assert_eq!(
+            host.live_plane().get(session).unwrap().doc.annotations()[0].body,
+            "from the second device"
         );
     }
 
