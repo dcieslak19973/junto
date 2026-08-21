@@ -1341,7 +1341,15 @@ pub(crate) async fn archive_live_snapshot(
     snapshot: &[u8],
 ) -> Result<()> {
     let junto_home = crate::host::junto_home()?;
-    let hex: String = snapshot.iter().map(|byte| format!("{byte:02x}")).collect();
+    // One allocation for the whole string, not one `format!` heap `String`
+    // per byte: a real turn's snapshot runs hundreds of KB to a few MB, so
+    // the old `.map(|byte| format!(...)).collect()` was millions of
+    // allocations on a tokio worker with no yield point in between.
+    use std::fmt::Write as _;
+    let mut hex = String::with_capacity(snapshot.len() * 2);
+    for byte in snapshot {
+        write!(hex, "{byte:02x}").expect("writing hex digits into a String never fails");
+    }
     let stored = store_artifact(&junto_home, &session, name, &hex)?;
     append(
         host,
@@ -1415,10 +1423,7 @@ fn workspace_diff(workspace: &Path) -> Option<WorkspaceDiff> {
     if status.trim().is_empty() && base.is_none() {
         return None;
     }
-    let commit = match &base {
-        Some(base_sha) => Some(base_sha.clone()),
-        None => workspace_head_commit(workspace),
-    };
+    let commit = workspace_commit(workspace);
     let diff = match &base {
         Some(base_sha) => run(&["diff", base_sha]).unwrap_or_default(),
         None => run(&["diff", "HEAD"]).unwrap_or_default(),
@@ -1439,6 +1444,56 @@ fn workspace_diff(workspace: &Path) -> Option<WorkspaceDiff> {
         }
     }
     Some(WorkspaceDiff { text, commit })
+}
+
+/// Resolve the workspace's real commit oid, independent of whether there
+/// happens to be a diff right now: the recorded PR-branch base commit
+/// (`branch.<branch>.juntoBaseSha`) when on a `junto/<session>` branch,
+/// otherwise `HEAD`'s own oid. The one oid-resolution codepath —
+/// [`workspace_diff`] uses it for [`WorkspaceDiff::commit`], and the
+/// live-plane begin-time worktree tap (`spawn_turn`, `spawn_outcome_loop`)
+/// calls it directly, because "no diff yet" (`workspace_diff`'s own
+/// gating condition — it returns `None` on a clean workspace even when a
+/// commit is perfectly resolvable) is not the same fact as "no commit to
+/// anchor against": a freshly connected watcher on an otherwise-clean
+/// workspace still has a real `HEAD` to anchor a `CodeAnchor` comment on.
+/// `None` only when the workspace has no commits at all yet; never
+/// fabricated.
+fn workspace_commit(workspace: &Path) -> Option<String> {
+    match pr_branch_base(workspace) {
+        Some(base_sha) => Some(base_sha),
+        None => workspace_head_commit(workspace),
+    }
+}
+
+/// Push a `{"kind":"diff", ...}` worktree entry carrying the workspace's
+/// current commit oid into `session`'s live-plane document, if one exists
+/// and a commit resolves — the begin-time half of the live plane's
+/// worktree tap (BLOCKER 2 of the final branch review). Before this
+/// existed, the only worktree push happened after the turn finished, in
+/// the same statement that torn the live connection down
+/// (`host.live().finish`), so the commit oid and the connection's end
+/// always arrived together and the composer's `CodeAnchor` path could
+/// never be exercised on a running session; `spawn_outcome_loop` pushed no
+/// worktree entry at all. Shared by both `spawn_turn`'s and
+/// `spawn_outcome_loop`'s `begin` sequence so a watcher connecting at any
+/// point during the run has a commit to anchor against, not only once the
+/// turn (or the whole Outcome loop) ends. No-op when `session` has no live
+/// plane entry or the workspace has no commits yet — never fabricates an
+/// oid (see [`workspace_commit`]).
+fn push_begin_worktree_diff(host: &Host, session: EntryId, workspace: &Path) {
+    if let Some(live) = host.live_plane().get(session)
+        && let Some(commit) = workspace_commit(workspace)
+    {
+        let text = workspace_diff(workspace)
+            .map(|diff| diff.text)
+            .unwrap_or_default();
+        live.doc.push_worktree(&serde_json::json!({
+            "kind": "diff",
+            "text": text,
+            "commit": commit,
+        }));
+    }
 }
 
 /// The PR branch junto prepared for an Outcome session: a fresh `junto/<session>`
@@ -1748,7 +1803,13 @@ pub(crate) async fn steer_live(
 /// slug, falling back to the stock agent for the recorded harness (its slug
 /// equals the harness id), and finally the default harness. Seed-on-read means
 /// a stock slug always resolves; only a deleted custom agent falls through.
-fn resume_agent(junto_home: &Path, session: &EntryId) -> Result<crate::agent::Agent> {
+///
+/// Also reused by `crate::live_bridge` (IMPORTANT 4 of the final branch
+/// review) to author a steer note as the session's own driving agent when
+/// the sender's identity has no local signing key on file — the same
+/// "which agent runs this session" question, asked from a different
+/// caller.
+pub(crate) fn resume_agent(junto_home: &Path, session: &EntryId) -> Result<crate::agent::Agent> {
     let slug = agent_slug_for(junto_home, session)?
         .or(harness_id_for(junto_home, session)?)
         .unwrap_or_else(|| HARNESSES[0].id.to_string());
@@ -1794,6 +1855,17 @@ fn spawn_turn(
         *live.workspace.lock().expect("live plane workspace lock") = Some(workspace.clone());
     }
     tokio::spawn(async move {
+        // Live-plane worktree tap, begin-time half (BLOCKER 2 of the final
+        // branch review): the only other worktree push used to happen
+        // after the turn finished, whose very next statement tears the
+        // live connection down (`host.live().finish`, below) — so the
+        // commit oid and the connection's end always arrived in the same
+        // instant, and the composer's `CodeAnchor` path could never be
+        // exercised on a running session. Push once, here, before the turn
+        // even starts, so a watcher connecting mid-turn has a commit to
+        // anchor against immediately. See `push_begin_worktree_diff`'s
+        // docs for the oid-resolution guarantee.
+        push_begin_worktree_diff(&host, session, &workspace);
         let outcome = run_turn(
             &workspace,
             &prompt,
@@ -1821,14 +1893,15 @@ fn spawn_turn(
                 None
             }
         };
-        // Live-plane worktree tap, v1 scope: one diff snapshot per turn,
-        // pushed while the session's `SessionLive` still exists (turn-end
-        // is the periodic floor for v1 — no in-turn ticker, no filesystem
-        // watcher). Fire-and-forget: never lets a live-plane hiccup affect
-        // the outcome already recorded above. Pushed only when
-        // `workspace_diff` resolved a real commit oid to pair with the
-        // diff — never a fabricated one, since watcher UIs anchor code
-        // comments on it (see `WorkspaceDiff::commit`).
+        // Live-plane worktree tap, turn-end half (see the begin-time push
+        // above, in this same task, for the other half): one more diff
+        // snapshot pushed while the session's `SessionLive` still exists
+        // (turn-end is the periodic floor for v1 — no in-turn ticker, no
+        // filesystem watcher). Fire-and-forget: never lets a live-plane
+        // hiccup affect the outcome already recorded above. Pushed only
+        // when `workspace_diff` resolved a real commit oid to pair with
+        // the diff — never a fabricated one, since watcher UIs anchor
+        // code comments on it (see `WorkspaceDiff::commit`).
         if let Some(live) = host.live_plane().get(session)
             && let Some(diff) = workspace_diff(&workspace)
             && let Some(commit) = diff.commit
@@ -2068,6 +2141,16 @@ fn spawn_outcome_loop(
         if let Some(live) = host.live_plane().get(session) {
             *live.workspace.lock().expect("live plane workspace lock") = Some(workspace.clone());
         }
+        // Live-plane worktree tap, begin-time (BLOCKER 2 of the final
+        // branch review): before this fix `spawn_outcome_loop` never
+        // pushed a `kind: "diff"` worktree entry at all, so
+        // `worktree_commit` stayed `None` for the whole loop and the
+        // composer's `CodeAnchor` path always refused with "no commit
+        // seen yet". Push once, here, before the PR branch is even
+        // prepared, so a watcher connecting during the loop has a commit
+        // to anchor against immediately. See `push_begin_worktree_diff`'s
+        // docs for the oid-resolution guarantee.
+        push_begin_worktree_diff(&host, session, &workspace);
 
         // Prepare a PR branch the worker commits onto (the push-gate's
         // deliverable). Best-effort: without it, grading falls back to the
@@ -3072,6 +3155,59 @@ mod tests {
         assert!(
             err.to_string().contains("live turn running"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_time_worktree_tap_publishes_a_commit_before_any_turn_runs() {
+        // BLOCKER 2 of the final branch review: pre-fix, a worktree
+        // `kind: "diff"` entry — the ONLY permitted source of a
+        // `CodeAnchor`'s commit — was pushed exactly once, after the turn
+        // finished, in the statement right before the live connection
+        // tore down. So the commit oid and the connection's end always
+        // arrived together, and the composer's code-anchor path could
+        // never be exercised on a running session. This proves the fix:
+        // a commit is visible in the worktree container immediately after
+        // `begin`, well before any turn (let alone turn-end work) runs.
+        let repo = git_repo_with_commit();
+        let member_home = tempfile::tempdir().unwrap();
+        let host = crate::host::Host::fixed_with_member_home(
+            vec![repo.path().to_path_buf()],
+            Some(member_home.path().to_path_buf()),
+        );
+        let session = EntryId::new();
+        let _rx = host.live().begin(host.clone(), "c".into(), session, false);
+        if let Some(live) = host.live_plane().get(session) {
+            *live.workspace.lock().expect("live plane workspace lock") =
+                Some(repo.path().to_path_buf());
+        }
+
+        // The exact call both `spawn_turn` and `spawn_outcome_loop` make
+        // at `begin`, before starting (or, for the loop, even preparing
+        // the PR branch for) any turn.
+        push_begin_worktree_diff(&host, session, repo.path());
+
+        let live = host
+            .live_plane()
+            .get(session)
+            .expect("session registered by begin");
+        assert_eq!(
+            live.doc.worktree_len(),
+            1,
+            "begin-time push must land exactly one worktree entry before any turn-end work runs"
+        );
+        let event = live
+            .doc
+            .worktree_event(0)
+            .expect("worktree entry must parse back as JSON");
+        assert_eq!(event["kind"], "diff");
+        let commit = event["commit"]
+            .as_str()
+            .expect("commit must be present — the composer refuses without one");
+        assert_eq!(
+            commit,
+            workspace_head_commit(repo.path()).expect("HEAD resolves in a committed repo"),
+            "must carry the real resolved oid, never a fabricated one"
         );
     }
 
