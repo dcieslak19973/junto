@@ -13,10 +13,23 @@
 //! record are deliberately kept apart.
 //!
 //! A [`LiveDoc`] holds three root containers:
-//! - `conversation` (`LoroList`) — the session's live event stream.
-//! - `worktree` (`LoroList`) — file-edit/diff events observed during the run.
+//! - `conversation` (`LoroMovableList`) — the session's live event stream.
+//! - `worktree` (`LoroMovableList`) — file-edit/diff events observed during
+//!   the run.
 //! - `annotations` (`LoroMap`) — the one container **any** authenticated
 //!   member may write into, keyed by annotation id.
+//!
+//! `conversation` and `worktree` are `LoroMovableList`, not a plain
+//! `LoroList`, so a growing segment can *replace* its own last entry rather
+//! than only ever append: [`LiveDoc::push_conversation`] and
+//! [`LiveDoc::push_worktree`] read the `seq` field already carried inside
+//! every pushed event, and when it is nonzero and matches the previous push
+//! to that container, `set()` the previous entry in place instead of
+//! `push()`-ing a new one. A growing Markdown block streamed chunk by chunk,
+//! or a tool call re-published on `tool_call_update`, lands as one list
+//! entry that grows/updates, not one entry per chunk — mirroring the same
+//! `seq`-keyed coalescing the host's own SSE replay buffer already does for
+//! its live feed.
 //!
 //! Only `annotations` is genuinely multi-writer; `conversation` and
 //! `worktree` are driver-writes-only in practice. That restriction is
@@ -31,6 +44,7 @@
 //! rides on loro's separate `EphemeralStore` in a later task.)
 
 use std::collections::HashSet;
+use std::sync::Mutex;
 
 use junto_kernel::Annotation;
 use loro::{ExportMode, LoroDoc, LoroValue, Subscription};
@@ -67,6 +81,20 @@ const ANNOTATIONS: &str = "annotations";
 #[derive(Debug)]
 pub struct LiveDoc {
     doc: LoroDoc,
+    /// The `seq` of the most recent push to `conversation`, so the next
+    /// push whose own `seq` is nonzero and matches this one replaces that
+    /// entry in place instead of appending (see the module docs). `0`
+    /// means "no active growing segment" — the sentinel a discrete,
+    /// non-growing event's own `seq` always carries, and a value a real
+    /// segment id never takes (the host's segment-id counter starts at 1).
+    /// Local bookkeeping only, never part of the CRDT itself: a fresh
+    /// [`LiveDoc::fork`] starts this back at `0`, even though it may
+    /// inherit a `conversation` container whose last entry has a nonzero
+    /// `seq` — a fork is read for validation, never locally pushed to (see
+    /// `crate::validate`), so this never observably diverges.
+    conversation_seq: Mutex<u64>,
+    /// Same contract as `conversation_seq`, for `worktree`.
+    worktree_seq: Mutex<u64>,
 }
 
 impl Default for LiveDoc {
@@ -82,33 +110,37 @@ impl LiveDoc {
     pub fn new() -> Self {
         Self {
             doc: LoroDoc::new(),
+            conversation_seq: Mutex::new(0),
+            worktree_seq: Mutex::new(0),
         }
     }
 
-    /// Append a conversation event and commit. `event` is stored as its own
-    /// JSON text, not decomposed into loro fields — the watcher UI parses it
-    /// back on read, so the wire shape lives with the event's own producer,
-    /// not with this crate.
+    /// Push a conversation event, replacing the previous one in place when
+    /// they share a growing segment's `seq` — see the module docs and
+    /// [`LiveDoc::push_event`]. `event` is stored as its own JSON text, not
+    /// decomposed into loro fields — the watcher UI parses it back on read,
+    /// so the wire shape lives with the event's own producer, not with this
+    /// crate.
     pub fn push_conversation(&self, event: serde_json::Value) {
-        self.push_event(CONVERSATION, event);
+        self.push_event(CONVERSATION, &self.conversation_seq, event);
     }
 
-    /// Append a worktree (file-edit/diff) event and commit. Same shape and
-    /// policy as [`LiveDoc::push_conversation`], distinct container.
+    /// Push a worktree (file-edit/diff) event. Same shape, replace-in-place,
+    /// and policy as [`LiveDoc::push_conversation`], distinct container.
     pub fn push_worktree(&self, event: serde_json::Value) {
-        self.push_event(WORKTREE, event);
+        self.push_event(WORKTREE, &self.worktree_seq, event);
     }
 
     /// Number of events pushed to `conversation` so far.
     #[must_use]
     pub fn conversation_len(&self) -> usize {
-        self.doc.get_list(CONVERSATION).len()
+        self.doc.get_movable_list(CONVERSATION).len()
     }
 
     /// Number of events pushed to `worktree` so far.
     #[must_use]
     pub fn worktree_len(&self) -> usize {
-        self.doc.get_list(WORKTREE).len()
+        self.doc.get_movable_list(WORKTREE).len()
     }
 
     /// Whether `self` and `other`'s `conversation` containers hold exactly
@@ -123,13 +155,15 @@ impl LiveDoc {
     /// only [`LiveDoc::conversation_len`] would miss the splice.
     #[must_use]
     pub fn conversation_matches(&self, other: &Self) -> bool {
-        self.doc.get_list(CONVERSATION).get_value() == other.doc.get_list(CONVERSATION).get_value()
+        self.doc.get_movable_list(CONVERSATION).get_value()
+            == other.doc.get_movable_list(CONVERSATION).get_value()
     }
 
     /// Same contract as [`LiveDoc::conversation_matches`], for `worktree`.
     #[must_use]
     pub fn worktree_matches(&self, other: &Self) -> bool {
-        self.doc.get_list(WORKTREE).get_value() == other.doc.get_list(WORKTREE).get_value()
+        self.doc.get_movable_list(WORKTREE).get_value()
+            == other.doc.get_movable_list(WORKTREE).get_value()
     }
 
     /// Insert (or overwrite) a signed annotation and commit. The map value is
@@ -256,18 +290,41 @@ impl LiveDoc {
     pub fn fork(&self) -> Self {
         Self {
             doc: self.doc.fork(),
+            // A fresh coalescing state, even though the fork inherits
+            // `conversation`/`worktree` history whose last entry may carry a
+            // nonzero `seq` — see the field docs on why this never
+            // observably diverges.
+            conversation_seq: Mutex::new(0),
+            worktree_seq: Mutex::new(0),
         }
     }
 
     /// Shared body of [`LiveDoc::push_conversation`] and
     /// [`LiveDoc::push_worktree`]: push `event`'s JSON text onto the named
-    /// list and commit.
-    fn push_event(&self, container: &str, event: serde_json::Value) {
+    /// list and commit — or, when `event`'s own `seq` field is nonzero and
+    /// equals `last_seq`'s current value, `set()` the list's last entry in
+    /// place instead of appending (see the module docs and the
+    /// `conversation_seq`/`worktree_seq` field docs).
+    fn push_event(&self, container: &str, last_seq: &Mutex<u64>, event: serde_json::Value) {
+        let seq = event
+            .get("seq")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
         // `serde_json::Value::to_string` cannot fail: `event` is already a
         // parsed value, not raw input being (re)validated.
-        self.doc.get_list(container).push(event.to_string()).expect(
+        let text = event.to_string();
+        let list = self.doc.get_movable_list(container);
+        let mut last = last_seq.lock().expect("LiveDoc coalescing-state lock");
+        let replace = seq != 0 && *last == seq && !list.is_empty();
+        let result = if replace {
+            list.set(list.len() - 1, text)
+        } else {
+            list.push(text)
+        };
+        result.expect(
             "LiveDoc never checks out a historical version, so editing cannot hit EditWhenDetached",
         );
+        *last = seq;
         self.doc.commit();
     }
 }
@@ -394,6 +451,48 @@ mod tests {
         // The two lists are independent containers: worktree activity must
         // not show up as a conversation event or vice versa.
         assert_eq!(b.conversation_len(), 0);
+    }
+
+    #[test]
+    fn same_seq_conversation_pushes_replace_in_place() {
+        let live = LiveDoc::new();
+        live.push_conversation(serde_json::json!({"seq": 1, "text": "a"}));
+        live.push_conversation(serde_json::json!({"seq": 1, "text": "ab"}));
+        live.push_conversation(serde_json::json!({"seq": 1, "text": "abc"}));
+        assert_eq!(
+            live.conversation_len(),
+            1,
+            "a growing segment (same nonzero seq) replaces in place, never appends"
+        );
+        // The surviving entry must be the *latest* replace, not the first
+        // (or a stale middle) write — conversation_matches compares content,
+        // not just length.
+        let expected = LiveDoc::new();
+        expected.push_conversation(serde_json::json!({"seq": 1, "text": "abc"}));
+        assert!(live.conversation_matches(&expected));
+
+        // A different nonzero seq starts a fresh entry.
+        live.push_conversation(serde_json::json!({"seq": 2, "text": "next"}));
+        assert_eq!(live.conversation_len(), 2);
+        // `seq: 0` (discrete lines, `LiveEvent::new`'s default) never
+        // coalesces, even against another `seq: 0` right behind it.
+        live.push_conversation(serde_json::json!({"seq": 0, "text": "line"}));
+        live.push_conversation(serde_json::json!({"seq": 0, "text": "line2"}));
+        assert_eq!(live.conversation_len(), 4);
+    }
+
+    #[test]
+    fn same_seq_worktree_pushes_replace_in_place() {
+        // The tool-call-start / tool-call-completed pair the host republishes
+        // under one stable seq (`acp::FeedState::tools`) must land as one
+        // `worktree` entry, not two, or every Edit/Write lands twice.
+        let live = LiveDoc::new();
+        live.push_worktree(serde_json::json!({"seq": 7, "text": "Edit: x.rs"}));
+        live.push_worktree(serde_json::json!({"seq": 7, "text": "Edit: x.rs [completed]"}));
+        assert_eq!(live.worktree_len(), 1);
+        let expected = LiveDoc::new();
+        expected.push_worktree(serde_json::json!({"seq": 7, "text": "Edit: x.rs [completed]"}));
+        assert!(live.worktree_matches(&expected));
     }
 
     #[test]

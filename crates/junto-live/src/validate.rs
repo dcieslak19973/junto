@@ -452,7 +452,7 @@ mod tests {
         // a length check alone cannot see this.
         let peer = loro::LoroDoc::new();
         peer.import(&server.export_snapshot()).unwrap();
-        let list = peer.get_list("conversation");
+        let list = peer.get_movable_list("conversation");
         list.delete(0, 1).unwrap();
         list.insert(
             0,
@@ -480,7 +480,7 @@ mod tests {
 
         let peer = loro::LoroDoc::new();
         peer.import(&server.export_snapshot()).unwrap();
-        let list = peer.get_list("worktree");
+        let list = peer.get_movable_list("worktree");
         list.delete(0, 1).unwrap();
         list.insert(0, serde_json::json!({"path": "forged.rs"}).to_string())
             .unwrap();

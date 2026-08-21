@@ -774,48 +774,44 @@ impl LiveSessions {
         feed.control.try_send(signal).map_err(|_| NotLive)
     }
 
-    /// Append an event: into the replay buffer (bounded) and to live tails.
-    /// A non-zero `seq` marks a growing segment — successive same-`seq` events
-    /// **coalesce** in the replay buffer (the last one wins, so a late joiner
-    /// sees one rendered block, not every intermediate frame), which also keeps
-    /// a long Markdown stream from blowing the bound. Live subscribers still
-    /// receive every frame.
+    /// Also taps the live plane first (fire-and-forget, never propagated —
+    /// see `crate::live_plane`'s module docs): every event feeds the
+    /// session's CRDT `conversation` container, and a tool event whose
+    /// label (`acp::tool_label`) indicates a file edit or write also lands
+    /// in `worktree` (reusing the same serialized value — see
+    /// [`SessionLive::publish_conversation`]), so watchers see file
+    /// activity without waiting for the turn-end diff snapshot.
     ///
-    /// Also taps the live plane (fire-and-forget, never propagated — see
-    /// `crate::live_plane`'s module docs): every event feeds the session's
-    /// CRDT `conversation` container, and a tool event whose label
-    /// (`acp::tool_label`) indicates a file edit or write also lands in
-    /// `worktree`, so watchers see file activity without waiting for the
-    /// turn-end diff snapshot.
+    /// Then: into the replay buffer (bounded) and to live tails. A
+    /// non-zero `seq` marks a growing segment — successive same-`seq`
+    /// events **coalesce** in the replay buffer (the last one wins, so a
+    /// late joiner sees one rendered block, not every intermediate frame),
+    /// which also keeps a long Markdown stream from blowing the bound.
+    /// Live subscribers still receive every frame.
     pub(crate) fn publish(&self, session: EntryId, event: LiveEvent) {
-        {
-            let mut map = self.inner.lock().expect("live sessions registry lock");
-            if let Some(feed) = map.get_mut(&session) {
-                let coalesce =
-                    event.seq != 0 && feed.buffer.last().is_some_and(|last| last.seq == event.seq);
-                if coalesce {
-                    if let Some(last) = feed.buffer.last_mut() {
-                        *last = event.clone();
-                    }
-                } else if feed.buffer.len() < 1000 {
-                    feed.buffer.push(event.clone());
-                }
-                // Err just means no one is watching right now — fine.
-                let _ = feed.sender.send(event.clone());
-            }
-        }
         if let Some(live) = self.plane.get(session) {
-            live.publish_conversation(&event);
             let is_edit_or_write =
                 event.text.starts_with("Edit") || event.text.starts_with("Write");
-            if event.kind == "tool" && is_edit_or_write {
-                match serde_json::to_value(&event) {
-                    Ok(value) => live.doc.push_worktree(value),
-                    Err(err) => tracing::warn!(
-                        "live plane: failed to serialize worktree tool event: {err:#}"
-                    ),
-                }
+            if let Some(value) = live.publish_conversation(&event)
+                && event.kind == "tool"
+                && is_edit_or_write
+            {
+                live.doc.push_worktree(value);
             }
+        }
+        let mut map = self.inner.lock().expect("live sessions registry lock");
+        if let Some(feed) = map.get_mut(&session) {
+            let coalesce =
+                event.seq != 0 && feed.buffer.last().is_some_and(|last| last.seq == event.seq);
+            if coalesce {
+                if let Some(last) = feed.buffer.last_mut() {
+                    *last = event.clone();
+                }
+            } else if feed.buffer.len() < 1000 {
+                feed.buffer.push(event.clone());
+            }
+            // Err just means no one is watching right now — fine.
+            let _ = feed.sender.send(event);
         }
     }
 
@@ -1267,9 +1263,15 @@ fn store_artifact(
 }
 
 /// Archive a finished session's live-plane snapshot (`LivePlane::finish`'s
-/// return value) as an artifact, using the exact `store_artifact` +
-/// `ArtifactAttached` shape [`record_outcome`] uses for `diff.patch` — same
-/// signing, same append path (see the taps in `LiveSessions::finish`).
+/// return value) as an artifact named `name`, using the exact
+/// `store_artifact` + `ArtifactAttached` shape [`record_outcome`] uses for
+/// `diff.patch` — same signing, same append path (see the taps in
+/// `LiveSessions::finish`). `name` must be collision-free per session — a
+/// constant name would let a later turn's archive silently overwrite an
+/// earlier turn's already-appended `ArtifactAttached` entry's `file://`
+/// target, corrupting that entry's recorded digest; callers use the same
+/// `turn-{turn}-*`-numbered convention `record_outcome`'s own artifacts use,
+/// falling back to an id-suffixed name where no single turn number applies.
 /// `store_artifact` only writes text, so the binary snapshot is hex-encoded
 /// first — the durable ledger never carries CRDT bytes verbatim, only their
 /// provenance-tracked artifact.
@@ -1279,11 +1281,12 @@ async fn archive_live_snapshot(
     channel: ChannelId,
     session: EntryId,
     agent: &crate::agent::Agent,
+    name: &str,
     snapshot: &[u8],
 ) -> Result<()> {
     let junto_home = crate::host::junto_home()?;
     let hex: String = snapshot.iter().map(|byte| format!("{byte:02x}")).collect();
-    let stored = store_artifact(&junto_home, &session, "live.loro", &hex)?;
+    let stored = store_artifact(&junto_home, &session, name, &hex)?;
     append(
         host,
         channel_ref,
@@ -1318,9 +1321,29 @@ pub(crate) fn no_console_window(command: &mut std::process::Command) {
     let _ = command;
 }
 
+/// A workspace's uncommitted-changes diff (`git diff` against the right
+/// base, plus untracked file names), paired with the commit oid that diff
+/// is relative to.
+#[derive(Default)]
+struct WorkspaceDiff {
+    text: String,
+    /// The commit oid `text` is relative to: the recorded PR-branch base
+    /// commit (`branch.<branch>.juntoBaseSha`) when on a `junto/<session>`
+    /// branch, otherwise `HEAD`'s own oid — resolved together with `text`
+    /// itself so the two can never drift to different commits between two
+    /// separate git invocations. `None` only when the workspace has no
+    /// commits at all yet (nothing for `HEAD` to name); `text` may still be
+    /// non-empty in that case (untracked files in a brand-new repo), so
+    /// callers that only want the diff text must not treat `None` here as
+    /// "no diff" — only a caller that needs a real oid to anchor against
+    /// (the live plane's worktree-diff tap) may skip on `None`, and must
+    /// never fabricate one.
+    commit: Option<String>,
+}
+
 /// The workspace's uncommitted changes (`git diff HEAD` + untracked names),
-/// or `None` when clean.
-fn workspace_diff(workspace: &Path) -> Option<String> {
+/// or `None` when clean — see [`WorkspaceDiff`] for the paired commit oid.
+fn workspace_diff(workspace: &Path) -> Option<WorkspaceDiff> {
     let run = |args: &[&str]| -> Option<String> {
         let mut command = std::process::Command::new("git");
         command.arg("-C").arg(workspace).args(args);
@@ -1336,6 +1359,10 @@ fn workspace_diff(workspace: &Path) -> Option<String> {
     if status.trim().is_empty() && base.is_none() {
         return None;
     }
+    let commit = match &base {
+        Some(base_sha) => Some(base_sha.clone()),
+        None => workspace_head_commit(workspace),
+    };
     let diff = match &base {
         Some(base_sha) => run(&["diff", base_sha]).unwrap_or_default(),
         None => run(&["diff", "HEAD"]).unwrap_or_default(),
@@ -1347,15 +1374,15 @@ fn workspace_diff(workspace: &Path) -> Option<String> {
         .lines()
         .filter(|line| line.starts_with("??"))
         .collect();
-    let mut out = diff;
+    let mut text = diff;
     if !untracked.is_empty() {
-        out.push_str("\n# untracked files:\n");
+        text.push_str("\n# untracked files:\n");
         for line in untracked {
-            out.push_str(line);
-            out.push('\n');
+            text.push_str(line);
+            text.push('\n');
         }
     }
-    Some(out)
+    Some(WorkspaceDiff { text, commit })
 }
 
 /// The PR branch junto prepared for an Outcome session: a fresh `junto/<session>`
@@ -1447,10 +1474,10 @@ fn current_branch(workspace: &Path) -> Option<String> {
 }
 
 /// The workspace's current `HEAD` commit oid, or `None` if git can't say
-/// (not a repo, or an initial repo with no commits yet). The live plane's
-/// worktree diff event (`spawn_turn`) only ever carries a commit oid it got
-/// from here — never a fabricated one, since watcher UIs anchor code
-/// comments on it.
+/// (not a repo, or an initial repo with no commits yet). [`workspace_diff`]
+/// uses this as the non-PR-branch case of [`WorkspaceDiff::commit`] — never
+/// a fabricated oid, since the live plane's worktree-diff tap anchors
+/// watcher code comments on it.
 fn workspace_head_commit(workspace: &Path) -> Option<String> {
     let mut command = std::process::Command::new("git");
     command.arg("-C").arg(workspace).args(["rev-parse", "HEAD"]);
@@ -1687,7 +1714,7 @@ fn spawn_turn(
             &mut control_rx,
         )
         .await;
-        if let Err(err) = record_outcome(
+        let turn = match record_outcome(
             &host,
             &channel_ref,
             channel,
@@ -1698,36 +1725,56 @@ fn spawn_turn(
         )
         .await
         {
-            tracing::warn!("recording session {session} outcome failed: {err:#}");
-        }
+            Ok(turn) => Some(turn),
+            Err(err) => {
+                tracing::warn!("recording session {session} outcome failed: {err:#}");
+                None
+            }
+        };
         // Live-plane worktree tap, v1 scope: one diff snapshot per turn,
-        // pushed while the session's `SessionLive` still exists (turn-end is
-        // the periodic floor for v1 — no in-turn ticker, no filesystem
+        // pushed while the session's `SessionLive` still exists (turn-end
+        // is the periodic floor for v1 — no in-turn ticker, no filesystem
         // watcher). Fire-and-forget: never lets a live-plane hiccup affect
-        // the outcome already recorded above. The commit oid only ever
-        // comes from git — never fabricated, since watcher UIs anchor code
-        // comments on it.
+        // the outcome already recorded above. Pushed only when
+        // `workspace_diff` resolved a real commit oid to pair with the
+        // diff — never a fabricated one, since watcher UIs anchor code
+        // comments on it (see `WorkspaceDiff::commit`).
         if let Some(live) = host.live_plane().get(session)
-            && let (Some(diff), Some(commit)) = (
-                workspace_diff(&workspace),
-                workspace_head_commit(&workspace),
-            )
+            && let Some(diff) = workspace_diff(&workspace)
+            && let Some(commit) = diff.commit
         {
             live.doc.push_worktree(serde_json::json!({
                 "kind": "diff",
-                "text": diff,
+                "text": diff.text,
                 "commit": commit,
             }));
         }
-        // Close the live feed only after the outcome is recorded, so a watcher
-        // reloading on stream-end sees the landed memo + diff, not "working".
-        // Also archives the live plane's final snapshot as an artifact.
-        if let Some(snapshot) = host.live().finish(session)
-            && let Err(err) =
-                archive_live_snapshot(&host, &channel_ref, channel, session, &agent, &snapshot)
-                    .await
-        {
-            tracing::warn!("archiving live snapshot for session {session} failed: {err:#}");
+        // Close the live feed only after the outcome is recorded, so a
+        // watcher reloading on stream-end sees the landed memo + diff, not
+        // "working". Also archives the live plane's final snapshot as an
+        // artifact, named per turn (like `record_outcome`'s own
+        // `turn-{turn}-*` artifacts) so a later steered turn on the same
+        // session never overwrites an earlier turn's archived snapshot;
+        // falls back to a collision-safe id (the `grade-{}.md` precedent)
+        // when the turn number itself couldn't be recorded above.
+        if let Some(snapshot) = host.live().finish(session) {
+            let name = match turn {
+                Some(turn) => format!("turn-{turn}-live.loro"),
+                None => format!("live-{}.loro", EntryId::new()),
+            };
+            if let Err(err) = archive_live_snapshot(
+                &host,
+                &channel_ref,
+                channel,
+                session,
+                &agent,
+                &name,
+                &snapshot,
+            )
+            .await
+            {
+                tracing::warn!("archiving live snapshot for session {session} failed: {err:#}");
+            }
         }
         // Best-effort sync so the session's record leaves this machine.
         if let Ok(resolution) = host.resolve(&channel_ref).await
@@ -1743,6 +1790,11 @@ fn spawn_turn(
     });
 }
 
+/// Record a finished turn's outcome: the result memo + workspace diff
+/// Artifacts and the final session state, authored as the harness member.
+/// Returns the recorded turn number ([`record_turn`]'s own counter) so the
+/// caller can name a same-turn artifact (the live-plane snapshot) without
+/// calling `record_turn` a second time, which would double-increment it.
 async fn record_outcome(
     host: &Host,
     channel_ref: &str,
@@ -1751,7 +1803,7 @@ async fn record_outcome(
     workspace: &Path,
     outcome: &TurnOutcome,
     agent: &crate::agent::Agent,
-) -> Result<()> {
+) -> Result<u32> {
     let junto_home = crate::host::junto_home()?;
     let harness = harness_by_id(&agent.harness);
     let turn = record_turn(
@@ -1794,7 +1846,7 @@ async fn record_outcome(
             &junto_home,
             &session,
             &format!("turn-{turn}-diff.patch"),
-            &diff,
+            &diff.text,
         )?;
         append(
             host,
@@ -1836,7 +1888,8 @@ async fn record_outcome(
             },
         },
     )
-    .await
+    .await?;
+    Ok(turn)
 }
 
 // ---- the Outcome loop: the code-PR push-gate (docs/adr/0025) ----
@@ -1968,10 +2021,22 @@ fn spawn_outcome_loop(
         {
             tracing::warn!("recording outcome terminal for session {session} failed: {err:#}");
         }
+        // No single turn number describes this snapshot — the outcome loop
+        // spans every iteration's `capture_turn` call under one `begin`/
+        // `finish` pair, unlike `spawn_turn`'s one-turn-per-archive case
+        // (see `archive_live_snapshot`'s doc comment) — so fall back to the
+        // `grade-{}.md` precedent's id-suffixed, collision-free naming.
         if let Some(snapshot) = host.live().finish(session)
-            && let Err(err) =
-                archive_live_snapshot(&host, &channel_ref, channel, session, &agent, &snapshot)
-                    .await
+            && let Err(err) = archive_live_snapshot(
+                &host,
+                &channel_ref,
+                channel,
+                session,
+                &agent,
+                &format!("live-{}.loro", EntryId::new()),
+                &snapshot,
+            )
+            .await
         {
             tracing::warn!("archiving live snapshot for session {session} failed: {err:#}");
         }
@@ -2077,7 +2142,7 @@ async fn verify_one(
 
     // Mechanical green → the Grader judges the diff in a fresh session.
     let diff = workspace_diff(workspace).unwrap_or_default();
-    let prompt = crate::grader::grader_prompt(crate::grader::default_code_pr_rubric(), &diff);
+    let prompt = crate::grader::grader_prompt(crate::grader::default_code_pr_rubric(), &diff.text);
     host.live().publish(
         session,
         LiveEvent::new("status", "checks green — grading the diff"),
@@ -2158,7 +2223,7 @@ async fn capture_turn(
             &junto_home,
             &session,
             &format!("turn-{turn}-diff.patch"),
-            &diff,
+            &diff.text,
         )?;
         append(
             host,
@@ -2300,7 +2365,7 @@ async fn finish_outcome(
                     &junto_home,
                     &session,
                     "deliverable-diff.patch",
-                    &diff,
+                    &diff.text,
                 )?);
             }
             append(
@@ -2363,7 +2428,7 @@ async fn finish_outcome(
                     &junto_home,
                     &session,
                     "escalation-diff.patch",
-                    &diff,
+                    &diff.text,
                 )?);
             }
             append(
@@ -2837,6 +2902,75 @@ mod tests {
         assert!(recorded.1.contains("focus on the parser"));
     }
 
+    #[tokio::test]
+    async fn archive_live_snapshot_records_a_named_artifact() {
+        let home = HomeGuard::new();
+        let repo = git_repo();
+        let host = crate::host::Host::fixed_with_member_home(
+            vec![repo.path().to_path_buf()],
+            Some(home.path().to_path_buf()),
+        );
+        let dan = Member::human("Dan", "dan@example.com");
+        let channel = host
+            .open_channel(None, "c", dan.clone(), None)
+            .await
+            .unwrap()
+            .id;
+        let session = EntryId::new();
+        let agent = crate::agent::Agent {
+            slug: "claude".into(),
+            name: "Claude".into(),
+            harness: "claude".into(),
+            email: "claude@junto.local".into(),
+            role: None,
+            model: None,
+            mcp_servers: Vec::new(),
+            skills: Vec::new(),
+            plugins: Vec::new(),
+        };
+
+        archive_live_snapshot(
+            &host,
+            "c",
+            channel,
+            session,
+            &agent,
+            "turn-1-live.loro",
+            b"snapshot-bytes",
+        )
+        .await
+        .unwrap();
+
+        let ledger = host.ledger_for(repo.path()).await.unwrap();
+        let view = ledger.lock().await.project(&channel).await.unwrap();
+        let recorded = view
+            .entries
+            .iter()
+            .find_map(|e| match &e.payload {
+                EntryPayload::ArtifactAttached {
+                    target,
+                    kind,
+                    provenance,
+                    ..
+                } if *target == session && kind == "live-snapshot" => Some(provenance.clone()),
+                _ => None,
+            })
+            .expect("a live-snapshot artifact was recorded");
+        assert_eq!(recorded.len(), 1);
+        assert!(recorded[0].uri.as_str().ends_with("turn-1-live.loro"));
+
+        // `store_artifact` only writes text, so the archived content is the
+        // hex encoding of the snapshot bytes, not the raw bytes.
+        let stored = std::fs::read_to_string(
+            home.path()
+                .join("artifacts")
+                .join(session.to_string())
+                .join("turn-1-live.loro"),
+        )
+        .unwrap();
+        assert_eq!(stored, "736e617073686f742d6279746573"); // hex("snapshot-bytes")
+    }
+
     #[test]
     fn pr_branch_makes_committed_work_show_in_the_base_relative_diff() {
         let repo = git_repo_with_commit();
@@ -2866,8 +3000,14 @@ mod tests {
         // `git diff HEAD` is now empty (the work is committed), but the
         // base-relative diff still shows it — so the Grader sees the change.
         let diff = workspace_diff(repo.path()).expect("committed work shows base-relative");
-        assert!(diff.contains("feature.rs"), "{diff}");
-        assert!(diff.contains("fn added"), "{diff}");
+        assert!(diff.text.contains("feature.rs"), "{}", diff.text);
+        assert!(diff.text.contains("fn added"), "{}", diff.text);
+        // The paired commit must be the PR-branch base, not the new "add
+        // feature" commit — otherwise a watcher would anchor this diff's
+        // line numbers against the wrong blob, which is exactly the bug
+        // pairing the two together in one call is meant to prevent.
+        let base_sha = pr_branch_base(repo.path()).expect("base sha recorded");
+        assert_eq!(diff.commit.as_deref(), Some(base_sha.as_str()));
     }
 
     #[test]
@@ -3060,6 +3200,62 @@ mod tests {
         assert!(buffer[0].html);
         assert_eq!(buffer[0].seq, 1);
         assert_eq!(buffer[1].kind, "tool");
+    }
+
+    #[test]
+    fn worktree_tap_gates_on_edit_and_write_tool_labels() {
+        let live = LiveSessions::default();
+        let session = EntryId::new();
+        let _rx = live.begin(session);
+        let plane = live.plane.get(session).expect("plane session began");
+
+        // A non-tool event, and a tool event whose label is neither `Edit`
+        // nor `Write` (`acp::tool_label`'s shapes), must never land in
+        // `worktree` — only feed `conversation`.
+        live.publish(session, LiveEvent::new("assistant", "hello"));
+        live.publish(session, LiveEvent::new("tool", "Bash: cargo test"));
+        assert_eq!(plane.doc.worktree_len(), 0);
+        assert_eq!(
+            plane.doc.conversation_len(),
+            2,
+            "both still feed conversation"
+        );
+
+        // Edit/Write-labeled tool events land in both containers.
+        live.publish(session, LiveEvent::new("tool", "Edit: src/x.rs"));
+        live.publish(session, LiveEvent::new("tool", "Write: src/y.rs"));
+        assert_eq!(plane.doc.worktree_len(), 2);
+        assert_eq!(plane.doc.conversation_len(), 4);
+    }
+
+    #[test]
+    fn finish_broadcasts_frame_end_to_connected_watchers() {
+        let live = LiveSessions::default();
+        let session = EntryId::new();
+        let _rx = live.begin(session);
+        let plane = live.plane.get(session).expect("plane session began");
+        let mut watcher = plane.outbound.subscribe();
+
+        live.finish(session);
+        assert!(matches!(watcher.try_recv(), Ok(junto_live::Frame::End)));
+    }
+
+    #[test]
+    fn begin_ends_a_stale_session_before_replacing_it() {
+        let live = LiveSessions::default();
+        let session = EntryId::new();
+        let _rx1 = live.begin(session);
+        let stale = live.plane.get(session).expect("plane session began");
+        let mut stale_watcher = stale.outbound.subscribe();
+
+        // Re-`begin` without an intervening `finish` (the prior turn's task
+        // never got there — a panic, or a process restart mid-turn) must
+        // still end the stale watcher's stream, exactly as `finish` would.
+        let _rx2 = live.begin(session);
+        assert!(matches!(
+            stale_watcher.try_recv(),
+            Ok(junto_live::Frame::End)
+        ));
     }
 
     #[test]

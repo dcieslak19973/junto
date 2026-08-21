@@ -71,16 +71,28 @@ pub(crate) struct SessionLive {
 impl SessionLive {
     /// Tap one conversation event from the existing SSE live feed
     /// (`crate::launch::LiveEvent`) into this session's CRDT document.
+    /// Returns the event's serialized JSON value on success, so a caller
+    /// that also needs to push the same event into `worktree` (a tool
+    /// event whose label indicates a file edit or write — see
+    /// `crate::launch::LiveSessions::publish`) can hand that value straight
+    /// to `doc.push_worktree` instead of serializing `event` a second time.
     ///
     /// Fire-and-forget: a serialization failure is logged and dropped, never
     /// propagated — see the module docs on the never-block invariant. In
     /// practice `LiveEvent` always serializes (plain strings, a `u64`, a
     /// `bool`); this only guards against that ceasing to be true.
-    pub(crate) fn publish_conversation(&self, event: &crate::launch::LiveEvent) {
+    pub(crate) fn publish_conversation(
+        &self,
+        event: &crate::launch::LiveEvent,
+    ) -> Option<serde_json::Value> {
         match serde_json::to_value(event) {
-            Ok(value) => self.doc.push_conversation(value),
+            Ok(value) => {
+                self.doc.push_conversation(value.clone());
+                Some(value)
+            }
             Err(err) => {
                 tracing::warn!("live plane: failed to serialize conversation event: {err:#}");
+                None
             }
         }
     }
@@ -101,9 +113,17 @@ pub(crate) struct LivePlane {
 }
 
 impl LivePlane {
-    /// Start a fresh [`SessionLive`] for `session` (replacing any stale
-    /// one), wiring its document's local-update subscription to forward
-    /// every commit into `outbound` as a `Frame::Update`.
+    /// Start a fresh [`SessionLive`] for `session`, wiring its document's
+    /// local-update subscription to forward every commit into `outbound` as
+    /// a `Frame::Update`.
+    ///
+    /// Replacing any stale entry (a turn's task ended without calling
+    /// [`LivePlane::finish`] — e.g. it panicked, or the process restarted
+    /// mid-turn — and the session was then re-launched) broadcasts
+    /// `Frame::End` on the *removed* entry's own `outbound` first, exactly
+    /// as `finish` would have: a watcher still holding that old
+    /// `broadcast::Receiver` must learn its stream is over rather than
+    /// silently hang on a sender nothing will ever send through again.
     pub(crate) fn begin(&self, session: EntryId) -> Arc<SessionLive> {
         let doc = LiveDoc::new();
         let (outbound, _rx) = broadcast::channel(256);
@@ -122,10 +142,14 @@ impl LivePlane {
             workspace: Mutex::new(None),
             _subscription: Box::new(subscription),
         });
-        self.sessions
+        let stale = self
+            .sessions
             .lock()
             .expect("live plane registry lock")
             .insert(session, Arc::clone(&live));
+        if let Some(stale) = stale {
+            let _ = stale.outbound.send(Frame::End);
+        }
         live
     }
 
@@ -180,6 +204,10 @@ mod tests {
         let replay = junto_live::LiveDoc::new();
         replay.import_update(&snapshot).unwrap();
         assert_eq!(replay.conversation_len(), 1);
+        assert!(
+            replay.conversation_matches(&live.doc),
+            "the archived snapshot must replay the exact event, not just its count"
+        );
         assert!(plane.get(session).is_none());
     }
 }
