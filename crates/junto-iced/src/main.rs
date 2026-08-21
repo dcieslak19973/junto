@@ -151,10 +151,13 @@ struct Pane {
     annotate_email: Option<String>,
     /// The live doc's current `conversation` container length, mirrored
     /// from the stream task (`Message::ConversationLen`). The composer's
-    /// `StreamAnchor` (an empty `path`) anchors at
-    /// `conversation_len.saturating_sub(1)` — the most recent event's own
-    /// CONTAINER index, which is not necessarily `feed.len() - 1` (the feed
-    /// also carries synthetic, non-document error lines).
+    /// `StreamAnchor` (an empty `path`) anchors at `conversation_len - 1`
+    /// — the most recent event's own CONTAINER index, which is not
+    /// necessarily `feed.len() - 1` (the feed also carries synthetic,
+    /// non-document error lines). An empty container (`conversation_len
+    /// == 0`, nothing has arrived yet) is refused outright rather than
+    /// saturating to a nonexistent index 0 — see the composer's
+    /// `AnnotateSubmit` handler.
     conversation_len: usize,
     /// The most recent commit oid seen in a `{"kind":"diff","commit":…}`
     /// worktree event on this pane's live doc (`Message::WorktreeDiff`) —
@@ -969,7 +972,12 @@ impl App {
             }
             Message::WatchEmailChanged(pane, value) => {
                 if let Some(state) = self.panes.get_mut(pane) {
-                    state.watch_email = value;
+                    // Trimmed on store, exactly as `remote` already is
+                    // (`Message::RemoteChanged`, above): a pasted email
+                    // with surrounding whitespace must still resolve
+                    // `load_signing_key`'s lookup and match verbatim what
+                    // the `Auth` frame sends.
+                    state.watch_email = value.trim().to_string();
                 }
                 Task::none()
             }

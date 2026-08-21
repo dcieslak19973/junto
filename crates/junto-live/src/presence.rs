@@ -127,12 +127,18 @@ mod tests {
 
     #[test]
     fn entries_expire_after_timeout() {
-        let a = Presence::with_timeout(50);
+        // 200ms timeout / 800ms sleep (4x margin), not 50ms/200ms: the
+        // pre-expiry assertion right after `set_watching` needs the
+        // process to be scheduled back in before the entry's OWN timeout
+        // elapses, or it fails spuriously — a real risk on a loaded
+        // parallel `cargo test` run, and CI runs this on three OSes
+        // including Windows. Still comfortably under a second.
+        let a = Presence::with_timeout(200);
         a.set_watching("temp@x.com");
         assert_eq!(a.watchers(), vec!["temp@x.com".to_string()]);
 
-        // Sleep past timeout: 50ms timeout + 200ms sleep = well past expiry
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        // Sleep past timeout: 200ms timeout + 800ms sleep = well past expiry.
+        std::thread::sleep(std::time::Duration::from_millis(800));
         assert_eq!(a.watchers(), vec![] as Vec<String>);
     }
 }

@@ -52,13 +52,13 @@ Three planes, strict separation:
 
 ```
   Live plane (ephemeral, CRDT)      Session plane (existing)      Record (untouched)
- ┌──────────────────────────┐     ┌───────────────────────┐     ┌────────────────────┐
+ ┌───────────────────────────┐     ┌───────────────────────┐     ┌────────────────────┐
  │  LiveDoc per session      │◄────│  ACP loop             │     │ append-only entries│
  │  (loro document)          │────►│  steer / interrupt    │     │ refs/junto/*       │
  │   • conversation (drv)    │     │  owned worktree       │     │ union-merge sync   │
  │   • worktree      (drv)   │     └───────────────────────┘     └────────────────────┘
  │   • annotations (multi)   │        session end: LiveDoc               ▲
- └──────────────────────────┘        archived as versioned              │
+ └───────────────────────────┘        archived as versioned              │
   + Presence (loro EphemeralStore,    session artifact ──────────────────┘
     own sync channel, never archived) (ratified outcomes only, via
                                        existing verification acts)
