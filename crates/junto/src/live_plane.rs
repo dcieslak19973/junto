@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use junto_kernel::EntryId;
+use junto_kernel::{Annotation, EntryId};
 use junto_live::{Frame, LiveDoc, Presence};
 use tokio::sync::broadcast;
 
@@ -46,15 +46,6 @@ pub(crate) struct SessionLive {
     /// drops frames rather than backing up the sender — joining from a
     /// fresh snapshot is the recovery path, not replay.
     pub outbound: broadcast::Sender<Frame>,
-    /// Watcher annotations validated but not yet delivered to the driving
-    /// agent as steering context. Appended by [`crate::live_ws`] (via
-    /// [`crate::live_bridge::deliver`]) after
-    /// `junto_live::validate_annotation_update` accepts them; drained at the
-    /// next turn boundary by [`crate::live_bridge::flush_pending`], or
-    /// immediately by [`crate::live_bridge::deliver`]'s urgent path when the
-    /// running turn's control channel rejects a steer (no turn currently
-    /// live) — either way, nothing appended here is ever silently dropped.
-    pub pending: Mutex<Vec<junto_kernel::Annotation>>,
     /// The session's workspace path, for re-anchoring annotations before
     /// they're delivered as steering context. Set from `spawn_turn`/
     /// `spawn_outcome_loop` (`crate::launch`), which already have it in
@@ -115,6 +106,17 @@ impl SessionLive {
 #[derive(Default)]
 pub(crate) struct LivePlane {
     sessions: Mutex<HashMap<EntryId, Arc<SessionLive>>>,
+    /// Watcher annotations validated but not yet delivered to the driving
+    /// agent as steering context, keyed by session — deliberately **not**
+    /// on `SessionLive` above: a `SessionLive` is torn down and rebuilt at
+    /// every turn boundary (`crate::launch::LiveSessions::begin`/`finish`
+    /// close/reopen it once per turn for an interactive session), while a
+    /// queued annotation must survive exactly that boundary to ever reach
+    /// the agent — a queue owned by `SessionLive` cannot cross the
+    /// boundary it exists to cross. Appended by [`crate::live_bridge`]
+    /// (`queue_pending`) and drained at the next turn boundary or an
+    /// immediate urgent delivery (`take_pending`); see that module's docs.
+    pending: Mutex<HashMap<EntryId, Vec<Annotation>>>,
 }
 
 impl LivePlane {
@@ -143,7 +145,6 @@ impl LivePlane {
             doc,
             presence: Presence::new(),
             outbound,
-            pending: Mutex::new(Vec::new()),
             workspace: Mutex::new(None),
             _subscription: Box::new(subscription),
         });
@@ -181,6 +182,46 @@ impl LivePlane {
         // Fire-and-forget: no watcher connected is not an error.
         let _ = live.outbound.send(Frame::End);
         Some(live.doc.export_snapshot())
+    }
+
+    /// Append `annotations` to `session`'s pending queue (arrival order,
+    /// batched across separate calls) — a no-op for an empty `annotations`,
+    /// so a caller never has to special-case "nothing to queue" and this
+    /// map never gains a stale empty entry from an empty append.
+    pub(crate) fn queue_pending(&self, session: EntryId, annotations: Vec<Annotation>) {
+        if annotations.is_empty() {
+            return;
+        }
+        self.pending
+            .lock()
+            .expect("live plane pending-annotations lock")
+            .entry(session)
+            .or_default()
+            .extend(annotations);
+    }
+
+    /// Whether `session` has any annotations queued, without draining them
+    /// — the cheap check `crate::live_bridge::flush_pending` makes before
+    /// deciding a delayed delivery task is worth spawning at all.
+    #[must_use]
+    pub(crate) fn has_pending(&self, session: EntryId) -> bool {
+        self.pending
+            .lock()
+            .expect("live plane pending-annotations lock")
+            .get(&session)
+            .is_some_and(|batch| !batch.is_empty())
+    }
+
+    /// Drain and return `session`'s pending queue, removing the map entry
+    /// entirely (not leaving an empty `Vec` in its place) so this map stays
+    /// bounded by the sessions currently *carrying* undelivered annotations,
+    /// not by every session that ever queued one.
+    pub(crate) fn take_pending(&self, session: EntryId) -> Vec<Annotation> {
+        self.pending
+            .lock()
+            .expect("live plane pending-annotations lock")
+            .remove(&session)
+            .unwrap_or_default()
     }
 }
 

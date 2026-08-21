@@ -721,11 +721,23 @@ pub(crate) struct NotLive;
 
 /// Per-session live feed: a bounded replay buffer (for a page that loads
 /// mid-turn), a broadcast sender for the live tail (host → human), and a
-/// control sender for mid-turn signals (human → turn).
+/// control sender for mid-turn signals (human → turn) — `None` for a
+/// session `begin` opened as non-steerable (`LiveSessions::begin`'s
+/// `steerable` flag), so [`LiveSessions::control`] reports [`NotLive`] for
+/// it even while the feed itself is registered. This is deliberately
+/// *not* the same thing as no feed existing at all: an autonomous Outcome
+/// loop turn (`crate::launch::spawn_outcome_loop`) drives itself with its
+/// own inert control channel and never reads the one `begin` would hand
+/// back, so a real, always-succeeding `try_send` into that channel would
+/// make `steer_live` report success for a steer nobody will ever act on —
+/// and `record_steer_note` would then write a `SessionUpdated` entry
+/// asserting a steer that never happened. `control: None` makes that
+/// failure mode structurally unreachable instead of relying on every
+/// caller to remember not to steer an unsteerable session.
 struct LiveFeed {
     buffer: Vec<LiveEvent>,
     sender: broadcast::Sender<LiveEvent>,
-    control: mpsc::Sender<TurnControl>,
+    control: Option<mpsc::Sender<TurnControl>>,
 }
 
 /// The host's in-memory registry of running sessions' live feeds. Ephemeral —
@@ -745,8 +757,23 @@ pub struct LiveSessions {
 impl LiveSessions {
     /// Open a fresh feed for a session about to run (replaces any stale one),
     /// returning the control receiver the running turn selects on (human →
-    /// turn).
-    pub(crate) fn begin(&self, session: EntryId) -> mpsc::Receiver<TurnControl> {
+    /// turn). `steerable` is `false` for an autonomous Outcome-loop turn
+    /// (`crate::launch::spawn_outcome_loop`) that never reads its own
+    /// control receiver — see [`LiveFeed`]'s doc for why that must not
+    /// register a real control sender.
+    ///
+    /// Also flushes `session`'s pending annotation queue (any watcher
+    /// comments queued while no turn was running) at the end, once the
+    /// fresh feed and live-plane document both exist: wired in here
+    /// directly, not left to the caller, so a future `begin` call site
+    /// cannot silently skip it (`crate::live_bridge::flush_pending`'s docs).
+    pub(crate) fn begin(
+        &self,
+        host: std::sync::Arc<Host>,
+        channel: String,
+        session: EntryId,
+        steerable: bool,
+    ) -> mpsc::Receiver<TurnControl> {
         let (sender, _rx) = broadcast::channel(256);
         // Capacity 1: one human, one in-flight signal at a time.
         let (control, control_rx) = mpsc::channel(1);
@@ -756,22 +783,28 @@ impl LiveSessions {
             LiveFeed {
                 buffer: Vec::new(),
                 sender,
-                control,
+                control: steerable.then_some(control),
             },
         );
         drop(map);
         // Live-plane tap: start this session's CRDT document alongside the
         // SSE feed above (docs/superpowers/specs/2026-08-20-live-session-plane-design.md).
         self.plane.begin(session);
+        crate::live_bridge::flush_pending(host, channel, session);
         control_rx
     }
 
     /// Deliver a human's control signal to the running turn, or `Err(NotLive)`
-    /// if no turn is currently streaming for the session.
+    /// if no turn is currently streaming for the session, or the session's
+    /// feed was opened non-steerable (`begin`'s `steerable` flag).
     pub(crate) fn control(&self, session: EntryId, signal: TurnControl) -> Result<(), NotLive> {
         let map = self.inner.lock().expect("live sessions registry lock");
         let feed = map.get(&session).ok_or(NotLive)?;
-        feed.control.try_send(signal).map_err(|_| NotLive)
+        feed.control
+            .as_ref()
+            .ok_or(NotLive)?
+            .try_send(signal)
+            .map_err(|_| NotLive)
     }
 
     /// Also taps the live plane first (fire-and-forget, never propagated —
@@ -831,7 +864,7 @@ impl LiveSessions {
     /// taps the live plane: removes its `SessionLive` and returns the
     /// session's final CRDT snapshot bytes for the caller to archive as an
     /// artifact (`None` if the live plane wasn't tracking the session).
-    fn finish(&self, session: EntryId) -> Option<Vec<u8>> {
+    pub(crate) fn finish(&self, session: EntryId) -> Option<Vec<u8>> {
         let mut map = self.inner.lock().expect("live sessions registry lock");
         map.remove(&session);
         drop(map);
@@ -1702,16 +1735,23 @@ fn spawn_turn(
     // Open the live feed *before* spawning, so it exists the moment this
     // function returns — a client that subscribes right after the launch/steer
     // HTTP call lands on the running turn instead of an immediate "end".
-    let mut control_rx = host.live().begin(session);
+    // Steerable: an interactive session's turn selects on this receiver
+    // (`run_turn`, below) and acts on a delivered `TurnControl::Steer`.
+    // `begin` also flushes any annotations queued while no turn was running
+    // for this session (e.g. between turns) now that the fresh control
+    // channel is up.
+    let mut control_rx = host.live().begin(
+        std::sync::Arc::clone(&host),
+        channel_ref.clone(),
+        session,
+        true,
+    );
     // Populate the live plane's workspace so `crate::live_bridge` can
     // re-anchor annotations against it; this is the one place a running
     // turn's workspace path is in hand at `begin` time.
     if let Some(live) = host.live_plane().get(session) {
         *live.workspace.lock().expect("live plane workspace lock") = Some(workspace.clone());
     }
-    // Flush any annotations queued while no turn was running for this
-    // session (e.g. between turns) now that the control channel is up.
-    crate::live_bridge::flush_pending(std::sync::Arc::clone(&host), channel_ref.clone(), session);
     tokio::spawn(async move {
         let outcome = run_turn(
             &workspace,
@@ -1964,18 +2004,24 @@ fn spawn_outcome_loop(
     agent: crate::agent::Agent,
 ) {
     tokio::spawn(async move {
-        let _control_rx = host.live().begin(session);
-        // Populate the live plane's workspace so `crate::live_bridge` can
-        // re-anchor annotations against it, and flush any queued while no
-        // turn was running for this session — same wiring as `spawn_turn`.
-        if let Some(live) = host.live_plane().get(session) {
-            *live.workspace.lock().expect("live plane workspace lock") = Some(workspace.clone());
-        }
-        crate::live_bridge::flush_pending(
+        // Not steerable (finding 2 of the Task 8 fix round): this loop
+        // drives its own inert control channel via `run_worker_turn`'s
+        // local `mpsc::channel`, never the receiver `begin` hands back
+        // here, so a real registered control sender would let `steer_live`
+        // report success for a steer nobody will ever act on. `begin` still
+        // does the live-plane/SSE bookkeeping (and flushes any pending
+        // annotations) — only the control channel itself is unsteerable.
+        let _control_rx = host.live().begin(
             std::sync::Arc::clone(&host),
             channel_ref.clone(),
             session,
+            false,
         );
+        // Populate the live plane's workspace so `crate::live_bridge` can
+        // re-anchor annotations against it.
+        if let Some(live) = host.live_plane().get(session) {
+            *live.workspace.lock().expect("live plane workspace lock") = Some(workspace.clone());
+        }
 
         // Prepare a PR branch the worker commits onto (the push-gate's
         // deliverable). Best-effort: without it, grading falls back to the
@@ -3192,11 +3238,12 @@ mod tests {
     #[test]
     fn live_registry_replays_buffer_and_tails() {
         let live = LiveSessions::default();
+        let host = crate::host::Host::fixed(vec![]);
         let session = EntryId::new();
         // No feed yet → no subscription.
         assert!(live.subscribe(session).is_none());
 
-        let _ = live.begin(session);
+        let _ = live.begin(std::sync::Arc::clone(&host), "c".into(), session, true);
         live.publish(session, LiveEvent::new("assistant", "first"));
         let (buffer, mut receiver) = live.subscribe(session).expect("feed is live");
         assert_eq!(buffer.len(), 1, "late joiner replays what already happened");
@@ -3219,8 +3266,9 @@ mod tests {
     #[test]
     fn segment_events_coalesce_in_the_replay_buffer() {
         let live = LiveSessions::default();
+        let host = crate::host::Host::fixed(vec![]);
         let session = EntryId::new();
-        let _rx = live.begin(session);
+        let _rx = live.begin(std::sync::Arc::clone(&host), "c".into(), session, true);
         // Two frames of the same growing segment (seq 1) keep only the latest.
         let frame1 = LiveEvent::segment("assistant", "hel", "<p>hel</p>", 1);
         let frame2 = LiveEvent::segment("assistant", "hello", "<p>hello</p>", 1);
@@ -3243,8 +3291,9 @@ mod tests {
     #[test]
     fn worktree_tap_gates_on_edit_and_write_tool_labels() {
         let live = LiveSessions::default();
+        let host = crate::host::Host::fixed(vec![]);
         let session = EntryId::new();
-        let _rx = live.begin(session);
+        let _rx = live.begin(std::sync::Arc::clone(&host), "c".into(), session, true);
         let plane = live.plane.get(session).expect("plane session began");
 
         // A non-tool event, and a tool event whose label is neither `Edit`
@@ -3269,8 +3318,9 @@ mod tests {
     #[test]
     fn finish_broadcasts_frame_end_to_connected_watchers() {
         let live = LiveSessions::default();
+        let host = crate::host::Host::fixed(vec![]);
         let session = EntryId::new();
-        let _rx = live.begin(session);
+        let _rx = live.begin(std::sync::Arc::clone(&host), "c".into(), session, true);
         let plane = live.plane.get(session).expect("plane session began");
         let mut watcher = plane.outbound.subscribe();
 
@@ -3281,15 +3331,16 @@ mod tests {
     #[test]
     fn begin_ends_a_stale_session_before_replacing_it() {
         let live = LiveSessions::default();
+        let host = crate::host::Host::fixed(vec![]);
         let session = EntryId::new();
-        let _rx1 = live.begin(session);
+        let _rx1 = live.begin(std::sync::Arc::clone(&host), "c".into(), session, true);
         let stale = live.plane.get(session).expect("plane session began");
         let mut stale_watcher = stale.outbound.subscribe();
 
         // Re-`begin` without an intervening `finish` (the prior turn's task
         // never got there — a panic, or a process restart mid-turn) must
         // still end the stale watcher's stream, exactly as `finish` would.
-        let _rx2 = live.begin(session);
+        let _rx2 = live.begin(std::sync::Arc::clone(&host), "c".into(), session, true);
         assert!(matches!(
             stale_watcher.try_recv(),
             Ok(junto_live::Frame::End)
@@ -3320,12 +3371,13 @@ mod tests {
     #[tokio::test]
     async fn control_channel_delivers_to_live_turn_and_errors_when_idle() {
         let live = LiveSessions::default();
+        let host = crate::host::Host::fixed(vec![]);
         let session = EntryId::new();
 
         // No feed yet → control reports NotLive.
         assert!(live.control(session, TurnControl::Interrupt).is_err());
 
-        let mut control_rx = live.begin(session);
+        let mut control_rx = live.begin(std::sync::Arc::clone(&host), "c".into(), session, true);
         live.control(session, TurnControl::Steer("focus on the parser".into()))
             .expect("delivered to the live turn");
         match control_rx.recv().await {
@@ -3336,6 +3388,24 @@ mod tests {
         // After finish, control is NotLive again.
         live.finish(session);
         assert!(live.control(session, TurnControl::Interrupt).is_err());
+    }
+
+    #[test]
+    fn non_steerable_feed_never_accepts_control() {
+        // The Outcome loop's autonomous turn (`spawn_outcome_loop`) drives
+        // itself with its own inert control channel and never reads the one
+        // `begin` hands back; `steerable: false` must make `control` report
+        // `NotLive` regardless, or a "successful" steer would silently go
+        // nowhere while `steer_live` still records a ledger note claiming
+        // it landed (finding 2 of the Task 8 fix round).
+        let live = LiveSessions::default();
+        let host = crate::host::Host::fixed(vec![]);
+        let session = EntryId::new();
+        let _rx = live.begin(std::sync::Arc::clone(&host), "c".into(), session, false);
+        assert!(
+            live.control(session, TurnControl::Interrupt).is_err(),
+            "a non-steerable feed must never accept a control signal"
+        );
     }
 
     #[test]

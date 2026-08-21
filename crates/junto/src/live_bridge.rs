@@ -9,17 +9,21 @@
 //!   it straight at the running turn's control channel via
 //!   [`crate::launch::steer_live`]. If no turn is currently running
 //!   ([`crate::launch::NotLive`]), the batch falls back onto
-//!   [`crate::live_plane::SessionLive::pending`] rather than being dropped —
-//!   a watcher's urgent comment must reach the agent *somehow*, even if not
-//!   this instant.
-//! - **Ordinary** annotations just join `pending`. They are flushed as one
-//!   batch at the next turn boundary by [`flush_pending`], called from
-//!   `crate::launch`'s `LiveSessions::begin` call sites (not from inside
-//!   `begin` itself — see that function's docs for why).
+//!   [`crate::live_plane::LivePlane`]'s pending queue rather than being
+//!   dropped — a watcher's urgent comment must reach the agent *somehow*,
+//!   even if not this instant.
+//! - **Ordinary** annotations just join the pending queue. They are flushed
+//!   as one batch at the next turn boundary by [`flush_pending`], wired
+//!   directly into `crate::launch`'s `LiveSessions::begin` so no future
+//!   caller can add a `begin` site that forgets it.
 //!
 //! Both paths converge on [`deliver_batch`], which renders and calls
-//! `steer_live`, falling back to `pending` on `NotLive` either way: nothing
-//! this module touches may ever be silently dropped.
+//! `steer_live`, falling back to the pending queue on `NotLive` either way:
+//! nothing this module touches may ever be silently dropped. The queue
+//! itself lives on `LivePlane` (keyed by session), not on the per-turn
+//! `SessionLive` — see that struct's `pending` field doc for why: a queue
+//! tied to `SessionLive`'s lifetime cannot survive the turn boundary it
+//! exists to cross.
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,11 +45,13 @@ use crate::launch::NotLive;
 /// The agent has no other view of the watcher's screen, so each block names
 /// **who** commented, **where** (the pinned `path:span`, plus where that
 /// span sits now if it moved), quotes the **pinned excerpt** if the
-/// annotation carried one — it travels with the comment because the current
-/// file content may no longer match what the watcher was actually looking
-/// at — and then the comment body itself. An `Orphaned` re-anchor says so
-/// plainly rather than pointing at a line range that no longer corresponds
-/// to anything the watcher commented on.
+/// annotation carried one — it travels with the comment, every line of it
+/// prefixed so a multi-line span (the normal case: a `CodeAnchor` pins a
+/// line *range*) reads as one quoted block rather than bleeding into the
+/// comment that follows — because the current file content may no longer
+/// match what the watcher was actually looking at. An `Orphaned` re-anchor
+/// says so plainly rather than pointing at a line range that no longer
+/// corresponds to anything the watcher commented on.
 pub(crate) fn format_steer(annotations: &[Annotation], reanchored: &[Option<Reanchor>]) -> String {
     let mut out = String::new();
     for (i, annotation) in annotations.iter().enumerate() {
@@ -81,9 +87,15 @@ pub(crate) fn format_steer(annotations: &[Annotation], reanchored: &[Option<Rean
             annotation.author.email
         ));
         if let Some(excerpt) = &annotation.excerpt {
-            out.push_str("> ");
-            out.push_str(excerpt);
-            out.push('\n');
+            // Every line quoted, not just the first: a `CodeAnchor`'s span
+            // is a line *range* (the excerpt is normally multi-line), and
+            // an unmarked line reads to the model as the start of the
+            // comment body rather than still-quoted code.
+            for line in excerpt.lines() {
+                out.push_str("> ");
+                out.push_str(line);
+                out.push('\n');
+            }
         }
         out.push_str(&annotation.body);
         out.push('\n');
@@ -115,112 +127,114 @@ async fn reanchor_batch(
     out
 }
 
-/// Render `annotations` and steer the running turn with them, falling back
-/// to `pending` if no turn is currently running. Shared by [`deliver`]'s
-/// urgent path and [`flush_pending`]'s boundary flush — the only difference
-/// between the two callers is *when* this runs, not what it does.
+/// Render `annotations` and steer the running turn with them, requeuing the
+/// whole batch onto [`crate::live_plane::LivePlane`]'s pending queue if
+/// delivery can't land right now — a channel that fails to resolve, or a
+/// `steer_live` call that reports [`NotLive`] (no turn currently running).
+/// Shared by [`deliver`]'s urgent path and [`flush_pending`]'s boundary
+/// flush — the only difference between the two callers is *when* this runs,
+/// not what it does.
+///
+/// Deliberately does **not** require a live [`crate::live_plane::SessionLive`]
+/// to proceed or to requeue: the pending queue lives on `LivePlane` itself,
+/// independent of whether a `SessionLive` is currently registered for
+/// `session` (it may have ended between validation and this call, or the
+/// turn this batch was meant for may already have finished within the
+/// flush delay) — there is always somewhere to put the batch back.
 async fn deliver_batch(
     host: Arc<Host>,
     channel: String,
     session: EntryId,
     annotations: Vec<Annotation>,
 ) {
-    let Some(live) = host.live_plane().get(session) else {
-        // The session ended between validation and this call — nothing left
-        // to append to or steer; not an error (`crate::live_plane` module
-        // docs: the never-block invariant).
+    // An empty batch is a no-op, not an error — the private helper in the
+    // one module whose contract is that nothing here may panic the session
+    // guards its own invariant rather than trusting every call site to.
+    let Some(first) = annotations.first() else {
         return;
     };
     // Resolved the same way `web.rs`'s `steer_session` handler resolves its
     // `channel` path param before calling `steer_live`.
     let Ok(Resolution::Resolved { id, .. }) = host.resolve(&channel).await else {
-        live.pending
-            .lock()
-            .expect("live plane pending-annotations lock")
-            .extend(annotations);
+        host.live_plane().queue_pending(session, annotations);
         return;
     };
-    let workspace = live
-        .workspace
-        .lock()
-        .expect("live plane workspace lock")
-        .clone();
+    // Best-effort: `None` (no `SessionLive`, or no workspace recorded on it
+    // yet) just means `reanchor_batch` renders every anchor pinned-only —
+    // never a reason to withhold the comment itself.
+    let workspace = host.live_plane().get(session).and_then(|live| {
+        live.workspace
+            .lock()
+            .expect("live plane workspace lock")
+            .clone()
+    });
     let reanchored = reanchor_batch(workspace.as_deref(), &annotations).await;
     let message = format_steer(&annotations, &reanchored);
     // The batch becomes one steer message, so the ledger's steer note
     // records a single author: the first annotation's, in batch order.
-    let steered_by = annotations[0].author.clone();
+    let steered_by = first.author.clone();
     if let Err(NotLive) =
         crate::launch::steer_live(Arc::clone(&host), id, channel, session, steered_by, message)
             .await
     {
-        live.pending
-            .lock()
-            .expect("live plane pending-annotations lock")
-            .extend(annotations);
+        host.live_plane().queue_pending(session, annotations);
     }
 }
 
 /// Hand newly validated watcher `annotations` for `session` (in `channel`) to
 /// the steering bridge.
 ///
-/// Splits the batch on [`Annotation::urgent`]: ordinary annotations join
-/// `pending` for the next turn-boundary flush ([`flush_pending`]); urgent
-/// ones are delivered immediately via [`deliver_batch`], which itself falls
-/// back to `pending` if no turn is currently running. Fire-and-forget, like
-/// every other live-plane tap (`crate::live_plane` module docs: the
-/// never-block invariant) — a session that ended between validation and this
-/// call is not an error, just nothing left to append to.
+/// Splits the batch on [`Annotation::urgent`]. Urgent annotations are
+/// attempted (and, on failure, requeued) via [`deliver_batch`] **first**,
+/// before ordinary ones join the pending queue — so a requeued urgent batch
+/// keeps priority ahead of same-frame ordinary annotations in the next
+/// flush, rather than an ordinary annotation queued first pushing an urgent
+/// one to the back. Fire-and-forget, like every other live-plane tap
+/// (`crate::live_plane` module docs: the never-block invariant).
 pub(crate) async fn deliver(
     host: Arc<Host>,
     channel: String,
     session: EntryId,
     annotations: Vec<Annotation>,
 ) {
-    let Some(live) = host.live_plane().get(session) else {
-        return;
-    };
     let (urgent, ordinary): (Vec<Annotation>, Vec<Annotation>) =
         annotations.into_iter().partition(|a| a.urgent);
-    if !ordinary.is_empty() {
-        live.pending
-            .lock()
-            .expect("live plane pending-annotations lock")
-            .extend(ordinary);
-    }
     if !urgent.is_empty() {
-        deliver_batch(host, channel, session, urgent).await;
+        deliver_batch(Arc::clone(&host), channel.clone(), session, urgent).await;
+    }
+    if !ordinary.is_empty() {
+        host.live_plane().queue_pending(session, ordinary);
     }
 }
 
-/// Drain `session`'s pending annotation queue at a turn boundary and, if it
-/// carried anything, deliver the whole batch as one steer message.
+/// Check `session`'s pending queue at a turn boundary and, if it carries
+/// anything, spawn a delayed delivery of the whole batch as one steer
+/// message.
 ///
-/// Called from `crate::launch`'s `LiveSessions::begin` call sites right
-/// after `begin` — not wired into `begin` itself, because `begin` is also
-/// exercised directly by unit tests that construct a bare `LiveSessions`
-/// with no [`Host`] to resolve a channel against; the host-needing flush
-/// lives at the call sites that already hold a `Host` and `channel_ref`.
+/// Called from inside `crate::launch`'s `LiveSessions::begin` itself (not
+/// left to each call site): a queued annotation must survive exactly the
+/// turn boundary `begin` represents, so the flush is part of what `begin`
+/// *means*, not an extra step a future caller could add a `begin` site
+/// without.
 ///
-/// Spawns a task that waits 2s before delivering: `begin`'s control
-/// receiver has to actually be selected on by the fresh turn loop before a
-/// steer lands on it, the same margin `steer_live` implicitly relies on when
-/// called well after a turn is confirmed running.
+/// Only peeks (`LivePlane::has_pending`) before deciding whether to spawn —
+/// the actual drain (`LivePlane::take_pending`) happens inside the spawned
+/// task, *after* the delay, so a batch is never held outside the shared
+/// queue (and thus unreachable if anything fails) while waiting out the
+/// delay. The 2s delay itself lets the turn's control receiver — `begin`'s
+/// own return value — actually get selected on by the fresh turn loop
+/// before a steer lands on it, the same margin `steer_live` implicitly
+/// relies on when called well after a turn is confirmed running.
 pub(crate) fn flush_pending(host: Arc<Host>, channel: String, session: EntryId) {
-    let Some(live) = host.live_plane().get(session) else {
-        return;
-    };
-    let batch = std::mem::take(
-        &mut *live
-            .pending
-            .lock()
-            .expect("live plane pending-annotations lock"),
-    );
-    if batch.is_empty() {
+    if !host.live_plane().has_pending(session) {
         return;
     }
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(2)).await;
+        let batch = host.live_plane().take_pending(session);
+        if batch.is_empty() {
+            return;
+        }
         deliver_batch(host, channel, session, batch).await;
     });
 }
@@ -292,6 +306,20 @@ mod tests {
     }
 
     #[test]
+    fn exact_reanchor_renders_without_a_qualifier() {
+        let ann = code_annotation("dan@x.com", "src/foo.rs", 5, 5, None, "still true");
+        let out = format_steer(
+            &[ann],
+            &[Some(Reanchor::Exact {
+                span: Span::new(5, 5).unwrap(),
+            })],
+        );
+        assert!(out.contains("src/foo.rs:5-5"));
+        assert!(!out.contains("moved to"));
+        assert!(!out.contains("changed since"));
+    }
+
+    #[test]
     fn batch_concatenates_in_order() {
         let a = code_annotation("a@x.com", "a.rs", 1, 1, None, "first");
         let b = code_annotation("b@x.com", "b.rs", 2, 2, None, "second");
@@ -304,6 +332,23 @@ mod tests {
         let ann = code_annotation("a@x.com", "a.rs", 1, 1, None, "no excerpt here");
         let out = format_steer(&[ann], &[None]);
         assert!(!out.contains('>'));
+    }
+
+    #[test]
+    fn multiline_excerpt_quotes_every_line() {
+        let ann = code_annotation(
+            "a@x.com",
+            "a.rs",
+            1,
+            2,
+            Some("let x = 1;\nlet y = 2;"),
+            "both wrong",
+        );
+        let out = format_steer(&[ann], &[None]);
+        assert!(
+            out.contains("> let x = 1;\n> let y = 2;\n"),
+            "every excerpt line must carry its own quote marker: {out}"
+        );
     }
 
     #[test]
@@ -324,5 +369,69 @@ mod tests {
         };
         let out = format_steer(&[ann], &[None]);
         assert!(out.contains("on conversation event 12@7"));
+    }
+
+    /// A fresh test host: a temp git repo (git user `Dan <dan@x.com>`) and a
+    /// channel opened by that user — enough for `host.resolve` to succeed in
+    /// `deliver_batch`, with no `LiveSessions` feed registered at all, so
+    /// `steer_live` reports `NotLive`. Returns the host, the channel's
+    /// resolvable ref (its id, as a string), and the temp dirs — kept alive
+    /// by the caller for the fixture's lifetime, same convention as
+    /// `live_ws.rs`'s `fixture`.
+    async fn host_with_channel() -> (Arc<Host>, String, tempfile::TempDir, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(dir.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        for (key, value) in [("user.name", "Dan"), ("user.email", "dan@x.com")] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(["config", key, value])
+                    .current_dir(dir.path())
+                    .status()
+                    .expect("git config")
+                    .success()
+            );
+        }
+        let member_home = tempfile::tempdir().expect("member home");
+        let host = Host::fixed_with_member_home(
+            vec![dir.path().to_path_buf()],
+            Some(member_home.path().to_path_buf()),
+        );
+        let founder = Member::human("Dan", "dan@x.com");
+        let opened = host
+            .open_channel(None, "live-bridge-test", founder, None)
+            .await
+            .expect("open channel");
+        (host, opened.id.to_string(), dir, member_home)
+    }
+
+    #[tokio::test]
+    async fn not_live_urgent_delivery_requeues_the_batch() {
+        let (host, channel_ref, _dir, _member_home) = host_with_channel().await;
+        let session = EntryId::new();
+        // A `SessionLive` exists (so re-anchoring/workspace lookups have
+        // somewhere to look) but no `LiveSessions` feed was ever begun for
+        // it, so `steer_live` must report `NotLive`.
+        host.live_plane().begin(session);
+
+        let mut annotation = code_annotation("dan@x.com", "src/foo.rs", 1, 1, None, "please look");
+        annotation.urgent = true;
+        let id = annotation.id;
+
+        deliver(Arc::clone(&host), channel_ref, session, vec![annotation]).await;
+
+        let requeued = host.live_plane().take_pending(session);
+        assert_eq!(
+            requeued.len(),
+            1,
+            "the undelivered batch must land back on the pending queue"
+        );
+        assert_eq!(requeued[0].id, id);
     }
 }

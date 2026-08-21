@@ -305,13 +305,23 @@ impl Connection {
                             Ok(()) => {
                                 let _ = self.live.outbound.send(Frame::update(&bytes));
                                 if !annotations.is_empty() {
-                                    crate::live_bridge::deliver(
+                                    // Spawned, not awaited: `deliver` does a
+                                    // git shell-out (re-anchoring) plus a
+                                    // ledger append (the steer note) before
+                                    // it returns, and awaiting it inline here
+                                    // would stall this connection's read loop
+                                    // — and thus its `outbound` broadcast
+                                    // receiver, capacity 256 — for exactly as
+                                    // long, a direct hit on the never-block
+                                    // invariant (`crate::live_plane` module
+                                    // docs) landing on the *watcher*, not the
+                                    // session loop.
+                                    tokio::spawn(crate::live_bridge::deliver(
                                         Arc::clone(&self.host),
                                         self.channel.clone(),
                                         self.session,
                                         annotations,
-                                    )
-                                    .await;
+                                    ));
                                 }
                                 true
                             }
@@ -586,7 +596,9 @@ mod tests {
         // also opens the session's control channel, so tests can hold
         // `control_rx` and assert an urgent annotation reaches it as a
         // `TurnControl::Steer` (`crate::live_bridge`'s delivery test).
-        let control_rx = host.live().begin(session);
+        let control_rx = host
+            .live()
+            .begin(Arc::clone(&host), channel.to_string(), session, true);
         let live = host
             .live_plane()
             .get(session)
@@ -901,6 +913,92 @@ mod tests {
             crate::launch::TurnControl::Steer(message) => {
                 assert!(
                     message.contains("off by one"),
+                    "steer message missing the annotation body: {message}"
+                );
+            }
+            other => panic!("expected a Steer control signal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_annotation_survives_the_turn_boundary_and_is_delivered_next_begin() {
+        // Finding 1 of the Task 8 fix round: a pending queue owned by
+        // `SessionLive` cannot cross the turn boundary it exists to
+        // cross, because `finish` drops that `SessionLive` and the next
+        // `begin` recreates it empty. This must fail against that design
+        // and pass once the queue lives on `LivePlane`, independent of
+        // `SessionLive`'s per-turn lifecycle.
+        let (host, channel, session, signing_key, _dir, _member_home, _control_rx1) =
+            fixture().await;
+        let addr = serve_router(host.clone()).await;
+
+        let url = format!("ws://{addr}/channels/{channel}/sessions/{session}/live");
+        let (mut ws, _response) = tokio_tungstenite::connect_async(url)
+            .await
+            .expect("connect");
+
+        let nonce = match recv_until(&mut ws, |f| matches!(f, Frame::Challenge { .. })).await {
+            Frame::Challenge { nonce } => nonce,
+            _ => unreachable!(),
+        };
+        let signature = signing_key.sign_bytes(nonce.as_bytes());
+        send_frame(
+            &mut ws,
+            &Frame::Auth {
+                email: "dan@x.com".to_string(),
+                signature: signature.into(),
+            },
+        )
+        .await;
+        assert_eq!(
+            recv_until(&mut ws, |f| matches!(
+                f,
+                Frame::AuthOk | Frame::Rejected { .. }
+            ))
+            .await,
+            Frame::AuthOk
+        );
+        recv_until(&mut ws, |f| matches!(f, Frame::Update { .. })).await; // the snapshot
+
+        // Ordinary (non-urgent) — must queue, not deliver immediately.
+        let mut annotation = test_annotation("dan@x.com", "please add a doc comment");
+        annotation.sign(&signing_key).expect("sign");
+        let local = LiveDoc::new();
+        local.insert_annotation(&annotation).expect("insert");
+        send_frame(&mut ws, &Frame::update(&local.export_snapshot())).await;
+
+        // Wait for it to land in the real document (same pattern as the
+        // existing acceptance test).
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(live) = host.live_plane().get(session)
+                    && live.doc.annotations().len() == 1
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the accepted annotation lands in the real document");
+
+        drop(ws);
+
+        // Simulate the turn ending, then the next turn beginning — this is
+        // exactly the boundary the annotation must survive.
+        host.live().finish(session);
+        let mut control_rx2 = host
+            .live()
+            .begin(host.clone(), channel.to_string(), session, true);
+
+        let signal = tokio::time::timeout(Duration::from_secs(5), control_rx2.recv())
+            .await
+            .expect("a control signal arrives before the timeout")
+            .expect("the control channel is still open");
+        match signal {
+            crate::launch::TurnControl::Steer(message) => {
+                assert!(
+                    message.contains("please add a doc comment"),
                     "steer message missing the annotation body: {message}"
                 );
             }

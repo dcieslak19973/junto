@@ -1,4 +1,4 @@
-﻿//! The host's web routes — the first human surface.
+//! The host's web routes — the first human surface.
 //!
 //! Three GET endpoints over the same projection (`docs/adr/0013`, `0015`):
 //! - `/` — the channel index: every channel across every registered home
@@ -2286,7 +2286,10 @@ mod tests {
 
         // With a live feed (receiver kept alive), the interrupt is delivered
         // and the card redirects.
-        let _rx = fx.host.live().begin(fx.target);
+        let _rx = fx
+            .host
+            .live()
+            .begin(fx.host.clone(), "web-test".into(), fx.target, true);
         let live = interrupt_session(
             State(fx.host.clone()),
             Path(("web-test".into(), fx.target.to_string())),
