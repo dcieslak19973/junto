@@ -1324,7 +1324,14 @@ fn store_artifact(
 /// `store_artifact` only writes text, so the binary snapshot is hex-encoded
 /// first — the durable ledger never carries CRDT bytes verbatim, only their
 /// provenance-tracked artifact.
-async fn archive_live_snapshot(
+/// `pub(crate)` (not private) so `crate::live_ws`'s end-to-end smoke test
+/// (Task 11 of the live-session-plane plan) can archive a real finished
+/// session the same way `spawn_turn`/`capture_turn` do — this is the only
+/// path that proves the archived artifact is genuinely re-importable and
+/// that the durable `ArtifactAttached` ledger entry actually lands, not a
+/// hand-rolled substitute. Crate-internal only: do not re-tighten this back
+/// to private without moving or duplicating that test.
+pub(crate) async fn archive_live_snapshot(
     host: &Host,
     channel_ref: &str,
     channel: ChannelId,

@@ -443,8 +443,8 @@ mod tests {
 
     use futures_util::{SinkExt, StreamExt};
     use junto_kernel::{
-        Anchor, Annotation, AnnotationId, CodeAnchor, CommitOid, ContentDigest, Member, Span,
-        Timestamp,
+        Anchor, Annotation, AnnotationId, CodeAnchor, CommitOid, ContentDigest, EntryPayload,
+        Member, Span, Timestamp,
     };
     use junto_live::LiveDoc;
     use tokio_tungstenite::tungstenite::Message as ClientMessage;
@@ -1010,5 +1010,264 @@ mod tests {
             }
             other => panic!("expected a Steer control signal, got {other:?}"),
         }
+    }
+
+    /// Task 11 of the live-session-plane plan: the whole loop proved in one
+    /// run, not just its parts in isolation. Points 1-4 are already covered
+    /// by `watcher_authenticates_receives_snapshot_and_posts_annotation` and
+    /// `urgent_annotation_steers_the_running_turn_immediately`, and a
+    /// broadcast-fan-out variant of point 5 by
+    /// `a_second_watcher_observes_the_first_watchers_accepted_annotation` —
+    /// this test still exercises 1-4 itself so the six points are provably
+    /// causally chained in a single session, and adds the two pieces no
+    /// existing test covers: a watcher joining *after* the annotation
+    /// exists (point 5, distinct from that fan-out test, which connects
+    /// before the write and only ever observes it via the outbound
+    /// broadcast) and `finish`'s durable archive (point 6 — `Frame::End` on
+    /// every socket, plus a re-importable, ledger-anchored artifact). Each
+    /// assertion below is labelled with the point of the loop it proves.
+    #[tokio::test]
+    async fn end_to_end_live_session_smoke() {
+        // Isolates `archive_live_snapshot`'s `JUNTO_HOME`-rooted artifact
+        // store from the real `~/.junto` — distinct from `fixture`'s own
+        // `member_home` tempdir, which only backs signing keys.
+        let home = crate::host::test_home::HomeGuard::new();
+        let (host, channel, session, signing_key, dir, _member_home, mut control_rx) =
+            fixture().await;
+        let addr = serve_router(host.clone()).await;
+        let url = format!("ws://{addr}/channels/{channel}/sessions/{session}/live");
+
+        async fn authenticate(ws: &mut ClientSocket, signing_key: &junto_kernel::SigningKey) {
+            let nonce = match recv_until(ws, |f| matches!(f, Frame::Challenge { .. })).await {
+                Frame::Challenge { nonce } => nonce,
+                _ => unreachable!(),
+            };
+            let signature = signing_key.sign_bytes(nonce.as_bytes());
+            send_frame(
+                ws,
+                &Frame::Auth {
+                    email: "dan@x.com".to_string(),
+                    signature: signature.into(),
+                },
+            )
+            .await;
+            assert_eq!(
+                recv_until(ws, |f| matches!(f, Frame::AuthOk | Frame::Rejected { .. })).await,
+                Frame::AuthOk,
+                "a correctly signed nonce must authenticate"
+            );
+        }
+
+        // --- Points 1-2: host is up, channel + keyed member + session +
+        // one conversation event exist (fixture()); a watcher connects,
+        // authenticates, and imports the snapshot, seeing that event. ---
+        let (mut watcher1, _r1) = tokio_tungstenite::connect_async(url.clone())
+            .await
+            .expect("connect watcher1");
+        authenticate(&mut watcher1, &signing_key).await;
+        let snapshot1 = recv_until(&mut watcher1, |f| matches!(f, Frame::Update { .. })).await;
+        let local1 = LiveDoc::new();
+        local1
+            .import_update(&snapshot1.update_bytes().expect("update payload"))
+            .expect("import snapshot");
+        assert_eq!(
+            local1.conversation_len(),
+            1,
+            "point 2: the first watcher's snapshot must carry the one conversation \
+             event published before it connected"
+        );
+
+        // --- Point 3: the watcher inserts a signed urgent annotation and
+        // sends the update. ---
+        let mut annotation = test_annotation("dan@x.com", "please double-check the bounds check");
+        annotation.urgent = true;
+        annotation.sign(&signing_key).expect("sign annotation");
+        local1
+            .insert_annotation(&annotation)
+            .expect("insert locally");
+        send_frame(&mut watcher1, &Frame::update(&local1.export_snapshot())).await;
+
+        // --- Point 4a: the server document converges. ---
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(live) = host.live_plane().get(session)
+                    && live.doc.annotations().len() == 1
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect(
+            "point 4a: the accepted urgent annotation must land in the real \
+             server document within 5s",
+        );
+        assert_eq!(
+            host.live_plane().get(session).unwrap().doc.annotations()[0].body,
+            "please double-check the bounds check",
+            "point 4a: the server document must carry the exact annotation body"
+        );
+
+        // --- Point 4b: the running turn's control channel receives a Steer
+        // signal carrying the annotation body. ---
+        let signal = tokio::time::timeout(Duration::from_secs(5), control_rx.recv())
+            .await
+            .expect("point 4b: a control signal must arrive before the timeout")
+            .expect("point 4b: the control channel must still be open");
+        match signal {
+            crate::launch::TurnControl::Steer(message) => {
+                assert!(
+                    message.contains("please double-check the bounds check"),
+                    "point 4b: the Steer message must carry the annotation body, got: {message}"
+                );
+            }
+            other => panic!("point 4b: expected a Steer control signal, got {other:?}"),
+        }
+
+        // --- Point 5: a SECOND watcher connects after the annotation
+        // already exists and must receive it in its own initial snapshot —
+        // deliberately distinct from
+        // `a_second_watcher_observes_the_first_watchers_accepted_annotation`,
+        // which connects before the write and only ever sees it via the
+        // later outbound-broadcast fan-out. ---
+        let (mut watcher2, _r2) = tokio_tungstenite::connect_async(url.clone())
+            .await
+            .expect("connect watcher2");
+        authenticate(&mut watcher2, &signing_key).await;
+        let snapshot2 = recv_until(&mut watcher2, |f| matches!(f, Frame::Update { .. })).await;
+        let local2 = LiveDoc::new();
+        local2
+            .import_update(&snapshot2.update_bytes().expect("update payload"))
+            .expect("import second watcher's snapshot");
+        assert_eq!(
+            local2.conversation_len(),
+            1,
+            "point 5: the second watcher's initial snapshot must still carry \
+             the one conversation event"
+        );
+        assert_eq!(
+            local2
+                .annotations()
+                .iter()
+                .find(|a| a.id == annotation.id)
+                .map(|a| a.body.clone()),
+            Some("please double-check the bounds check".to_string()),
+            "point 5: a watcher connecting after the annotation was accepted \
+             must receive it in its own snapshot, not only via later fan-out"
+        );
+
+        // --- Point 6: finishing the session ends every socket with
+        // Frame::End and archives a re-importable, ledger-anchored
+        // artifact. ---
+        let final_snapshot = host
+            .live()
+            .finish(session)
+            .expect("point 6: finish must return the session's final snapshot bytes");
+
+        assert_eq!(
+            recv_until(&mut watcher1, |f| matches!(f, Frame::End)).await,
+            Frame::End,
+            "point 6: the first watcher must receive Frame::End"
+        );
+        assert_eq!(
+            recv_until(&mut watcher2, |f| matches!(f, Frame::End)).await,
+            Frame::End,
+            "point 6: the second watcher must receive Frame::End"
+        );
+
+        let agent = crate::agent::Agent {
+            slug: "claude".into(),
+            name: "Claude".into(),
+            harness: "claude".into(),
+            email: "claude@junto.local".into(),
+            role: None,
+            model: None,
+            mcp_servers: Vec::new(),
+            skills: Vec::new(),
+            plugins: Vec::new(),
+        };
+        crate::launch::archive_live_snapshot(
+            &host,
+            &channel.to_string(),
+            channel,
+            session,
+            &agent,
+            "turn-1-live.loro",
+            &final_snapshot,
+        )
+        .await
+        .expect("point 6: archiving the finished session's snapshot must succeed");
+
+        let archived_hex = std::fs::read_to_string(
+            home.path()
+                .join("artifacts")
+                .join(session.to_string())
+                .join("turn-1-live.loro"),
+        )
+        .expect(
+            "point 6: the archived turn-1-live.loro artifact must exist under \
+             the session's artifact dir",
+        );
+        let archived_bytes: Vec<u8> = (0..archived_hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&archived_hex[i..i + 2], 16).expect("valid hex byte"))
+            .collect();
+        let replay = LiveDoc::new();
+        replay
+            .import_update(&archived_bytes)
+            .expect("point 6: the archived artifact must re-import as a valid LiveDoc update");
+        assert_eq!(
+            replay.conversation_len(),
+            1,
+            "point 6: the re-imported archive must still carry the one \
+             conversation event"
+        );
+        assert_eq!(
+            replay
+                .annotations()
+                .iter()
+                .find(|a| a.id == annotation.id)
+                .map(|a| a.body.clone()),
+            Some("please double-check the bounds check".to_string()),
+            "point 6: the re-imported archive must still carry the urgent annotation"
+        );
+
+        // The artifact alone is not proof it is part of the durable
+        // record — the `ArtifactAttached` ledger entry is what anchors it.
+        let ledger = host.ledger_for(dir.path()).await.expect("ledger_for");
+        let view = ledger
+            .lock()
+            .await
+            .project(&channel)
+            .await
+            .expect("project channel");
+        let recorded = view
+            .entries
+            .iter()
+            .find_map(|e| match &e.payload {
+                EntryPayload::ArtifactAttached {
+                    target,
+                    kind,
+                    provenance,
+                    ..
+                } if *target == session && kind == "live-snapshot" => Some(provenance.clone()),
+                _ => None,
+            })
+            .expect(
+                "point 6: an ArtifactAttached entry for this session's \
+                 live-snapshot must be in the ledger",
+            );
+        assert_eq!(
+            recorded.len(),
+            1,
+            "point 6: the ArtifactAttached entry must carry exactly one provenance ref"
+        );
+        assert!(
+            recorded[0].uri.as_str().ends_with("turn-1-live.loro"),
+            "point 6: the recorded provenance must point at the archived \
+             artifact, got: {:?}",
+            recorded[0].uri
+        );
     }
 }
