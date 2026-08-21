@@ -1,15 +1,17 @@
 # Competitive & ecosystem landscape
 
-> Snapshot: **2026-06-13.** This is a record of **bets and tradeoffs, not a
-> claim of superiority** — where comparisons appear, they name where the other
-> approach is *genuinely better* too. Covers two reference points junto keeps
-> bumping into: **Ace** (the integrated rival from the "Zero Alignment" essay)
-> and **Kun Chen's toolkit** (the composable agent-native-CLI school). Re-read
+> Snapshot: **2026-06-13**; Zed Delta/DeltaDB section added **2026-08-20**.
+> This is a record of **bets and tradeoffs, not a claim of superiority** —
+> where comparisons appear, they name where the other approach is *genuinely
+> better* too. Covers three reference points junto keeps bumping into:
+> **Ace** (the integrated rival from the "Zero Alignment" essay), **Kun
+> Chen's toolkit** (the composable agent-native-CLI school), and **Zed's
+> Delta/DeltaDB** (the replicated-multiplayer school). Re-read
 > [`junto.md`](junto.md) for the thesis these are measured against.
 
 ## TL;DR — where junto sits
 
-Two schools are forming around "humans + agents do real work":
+Three schools are forming around "humans + agents do real work":
 
 - **Integrated platforms** — one hosted product (Ace): sessions, shared docs,
   microVMs, governance, an MCP surface. Bet: own the whole surface.
@@ -17,6 +19,9 @@ Two schools are forming around "humans + agents do real work":
   agent invokes (Kun Chen: worktrees, gates, evals, HTML review, orchestration),
   unified only by a token-efficiency *design standard* (AXI). Bet: Unix, for
   agents.
+- **Replicated multiplayer environments** — Delta/DeltaDB (Zed): the
+  conversation and the worktree CRDT-replicated together in real time, review
+  anchored in place as code evolves. Bet: liveness + anchoring beat ceremony.
 
 **junto is an integrated *governed* surface with a verified record** — closer to
 Ace in shape, but its differentiator is the **provenance-bound, append-only
@@ -182,6 +187,251 @@ agent write surface (ADR 0012). Honest read:
 
 ---
 
+## Zed — Delta & DeltaDB (assessed 2026-08-20) — the fluidity rival
+
+The Zed team's second act: **DeltaDB**
+([announced 2026-06-11](https://zed.dev/blog/introducing-deltadb)), "version
+control built for the conversation," and **Delta**
+([announced 2026-08-12](https://zed.dev/blog/introducing-delta)), a
+multiplayer environment for coding with agents built on it. Private beta,
+proprietary, their cloud. This is the closest thing to junto anyone has
+shipped — closer than Ace — and it is also the strongest counter-evidence yet
+against one junto bet (the reopening, below).
+
+**What DeltaDB is (evidence from the posts).**
+
+- Versions the work *between* commits: every operation is a **delta with a
+  stable identity**; the worktree and the conversation driving it are
+  replicated together, in real time, for everyone in a thread.
+- **CRDT-replicated worktrees**: many people and agents edit the same files
+  at once across machines; the files are real (agents work in them through a
+  terminal; the worktree mounts to disk on demand).
+- **References anchor to deltas, not line numbers**, so they survive as code
+  moves: from a conversation line, jump to that code as it stands now or as
+  it stood then; from a code line, find every conversation that touched it.
+- **Coexists with git**: captured between commits; commit and push as
+  always; teammates who never open Delta see a normal repo. (The same
+  "don't replace the forge" posture as `refs/junto/*`.)
+
+**What Delta adds.** The conversation is a document: cursor anywhere,
+span-anchored comments on anything (a diff line, a plan step, a thinking
+block), replicated in place for everyone as the code evolves. Join mid-work
+without commit/push. Cloud runners; the same Rust app compiled to
+wasm/WebGL for zero-install browser sharing; and third-party harness sync —
+a Claude Code terminal session syncs live into a shareable Delta thread.
+Notably absent from all the material: gates, verification standing, rubrics,
+workflow-generality. Review is conversational, not governed.
+
+**From the memory corpus (graphiti `agent_harness_research` /
+`agent_eval_research` / `agent_infra_research`, episodes of 2026-08-20) —
+hands-on and verified detail beyond the blogs:**
+
+- An early-access hands-on (third-party demo video) reports Delta is
+  **BYO-model and harness-pragmatic under the hood** — OpenCode as an agent
+  backend, keys via Anthropic/OpenAI/OpenRouter/Baseten, Sonnet 5.6 —
+  i.e. Delta itself is harness/model-neutral at the seam junto standardized
+  with ACP (a Zed-originated protocol).
+- The Zed team dogfoods it as **same-worktree, threads-instead-of-PRs**
+  collaboration — the live shape of the workflow, not just marketing.
+- The eval-research read: DeltaDB's delta-level identity enables precise
+  attribution, SZZ-style analysis, and plan-adherence measurement, but
+  **"adds granularity and offers no gating or scoring"** — independent
+  corroboration that the verification layer is junto's unclaimed ground.
+
+### Where it collides with junto's settled bets
+
+| junto (settled) | Delta/DeltaDB |
+|---|---|
+| **No CRDT** (hard constraint #3); record = append-only entries, union-merge sync ([ADR 0011](adr/0011-sync-is-push-fetch-plus-convergent-union-merge.md)) | CRDT-replicated worktree + conversation are the core abstraction |
+| Record holds **ratified intent**, state-not-history; auto-captured rationale is "worse than no record" (`junto.md`) | The **full conversation is the source artifact** — auto-captured, exhaustively versioned |
+| Pluggable substrate, forge-as-hub, MIT, local host | One proprietary DB + their cloud + their client |
+| Workflow-general — coding is one Playbook | Code-centric |
+
+The scope note that matters: ADR 0011's no-CRDT argument is about the
+**durable record** — entries are immutable, so set union *is* the merge and
+CRDT machinery has no job there. DeltaDB's CRDT lives in a plane junto
+deliberately does not have: **live, in-flight working state**. The bets
+collide only if junto builds that plane the same way; they do not collide
+over the record.
+
+### Decomposing the fluidity
+
+The screencast fluidity has four separable causes — only one requires CRDT:
+
+1. **Span-anchored, zero-ceremony comments everywhere** — needs anchors and
+   fast rendering, not CRDT.
+2. **Code ↔ conversation links that survive motion** — needs *stable
+   reference identity*, not CRDT. Git-native approximations exist
+   (commit + blob digest + hunk, re-anchored across commits the way blame
+   already is).
+3. **Join without commit/push** — needs replication of in-flight state.
+   Zed's answer is CRDT; a **single-writer stream with live viewers** (one
+   Session owns its worktree, everyone else watches and comments) delivers
+   the felt experience for the dominant case — and most of what the Delta
+   videos actually show *is* that case: an agent writes while humans comment
+   and steer.
+4. **True multi-writer co-editing** — the only part that genuinely requires
+   CRDT, and the part junto's diagnosis (alignment is async/social, not
+   co-presence) bets is not the bottleneck.
+
+### Concepts to borrow (ranked)
+
+- **★ Code→record back-links ("decision blame") — strongest fit.** From any
+  file/line, surface the ledger entries and Sessions that touched it. This
+  is junto's lead job — *your repo remembers why* — wearing Delta's best UI.
+  Buildable today as a **projection over existing provenance** (entries →
+  artifacts → paths, reverse-indexed); touches no constraint. Delta had to
+  build a database to get this; junto already has the data.
+- **★ Span-anchored, low-ceremony annotation.** Lands exactly on the parked
+  collaborative-space (ledger `b405a1cb`), whose recorded load-bearing
+  constraint — an append-only versioned artifact evolving through the loop,
+  turn-based — remains compatible: comments are annotations/messages; only
+  ratified outcomes fold into entries. Delta proves the UX ceiling worth
+  aiming at.
+- **★ Anchor durability.** Adopt the *idea* of delta-stable references via
+  git-native content addressing: provenance today pins frozen digests
+  ("what it was"); add re-anchoring ("where it is now").
+- **◆ A live-viewer plane.** Presence + streaming a Session's conversation
+  and worktree to watchers. The SSE session view exists locally; the gap is
+  cross-machine cadence. `worked-example-production-troubleshooting.md`
+  already licenses exactly this: *"shared real-time awareness … not shared
+  real-time decision-making — a light presence layer, not a CRDT or
+  co-edit."*
+- **◆ Harness live-sync as validation.** Delta syncing Claude Code sessions
+  into shareable threads is the same seam as junto's ACP session capture —
+  it validates the session-artifact model and pressures its *cadence* (live
+  stream vs post-hoc memo).
+- **✗ Don't clone the CRDT worktree or conversation-as-source.** The
+  engineering is enormous (Zed spent years on CRDTs before this), the record
+  philosophy is opposed, and DeltaDB is proprietary — nothing to build on.
+
+### The reopening (Dan, 2026-08-20)
+
+Two parked/ratified decisions sit in this territory; per the dead-ends
+convention they are surfaced, not silently retried:
+
+- **`1d9cf9b1` (park ratified 2026-06-14):** *"Turn-taking is unsolved and
+  worktree isolation is a prerequisite; the human-initiated sequential model
+  works and avoids the coordination problem entirely. Park until both
+  prerequisites and a real use case land."*
+- **`b405a1cb` (ratified 2026-06-13):** the collaborative space stays on the
+  roadmap, constrained to a turn-based, append-only versioned artifact.
+
+Conditions have changed: **worktree isolation has since landed** (the
+`185fd301` ratification), **Delta is the real-use-case evidence**, and Dan
+has signaled willingness to reconsider the turn-based approach
+(2026-08-20). The graduated ladder — each rung ships value alone, climb in
+order:
+
+1. **Anchored comments + decision blame** — async; no constraint touched.
+2. **Presence + live session viewing** — ephemeral plane over the record;
+   already licensed by the incident worked example.
+3. **A live shared *conversation/plan document*** — CRDT scoped to one
+   ephemeral document (permissive crates exist: loro / yrs / automerge, all
+   MIT — verify at adoption); durable outcomes still fold into entries.
+   Only if rung 2 leaves the itch.
+4. **Replicated worktrees** (DeltaDB territory) — only with evidence that
+   rungs 1–3 can't deliver; a new substrate *plane*, never a change to the
+   record.
+
+Whatever rung is reached: **the record stays append-only ratified entries**
+(ADR 0011 untouched). If CRDT ever enters, it is confined to the live plane
+or a versioned artifact — never the durable record.
+
+### Tradeoffs, stated honestly
+
+Delta is **genuinely better** at immediacy: joining work mid-flight,
+anchored review fluidity, reference stability under motion, zero-install
+web sharing. junto's surviving differentiators are exactly what the posts
+never mention: **verification standing** (ratified/parked, gates, Rubrics),
+**workflow-generality**, a **vendor-neutral pluggable substrate**, and
+**MIT + local-first**. And Delta *validates* junto's spine from the largest
+independent team yet: a conversation-centered, terminal-optional surface;
+review where the work happened; agents as first-class thread participants;
+comments on anything — the one-surface thesis, built by someone else.
+
+The research corpus sharpens the split (`D:\git\research-reports\`
+`pr-review-unbundling-2026-08.md`): the PR bundles four jobs — standards
+enforcement, defect detection, verification of intent, knowledge transfer &
+alignment — now separating by how cheaply each is verified. Delta rebuilds
+the surface for the *alignment/knowledge-transfer* row (conversation
+anchored to code, review where the work happened) and ships nothing for the
+verification rows; junto's gates/rubrics/standing are the verification
+rows with the alignment surface still thin. The unbundling frame says these
+are complements — and that the team that mechanizes verification should
+reinvest the freed attention into alignment, which is precisely the surface
+Delta just raised the bar on.
+
+**Openness (verified 2026-08-20, memory corpus):** Zed has **stated an
+intention to open-source DeltaDB** "with optional paid services" — but no
+license, no repo, no date (the zed-industries GitHub org contains no DeltaDB
+repository; Delta is invite-only; sync runs on Zed's infrastructure). Today
+it is hosted-only proprietary with a credible promise — credible because the
+Zed editor and its collab server are already open source. Caveat for junto:
+Zed's editor lineage is **GPL/AGPL**; if DeltaDB opens under copyleft, junto
+can never vendor or link its source (hard constraint #1) — speaking its
+*protocol* or shelling out would be the only integration paths. Until it
+ships, DeltaDB-class conversation-linked version control is **a category of
+one**. **Watch:** the license when it lands, and whether span-anchored
+comment UX becomes table stakes for every agent surface.
+
+### The opposite bet — Cursor's Origin & Continuity (assessed 2026-08-20)
+
+[Git at any scale](https://cursor.com/blog/git-at-any-scale) (Vicent Martí,
+2026-08-18) answers the same "version control in the agent era" pressure from
+the opposite direction. Where Zed **replaces the versioning model**
+(operation-level deltas, CRDT replication, a new DB), Cursor keeps git's
+contract untouched and **rebuilds the hosting under it**: *Continuity* stores
+every push as a WAL entry in S3 (the source of truth — on-disk repos are a
+warm cache), linearizes all pushes via CAS on the WAL index, and scales
+reads linearly with stateless replicas (rendezvous hashing + gossip, always
+verified against S3). *Origin* is the hosted platform on top. Their stated
+philosophy is junto's own: reuse git as-is, *"instead of doing weird stuff
+with Git."*
+
+Reads on junto:
+
+- **Direct validation of the substrate bet.** Cursor's thesis is that
+  git-the-contract stays the durable interface at any scale. junto's record
+  rides exactly that contract (`refs/junto/*` over standard push/fetch), so
+  it works against any host that honors it — Origin included.
+- **The agent workload shape is confirmed:** *"vast numbers of small,
+  throwaway repositories"* created by agents is a first-class design load —
+  the same pressure behind junto's pooled worktrees and session isolation.
+- **Hosting-level provenance:** Continuity retains every push ever made
+  (*"we can look at every state a repository has ever been in"*) — a
+  substrate-side complement to junto's entry-level provenance, and a
+  reminder that re-anchoring (the Zed borrow above) can lean on history the
+  host already keeps.
+- **Layering, not rivalry (memory corpus):** DeltaDB is *single-repo-deep*
+  (provenance inside one worktree); Continuity is *fleet-wide* (storage
+  across millions of repos) — nothing prevents a DeltaDB-like layer running
+  **on** a Continuity-like store. And Continuity's WAL is push-granularity
+  time travel — a weaker cousin of delta identity (no conversation linkage,
+  no survival across code motion) that **exists today under unmodified git
+  tooling**.
+- **Openness (verified 2026-08-20):** Origin is an early-beta **hosted SaaS
+  gated by Cursor paid plans** — no self-hosting offered or promised; the
+  blog's "deployed on any cloud" refers to Cursor's own portability across
+  S3-compatible stores, not customer self-hosting; no license statement.
+  The self-hostable analogue is GitLab's Gitaly (MIT; Spokes-pattern today,
+  WAL-based rework in progress).
+- **The week of 2026-08-18 in one line:** the three major agent-IDE vendors
+  each attacked a different layer — Warp the SDLC orchestration envelope
+  (Factories), Zed the version-control *data model* (Delta/DeltaDB), Cursor
+  the version-control *hosting* (Origin/Continuity). The layer junto claims
+  — the governed, verified record — is contested by none of them.
+- **A new forge target with one capability question:** classify Origin in
+  the custom-ref table when it's reachable — does it accept `refs/junto/*`?
+  (Same verify-empirically posture as Bitbucket.)
+
+Triangulating the three approaches: **Zed rebuilds the model, Cursor
+rebuilds the hosting, junto adds a governed record beside the model.**
+Cursor is orthogonal-complementary infrastructure junto could run on; Zed
+is the workflow-layer competitor.
+
+---
+
 ## Licensing read
 
 Checked against hard constraint #1 (`CLAUDE.md`): **MIT, no copyleft *source*;
@@ -193,6 +443,9 @@ to `git`, GPL-2.0).**
 |---|---|---|
 | treehouse · no-mistakes · lavish-axi · axi · gnhf · firstmate · acp-mock · gh-axi · chrome-devtools-axi | **MIT** | ✅ |
 | **ACP** (Zed repo + `agent-client-protocol` Rust crate) | **Apache-2.0** | ✅ links into MIT |
+| **Delta / DeltaDB** (Zed) | **proprietary** today; open-sourcing *stated intent*, license TBD | ⚠️ ideas clean-room only; if it opens copyleft (Zed lineage is GPL/AGPL), protocol/shell-out only — never vendor/link |
+| **Origin / Continuity** (Cursor) | **proprietary** hosted SaaS; no self-host promised | ⚠️ ideas clean-room only |
+| CRDT crates, if rung 3 is ever built: **loro** · **yrs** · **automerge** | **MIT** (verify at adoption) | ✅ |
 | **gsh** | **GPL-3.0** | ⚠️ don't vendor/link source |
 | **superpowers-bench** | **no license** | ⚠️ all-rights-reserved |
 
@@ -238,11 +491,25 @@ the ACP-as-harness-protocol idea is wide open.
    representation (ADR 0013) — discrete metadata-carrying items, localized-delta
    folds, an explicit curation pass — to defend the scaled brief against its own
    *context collapse* as channels age. Keep junto's governed evolution.
+9. **Decision blame (code→record back-links):** build the reverse provenance
+   index (file/line → entries + Sessions). The lead job's killer UI, proven
+   wanted by Delta; a projection over data junto already has.
+10. **Collaborative space, unparked path:** revive `b405a1cb` as rung 1 of
+    the ladder (span-anchored annotation, turn-based, versioned artifact);
+    reassess `1d9cf9b1` — its worktree-isolation prerequisite has landed.
+11. **Live plane before CRDT:** presence + cross-machine session streaming
+    first; any CRDT stays confined to an ephemeral document or versioned
+    artifact — the record and ADR 0011 are untouched at every rung.
 
 ## Sources
 
 - Ace: [MCP docs](https://docs.aceagent.io/docs/developer-guides/mcp-integration/overview) · [docs home](https://docs.aceagent.io) · [Zero Alignment essay](https://maggieappleton.com/zero-alignment/) · [ACE paper (ICLR 2026)](https://arxiv.org/abs/2510.04618) · [delta-update analysis (softmax)](https://softmaxdata.com/blog/the-biggest-lesson-from-ace-iclr-2026-the-power-of-agentic-engineering/) · [self-improvement-tools comparison (Ry Walker)](https://rywalker.com/research/agent-self-improvement)
 - Kun Chen: [GitHub](https://github.com/kunchenguid) · [lavish-axi](https://github.com/kunchenguid/lavish-axi) · [no-mistakes](https://github.com/kunchenguid/no-mistakes) · [treehouse](https://github.com/kunchenguid/treehouse) · [firstmate](https://github.com/kunchenguid/firstmate) · [gnhf](https://github.com/kunchenguid/gnhf) · [axi](https://github.com/kunchenguid/axi) · [superpowers-bench](https://github.com/kunchenguid/superpowers-bench) · [acp-mock](https://github.com/kunchenguid/acp-mock)
 - ACP: [Agent Client Protocol (Zed)](https://github.com/zed-industries/agent-client-protocol)
+- Zed: [Introducing DeltaDB](https://zed.dev/blog/introducing-deltadb) ·
+  [Introducing Delta](https://zed.dev/blog/introducing-delta) ·
+  [delta.dev](https://delta.dev) · CRDT lineage: [zed.dev/blog/crdts](https://zed.dev/blog/crdts)
+- Cursor: [Git at any scale — Origin & Continuity](https://cursor.com/blog/git-at-any-scale)
+- Memory corpus: graphiti groups `agent_harness_research` · `agent_eval_research` · `agent_infra_research` (episodes `1f032055`, `cad5d93f`, `6ce279e0`, `88e6f546`; work done in `D:\git\graphiti`, 2026-08) and the syntheses in `D:\git\research-reports\`
 - t3code: [pingdotgg/t3code](https://github.com/pingdotgg/t3code)
 - "Harness engineering" (Ryan / OpenAI, AI Native DevCon): [talk](https://www.youtube.com/watch?v=c8bE0cj7vHY) — assessed against junto in [`self-improving-harness.md`](self-improving-harness.md) (the practitioner camp for the self-improvement loop; converges on the loop + observability afferent nerve, diverges on shift-right autonomy, eval rigor, and in-repo vs provenance-bound record)
