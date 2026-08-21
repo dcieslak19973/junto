@@ -821,39 +821,56 @@ fn fingerprint(key: &PublicKey) -> String {
         .collect()
 }
 
-/// `junto keys list` — print every grant in a channel: member, fingerprint,
-/// the granting entry id (`retire-device`'s `--grant` handle), and its
-/// retirement timestamp when set (device-key-enrollment plan, Task 9).
+/// The formatted lines `junto keys list` prints, one per grant: member,
+/// fingerprint (never the full public key), the granting entry id
+/// (`retire-device`'s `--grant` handle), and `active` or its retirement
+/// timestamp (device-key-enrollment plan, Task 9). Pure and sorted by
+/// email so it is testable without capturing stdout — `keys_list` prints
+/// exactly what this returns.
+fn keys_list_lines(view: &ChannelView, member: Option<&str>) -> Vec<String> {
+    let mut emails: Vec<&String> = match member {
+        Some(email) => view
+            .keyring
+            .keys()
+            .filter(|e| e.as_str() == email)
+            .collect(),
+        None => view.keyring.keys().collect(),
+    };
+    emails.sort();
+
+    let mut lines = Vec::new();
+    for email in emails {
+        for grant in &view.keyring[email] {
+            let status = match grant.retired_at {
+                Some(ts) => format!("retired {}", render::iso_utc(ts.as_millis())),
+                None => "active".to_string(),
+            };
+            lines.push(format!(
+                "{email}  {}  granted_by={}  {status}",
+                fingerprint(&grant.key),
+                grant.granted_by
+            ));
+        }
+    }
+    lines
+}
+
+/// `junto keys list` — print every grant in a channel (device-key-
+/// enrollment plan, Task 9); see [`keys_list_lines`] for the line shape.
 async fn keys_list(channel: String, member: Option<String>) -> Result<()> {
     let host = host::Host::from_registry(host::junto_home()?);
     let (_substrate, ledger, id) = resolve_channel(&host, &channel).await?;
     let view = ledger.lock().await.project(&id).await?;
 
-    let mut emails: Vec<&String> = match &member {
-        Some(email) => view.keyring.keys().filter(|e| *e == email).collect(),
-        None => view.keyring.keys().collect(),
-    };
-    emails.sort();
-
-    let mut printed = 0usize;
-    for email in emails {
-        for grant in &view.keyring[email] {
-            printed += 1;
-            let status = match grant.retired_at {
-                Some(ts) => format!("retired {}", render::iso_utc(ts.as_millis())),
-                None => "active".to_string(),
-            };
-            println!(
-                "{email}  {}  granted_by={}  {status}",
-                fingerprint(&grant.key),
-                grant.granted_by
-            );
-        }
-    }
-    if printed == 0 {
+    let lines = keys_list_lines(&view, member.as_deref());
+    if lines.is_empty() {
         match member {
             Some(email) => println!("no key grants for {email} in channel '{channel}'"),
             None => println!("no key grants in channel '{channel}'"),
+        }
+    } else {
+        for line in lines {
+            println!("{line}");
         }
     }
     Ok(())
@@ -1507,16 +1524,19 @@ mod tests {
         }
     }
 
-    /// The only difference between the two grants below is `retired_at` —
-    /// same key, same email, arbitrary distinct `granted_by` ids — so a
-    /// mutation that drops the `retired_at` filter (returns both) or
-    /// inverts it (returns the retired one instead) fails this exact
-    /// assertion, not just a differently-shaped one.
+    /// The only difference between the retired grant and the two active
+    /// ones is `retired_at` — same key, same email, distinct `granted_by`
+    /// ids — so a mutation that drops the filter (returns all three) or
+    /// inverts it (returns only the retired one) fails this exact
+    /// assertion. Two active grants, not one, so a mutation that narrows
+    /// to `.next()`/`.last()` of the filtered iterator (satisfying "active"
+    /// but not "every") also fails it.
     #[test]
-    fn grants_to_park_returns_only_the_active_grant_when_the_email_has_a_mix() {
+    fn grants_to_park_returns_every_active_grant_when_the_email_has_a_mix() {
         use junto_kernel::KeyGrant;
         let key = PublicKey::new(format!("ed25519:{}", "a".repeat(64))).unwrap();
-        let active_id = EntryId::new();
+        let active_a = EntryId::new();
+        let active_b = EntryId::new();
         let retired_id = EntryId::new();
         let mut keyring = junto_kernel::Keyring::new();
         keyring.insert(
@@ -1528,14 +1548,22 @@ mod tests {
                     retired_at: Some(Timestamp::from_millis(10)),
                 },
                 KeyGrant {
+                    key: key.clone(),
+                    granted_by: active_a,
+                    retired_at: None,
+                },
+                KeyGrant {
                     key,
-                    granted_by: active_id,
+                    granted_by: active_b,
                     retired_at: None,
                 },
             ],
         );
         let view = channel_view_with_keyring(keyring);
-        assert_eq!(grants_to_park(&view, "alice@example.com"), vec![active_id]);
+        assert_eq!(
+            grants_to_park(&view, "alice@example.com"),
+            vec![active_a, active_b]
+        );
     }
 
     #[test]
@@ -1805,5 +1833,84 @@ mod tests {
         keys_list(channel_id.to_string(), Some("dana@example.com".to_string()))
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn keys_list_lines_prints_the_fingerprint_never_the_full_key() {
+        let key = PublicKey::new(format!("ed25519:{}", "7".repeat(64))).unwrap();
+        let grant_id = EntryId::new();
+        let mut keyring = junto_kernel::Keyring::new();
+        keyring.insert(
+            "alice@example.com".to_string(),
+            vec![junto_kernel::KeyGrant {
+                key,
+                granted_by: grant_id,
+                retired_at: None,
+            }],
+        );
+        let view = channel_view_with_keyring(keyring);
+        let lines = keys_list_lines(&view, None);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("7777777777777777"), "{}", lines[0]);
+        assert!(!lines[0].contains(&"7".repeat(64)), "{}", lines[0]);
+        assert!(
+            lines[0].contains(&format!("granted_by={grant_id}")),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[0].contains("active"), "{}", lines[0]);
+    }
+
+    /// Pinned to the literal expected date string, like `invite_line`'s own
+    /// test — not derived by calling `render::iso_utc` again.
+    #[test]
+    fn keys_list_lines_renders_the_retirement_timestamp_when_set() {
+        let key = PublicKey::new(format!("ed25519:{}", "8".repeat(64))).unwrap();
+        let grant_id = EntryId::new();
+        let mut keyring = junto_kernel::Keyring::new();
+        keyring.insert(
+            "bob@example.com".to_string(),
+            vec![junto_kernel::KeyGrant {
+                key,
+                granted_by: grant_id,
+                retired_at: Some(Timestamp::from_millis(1_700_000_000_000)),
+            }],
+        );
+        let view = channel_view_with_keyring(keyring);
+        let lines = keys_list_lines(&view, None);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("retired 2023-11-14 22:13 UTC"),
+            "{}",
+            lines[0]
+        );
+        assert!(!lines[0].contains("active"), "{}", lines[0]);
+    }
+
+    #[test]
+    fn keys_list_lines_with_member_filters_to_exactly_that_email() {
+        let key_a = PublicKey::new(format!("ed25519:{}", "1".repeat(64))).unwrap();
+        let key_b = PublicKey::new(format!("ed25519:{}", "2".repeat(64))).unwrap();
+        let mut keyring = junto_kernel::Keyring::new();
+        keyring.insert(
+            "alice@example.com".to_string(),
+            vec![junto_kernel::KeyGrant {
+                key: key_a,
+                granted_by: EntryId::new(),
+                retired_at: None,
+            }],
+        );
+        keyring.insert(
+            "bob@example.com".to_string(),
+            vec![junto_kernel::KeyGrant {
+                key: key_b,
+                granted_by: EntryId::new(),
+                retired_at: None,
+            }],
+        );
+        let view = channel_view_with_keyring(keyring);
+        let lines = keys_list_lines(&view, Some("alice@example.com"));
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("alice@example.com"), "{}", lines[0]);
     }
 }
