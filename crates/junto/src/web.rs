@@ -3519,11 +3519,15 @@ mod tests {
             .expect("founder has grants");
         assert_eq!(grants.len(), 2, "genesis grant + the explicit device grant");
         let genesis_key = grants[0].key.clone();
-        let device_grant_id = grants[1].granted_by;
+        let genesis_grant_id = grants[0].granted_by;
 
-        // Retire the second (explicit device) grant only — one active, one
-        // retired, matching the brief's fixture.
-        park_grant(&fx.host, &fx.founder, device_grant_id).await;
+        // Retire the FIRST (genesis) grant only — one active, one retired,
+        // and — because it is the physically-first keyring entry — a
+        // retirement-based sort (e.g. `sort_by_key(|g| g.retired_at)`,
+        // where `None < Some` moves the still-active device grant ahead of
+        // it) would visibly reorder `devices` relative to the untouched
+        // keyring order this test pins below.
+        park_grant(&fx.host, &fx.founder, genesis_grant_id).await;
 
         let response = keys_json(State(fx.host.clone()), Path("keys-test".into())).await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -3580,13 +3584,13 @@ mod tests {
         // survive — not sorted by fingerprint or by retirement.
         assert_eq!(devices[0]["fingerprint"], genesis_fingerprint);
         assert!(
-            devices[0]["retired_at"].is_null(),
-            "the genesis grant is still active: {devices:?}"
+            !devices[0]["retired_at"].is_null(),
+            "the genesis grant was retired: {devices:?}"
         );
         assert_eq!(devices[1]["fingerprint"], device_fingerprint);
         assert!(
-            !devices[1]["retired_at"].is_null(),
-            "the device grant was retired: {devices:?}"
+            devices[1]["retired_at"].is_null(),
+            "the device grant is still active: {devices:?}"
         );
 
         // The genesis grant predates transport keys (Task 16): its
@@ -3681,6 +3685,11 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_text(response).await;
         let json: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        // Two members now (founder + keyless): a real ordering pin — party
+        // order, founder first — not the vacuous single-element compare a
+        // one-member fixture would give.
+        assert_eq!(json["members"][0]["email"], "web@example.com");
+        assert_eq!(json["members"][1]["email"], "keyless@example.com");
         let keyless_dto = json["members"]
             .as_array()
             .expect("members array")
