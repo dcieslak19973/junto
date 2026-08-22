@@ -31,6 +31,7 @@
 
 **Files:**
 - Modify: `crates/junto/src/enroll.rs` (consts, `InvitePayload`, `decode_invite`, module docs, tests)
+- Modify: `crates/junto/src/main.rs` — **compile-only** call-site adaptation. `crates/junto` is a binary crate: if `main.rs` does not compile, `cargo test -p junto` cannot run *any* test, including this task's. So make the three call sites (`invite`, `enroll`, `add_member`) compile against `channels` in the most mechanical way possible — wrap the existing single channel in `vec![…]` where one is built, read `channels.first()` where one is read — each marked `// Task 3/4 replaces this` . Do not implement multi-channel behaviour here; that is Tasks 3 and 4.
 
 **Interfaces:**
 - Consumes: nothing new.
@@ -100,7 +101,7 @@ fn a_v1_invite_is_refused_with_instructions_to_mint_a_new_one() {
 
 - [ ] **Step 2: Run to verify failure** — `cargo test -p junto enroll::` → FAIL (`channels` does not exist; `MAX_INVITE_CHANNELS` unresolved).
 - [ ] **Step 3: Implement.** Add the const with a doc comment explaining the number ("a founder ticking more than 32 channels in one pass is a mistake, and an unbounded set makes redemption fan out unboundedly"); flip `PAYLOAD_VERSION` to 2; change the field; add the checks in the stated order; extend `check_version`'s message to `"unsupported payload version {v} (expected {PAYLOAD_VERSION}) — this code came from an older junto; mint a new one"`. Update the module docs' payload sketch to show `channels`.
-- [ ] **Step 4: Run** — `cargo test -p junto enroll::` → PASS. Then `cargo test -p junto` and expect **known** failures only in `main.rs` call sites (Task 3/4 fix them); note them in the commit body rather than patching them here.
+- [ ] **Step 4: Run** — `cargo test -p junto` → PASS, whole crate. (Ruling, preflight: an earlier draft of this step expected "known failures in main.rs call sites". That is impossible — a binary crate whose root does not compile runs no tests at all, so this task carries the compile-only adaptation above and leaves the suite green.)
 - [ ] **Step 5: Commit**
 
 ```bash
@@ -298,7 +299,7 @@ Rules:
 - The channel set comes from `channels_for(&junto_home()?, &payload.invite_token)`. An empty set is an error naming the two causes (never issued here / already fully redeemed).
 - Per channel, in this order: resolve to canonical id → project → founder check → `consume` for **that** id → `add_member`. A channel whose `consume` returns anything but `Ok` maps to `InviteAlreadyUsed` (for `AlreadyUsed`) or `Failed(<consumed_error message>)`; a non-founder channel maps to `NotFounder` **without consuming**.
 - Burn only what appends: `consume` immediately before `add_member`, and if `add_member` errors, report `Failed` for that channel and keep going. The token for other channels is untouched, so re-pasting the code retries exactly the remainder.
-- `AlreadyAMember` is reported (not hidden) when `add_member` returns without appending — detect it by projecting after the call and checking the keyring for an active grant on the payload's key.
+- `AlreadyAMember` is reported (not hidden) when `add_member` would append nothing. Detect it **before** the call, on the fresh projection this loop already holds, using exactly `Host::add_member`'s own no-op condition (host.rs:627-638): the email is in `view.party` **and** the payload's key already has a grant on that email with `retired_at.is_none()`. Do not diff state before and after the call. A *retired* grant for the same key is **not** `AlreadyAMember` — re-admitting a revoked member must still append, which is what `add_member_enroll_still_succeeds_when_re_enrolling_a_revoked_member` pins.
 - `--kind` is asked once and applied to every channel. `revocation_cutoff_warning` still prints, per channel, before its append.
 - Never `bail!` mid-set: a partial run must print its whole outcome list, then exit non-zero if **no** channel was granted.
 
@@ -615,8 +616,12 @@ git commit -m "feat(host): enroll this machine's device key from an invite"
   - `struct RedeemForm { enroll: String, kind: String }`
   - `#[derive(Serialize)] struct RedeemedDto { outcomes: Vec<RedeemOutcomeDto> }`, `#[derive(Serialize)] struct RedeemOutcomeDto { channel: String, channel_name: Option<String>, result: String, detail: Option<String> }`
   - Route: `.route("/members", post(redeem_enrollment_endpoint))`.
+  - `#[derive(Serialize)] struct EnrollPreviewDto { email: String, display_name: String, fingerprint: String, channels: Vec<PreviewChannelDto> }`, `#[derive(Serialize)] struct PreviewChannelDto { id: String, name: Option<String> }`
+  - Route: `.route("/devices/preview", post(preview_enrollment))` — same `RedeemForm` shape minus `kind` (a `PreviewForm { enroll: String }`).
 
 Rules: `kind` is required and parsed strictly (`"human"` | `"agent"`; anything else is a 400 — no default, ADR 0035). The handler is a thin shell over Task 4's engine: decode, parse kind, call `redeem_enrollment`, serialize. `result` is the `RedeemOutcome` variant in snake_case; `detail` carries `Failed`'s message. HTTP status is 200 when at least one channel was granted, 409 when none were (the whole set was already used or not ours) — the body carries the per-channel truth either way. `channel_name` is resolved for display; `channel` is always the canonical id.
+
+`POST /devices/preview` rules: it **appends nothing and consumes nothing** — decode the enroll payload, hash its token, and answer from `invites::channels_for` plus the payload's own email/display-name/public-key fingerprint. An empty channel set is a 409 naming both causes (never issued here / already fully redeemed), the same message `redeem_enrollment` uses. This endpoint exists because the spec promises the founder sees what they are about to grant before anything is appended, and the channel set deliberately never travels inside the code, so the GUI has no other way to know it.
 
 - [ ] **Step 1: Write the failing tests:**
 
@@ -637,11 +642,26 @@ async fn post_members_returns_409_with_outcomes_when_nothing_could_be_granted() 
 async fn post_members_refuses_a_missing_or_unknown_kind() {
     // kind absent → 400; kind="person" → 400. ADR 0035: never defaulted.
 }
+
+#[tokio::test]
+async fn post_devices_preview_shows_the_channel_set_without_consuming_it() {
+    // Invite covering two channels; preview → 200 listing both ids (with names
+    // where known) plus the payload's email and fingerprint. Then redeem for
+    // real and assert BOTH channels were still grantable — proving preview
+    // consumed nothing. A preview that burned the token would make this fail
+    // with invite_already_used.
+}
+
+#[tokio::test]
+async fn post_devices_preview_409s_when_the_token_covers_nothing() {
+    // A token never issued on this machine → 409 whose message names both
+    // causes (never issued / already redeemed).
+}
 ```
 
-- [ ] **Step 2: Run to verify failure** — `cargo test -p junto post_members` → FAIL.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run** — `cargo test -p junto post_members` → PASS, and Task 4's CLI tests still green (shared engine, one behaviour).
+- [ ] **Step 2: Run to verify failure** — `cargo test -p junto post_members` and `cargo test -p junto post_devices_preview` → FAIL.
+- [ ] **Step 3: Implement** both handlers.
+- [ ] **Step 4: Run** — both filters → PASS, and Task 4's CLI tests still green (shared engine, one behaviour).
 - [ ] **Step 5: Commit**
 
 ```bash
@@ -822,7 +842,7 @@ Rules:
 - Every form is the lifecycle pattern: one open form at a time per pane, confirm shows `working…` while `identity_pending`, cancel always enabled, error text under the form.
 - Retire and revoke require a rationale before the confirm button activates — the host refuses an empty one, and the GUI must not make the user discover that over HTTP.
 - The invite form's channel list comes from the app's existing channel list, pre-ticking the current pane's channel. The minted code shows a **countdown**: add a 1-second `Tick` subscription that is live **only** while `invite_minted` is `Some` and unexpired, so the app does not wake every second for nothing. On expiry the code is replaced by "expired — mint another".
-- Redeem shows a pre-append preview (email, fingerprint, channels from the response of a first "preview" — since the endpoint appends, preview is simply the confirmation screen built from `decode`-free data the user pasted; do not add a preview endpoint) then the outcome list, which persists until dismissed.
+- Redeem shows a pre-append preview built from `POST /devices/preview` (Task 9): email, fingerprint, and the channel set the invite still covers. The spec promises the founder sees what they are about to grant *before* anything is appended, and the GUI cannot know the channel set otherwise — the set never travels in the code. After confirming, the outcome list persists until dismissed.
 - After any successful act, refetch `keys.json` and the pane's `view.json` so the panel and the timeline agree.
 
 - [ ] **Step 1: Write the failing tests** (pure helpers only — this crate has no widget tests):
