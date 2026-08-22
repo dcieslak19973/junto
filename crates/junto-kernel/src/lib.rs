@@ -32,6 +32,7 @@ pub mod provenance;
 pub mod serial;
 pub mod session;
 pub mod sign;
+pub mod subject;
 pub mod substrate;
 pub mod time;
 
@@ -41,13 +42,14 @@ pub use error::{Error, Result};
 pub use gate::{ApprovalRequirement, GateStatus};
 pub use ids::{ChannelId, EntryId};
 pub use ledger::{
-    ChannelView, KeyGrant, Keyring, Ledger, LineageDirection, LineageEdge, LineageRelation,
-    Standing,
+    ChannelStanding, ChannelView, KeyGrant, Keyring, Ledger, LineageDirection, LineageEdge,
+    LineageRelation, Standing,
 };
 pub use member::{Member, MemberKind};
 pub use provenance::{ContentDigest, ProvenanceRef, Uri};
 pub use session::{SessionState, SessionView};
 pub use sign::{PublicKey, Signature, SigningKey};
+pub use subject::{Subject, SubjectKind};
 pub use substrate::{InMemorySubstrate, SubstrateProvider};
 pub use time::Timestamp;
 

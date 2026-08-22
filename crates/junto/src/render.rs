@@ -479,7 +479,10 @@ pub fn brief_markdown(
 fn recent_line(entry: &LedgerEntry) -> String {
     const TAIL_CLAMP: usize = 80;
     match &entry.payload {
-        EntryPayload::ChannelOpened { name } => format!("opened channel '{name}'"),
+        EntryPayload::ChannelOpened { name } => match name {
+            Some(name) => format!("opened channel '{name}'"),
+            None => "opened channel".to_string(),
+        },
         EntryPayload::MemberAdded { member } => {
             format!("added member {}", member.display_name)
         }
@@ -512,6 +515,18 @@ fn recent_line(entry: &LedgerEntry) -> String {
         }
         EntryPayload::ArtifactAttached { description, .. } => {
             format!("attached artifact: {}", clamp(description, TAIL_CLAMP))
+        }
+        // Provisional copy — the surface plan owns subject rendering.
+        EntryPayload::SubjectAttached { subject } => {
+            format!(
+                "subject attached: {:?} {}",
+                subject.kind,
+                clamp(subject.uri.as_str(), TAIL_CLAMP)
+            )
+        }
+        // Provisional copy — the surface plan owns subject rendering.
+        EntryPayload::SubjectDetached { target } => {
+            format!("subject detached `{}`", short(target))
         }
         EntryPayload::ChannelClosed { rationale } => {
             format!("closed the channel: {}", clamp(rationale, TAIL_CLAMP))
@@ -732,9 +747,10 @@ pub fn transcript_markdown(name: &str, id: &ChannelId, view: &ChannelView) -> St
 /// One entry on one markdown line, with its derived state attached.
 fn describe_markdown(entry: &LedgerEntry, view: &ChannelView) -> String {
     match &entry.payload {
-        EntryPayload::ChannelOpened { name } => {
-            format!("**genesis** — channel '{name}' opened")
-        }
+        EntryPayload::ChannelOpened { name } => match name {
+            Some(name) => format!("**genesis** — channel '{name}' opened"),
+            None => "**genesis** — channel opened".to_string(),
+        },
         EntryPayload::MemberAdded { member } => {
             format!("**member added** — {}", member_label(member))
         }
@@ -796,6 +812,18 @@ fn describe_markdown(entry: &LedgerEntry, view: &ChannelView) -> String {
             ..
         } => {
             format!("**artifact** ({kind}) on session `{target}` — {description}")
+        }
+        // Provisional copy — the surface plan owns subject rendering.
+        EntryPayload::SubjectAttached { subject } => {
+            format!(
+                "**subject attached** — {:?} {}",
+                subject.kind,
+                subject.uri.as_str()
+            )
+        }
+        // Provisional copy — the surface plan owns subject rendering.
+        EntryPayload::SubjectDetached { target } => {
+            format!("**subject detachment** of `{target}`")
         }
         EntryPayload::ChannelClosed { rationale } => {
             format!("**channel closed** — {rationale}")
@@ -2286,7 +2314,7 @@ pub fn channel_html(
              <input name=\"intent\" placeholder=\"what should the agent do? e.g. fix the flaky \
              sync test\" required>\
              <input name=\"workspace\" value=\"{workspace}\" placeholder=\"workspace repo path \
-             (remembered after first launch)\"{ws_required}>\
+             (optional — a channel with no repo runs in a scratch directory)\">\
              {harness_picker}\
              <label class=\"mode\" title=\"verify each change against the rubric and re-run until it passes (docs/adr/0025)\">\
              <input type=\"checkbox\" name=\"mode\" value=\"outcome\"> code-PR push-gate (verify loop)</label>\
@@ -2302,7 +2330,6 @@ pub fn channel_html(
                     .map(|p| p.display().to_string())
                     .unwrap_or_default()
             ),
-            ws_required = if workspace.is_some() { "" } else { " required" },
         )
     };
     let sessions = sessions_section(view, id);
@@ -2576,7 +2603,10 @@ fn entry_family(payload: &EntryPayload) -> &'static str {
         EntryPayload::Assertion { .. } | EntryPayload::Proposal { .. } => "fam-decision",
         EntryPayload::SessionStarted { .. }
         | EntryPayload::SessionUpdated { .. }
-        | EntryPayload::ArtifactAttached { .. } => "fam-work",
+        | EntryPayload::ArtifactAttached { .. }
+        // Provisional copy — the surface plan owns subject rendering.
+        | EntryPayload::SubjectAttached { .. }
+        | EntryPayload::SubjectDetached { .. } => "fam-work",
         EntryPayload::ChannelOpened { .. }
         | EntryPayload::MemberAdded { .. }
         | EntryPayload::ChannelClosed { .. }
@@ -2602,7 +2632,10 @@ fn entry_card(entry: &LedgerEntry, view: &ChannelView, channel: &ChannelId) -> S
         EntryPayload::ChannelOpened { name } => (
             "genesis",
             None,
-            Some(format!("channel '{name}' opened")),
+            Some(match name {
+                Some(name) => format!("channel '{name}' opened"),
+                None => "channel opened".to_string(),
+            }),
             None,
             None,
             None,
@@ -2750,6 +2783,19 @@ fn entry_card(entry: &LedgerEntry, view: &ChannelView, channel: &ChannelId) -> S
             Some(provenance.as_slice()),
             Some(*target),
         ),
+        // Provisional copy — the surface plan owns subject rendering.
+        EntryPayload::SubjectAttached { subject } => (
+            "subject attached",
+            None,
+            Some(format!("{:?} {}", subject.kind, subject.uri.as_str())),
+            None,
+            None,
+            None,
+        ),
+        // Provisional copy — the surface plan owns subject rendering.
+        EntryPayload::SubjectDetached { target } => {
+            ("subject detached", None, None, None, None, Some(*target))
+        }
         EntryPayload::DivergedFrom { parent, .. } => (
             "diverged from",
             None,
@@ -3593,7 +3639,7 @@ pub(crate) fn iso_utc(millis: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use junto_kernel::{EntryId, Member, Timestamp};
+    use junto_kernel::{ChannelStanding, EntryId, Member, Timestamp};
     use std::collections::HashMap;
 
     fn summary(name: &str, repo: &std::path::Path, secs: i64, gates: usize) -> ChannelSummary {
@@ -3809,6 +3855,8 @@ mod tests {
             sessions: HashMap::new(),
             closed: false,
             lineage: Vec::new(),
+            subjects: Vec::new(),
+            channel_standing: ChannelStanding::Scratch,
         }
     }
 
@@ -3833,6 +3881,37 @@ mod tests {
         assert!(
             !html.contains("badge unverified"),
             "verified entry renders no badge"
+        );
+    }
+
+    /// An unnamed genesis (`EntryPayload::ChannelOpened { name: None }`)
+    /// must describe the act honestly — no quoted empty name, and no
+    /// fabricated placeholder like "Untitled" borrowed from the channel's
+    /// display-name fallback, which is a different mechanism entirely.
+    #[test]
+    fn an_unnamed_genesis_renders_without_quotes_or_a_placeholder_word() {
+        let channel = ChannelId::new();
+        let entry = LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel,
+            author: Member::human("Ada", "ada@example.com"),
+            timestamp: Timestamp::from_millis(1_781_046_734_154),
+            payload: EntryPayload::ChannelOpened { name: None },
+        };
+        let view = view_with(vec![entry.clone()]);
+        let card = entry_card(&entry, &view, &channel);
+        assert!(
+            card.contains("channel opened"),
+            "an unnamed genesis still describes the act: {card}"
+        );
+        assert!(
+            !card.contains("channel ''") && !card.contains("channel \"\""),
+            "no empty quotes for the missing name: {card}"
+        );
+        assert!(
+            !card.contains("Untitled"),
+            "the act text must not fabricate a name: {card}"
         );
     }
 
@@ -4148,6 +4227,34 @@ mod tests {
     }
 
     #[test]
+    fn start_work_workspace_field_is_optional_when_nothing_is_mounted() {
+        // Finding 2: `ws_required` used to emit ` required` whenever
+        // `channel_mount` resolved nothing, which made a repo-free
+        // channel's headline capability (Task 6: a session runs in a
+        // scratch directory) unreachable from the browser — HTML5
+        // validation blocked the empty-field submit before the server-side
+        // `NO_MOUNTABLE_SUBJECT` / scratch fallback logic ever ran.
+        let view = view_with(vec![]);
+        let html = channel_html(
+            &[],
+            "t",
+            &ChannelId::new(),
+            &view,
+            std::path::Path::new("/repo"),
+            None,
+        );
+        let workspace_input = html
+            .split("name=\"workspace\"")
+            .nth(1)
+            .and_then(|rest| rest.split('>').next())
+            .expect("workspace input tag is rendered");
+        assert!(
+            !workspace_input.contains("required"),
+            "the workspace input must be optional when nothing is mounted: {workspace_input}"
+        );
+    }
+
+    #[test]
     fn channel_page_offers_open_an_inquiry_here() {
         // The contextual form carries the channel's home substrate hidden —
         // a sibling inquiry opens in the same repo, no picker.
@@ -4272,6 +4379,8 @@ mod tests {
             sessions: Default::default(),
             closed: false,
             lineage: Vec::new(),
+            subjects: Vec::new(),
+            channel_standing: ChannelStanding::Standing,
         };
         let brief = brief_markdown("t", &ChannelId::new(), &view, &Default::default());
 
@@ -4311,6 +4420,8 @@ mod tests {
             sessions: Default::default(),
             closed: false,
             lineage: Vec::new(),
+            subjects: Vec::new(),
+            channel_standing: ChannelStanding::Standing,
         };
         let brief = brief_markdown("t", &ChannelId::new(), &view, &Default::default());
 

@@ -25,3 +25,13 @@ The dogfood channel's id (`c441363c-…`, UUIDv5-derived) is already synced and 
 - The Channel noun gets its first real model (id, name, opened-by, opened-at) — pulled forward from the not-built-yet list by addressing pressure, exactly how 0012 predicted ("the first modelling pressure dogfooding put on the unbuilt Channel noun").
 - MCP tools that today derive an id from the `channel` argument on every call must instead resolve the name against the substrate, and fail on a name no one has opened (new failure mode: *channel not found*; new tool or parameter: *open*).
 - The ref layout `refs/junto/<channel-id>/<author>` is unchanged.
+
+## Amendment (2026-08-22): names stop being unique
+
+[The collapse](../superpowers/specs/2026-08-21-multiplayer-first-rethink-design.md) (§2) drops the per-substrate uniqueness rule "The decision" above states: cheap, unceremonious channel creation means many channels legitimately share a name — "you will have twelve called 'auth stuff'." The name stays exactly what this ADR already called it — "a human-facing label, not identity" — so the collapse removes only the uniqueness constraint layered on top of that label, not the label itself.
+
+- **`Host::open_channel` no longer scans for a same-named channel before appending the genesis.** Two channels may carry the identical name in the identical home substrate; `rename_channel`'s matching refusal is dropped for the same reason.
+- **Name resolution now returns the most recently opened match.** A tie (two genesis entries in the same millisecond) breaks deterministically by `EntryId`, the same order [`LedgerEntry::canonical_cmp`](../../crates/junto-kernel/src/entry.rs) uses — so every replica resolves an ambiguous name identically, without asking a human to qualify it by substrate the way "Name resolution reads the substrate" above once did.
+- **The human surface is permitted to open a channel with no name at all.** The kernel already accepts and renders an unnamed `ChannelOpened` genesis (`name: Option<String>`, spec §2's collapse). This amendment records the design the collapse settles on for the human surface specifically: the first message opens the channel — no name, substrate, or playbook prompt — leaving the genesis unnamed until (if ever) a name is bound. Wiring that zero-ceremony open path into a UI control is separate, later work; the record already permits it.
+
+The asymmetry this ADR did not originally anticipate: the **agent surface keeps `open_channel`'s explicit, required arguments** — the collapse's zero-ceremony path is a human-surface concern (`docs/adr/0021`'s human/agent seam), not a kernel one. This amendment changes what the record *permits*, not what every surface *requires*.

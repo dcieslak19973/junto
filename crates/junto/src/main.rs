@@ -24,6 +24,7 @@ mod live_plane;
 mod live_ws;
 mod mcp;
 mod members;
+mod mounts;
 mod outcome;
 mod pending_lineage;
 mod render;
@@ -35,7 +36,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use junto_kernel::{
-    ChannelId, EntryId, EntryPayload, LedgerEntry, Member, MemberKind, PublicKey, Timestamp,
+    ChannelId, ChannelStanding, EntryId, EntryPayload, LedgerEntry, Member, MemberKind, PublicKey,
+    Timestamp,
 };
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
@@ -69,7 +71,7 @@ enum Command {
     /// ChannelOpened genesis entry binding the name, directly into the home
     /// substrate (no running host required).
     Open {
-        /// The channel's human-facing name (unique within the home substrate).
+        /// The channel's human-facing name (not required to be unique).
         name: String,
         /// The home substrate repo. Defaults to the current directory.
         #[arg(long, default_value = ".")]
@@ -334,7 +336,7 @@ async fn main() -> Result<()> {
             };
             init::run(&repo, channel, open, agent).await
         }
-        Command::Brief { dir } => brief(dir).await,
+        Command::Brief { dir } => brief(dir, &mut std::io::stdout()).await,
         Command::AddMember {
             email,
             name,
@@ -1069,9 +1071,6 @@ async fn diverge(from: String, child_name: String, at: Option<String>) -> Result
     let substrate = match host.resolve(&from).await? {
         host::Resolution::Resolved { substrate, .. } => substrate,
         host::Resolution::NotFound => bail!("no channel '{from}' in any registered substrate"),
-        host::Resolution::Ambiguous(substrates) => bail!(
-            "channel name '{from}' exists in several substrates ({substrates:?}); address it by id"
-        ),
     };
     let author = host::git_user(&substrate)?;
     let code = member_code_for(&author.email)?;
@@ -1100,10 +1099,6 @@ async fn converge(source: String, into: String, rationale: String) -> Result<()>
     let substrate = match host.resolve(&source).await? {
         host::Resolution::Resolved { substrate, .. } => substrate,
         host::Resolution::NotFound => bail!("no channel '{source}' in any registered substrate"),
-        host::Resolution::Ambiguous(substrates) => bail!(
-            "channel name '{source}' exists in several substrates ({substrates:?}); \
-             address it by id"
-        ),
     };
     let author = host::git_user(&substrate)?;
     let code = member_code_for(&author.email)?;
@@ -1136,10 +1131,6 @@ async fn resolve_channel(
         host::Resolution::NotFound => {
             bail!("no channel '{channel}' in any registered substrate")
         }
-        host::Resolution::Ambiguous(substrates) => bail!(
-            "channel name '{channel}' exists in several substrates ({substrates:?}); \
-             address it by id"
-        ),
     }
 }
 
@@ -1295,8 +1286,10 @@ async fn retire_device(channel: String, grant: String, rationale: String) -> Res
 
 /// Print the briefs of every channel this checkout is bound to. Best-effort by
 /// design — a SessionStart hook must never break session start, so failures
-/// are notes on stderr and the exit is always success.
-async fn brief(dir: PathBuf) -> Result<()> {
+/// are notes on stderr and the exit is always success. `out` receives each
+/// channel's rendered brief — production passes `stdout`; tests substitute a
+/// buffer so they can assert on what would (or would not) have been printed.
+async fn brief(dir: PathBuf, out: &mut impl std::io::Write) -> Result<()> {
     let channels = match binding::bound_channels(&dir) {
         Ok(channels) => channels,
         Err(err) => {
@@ -1326,21 +1319,37 @@ async fn brief(dir: PathBuf) -> Result<()> {
                 let projected = ledger.lock().await.project(&id).await;
                 match projected {
                     Ok(view) => {
-                        let name = view.name.clone().unwrap_or_else(|| channel.clone());
                         let lineage = host.lineage_context(&view).await.unwrap_or_default();
-                        println!("{}", render::brief_markdown(&name, &id, &view, &lineage));
+                        // Nothing ratified yet — epistemically free, stays
+                        // out of the brief until something in it earns
+                        // standing (spec §2's collapse: "a scratch thread
+                        // is epistemically free: invisible to the brief
+                        // until something in it is ratified"). The view is
+                        // already in hand, so this reads its own derived
+                        // `channel_standing` directly rather than paying a
+                        // second, machine-wide projection sweep for a
+                        // single-channel check.
+                        if view.channel_standing != ChannelStanding::Scratch {
+                            let name = view.name.clone().unwrap_or_else(|| channel.clone());
+                            // Best-effort like every other failure in this
+                            // function (module doc): a write failure must
+                            // not turn a SessionStart hook into a non-zero
+                            // exit, and must not skip the remaining bound
+                            // channels.
+                            if let Err(err) = writeln!(
+                                out,
+                                "{}",
+                                render::brief_markdown(&name, &id, &view, &lineage)
+                            ) {
+                                eprintln!("junto brief: writing '{channel}': {err}");
+                            }
+                        }
                     }
                     Err(err) => eprintln!("junto brief: projecting '{channel}': {err}"),
                 }
             }
             Ok(host::Resolution::NotFound) => {
                 eprintln!("junto brief: bound channel '{channel}' not found (not opened yet?)");
-            }
-            Ok(host::Resolution::Ambiguous(substrates)) => {
-                eprintln!(
-                    "junto brief: bound channel '{channel}' is ambiguous across {substrates:?}; \
-                     bind by id"
-                );
             }
             Err(err) => eprintln!("junto brief: resolving '{channel}': {err:#}"),
         }
@@ -1621,7 +1630,7 @@ mod tests {
             author: founder,
             timestamp: Timestamp::now(),
             payload: EntryPayload::ChannelOpened {
-                name: name.to_string(),
+                name: Some(name.to_string()),
             },
         };
         ledger.lock().await.append(genesis).await.unwrap();
@@ -1663,9 +1672,10 @@ mod tests {
         )
         .unwrap();
 
+        let mut out = Vec::new();
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            brief(checkout.path().to_path_buf()),
+            brief(checkout.path().to_path_buf(), &mut out),
         )
         .await;
         assert!(
@@ -1675,6 +1685,136 @@ mod tests {
              per-substrate ledger for the sibling channel and deadlocks"
         );
         outcome.unwrap().unwrap();
+    }
+
+    /// A bound channel with nothing ratified must not break session start,
+    /// and must print nothing for it (spec §2's collapse: "invisible to the
+    /// brief until something in it is ratified") — not just "didn't error".
+    #[tokio::test]
+    async fn brief_skips_a_scratch_bound_channel_without_erroring() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (_repo, _id) = setup_channel("scratch-only").await;
+        let checkout = tempfile::tempdir().unwrap();
+        std::fs::write(
+            checkout.path().join(binding::PROJECT_BINDING),
+            "channels = [\"scratch-only\"]\n",
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        brief(checkout.path().to_path_buf(), &mut out)
+            .await
+            .unwrap();
+        assert!(
+            out.is_empty(),
+            "a scratch channel must print nothing to the brief: {}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    /// Give `id` (already opened in `repo`'s substrate) one ratified entry
+    /// — the minimal way a test-fixture channel earns `ChannelStanding::Standing`.
+    async fn ratify_a_channel(host: &host::Host, repo: &Path, id: ChannelId) {
+        let ledger = host.ledger_for(repo).await.unwrap();
+        let decision = EntryId::new();
+        ledger
+            .lock()
+            .await
+            .append(LedgerEntry {
+                signature: None,
+                id: decision,
+                channel: id,
+                author: Member::human("Dan", "dan@example.com"),
+                timestamp: Timestamp::now(),
+                payload: EntryPayload::Assertion {
+                    statement: "use NDJSON for the pending queue".into(),
+                    rationale: "matches the substrate".into(),
+                    provenance: vec![],
+                    frame: None,
+                },
+            })
+            .await
+            .unwrap();
+        ledger
+            .lock()
+            .await
+            .append(LedgerEntry {
+                signature: None,
+                id: EntryId::new(),
+                channel: id,
+                author: Member::human("Dan", "dan@example.com"),
+                timestamp: Timestamp::now(),
+                payload: EntryPayload::Ratification {
+                    target: decision,
+                    rationale: "agreed".into(),
+                },
+            })
+            .await
+            .unwrap();
+    }
+
+    /// The counterpart to the scratch skip above: once a bound channel
+    /// earns standing (a ratified entry), the brief actually prints it —
+    /// guards against a filter bug that suppresses everything.
+    #[tokio::test]
+    async fn brief_prints_a_bound_channel_that_has_earned_standing() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (repo, id) = setup_channel("ratified-only").await;
+        let host = host::Host::fixed(vec![repo.path().to_path_buf()]);
+        ratify_a_channel(&host, repo.path(), id).await;
+
+        let checkout = tempfile::tempdir().unwrap();
+        std::fs::write(
+            checkout.path().join(binding::PROJECT_BINDING),
+            "channels = [\"ratified-only\"]\n",
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        brief(checkout.path().to_path_buf(), &mut out)
+            .await
+            .unwrap();
+        let printed = String::from_utf8(out).unwrap();
+        assert!(
+            printed.contains("ratified-only"),
+            "a channel with a ratified entry must print in the brief: {printed}"
+        );
+    }
+
+    /// A writer whose every `write` fails — pins `brief`'s documented
+    /// contract (module doc above `brief`: "the exit is always success")
+    /// against the one failure mode fix round 1 introduced when it started
+    /// writing through an `impl Write` instead of `println!`.
+    struct FailingWriter;
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A broken output stream must not make `brief` return `Err` — it is a
+    /// SessionStart hook, and a write failure is exactly the kind of
+    /// best-effort failure every other step in `brief` already degrades on
+    /// (an `eprintln!` and keep going), not one that should be the sole
+    /// exception.
+    #[tokio::test]
+    async fn brief_returns_ok_even_when_its_writer_fails() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (repo, id) = setup_channel("write-fails").await;
+        let host = host::Host::fixed(vec![repo.path().to_path_buf()]);
+        ratify_a_channel(&host, repo.path(), id).await;
+
+        let checkout = tempfile::tempdir().unwrap();
+        std::fs::write(
+            checkout.path().join(binding::PROJECT_BINDING),
+            "channels = [\"write-fails\"]\n",
+        )
+        .unwrap();
+        brief(checkout.path().to_path_buf(), &mut FailingWriter)
+            .await
+            .unwrap();
     }
 
     fn build_enroll_url(

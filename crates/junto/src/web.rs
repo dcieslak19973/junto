@@ -31,11 +31,14 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
-use junto_kernel::{ChannelId, ChannelView, EntryId, EntryPayload, LedgerEntry, Timestamp};
+use junto_kernel::{
+    ChannelId, ChannelView, EntryId, EntryPayload, LedgerEntry, Subject, SubjectKind, Timestamp,
+    Uri,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::RedeemOutcome;
-use crate::host::{Host, Resolution};
+use crate::host::{Host, Resolution, WriteAuth};
 use crate::render;
 
 /// The web routes, to be merged into the host's router.
@@ -152,6 +155,58 @@ pub(crate) async fn project_fresh(
     Ok((id, view, substrate))
 }
 
+/// The refusal every write-side mount lookup gives when a channel has no
+/// attached, mounted Subject to run in.
+const NO_MOUNTABLE_SUBJECT: &str = "channel has no subject to run in — attach one first";
+
+/// The first `Execute`-capable mounted subject on this machine — or the
+/// error reading the mount store itself, kept distinct from "nothing is
+/// mounted" so a write-side caller can tell an unreadable `mounts.toml` (a
+/// real failure) apart from a channel with no mountable subject (a
+/// refusal, not a failure). Delegates to `crate::launch::executable_mount`
+/// — the same search `session_workdir` runs — rather than "the first mount
+/// of any kind": a Document subject can be mounted without ever being
+/// `Execute`-capable, and this must agree with what a launch will actually
+/// use, not just with what happens to be on disk.
+// Same Response-as-error idiom as `project`/`project_fresh`; see the
+// rationale above `project`.
+#[allow(clippy::result_large_err)]
+fn resolve_channel_mount(
+    junto_home: &std::path::Path,
+    view: &ChannelView,
+) -> Result<Option<std::path::PathBuf>, Response> {
+    crate::launch::executable_mount(junto_home, view)
+        .map_err(|err| internal(format!("reading mounts: {err}")))
+}
+
+/// [`resolve_channel_mount`], collapsed to `None` on any failure — for
+/// read-only callers that only prefill a form and would rather show it
+/// empty than surface a 500 for an unreadable mount store.
+fn channel_mount(junto_home: &std::path::Path, view: &ChannelView) -> Option<std::path::PathBuf> {
+    resolve_channel_mount(junto_home, view).ok().flatten()
+}
+
+/// True when the channel carries a Repo subject this machine hasn't
+/// mounted. The one case where `launch_session`'s empty-workspace-field
+/// path still refuses (`NO_MOUNTABLE_SUBJECT`) instead of falling back to
+/// `crate::launch::session_workdir`'s scratch directory: that subject could
+/// become `Execute`-capable simply by mounting it (`mounts::capabilities`),
+/// so silently working in scratch would strand the human's evident intent
+/// behind a directory nobody asked for. A Document subject, or no subject
+/// at all, has no such escape hatch — those fall through to scratch.
+#[allow(clippy::result_large_err)]
+fn channel_has_unmounted_repo_subject(
+    junto_home: &std::path::Path,
+    view: &ChannelView,
+) -> Result<bool, Response> {
+    let subjects: Vec<_> = view.subjects.iter().map(|(_, s)| s.clone()).collect();
+    let mounts = crate::mounts::mounts_for(junto_home, &subjects)
+        .map_err(|err| internal(format!("reading mounts: {err}")))?;
+    Ok(subjects.iter().any(|subject| {
+        subject.kind == SubjectKind::Repo && !mounts.iter().any(|m| m.uri == subject.uri)
+    }))
+}
+
 // Same Response-as-error idiom, same cold Err path, and both callers above
 // already carry this allow — boxing here would only add a deref at each of
 // them. See the rationale above `project`.
@@ -173,14 +228,6 @@ async fn resolve_for_projection(
         Resolution::NotFound => Err((
             StatusCode::NOT_FOUND,
             format!("no channel '{channel}' in any registered substrate"),
-        )
-            .into_response()),
-        Resolution::Ambiguous(substrates) => Err((
-            StatusCode::CONFLICT,
-            format!(
-                "channel name '{channel}' exists in several substrates ({substrates:?}); \
-                 address it by id"
-            ),
         )
             .into_response()),
     }
@@ -510,8 +557,8 @@ async fn delete_agent(State(_host): State<Arc<Host>>, Path(slug): Path<String>) 
 /// The form body for opening a channel from the index page.
 #[derive(Debug, Deserialize)]
 struct OpenChannelForm {
-    /// The channel's name — a label, unique within its home substrate
-    /// (`docs/adr/0014`).
+    /// The channel's name — a label, not required to be unique
+    /// (`docs/adr/0014`'s amendment).
     name: String,
     /// The home substrate repo path; may be empty when the host serves
     /// exactly one.
@@ -564,7 +611,7 @@ async fn open_channel(
     match host.open_channel(Some(&repo), name, founder, None).await {
         // Id-addressed: ids are URL-safe, names may not be.
         Ok(opened) => Redirect::to(&format!("/channels/{}", opened.id)).into_response(),
-        // Name taken, unregistered substrate, … — the message says which.
+        // Unregistered substrate, empty/id-shaped name, … — the message says which.
         Err(err) => (StatusCode::CONFLICT, format!("{err:#}")).into_response(),
     }
 }
@@ -613,8 +660,8 @@ async fn setup_repo(State(host): State<Arc<Host>>, Form(form): Form<SetupRepoFor
         Ok(Resolution::Resolved { id, .. }) => {
             Redirect::to(&format!("/channels/{id}")).into_response()
         }
-        // Ambiguous (the name exists elsewhere too) or anything unexpected:
-        // the index shows the new substrate either way.
+        // Not found or anything unexpected: the index shows the new
+        // substrate either way.
         _ => Redirect::to("/").into_response(),
     }
 }
@@ -631,7 +678,7 @@ async fn channel_page(State(host): State<Arc<Host>>, Path(channel): Path<String>
             // (docs/adr/0023); best-effort, like the nav.
             let workspace = crate::host::junto_home()
                 .ok()
-                .and_then(|home| crate::launch::workspace_for(&home, &id).ok().flatten());
+                .and_then(|home| channel_mount(&home, &view));
             Html(render::channel_html(
                 &nav,
                 &name,
@@ -652,7 +699,8 @@ struct LaunchForm {
     /// What the agent should do — becomes the session's intent and the
     /// harness prompt.
     intent: String,
-    /// The workspace repo; empty falls back to the remembered mapping.
+    /// The workspace repo; empty (or unchanged from the prefilled, already
+    /// mounted value) resolves through this machine's Mount store instead.
     #[serde(default)]
     workspace: String,
     /// Which agent runs it (its slug); empty/unknown → the default agent
@@ -665,9 +713,64 @@ struct LaunchForm {
     mode: String,
 }
 
+/// A git repo's portable identity: its `origin` remote when it has one, else
+/// a `file://` URI of the canonical path. Portable in the common case; the
+/// fallback is machine-shaped on purpose — a repo with no remote has no
+/// portable identity to offer.
+///
+/// # Errors
+/// Errors if `path` is not a git repository (`git -C <path> rev-parse
+/// --git-dir` fails) — a typo'd or non-repo directory refuses rather than
+/// silently recording a `file://` Subject the session runner cannot diff —
+/// or if the fallback path cannot be canonicalized, or if the resulting
+/// string is not a valid [`Uri`].
+fn repo_subject_uri(path: &std::path::Path) -> anyhow::Result<Uri> {
+    let mut probe = std::process::Command::new("git");
+    probe.arg("-C").arg(path).args(["rev-parse", "--git-dir"]);
+    crate::launch::no_console_window(&mut probe);
+    let is_repo = probe.output().is_ok_and(|out| out.status.success());
+    if !is_repo {
+        anyhow::bail!("'{}' is not a git repository", path.display());
+    }
+    let mut command = std::process::Command::new("git");
+    command
+        .arg("-C")
+        .arg(path)
+        .args(["remote", "get-url", "origin"]);
+    // Terminal-less: no flashed console window (runs on every launch).
+    crate::launch::no_console_window(&mut command);
+    let origin = command
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+    let raw = match origin {
+        Some(url) => url,
+        None => {
+            // The same `file:///` spelling `store_artifact` (`launch.rs`)
+            // writes and `file_uri_to_path` decodes: forward slashes
+            // throughout, one more `/` than `file://` alone so a POSIX
+            // absolute path's own leading `/` lands where that decoder
+            // expects it.
+            let canonical = dunce::canonicalize(path)
+                .map_err(|err| anyhow::anyhow!("canonicalizing {}: {err}", path.display()))?;
+            format!(
+                "file:///{}",
+                canonical.display().to_string().replace('\\', "/")
+            )
+        }
+    };
+    Ok(Uri::new(raw)?)
+}
+
 /// Launch an Agent Session from the channel page: resolve the workspace
-/// (remembering a newly typed one), check the agent's member is in the
-/// Party, and spawn the first turn in the background.
+/// through this machine's Mount store — an already-mounted subject's path,
+/// or, when nothing is mounted yet, a freshly typed path (which attaches a
+/// Subject derived from it and remembers the mount, [`repo_subject_uri`] /
+/// [`Host::attach_subject`]) — check the agent's member is in the Party,
+/// and spawn the first turn in the background.
 async fn launch_session(
     State(host): State<Arc<Host>>,
     Path(channel): Path<String>,
@@ -730,36 +833,193 @@ async fn launch_session(
             return (StatusCode::FORBIDDEN, format!("{err:#}")).into_response();
         }
     }
-    let workspace = if form.workspace.trim().is_empty() {
-        match crate::launch::workspace_for(&junto_home, &id) {
-            Ok(Some(workspace)) => workspace,
-            Ok(None) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    "no workspace is remembered for this channel — fill in the workspace \
-                     repo path (it will be remembered)",
-                )
-                    .into_response();
+    let mounted = match resolve_channel_mount(&junto_home, &view) {
+        Ok(mounted) => mounted,
+        Err(response) => return response,
+    };
+    let typed = form.workspace.trim();
+    // Minted here, not inside `launch`/`launch_outcome`, so this handler can
+    // resolve the same id's workdir (`session_workdir`) before the session
+    // exists in the ledger.
+    let session = EntryId::new();
+    let mut attached_view: Option<ChannelView> = None;
+    let workspace = match (typed.is_empty(), mounted) {
+        // Either arm below that does *not* introduce a new typed path
+        // resolves through `session_workdir` — the sole authority on
+        // where a session runs (`crate::launch::session_workdir`'s own
+        // doc comment) — rather than using `mounted` directly. `mounted`
+        // itself is now `Execute`-capability-filtered
+        // (`resolve_channel_mount` delegates to `executable_mount`), so
+        // when it is `Some` this always resolves to that same mount; the
+        // point is that launch and steer can never again disagree by
+        // construction, not by two call sites coincidentally agreeing.
+        (true, mount) => {
+            // Nothing `Execute`-capable is mounted. That is not
+            // automatically a refusal any more (Task 6: a session runs
+            // without a repo) — but a Repo subject that merely isn't
+            // mounted *yet* is still fixable by typing its path, so that
+            // refusal survives (`NO_MOUNTABLE_SUBJECT`) when nothing is
+            // mounted at all; a Document subject, or no subject at all,
+            // has no such escape hatch and falls through to
+            // `session_workdir`'s scratch-directory fallback instead.
+            if mount.is_none() {
+                match channel_has_unmounted_repo_subject(&junto_home, &view) {
+                    Ok(true) => {
+                        return (StatusCode::BAD_REQUEST, NO_MOUNTABLE_SUBJECT).into_response();
+                    }
+                    Ok(false) => {}
+                    Err(response) => return response,
+                }
             }
-            Err(err) => return internal(format!("reading workspaces: {err}")),
+            match crate::launch::session_workdir(&junto_home, &view, session) {
+                Ok(path) => path,
+                Err(err) => return internal(format!("preparing a workdir: {err}")),
+            }
         }
-    } else {
-        let typed = std::path::PathBuf::from(form.workspace.trim());
-        if let Err(err) = crate::launch::remember_workspace(&junto_home, &id, &typed) {
-            return (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response();
+        // The form prefills the resolved mount (`channel_mount`,
+        // `render::channel_html`'s start-work form); a submission carrying
+        // that value back unchanged is not a new path, so accept it exactly
+        // as the empty-field case above would (and resolve it the same way).
+        (false, Some(path)) if path == std::path::Path::new(typed) => {
+            match crate::launch::session_workdir(&junto_home, &view, session) {
+                Ok(path) => path,
+                Err(err) => return internal(format!("preparing a workdir: {err}")),
+            }
         }
-        match crate::launch::workspace_for(&junto_home, &id) {
-            Ok(Some(workspace)) => workspace,
-            _ => return internal("workspace vanished after remembering".into()),
+        // `mounted` being `None` doesn't mean the channel has no Subject:
+        // `mounts_for` skips subjects this machine hasn't mounted (a
+        // teammate's checkout, `mounts.rs`'s "a teammate may hold a
+        // checkout you do not"), so a fresh clone of an already-attached
+        // repo lands here too. `Host::attach_subject` is idempotent against
+        // a uri the channel already carries — it returns the existing
+        // attachment rather than duplicating it — so this always calls it
+        // and always remembers the mount, with no redundant check here.
+        (false, None) => {
+            let repo_path = std::path::Path::new(typed);
+            let uri = match repo_subject_uri(repo_path) {
+                Ok(uri) => uri,
+                Err(err) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        format!("could not derive a subject for '{typed}': {err:#}"),
+                    )
+                        .into_response();
+                }
+            };
+            let author = match crate::host::git_user(&substrate) {
+                Ok(author) => author,
+                Err(err) => {
+                    return internal(format!(
+                        "no author identity: {err} (set git config user.name / user.email)"
+                    ));
+                }
+            };
+            // The append below is the one irreversible step in this arm —
+            // nothing can withdraw a `SubjectAttached` yet (`SubjectDetached`
+            // has no writer, ADR 0037's Known limits). So it runs last among
+            // what can still fail: `remember_mount` needs only `uri` and
+            // `repo_path`, already in hand, not anything `attach_subject`
+            // returns, so it moves ahead of the append (fix round, finding
+            // 9). What can't move ahead of it is `session_workdir` below —
+            // it walks a *fresh* view's subjects, and the newly attached
+            // one isn't there until the append lands — nor, for the same
+            // reason, the `mode=outcome` gate a few lines down. That
+            // dependency is the residual this reordering cannot remove.
+            if let Err(err) = crate::mounts::remember_mount(&junto_home, &uri, repo_path) {
+                return internal(format!("remembering mount: {err}"));
+            }
+            let subject = Subject::new(SubjectKind::Repo, uri.clone());
+            if let Err(err) = host
+                .attach_subject(&channel, subject, author, WriteAuth::Human)
+                .await
+            {
+                return lineage_error(err);
+            }
+            // `session_workdir` re-derives from a fresh view the same way
+            // every other arm does (finding 8) — `mount_path` alone is
+            // capability-unfiltered and can't tell an `Execute`-capable
+            // mount from any other, which is exactly the four-step
+            // coincidence-of-reasoning `session_workdir`'s "sole authority"
+            // contract exists to replace with construction.
+            let fresh = match project(&host, &channel).await {
+                Ok((_, fresh, _)) => fresh,
+                Err(response) => return response,
+            };
+            let workspace = match crate::launch::session_workdir(&junto_home, &fresh, session) {
+                Ok(path) => path,
+                Err(err) => return internal(format!("preparing a workdir: {err}")),
+            };
+            attached_view = Some(fresh);
+            workspace
+        }
+        // A subject is already mounted; a typed path that differs from it
+        // can't be remembered directly without knowing whether it means to
+        // re-point that same subject or introduce a second one.
+        (false, Some(_)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "typing a new workspace path is not supported yet — this channel's subject is \
+                 already mounted elsewhere",
+            )
+                .into_response();
         }
     };
     // "outcome" runs the code-PR push-gate (the verify/Grader loop, docs/adr/0025);
-    // otherwise a single turn (docs/adr/0023).
-    let launched = if form.mode.trim() == "outcome" {
-        crate::launch::launch_outcome(host.clone(), id, channel.clone(), workspace, intent, agent)
-            .await
+    // otherwise a single turn (docs/adr/0023). The push-gate grades a
+    // mechanical before/after (`Capability::Diff`) — checked directly
+    // against `crate::mounts::capabilities`, not inferred from whether the
+    // resolved workspace happens to sit under the scratch root: a mounted
+    // *Document* subject is neither scratch nor diffable, and inferring
+    // from the path alone let exactly that case slip the gate and reach
+    // `prepare_pr_branch`/`workspace_diff`, which would then git-discover
+    // whatever repository happens to enclose the document's directory.
+    // Refuse here rather than let the loop run and starve on an empty (or
+    // wrong) diff: a single-turn session (the `else` branch below) stays
+    // fully supported in a scratch directory.
+    let outcome_mode = form.mode.trim() == "outcome";
+    if outcome_mode {
+        // The `(false, None)` arm above may have just attached a Repo
+        // subject and remembered its mount, and already re-projected to
+        // resolve `session_workdir` against it (finding 8) — reuse that
+        // same fresh view here rather than projecting a third time; `view`
+        // (projected before that write, if it happened) is current for
+        // every other arm.
+        let gate_view = attached_view.unwrap_or(view);
+        match crate::launch::diff_capable(&junto_home, &gate_view) {
+            Ok(true) => {}
+            Ok(false) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "the Outcome loop needs a diffable subject to grade — mount a Repo \
+                     subject, or launch a single-turn session instead",
+                )
+                    .into_response();
+            }
+            Err(err) => return internal(format!("reading mounts: {err}")),
+        }
+    }
+    let launched = if outcome_mode {
+        crate::launch::launch_outcome(
+            host.clone(),
+            id,
+            channel.clone(),
+            session,
+            workspace,
+            intent,
+            agent,
+        )
+        .await
     } else {
-        crate::launch::launch(host.clone(), id, channel.clone(), workspace, intent, agent).await
+        crate::launch::launch(
+            host.clone(),
+            id,
+            channel.clone(),
+            session,
+            workspace,
+            intent,
+            agent,
+        )
+        .await
     };
     match launched {
         Ok(_session) => Redirect::to(&format!("/channels/{id}")).into_response(),
@@ -839,20 +1099,11 @@ async fn steer_session(
         Ok(home) => home,
         Err(err) => return internal(format!("no junto home: {err}")),
     };
-    let workspace = match crate::launch::workspace_for(&junto_home, &id) {
-        Ok(Some(workspace)) => workspace,
-        Ok(None) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                "no workspace is remembered for this channel on this machine",
-            )
-                .into_response();
-        }
-        Err(err) => return internal(format!("reading workspaces: {err}")),
-    };
-    // One steer box, routed on liveness: a running turn is steered in place over
-    // the control channel; a turn that has already landed is resumed (docs/adr/
-    // 0032).
+    // One steer box, routed on liveness: a running turn is steered in place
+    // over the control channel; a turn that has already landed is resumed
+    // (docs/adr/0032). A live steer touches no workspace at all, so the
+    // mount checks below run only inside the between-turns resume path,
+    // after this routing decision — never ahead of it.
     match crate::launch::steer_live(
         host.clone(),
         id,
@@ -864,20 +1115,72 @@ async fn steer_session(
     .await
     {
         Ok(()) => Redirect::to(&format!("/channels/{id}")).into_response(),
-        Err(crate::launch::NotLive) => match crate::launch::steer(
-            host.clone(),
-            id,
-            channel.clone(),
-            workspace,
-            session,
-            author,
-            message,
-        )
-        .await
-        {
-            Ok(()) => Redirect::to(&format!("/channels/{id}")).into_response(),
-            Err(err) => (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
-        },
+        Err(crate::launch::NotLive) => {
+            // A channel with a mounted, `Execute`-capable subject resolves
+            // through it regardless of anything else the channel carries
+            // (the same rule `launch_session` follows —
+            // `a_mounted_repo_subject_still_launches_alongside_a_second_unmounted_one`).
+            // Refuse only when *nothing* is `Execute`-capable *and* a Repo
+            // subject this machine has no mount for exists (`mounts.toml`
+            // edited, or the entry removed after launch): that is a
+            // fixable gap, not a repo-free channel, and silently resuming
+            // into a fresh, empty `session_workdir` scratch directory
+            // would discard whatever work already exists in the mount the
+            // human just lost.
+            let executable = match crate::launch::executable_mount(&junto_home, &view) {
+                Ok(mount) => mount,
+                Err(err) => return internal(format!("reading mounts: {err}")),
+            };
+            if executable.is_none() {
+                match channel_has_unmounted_repo_subject(&junto_home, &view) {
+                    Ok(true) => {
+                        return (StatusCode::BAD_REQUEST, NO_MOUNTABLE_SUBJECT).into_response();
+                    }
+                    Ok(false) => {}
+                    Err(response) => return response,
+                }
+            }
+            // The same id's workdir `launch_session` resolved when this
+            // session started (`session_workdir`): a mounted subject's
+            // path, or the scratch directory Task 6 gives a repo-free
+            // channel — deterministic from `(junto_home, view, session)`,
+            // and therefore stable only while the mount store is: this
+            // re-resolves the *current* first Execute-capable mount, not
+            // necessarily the one this session launched in (ADR 0038's
+            // recorded limit). A session that already ran in scratch keeps
+            // running there: `<junto_home>/scratch/<session>` is created
+            // by `session_workdir` and never removed, so its existence is
+            // already a durable, machine-local record that this session
+            // ran in scratch — re-resolving instead would silently move a
+            // resumed turn into a repo mounted after launch, running the
+            // agent in a checkout this session was never launched against,
+            // and recording that repo's uncommitted changes as this
+            // session's diff artifact (the likely instance of ADR 0038's
+            // limit).
+            let scratch = junto_home.join("scratch").join(session.to_string());
+            let workspace = if scratch.is_dir() {
+                scratch
+            } else {
+                match crate::launch::session_workdir(&junto_home, &view, session) {
+                    Ok(workspace) => workspace,
+                    Err(err) => return internal(format!("preparing a workdir: {err}")),
+                }
+            };
+            match crate::launch::steer(
+                host.clone(),
+                id,
+                channel.clone(),
+                workspace,
+                session,
+                author,
+                message,
+            )
+            .await
+            {
+                Ok(()) => Redirect::to(&format!("/channels/{id}")).into_response(),
+                Err(err) => (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
+            }
+        }
     }
 }
 
@@ -1106,8 +1409,8 @@ fn file_uri_to_path(uri: &str) -> Option<std::path::PathBuf> {
 /// The form body for renaming a channel.
 #[derive(Debug, Deserialize)]
 struct RenameForm {
-    /// The new name — a label, unique within the home substrate
-    /// (`docs/adr/0014`).
+    /// The new name — a label, not required to be unique
+    /// (`docs/adr/0014`'s amendment).
     name: String,
     /// Why the rename. A rationale, not a checkbox.
     rationale: String,
@@ -1147,18 +1450,6 @@ async fn rename_channel(
         Ok(projected) => projected,
         Err(response) => return response,
     };
-    // Name uniqueness within the home substrate, same rule open_channel
-    // enforces (docs/adr/0014: names are substrate-scoped labels).
-    let taken = host.inventory().await.unwrap_or_default().iter().any(|s| {
-        s.substrate == substrate && s.id != id && s.name.as_deref() == Some(new_name.as_str())
-    });
-    if taken {
-        return (
-            StatusCode::CONFLICT,
-            format!("a channel named '{new_name}' already exists in this substrate"),
-        )
-            .into_response();
-    }
     let author = match crate::host::git_user(&substrate) {
         Ok(author) => author,
         Err(err) => {
@@ -1493,13 +1784,6 @@ async fn verify(
         Resolution::NotFound => {
             return (StatusCode::NOT_FOUND, format!("no channel '{channel}'")).into_response();
         }
-        Resolution::Ambiguous(_) => {
-            return (
-                StatusCode::CONFLICT,
-                format!("channel name '{channel}' is ambiguous; use the id"),
-            )
-                .into_response();
-        }
     };
 
     // Validate the act against the target's kind so a stale form (or a typo'd
@@ -1667,13 +1951,12 @@ async fn resolve_for_act(
             ledger,
             id,
         } => Ok((substrate, ledger, id)),
+        // Since the collapse (ADR 0014's amendment) a name may match several
+        // channels, and `resolve` picks the most recently opened rather than
+        // refusing — so there is no ambiguous outcome left to handle here.
         Resolution::NotFound => Err(identity_error(
             StatusCode::NOT_FOUND,
             format!("no channel '{channel}'"),
-        )),
-        Resolution::Ambiguous(_) => Err(identity_error(
-            StatusCode::CONFLICT,
-            format!("channel name '{channel}' is ambiguous; use the id"),
         )),
     }
 }
@@ -2053,46 +2336,30 @@ async fn substrates_json(State(host): State<Arc<Host>>) -> Response {
     axum::Json(paths).into_response()
 }
 
-/// Distinct **workspace repos**, most-recently-used first — the launch form's
-/// inferred default + suggestions for a fresh channel (so the user rarely has
-/// to pick a directory). Ordered by the last activity of the channel each repo
-/// is bound to.
-async fn workspaces_json(State(host): State<Arc<Host>>) -> Response {
+/// Distinct **mounted paths** on this machine — the launch form's
+/// suggestions for a fresh channel (so the user rarely has to pick a
+/// directory from scratch). Sorted by path for a stable, deterministic order.
+///
+/// The prior recency ranking (most-recently-used channel first) cannot be
+/// reproduced from the Mount store: mounts are keyed by Subject URI, not by
+/// channel, so channels no longer own paths and there is no channel-recency
+/// signal left to rank by. Giving the picker a *meaningful* order again
+/// (e.g. last-mounted time) is the surface plan's call, not invented here.
+async fn workspaces_json() -> Response {
     let junto_home = match crate::host::junto_home() {
         Ok(home) => home,
         Err(err) => return internal(format!("no junto home: {err}")),
     };
-    let mappings = match crate::launch::all_workspaces(&junto_home) {
-        Ok(mappings) => mappings,
-        Err(err) => return internal(format!("reading workspaces: {err}")),
+    let mounts = match crate::mounts::all_mounts(&junto_home) {
+        Ok(mounts) => mounts,
+        Err(err) => return internal(format!("reading mounts: {err}")),
     };
-    // Channel id → last activity, for recency ordering.
-    let activity: std::collections::HashMap<String, i64> = host
-        .inventory()
-        .await
-        .unwrap_or_default()
+    let mut repos: Vec<String> = mounts
         .into_iter()
-        .map(|s| {
-            (
-                s.id.to_string(),
-                s.last_activity.map(|t| t.as_millis()).unwrap_or(0),
-            )
-        })
+        .map(|mount| mount.path.display().to_string())
         .collect();
-    // Newest channel's repo first; dedup repos keeping their best (latest) rank.
-    let mut ranked: Vec<(i64, String)> = mappings
-        .into_iter()
-        .map(|(channel, repo)| {
-            let when = activity.get(&channel.to_string()).copied().unwrap_or(0);
-            (when, repo.display().to_string())
-        })
-        .collect();
-    ranked.sort_by_key(|entry| std::cmp::Reverse(entry.0));
-    let mut seen = std::collections::HashSet::new();
-    let repos: Vec<String> = ranked
-        .into_iter()
-        .filter_map(|(_, repo)| seen.insert(repo.clone()).then_some(repo))
-        .collect();
+    repos.sort();
+    repos.dedup();
     axum::Json(repos).into_response()
 }
 
@@ -2255,7 +2522,7 @@ async fn channel_view_json(State(host): State<Arc<Host>>, Path(channel): Path<St
             // form pre-fill it instead of asking the user to pick a directory.
             dto.workspace = crate::host::junto_home()
                 .ok()
-                .and_then(|home| crate::launch::workspace_for(&home, &id).ok().flatten())
+                .and_then(|home| channel_mount(&home, &view))
                 .map(|repo| repo.display().to_string());
             axum::Json(dto).into_response()
         }
@@ -2423,6 +2690,13 @@ impl EntryDto {
             EntryPayload::ArtifactAttached {
                 kind, description, ..
             } => ("artifact", format!("{kind}: {description}")),
+            // Provisional copy — the surface plan owns subject rendering.
+            EntryPayload::SubjectAttached { subject } => (
+                "subject",
+                format!("attached {:?}: {}", subject.kind, subject.uri.as_str()),
+            ),
+            // Provisional copy — the surface plan owns subject rendering.
+            EntryPayload::SubjectDetached { target } => ("subject", format!("detached {target}")),
         };
         let status = match &entry.payload {
             EntryPayload::Assertion { .. } | EntryPayload::Correction { .. } => view
@@ -3149,7 +3423,7 @@ async fn preview_enrollment(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use junto_kernel::{ApprovalRequirement, GateStatus, Member, Standing};
+    use junto_kernel::{ApprovalRequirement, ChannelStanding, GateStatus, Member, Standing};
     use std::process::Command as StdCommand;
     use tempfile::TempDir;
 
@@ -3286,6 +3560,41 @@ mod tests {
             channel,
             target,
         }
+    }
+
+    /// Attach a Repo Subject to `fx`'s channel and mount it to `path` on
+    /// this machine — the real write path a launch now needs
+    /// (`required_mount`, since a typed form path alone is refused).
+    /// `Host::attach_subject` (a follow-up task) will wrap the first half of
+    /// this; until then the entry is appended directly, exactly as this
+    /// module's other fixtures append entries the host has no wrapper for.
+    async fn attach_and_mount_repo(
+        fx: &WebFixture,
+        junto_home: &std::path::Path,
+        path: &std::path::Path,
+    ) {
+        let uri = junto_kernel::Uri::new(format!("https://example.com/{}.git", fx.channel))
+            .expect("valid uri");
+        let subject = junto_kernel::Subject::new(junto_kernel::SubjectKind::Repo, uri.clone());
+        let ledger = fx
+            .host
+            .ledger_for(fx._dirs[0].path())
+            .await
+            .expect("ledger");
+        ledger
+            .lock()
+            .await
+            .append(LedgerEntry {
+                signature: None,
+                id: EntryId::new(),
+                channel: fx.channel,
+                author: Member::human("Web User", "web@example.com"),
+                timestamp: Timestamp::now(),
+                payload: EntryPayload::SubjectAttached { subject },
+            })
+            .await
+            .expect("attach subject");
+        crate::mounts::remember_mount(junto_home, &uri, path).expect("remember mount");
     }
 
     fn assertion() -> EntryPayload {
@@ -3706,7 +4015,9 @@ mod tests {
             )
             .await
             .expect("grant the harness membership");
-        // A workspace repo for the session to run in.
+        // A workspace repo for the session to run in — attached as a Repo
+        // Subject and mounted here, the write path `required_mount` now
+        // requires (a typed form path is refused; see `launch_session`).
         let workspace = tempfile::tempdir().expect("workspace");
         assert!(
             StdCommand::new("git")
@@ -3716,13 +4027,14 @@ mod tests {
                 .expect("git init")
                 .success()
         );
+        attach_and_mount_repo(&fx, home.path(), workspace.path()).await;
 
         let response = launch_session(
             State(fx.host.clone()),
             Path("web-test".into()),
             Form(LaunchForm {
                 intent: "do the stub thing".into(),
-                workspace: workspace.path().display().to_string(),
+                workspace: String::new(),
                 agent: String::new(),
                 mode: String::new(),
             }),
@@ -3795,12 +4107,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn launch_accepts_the_forms_prefilled_value_when_it_matches_the_resolved_mount() {
+        // `render::channel_html` prefills the workspace field with
+        // `channel_mount`'s resolved path; submitting that value back
+        // unchanged must launch, not refuse it as a fresh, unmountable typed
+        // path. This guards the bug where `launch_session` refused every
+        // submission (empty *and* the prefilled round-trip alike) because
+        // any non-empty field was treated as "a new typed path".
+        let home = crate::host::test_home::HomeGuard::new();
+        let stub_dir = tempfile::tempdir().expect("stub dir");
+        let stub = if cfg!(windows) {
+            let path = stub_dir.path().join("stub.cmd");
+            std::fs::write(
+                &path,
+                "@echo {\"type\":\"result\",\"subtype\":\"success\",\"result\":\"ok\",\
+                 \"session_id\":\"h-prefill-1\",\"is_error\":false}\r\n",
+            )
+            .expect("write stub");
+            path
+        } else {
+            let path = stub_dir.path().join("stub.sh");
+            std::fs::write(
+                &path,
+                "#!/bin/sh\necho '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"ok\",\
+                 \"session_id\":\"h-prefill-1\",\"is_error\":false}'\n",
+            )
+            .expect("write stub");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod stub");
+            }
+            path
+        };
+        unsafe { std::env::set_var("JUNTO_HARNESS_CMD", &stub) };
+
+        let fx = host_with_entry(assertion()).await;
+        let founder = Member::human("Web User", "web@example.com");
+        fx.host
+            .add_member(
+                "web-test",
+                &founder,
+                crate::launch::harness_member(),
+                None,
+                None,
+            )
+            .await
+            .expect("grant the harness membership");
+        let workspace = tempfile::tempdir().expect("workspace");
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        attach_and_mount_repo(&fx, home.path(), workspace.path()).await;
+
+        // Exactly what the rendered start-work form would have prefilled.
+        let (_, view, _) = project(&fx.host, "web-test").await.expect("project");
+        let mounted = channel_mount(home.path(), &view).expect("mount resolved");
+
+        let response = launch_session(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LaunchForm {
+                intent: "do the stub thing".into(),
+                workspace: mounted.display().to_string(),
+                agent: String::new(),
+                mode: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::SEE_OTHER,
+            "the unchanged prefill must launch, not be refused as a new path"
+        );
+
+        unsafe { std::env::remove_var("JUNTO_HARNESS_CMD") };
+    }
+
+    #[tokio::test]
+    async fn launch_refuses_a_typed_path_that_differs_from_the_resolved_mount() {
+        // The fix for accepting the unchanged prefill above must not widen
+        // into accepting *any* typed path — only the one already mounted.
+        let home = crate::host::test_home::HomeGuard::new();
+        let fx = host_with_entry(assertion()).await;
+        let founder = Member::human("Web User", "web@example.com");
+        fx.host
+            .add_member(
+                "web-test",
+                &founder,
+                crate::launch::harness_member(),
+                None,
+                None,
+            )
+            .await
+            .expect("grant the harness membership");
+        let workspace = tempfile::tempdir().expect("workspace");
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        attach_and_mount_repo(&fx, home.path(), workspace.path()).await;
+
+        let other = tempfile::tempdir().expect("a different, unmounted directory");
+        let response = launch_session(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LaunchForm {
+                intent: "do the stub thing".into(),
+                workspace: other.path().display().to_string(),
+                agent: String::new(),
+                mode: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn launch_auto_grants_the_harness_when_the_founder_starts_work() {
         // A fresh channel has only its founder in the Party; the founder
         // starting work should bring the harness in (a founder-authored
         // MemberAdded) rather than reject the launch — the new-channel
         // papercut (docs/adr/0017).
-        let _home = crate::host::test_home::HomeGuard::new();
+        let home = crate::host::test_home::HomeGuard::new();
         let stub_dir = tempfile::tempdir().expect("stub dir");
         let stub = if cfg!(windows) {
             let path = stub_dir.path().join("stub.cmd");
@@ -3842,13 +4281,14 @@ mod tests {
                 .expect("git init")
                 .success()
         );
+        attach_and_mount_repo(&fx, home.path(), workspace.path()).await;
 
         let response = launch_session(
             State(fx.host.clone()),
             Path("web-test".into()),
             Form(LaunchForm {
                 intent: "start in a fresh channel".into(),
-                workspace: workspace.path().display().to_string(),
+                workspace: String::new(),
                 agent: String::new(),
                 mode: String::new(),
             }),
@@ -3876,6 +4316,1631 @@ mod tests {
         assert_eq!(granted_by.as_deref(), Some("web@example.com"));
 
         unsafe { std::env::remove_var("JUNTO_HARNESS_CMD") };
+    }
+
+    #[tokio::test]
+    async fn launching_in_a_channel_with_no_subject_runs_in_a_scratch_directory() {
+        // Task 6: a channel with no subject at all has nothing this
+        // machine could mount — that must no longer refuse
+        // (`NO_MOUNTABLE_SUBJECT`); it launches in a per-session scratch
+        // directory (`crate::launch::session_workdir`) instead.
+        let home = crate::host::test_home::HomeGuard::new();
+        let stub_dir = tempfile::tempdir().expect("stub dir");
+        // The stub also drops a marker file in its cwd — the load-bearing
+        // observation below is that this marker lands inside the scratch
+        // directory (proof the harness actually ran there), not a
+        // recomputation of `session_workdir` against the same inputs.
+        let stub = if cfg!(windows) {
+            let path = stub_dir.path().join("stub.cmd");
+            std::fs::write(
+                &path,
+                "@echo.>marker.txt\r\n@echo {\"type\":\"result\",\"subtype\":\"success\",\
+                 \"result\":\"scratch work done\",\"session_id\":\"h-scratch-1\",\
+                 \"is_error\":false}\r\n",
+            )
+            .expect("write stub");
+            path
+        } else {
+            let path = stub_dir.path().join("stub.sh");
+            std::fs::write(
+                &path,
+                "#!/bin/sh\ntouch marker.txt\necho '{\"type\":\"result\",\"subtype\":\
+                 \"success\",\"result\":\"scratch work done\",\"session_id\":\"h-scratch-1\",\
+                 \"is_error\":false}'\n",
+            )
+            .expect("write stub");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod stub");
+            }
+            path
+        };
+        unsafe { std::env::set_var("JUNTO_HARNESS_CMD", &stub) };
+
+        // host_with_entry founds "web-test" with no Subject attached at all.
+        let fx = host_with_entry(assertion()).await;
+
+        let response = launch_session(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LaunchForm {
+                intent: "research something with no repo".into(),
+                workspace: String::new(),
+                agent: String::new(),
+                mode: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::SEE_OTHER,
+            "a subject-less channel must launch, not be refused as unmountable"
+        );
+
+        let Resolution::Resolved { ledger, id, .. } = fx.host.resolve("web-test").await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+        let mut reached_done = false;
+        for _ in 0..100 {
+            let view = ledger.lock().await.project(&id).await.unwrap();
+            if view
+                .sessions
+                .iter()
+                .any(|(_, s)| s.state == junto_kernel::SessionState::Done)
+            {
+                reached_done = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(reached_done, "session reached done");
+
+        // What the harness actually did, not a recomputation of the same
+        // pure function `session_workdir` on the same inputs: it dropped
+        // `marker.txt` into its cwd, so that marker landing inside the one
+        // directory under the scratch root is proof the harness process
+        // itself ran there.
+        let scratch_root = home.path().join("scratch");
+        let mut scratch_dirs: Vec<_> = std::fs::read_dir(&scratch_root)
+            .expect("scratch root exists")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .collect();
+        assert_eq!(
+            scratch_dirs.len(),
+            1,
+            "exactly one scratch dir for this one session"
+        );
+        let workdir = scratch_dirs.remove(0);
+        assert!(
+            workdir.join("marker.txt").exists(),
+            "the harness must have actually run with the scratch dir as its cwd"
+        );
+        assert!(!workdir.join(".git").exists());
+
+        unsafe { std::env::remove_var("JUNTO_HARNESS_CMD") };
+    }
+
+    #[tokio::test]
+    async fn launching_with_an_unmounted_repo_subject_still_refuses() {
+        // The boundary Task 6 must preserve: a Repo subject this machine
+        // simply hasn't mounted *yet* is a fixable gap (type its path), not
+        // a repo-free channel — the old refusal survives here, unlike the
+        // no-subject and document-subject cases.
+        let home = crate::host::test_home::HomeGuard::new();
+        let fx = host_with_entry(assertion()).await;
+        let uri = junto_kernel::Uri::new(format!("git+https://example.com/{}.git", fx.channel))
+            .expect("valid uri");
+        let subject = junto_kernel::Subject::new(junto_kernel::SubjectKind::Repo, uri);
+        let ledger = fx
+            .host
+            .ledger_for(fx._dirs[0].path())
+            .await
+            .expect("ledger");
+        ledger
+            .lock()
+            .await
+            .append(LedgerEntry {
+                signature: None,
+                id: EntryId::new(),
+                channel: fx.channel,
+                author: Member::human("Web User", "web@example.com"),
+                timestamp: Timestamp::now(),
+                payload: EntryPayload::SubjectAttached { subject },
+            })
+            .await
+            .expect("attach subject, deliberately never mounted");
+
+        let response = launch_session(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LaunchForm {
+                intent: "do work".into(),
+                workspace: String::new(),
+                agent: String::new(),
+                mode: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&bytes), NO_MOUNTABLE_SUBJECT);
+        let _ = home;
+    }
+
+    #[tokio::test]
+    async fn a_scratch_session_can_be_steered_not_just_launched() {
+        // Fix round 1, finding 1: `steer_session` used to call
+        // `required_mount`, which always refused a scratch session — on the
+        // premise that a session existing meant it had a mounted subject
+        // already. Task 6 invalidates exactly that premise: a session can
+        // now exist in a channel with nothing mounted at all, and it must
+        // still be continuable from the channel page.
+        let home = crate::host::test_home::HomeGuard::new();
+        let stub_dir = tempfile::tempdir().expect("stub dir");
+        let stub = if cfg!(windows) {
+            let path = stub_dir.path().join("stub.cmd");
+            std::fs::write(
+                &path,
+                "@echo {\"type\":\"result\",\"subtype\":\"success\",\"result\":\"ok\",\
+                 \"session_id\":\"h-steer-scratch-1\",\"is_error\":false}\r\n",
+            )
+            .expect("write stub");
+            path
+        } else {
+            let path = stub_dir.path().join("stub.sh");
+            std::fs::write(
+                &path,
+                "#!/bin/sh\necho '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\
+                 \"ok\",\"session_id\":\"h-steer-scratch-1\",\"is_error\":false}'\n",
+            )
+            .expect("write stub");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod stub");
+            }
+            path
+        };
+        unsafe { std::env::set_var("JUNTO_HARNESS_CMD", &stub) };
+
+        // host_with_entry founds "web-test" with no Subject attached at all.
+        let fx = host_with_entry(assertion()).await;
+        let launched = launch_session(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LaunchForm {
+                intent: "research something with no repo".into(),
+                workspace: String::new(),
+                agent: String::new(),
+                mode: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(launched.status(), StatusCode::SEE_OTHER);
+
+        let Resolution::Resolved { ledger, id, .. } = fx.host.resolve("web-test").await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+        let mut session_id = None;
+        for _ in 0..100 {
+            let view = ledger.lock().await.project(&id).await.unwrap();
+            if let Some((sid, _)) = view
+                .sessions
+                .iter()
+                .find(|(_, s)| s.state == junto_kernel::SessionState::Done)
+            {
+                session_id = Some(*sid);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let session_id = session_id.expect("first turn reached done");
+
+        let steered = steer_session(
+            State(fx.host.clone()),
+            Path(("web-test".into(), session_id.to_string())),
+            Form(SteerForm {
+                message: "keep going".into(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            steered.status(),
+            StatusCode::SEE_OTHER,
+            "a scratch session must be steerable, not refused as unmountable"
+        );
+
+        // Wait for the resumed (steered) turn to also land before the stub
+        // and JUNTO_HOME env vars are torn down below — `steer` spawns it
+        // fire-and-forget, and letting it outlive this test's env would
+        // race the next test's own HomeGuard.
+        let mut turns_done = 0;
+        for _ in 0..100 {
+            let view = ledger.lock().await.project(&id).await.unwrap();
+            turns_done = view
+                .entries
+                .iter()
+                .filter(|entry| {
+                    matches!(
+                        &entry.payload,
+                        EntryPayload::SessionUpdated { target, state, .. }
+                            if *target == session_id && *state == junto_kernel::SessionState::Done
+                    )
+                })
+                .count();
+            if turns_done >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(turns_done >= 2, "the resumed turn must also complete");
+
+        let _ = home;
+        unsafe { std::env::remove_var("JUNTO_HARNESS_CMD") };
+    }
+
+    #[tokio::test]
+    async fn steering_a_scratch_session_stays_in_scratch_even_after_a_repo_is_mounted() {
+        // Finding 1 (final review): `steer_session` used to re-resolve the
+        // workdir from the channel's *current* subjects and mount store on
+        // every steer. A session that launched in scratch (no subject at
+        // launch time) would silently move into a repo mounted *after*
+        // launch — resuming the harness there, with write access to a
+        // checkout it was never launched against, and (via
+        // `record_turn`/`workspace_diff`) recording that repo's
+        // pre-existing uncommitted changes as this session's diff
+        // artifact. The fix: a session whose scratch directory still
+        // exists on disk keeps running there, unconditionally, regardless
+        // of what gets mounted later.
+        let home = crate::host::test_home::HomeGuard::new();
+        let stub_dir = tempfile::tempdir().expect("stub dir");
+        let stub = if cfg!(windows) {
+            let path = stub_dir.path().join("stub.cmd");
+            std::fs::write(
+                &path,
+                "@echo.>marker.txt\r\n@echo {\"type\":\"result\",\"subtype\":\"success\",\
+                 \"result\":\"ok\",\"session_id\":\"h-scratch-steer-1\",\
+                 \"is_error\":false}\r\n",
+            )
+            .expect("write stub");
+            path
+        } else {
+            let path = stub_dir.path().join("stub.sh");
+            std::fs::write(
+                &path,
+                "#!/bin/sh\ntouch marker.txt\necho '{\"type\":\"result\",\"subtype\":\
+                 \"success\",\"result\":\"ok\",\"session_id\":\"h-scratch-steer-1\",\
+                 \"is_error\":false}'\n",
+            )
+            .expect("write stub");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod stub");
+            }
+            path
+        };
+        unsafe { std::env::set_var("JUNTO_HARNESS_CMD", &stub) };
+
+        // host_with_entry founds "web-test" with no Subject attached at all.
+        let fx = host_with_entry(assertion()).await;
+        let launched = launch_session(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LaunchForm {
+                intent: "research something with no repo".into(),
+                workspace: String::new(),
+                agent: String::new(),
+                mode: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(launched.status(), StatusCode::SEE_OTHER);
+
+        let Resolution::Resolved { ledger, id, .. } = fx.host.resolve("web-test").await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+        let mut session_id = None;
+        for _ in 0..100 {
+            let view = ledger.lock().await.project(&id).await.unwrap();
+            if let Some((sid, _)) = view
+                .sessions
+                .iter()
+                .find(|(_, s)| s.state == junto_kernel::SessionState::Done)
+            {
+                session_id = Some(*sid);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let session_id = session_id.expect("first turn reached done");
+
+        // The scratch dir this session actually ran in.
+        let scratch_root = home.path().join("scratch");
+        let scratch_dirs: Vec<_> = std::fs::read_dir(&scratch_root)
+            .expect("scratch root exists")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .collect();
+        assert_eq!(
+            scratch_dirs.len(),
+            1,
+            "exactly one scratch dir for this session"
+        );
+        let scratch_dir = scratch_dirs[0].clone();
+        assert!(scratch_dir.join("marker.txt").exists());
+
+        // Now a repo gets mounted — the sequence the finding names as
+        // likely: scratch first, a Repo subject attached and mounted for a
+        // *later* session, which also makes it `executable_mount` for this
+        // channel from here on.
+        let repo_dir = tempfile::tempdir().expect("repo dir");
+        attach_and_mount_repo(&fx, home.path(), repo_dir.path()).await;
+
+        let steered = steer_session(
+            State(fx.host.clone()),
+            Path(("web-test".into(), session_id.to_string())),
+            Form(SteerForm {
+                message: "keep going".into(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            steered.status(),
+            StatusCode::SEE_OTHER,
+            "a scratch session must still be steerable once a repo is mounted"
+        );
+
+        let mut turns_done = 0;
+        for _ in 0..100 {
+            let view = ledger.lock().await.project(&id).await.unwrap();
+            turns_done = view
+                .entries
+                .iter()
+                .filter(|entry| {
+                    matches!(
+                        &entry.payload,
+                        EntryPayload::SessionUpdated { target, state, .. }
+                            if *target == session_id && *state == junto_kernel::SessionState::Done
+                    )
+                })
+                .count();
+            if turns_done >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            turns_done >= 2,
+            "the resumed (steered) turn must also complete"
+        );
+
+        // The load-bearing assertion: the resumed turn ran in the *same*
+        // scratch directory, never in the newly mounted repo. Before the
+        // fix, `steer_session` re-resolved through the now-mounted
+        // subject, so the harness would have run with `repo_dir` as its
+        // cwd instead, dropping `marker.txt` there — and, worse,
+        // `record_turn` would have appended a diff artifact describing
+        // that repo's pre-existing state as this session's own work.
+        assert!(
+            !repo_dir.path().join("marker.txt").exists(),
+            "the steered turn must not have run inside the newly mounted repo"
+        );
+        assert!(
+            scratch_dir.join("marker.txt").exists(),
+            "the scratch directory must still show the harness ran there"
+        );
+
+        let _ = home;
+        unsafe { std::env::remove_var("JUNTO_HARNESS_CMD") };
+    }
+
+    #[tokio::test]
+    async fn a_mounted_repo_subject_still_launches_alongside_a_second_unmounted_one() {
+        // Fix round 1, finding 2: the unmounted-Repo refusal must fire only
+        // when *nothing* is `Execute`-capable — a channel that already has
+        // a working, mounted Repo subject must still launch there even
+        // though a second Repo subject (a teammate's checkout this machine
+        // never needed to mount — `mounts_for`'s "a teammate may hold a
+        // checkout you do not") has no mount here.
+        let home = crate::host::test_home::HomeGuard::new();
+        let stub_dir = tempfile::tempdir().expect("stub dir");
+        let stub = if cfg!(windows) {
+            let path = stub_dir.path().join("stub.cmd");
+            std::fs::write(
+                &path,
+                "@echo {\"type\":\"result\",\"subtype\":\"success\",\"result\":\"ok\",\
+                 \"session_id\":\"h-second-repo-1\",\"is_error\":false}\r\n",
+            )
+            .expect("write stub");
+            path
+        } else {
+            let path = stub_dir.path().join("stub.sh");
+            std::fs::write(
+                &path,
+                "#!/bin/sh\necho '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\
+                 \"ok\",\"session_id\":\"h-second-repo-1\",\"is_error\":false}'\n",
+            )
+            .expect("write stub");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod stub");
+            }
+            path
+        };
+        unsafe { std::env::set_var("JUNTO_HARNESS_CMD", &stub) };
+
+        let fx = host_with_entry(assertion()).await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        attach_and_mount_repo(&fx, home.path(), workspace.path()).await;
+
+        // A second Repo subject, deliberately never mounted here.
+        let second_uri =
+            junto_kernel::Uri::new(format!("git+https://example.com/second-{}.git", fx.channel))
+                .expect("valid uri");
+        let second_subject =
+            junto_kernel::Subject::new(junto_kernel::SubjectKind::Repo, second_uri);
+        let ledger = fx
+            .host
+            .ledger_for(fx._dirs[0].path())
+            .await
+            .expect("ledger");
+        ledger
+            .lock()
+            .await
+            .append(LedgerEntry {
+                signature: None,
+                id: EntryId::new(),
+                channel: fx.channel,
+                author: Member::human("Web User", "web@example.com"),
+                timestamp: Timestamp::now(),
+                payload: EntryPayload::SubjectAttached {
+                    subject: second_subject,
+                },
+            })
+            .await
+            .expect("attach a second, deliberately unmounted repo subject");
+
+        let response = launch_session(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LaunchForm {
+                intent: "do the stub thing".into(),
+                workspace: String::new(),
+                agent: String::new(),
+                mode: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::SEE_OTHER,
+            "a mounted Repo subject must win even with a second, unmounted one present"
+        );
+
+        unsafe { std::env::remove_var("JUNTO_HARNESS_CMD") };
+    }
+
+    #[tokio::test]
+    async fn a_mounted_document_subject_resolves_the_same_workdir_for_launch_and_steer() {
+        // Fix round 2: `session_workdir` is the *sole* authority on where a
+        // session runs. Round 1's fix for finding 2 kept `resolve_channel_mount`
+        // ("first mount of any kind") on the launch path while finding 1's
+        // fix routed `steer_session` through `session_workdir`
+        // (`Execute`-capability-filtered) — so a channel whose only
+        // subject is a mounted Document (never `Execute`-capable) could
+        // launch in the document's own directory but steer back into a
+        // fresh, unrelated scratch dir. Both `launch_session` and
+        // `steer_session` now call `session_workdir` with the same
+        // `(junto_home, view, session)`, so they can never disagree again;
+        // prove it by observing what each process actually wrote, not by
+        // recomputing the same pure function twice.
+        let home = crate::host::test_home::HomeGuard::new();
+        let doc_dir = tempfile::tempdir().expect("document mount dir");
+        let fx = host_with_entry(assertion()).await;
+        let uri = junto_kernel::Uri::new("file:///notes/spec.md").expect("valid uri");
+        let subject = junto_kernel::Subject::new(junto_kernel::SubjectKind::Document, uri.clone());
+        let ledger = fx
+            .host
+            .ledger_for(fx._dirs[0].path())
+            .await
+            .expect("ledger");
+        ledger
+            .lock()
+            .await
+            .append(LedgerEntry {
+                signature: None,
+                id: EntryId::new(),
+                channel: fx.channel,
+                author: Member::human("Web User", "web@example.com"),
+                timestamp: Timestamp::now(),
+                payload: EntryPayload::SubjectAttached { subject },
+            })
+            .await
+            .expect("attach document subject");
+        crate::mounts::remember_mount(home.path(), &uri, doc_dir.path()).expect("remember mount");
+
+        // A mounted Document is never `Execute`-capable, so there is
+        // nothing to prefill — showing the document's directory here is
+        // exactly the bug fix round 1 left in place.
+        let (_, view, _) = project(&fx.host, "web-test").await.expect("project");
+        assert!(
+            channel_mount(home.path(), &view).is_none(),
+            "a mounted Document subject has nothing Execute-capable to prefill"
+        );
+
+        let mut stub_dirs: Vec<TempDir> = Vec::new();
+        let mut write_stub = |name: &str, marker: &str| -> std::path::PathBuf {
+            let dir = tempfile::tempdir().expect("stub dir");
+            let path = if cfg!(windows) {
+                let path = dir.path().join(format!("{name}.cmd"));
+                std::fs::write(
+                    &path,
+                    format!(
+                        "@echo.>{marker}\r\n@echo {{\"type\":\"result\",\"subtype\":\"success\",\
+                         \"result\":\"ok\",\"session_id\":\"h-{name}\",\"is_error\":false}}\r\n"
+                    ),
+                )
+                .expect("write stub");
+                path
+            } else {
+                let path = dir.path().join(format!("{name}.sh"));
+                std::fs::write(
+                    &path,
+                    format!(
+                        "#!/bin/sh\ntouch {marker}\necho '{{\"type\":\"result\",\"subtype\":\
+                         \"success\",\"result\":\"ok\",\"session_id\":\"h-{name}\",\
+                         \"is_error\":false}}'\n"
+                    ),
+                )
+                .expect("write stub");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                        .expect("chmod stub");
+                }
+                path
+            };
+            stub_dirs.push(dir);
+            path
+        };
+
+        let launch_stub = write_stub("launch", "marker-launch.txt");
+        unsafe { std::env::set_var("JUNTO_HARNESS_CMD", &launch_stub) };
+        let launched = launch_session(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LaunchForm {
+                intent: "read the doc".into(),
+                workspace: String::new(),
+                agent: String::new(),
+                mode: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(launched.status(), StatusCode::SEE_OTHER);
+
+        let Resolution::Resolved { ledger, id, .. } = fx.host.resolve("web-test").await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+        let mut session_id = None;
+        for _ in 0..100 {
+            let view = ledger.lock().await.project(&id).await.unwrap();
+            if let Some((sid, _)) = view
+                .sessions
+                .iter()
+                .find(|(_, s)| s.state == junto_kernel::SessionState::Done)
+            {
+                session_id = Some(*sid);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let session_id = session_id.expect("launch turn reached done");
+
+        let steer_stub = write_stub("steer", "marker-steer.txt");
+        unsafe { std::env::set_var("JUNTO_HARNESS_CMD", &steer_stub) };
+        let steered = steer_session(
+            State(fx.host.clone()),
+            Path(("web-test".into(), session_id.to_string())),
+            Form(SteerForm {
+                message: "keep reading".into(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            steered.status(),
+            StatusCode::SEE_OTHER,
+            "steering a mounted-Document session must not be refused"
+        );
+
+        // Wait for the resumed turn to also land before the stub/home env
+        // vars below are torn down.
+        let mut turns_done = 0;
+        for _ in 0..100 {
+            let view = ledger.lock().await.project(&id).await.unwrap();
+            turns_done = view
+                .entries
+                .iter()
+                .filter(|entry| {
+                    matches!(
+                        &entry.payload,
+                        EntryPayload::SessionUpdated { target, state, .. }
+                            if *target == session_id && *state == junto_kernel::SessionState::Done
+                    )
+                })
+                .count();
+            if turns_done >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(turns_done >= 2, "the resumed turn must also complete");
+
+        // Both markers must land in the *same* directory — the one
+        // scratch dir this session id resolves to (a mounted Document is
+        // never `Execute`-capable, so this is always scratch, never the
+        // document's own directory).
+        let scratch_root = home.path().join("scratch");
+        let scratch_dirs: Vec<_> = std::fs::read_dir(&scratch_root)
+            .expect("scratch root exists")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .collect();
+        assert_eq!(
+            scratch_dirs.len(),
+            1,
+            "launch and steer must resolve the same single scratch dir"
+        );
+        let workdir = &scratch_dirs[0];
+        assert!(
+            workdir.join("marker-launch.txt").exists(),
+            "the launch must have run in this workdir"
+        );
+        assert!(
+            workdir.join("marker-steer.txt").exists(),
+            "the steer must have run in the SAME workdir as the launch"
+        );
+
+        unsafe { std::env::remove_var("JUNTO_HARNESS_CMD") };
+    }
+
+    #[tokio::test]
+    async fn outcome_mode_refuses_in_a_scratch_directory() {
+        // Fix round 1, finding 3 (RULING): the Outcome loop grades a
+        // mechanical before/after (`Capability::Diff`), which only ever
+        // holds for a mounted Repo subject. A `session_workdir` scratch
+        // directory has nothing to diff, so `mode=outcome` must refuse
+        // there instead of running a loop that can never be satisfied — a
+        // single-turn session (the default mode) stays fully supported.
+        let home = crate::host::test_home::HomeGuard::new();
+
+        // host_with_entry founds "web-test" with no Subject attached at
+        // all — no harness stub is configured, so if this ever launched
+        // instead of refusing, the missing-harness failure would surface
+        // as a 303 to a session that never actually ran, not as this
+        // refusal; asserting BAD_REQUEST here is the load-bearing check.
+        let fx = host_with_entry(assertion()).await;
+
+        let response = launch_session(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LaunchForm {
+                intent: "grade something with no repo".into(),
+                workspace: String::new(),
+                agent: String::new(),
+                mode: "outcome".into(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "the Outcome loop must refuse a scratch workspace, not grade an empty diff"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("diffable"),
+            "the refusal must name the missing capability"
+        );
+
+        let (_, view, _) = project(&fx.host, "web-test").await.expect("project");
+        assert!(
+            view.sessions.is_empty(),
+            "a refused launch must not have started a session"
+        );
+        let _ = home;
+    }
+
+    #[tokio::test]
+    async fn outcome_mode_still_launches_with_a_mounted_repo_subject() {
+        // The other side of the same ruling: a channel with a real,
+        // mounted Repo subject is `Capability::Diff`-capable, so
+        // `mode=outcome` must still launch there exactly as before.
+        let home = crate::host::test_home::HomeGuard::new();
+        let stub_dir = tempfile::tempdir().expect("stub dir");
+        let stub = if cfg!(windows) {
+            let path = stub_dir.path().join("stub.cmd");
+            std::fs::write(
+                &path,
+                "@echo {\"type\":\"result\",\"subtype\":\"success\",\"result\":\"ok\",\
+                 \"session_id\":\"h-outcome-repo-1\",\"is_error\":false}\r\n",
+            )
+            .expect("write stub");
+            path
+        } else {
+            let path = stub_dir.path().join("stub.sh");
+            std::fs::write(
+                &path,
+                "#!/bin/sh\necho '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\
+                 \"ok\",\"session_id\":\"h-outcome-repo-1\",\"is_error\":false}'\n",
+            )
+            .expect("write stub");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod stub");
+            }
+            path
+        };
+        unsafe { std::env::set_var("JUNTO_HARNESS_CMD", &stub) };
+
+        let fx = host_with_entry(assertion()).await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        attach_and_mount_repo(&fx, home.path(), workspace.path()).await;
+
+        let response = launch_session(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LaunchForm {
+                intent: "grade a real change".into(),
+                workspace: String::new(),
+                agent: String::new(),
+                mode: "outcome".into(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::SEE_OTHER,
+            "a mounted Repo subject must still launch the Outcome loop"
+        );
+
+        let Resolution::Resolved { ledger, id, .. } = fx.host.resolve("web-test").await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+        // Wait for the whole Outcome loop to settle (mechanical checks fail
+        // fast against this manifest-less repo, so it escalates to a Gate
+        // within its 3-iteration budget) before the stub/home env vars
+        // below are torn down — leaving it running past that would race
+        // the next test's own HomeGuard over a now-deleted stub path.
+        let mut terminal = false;
+        for _ in 0..200 {
+            let view = ledger.lock().await.project(&id).await.unwrap();
+            if view
+                .sessions
+                .iter()
+                .any(|(_, s)| s.state != junto_kernel::SessionState::Working)
+            {
+                terminal = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(terminal, "the outcome loop must reach a terminal state");
+
+        unsafe { std::env::remove_var("JUNTO_HARNESS_CMD") };
+    }
+
+    #[tokio::test]
+    async fn outcome_mode_refuses_with_a_mounted_document_subject() {
+        // Fix round 2, finding 2: the gate must key on `Capability::Diff`
+        // directly, not on whether the resolved workspace happens to sit
+        // under the scratch root. A mounted Document subject resolves to
+        // neither: it is a real, non-scratch directory, but never
+        // `Execute`/`Diff`-capable. Round 1's scratch-path gate let this
+        // exact case slip through to `launch_outcome`, where
+        // `prepare_pr_branch`/`workspace_diff` would then git-discover
+        // whatever repository happens to enclose the document's
+        // directory — finding 4's leak, re-entered through this door.
+        let home = crate::host::test_home::HomeGuard::new();
+        let doc_dir = tempfile::tempdir().expect("document mount dir");
+        let fx = host_with_entry(assertion()).await;
+        let uri = junto_kernel::Uri::new("file:///notes/spec.md").expect("valid uri");
+        let subject = junto_kernel::Subject::new(junto_kernel::SubjectKind::Document, uri.clone());
+        let ledger = fx
+            .host
+            .ledger_for(fx._dirs[0].path())
+            .await
+            .expect("ledger");
+        ledger
+            .lock()
+            .await
+            .append(LedgerEntry {
+                signature: None,
+                id: EntryId::new(),
+                channel: fx.channel,
+                author: Member::human("Web User", "web@example.com"),
+                timestamp: Timestamp::now(),
+                payload: EntryPayload::SubjectAttached { subject },
+            })
+            .await
+            .expect("attach document subject");
+        crate::mounts::remember_mount(home.path(), &uri, doc_dir.path()).expect("remember mount");
+
+        // No harness stub configured: if this ever launched instead of
+        // refusing, that would surface as a 303 to a session that never
+        // ran, not as this refusal — asserting BAD_REQUEST is load-bearing.
+        let response = launch_session(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LaunchForm {
+                intent: "grade the doc somehow".into(),
+                workspace: String::new(),
+                agent: String::new(),
+                mode: "outcome".into(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "a mounted but non-Diff-capable Document subject must refuse mode=outcome"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("diffable"));
+
+        let (_, view, _) = project(&fx.host, "web-test").await.expect("project");
+        assert!(
+            view.sessions.is_empty(),
+            "a refused launch must not have started a session"
+        );
+    }
+
+    #[tokio::test]
+    async fn steering_refuses_when_the_channel_now_carries_an_unmounted_repo_subject() {
+        // Fix round 2, finding 3: deleting `required_mount` in round 1
+        // dropped its refusal along with it. If a channel now carries a
+        // Repo subject this machine has no mount for (`mounts.toml`
+        // edited, or the entry removed after launch), `steer_session` must
+        // not silently resume the agent in a fresh, empty
+        // `session_workdir` scratch directory holding none of the
+        // session's real work — that is strictly worse than the old loud
+        // refusal, and inconsistent with `launch_session`, which keeps
+        // exactly this refusal for exactly this channel shape.
+        let home = crate::host::test_home::HomeGuard::new();
+        let stub_dir = tempfile::tempdir().expect("stub dir");
+        let stub = if cfg!(windows) {
+            let path = stub_dir.path().join("stub.cmd");
+            std::fs::write(
+                &path,
+                "@echo {\"type\":\"result\",\"subtype\":\"success\",\"result\":\"ok\",\
+                 \"session_id\":\"h-steer-unmounted-1\",\"is_error\":false}\r\n",
+            )
+            .expect("write stub");
+            path
+        } else {
+            let path = stub_dir.path().join("stub.sh");
+            std::fs::write(
+                &path,
+                "#!/bin/sh\necho '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\
+                 \"ok\",\"session_id\":\"h-steer-unmounted-1\",\"is_error\":false}'\n",
+            )
+            .expect("write stub");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod stub");
+            }
+            path
+        };
+        unsafe { std::env::set_var("JUNTO_HARNESS_CMD", &stub) };
+
+        // Launch a session with no subject at all (scratch), matching a
+        // real research/document channel that later gains a Repo subject
+        // no one has mounted here yet.
+        let fx = host_with_entry(assertion()).await;
+        let launched = launch_session(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LaunchForm {
+                intent: "research something".into(),
+                workspace: String::new(),
+                agent: String::new(),
+                mode: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(launched.status(), StatusCode::SEE_OTHER);
+
+        let Resolution::Resolved { ledger, id, .. } = fx.host.resolve("web-test").await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+        let mut session_id = None;
+        for _ in 0..100 {
+            let view = ledger.lock().await.project(&id).await.unwrap();
+            if let Some((sid, _)) = view
+                .sessions
+                .iter()
+                .find(|(_, s)| s.state == junto_kernel::SessionState::Done)
+            {
+                session_id = Some(*sid);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let session_id = session_id.expect("launch turn reached done");
+
+        // Now the channel gains a Repo subject this machine has never
+        // mounted — the shape `channel_has_unmounted_repo_subject` exists
+        // to catch.
+        let uri = junto_kernel::Uri::new(format!("git+https://example.com/{}.git", fx.channel))
+            .expect("valid uri");
+        let subject = junto_kernel::Subject::new(junto_kernel::SubjectKind::Repo, uri);
+        let ledger_handle = fx
+            .host
+            .ledger_for(fx._dirs[0].path())
+            .await
+            .expect("ledger");
+        ledger_handle
+            .lock()
+            .await
+            .append(LedgerEntry {
+                signature: None,
+                id: EntryId::new(),
+                channel: fx.channel,
+                author: Member::human("Web User", "web@example.com"),
+                timestamp: Timestamp::now(),
+                payload: EntryPayload::SubjectAttached { subject },
+            })
+            .await
+            .expect("attach a repo subject, deliberately never mounted");
+
+        let steered = steer_session(
+            State(fx.host.clone()),
+            Path(("web-test".into(), session_id.to_string())),
+            Form(SteerForm {
+                message: "keep going".into(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            steered.status(),
+            StatusCode::BAD_REQUEST,
+            "steering must refuse rather than silently resume in a fresh, empty scratch dir"
+        );
+        let bytes = axum::body::to_bytes(steered.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&bytes), NO_MOUNTABLE_SUBJECT);
+        let _ = home;
+
+        unsafe { std::env::remove_var("JUNTO_HARNESS_CMD") };
+    }
+
+    #[tokio::test]
+    async fn steering_succeeds_when_a_mounted_repo_subject_is_present_alongside_an_unmounted_one() {
+        // Fix round 3, finding 1 (first half): the refusal must fire only
+        // when *nothing* is `Execute`-capable, matching `launch_session`'s
+        // own rule
+        // (`a_mounted_repo_subject_still_launches_alongside_a_second_unmounted_one`).
+        // A channel with a working, mounted Repo subject resolves through
+        // it for steering too, even with a second Repo subject this
+        // machine has never mounted (a teammate's checkout) also present.
+        let home = crate::host::test_home::HomeGuard::new();
+        let stub_dir = tempfile::tempdir().expect("stub dir");
+        let stub = if cfg!(windows) {
+            let path = stub_dir.path().join("stub.cmd");
+            std::fs::write(
+                &path,
+                "@echo {\"type\":\"result\",\"subtype\":\"success\",\"result\":\"ok\",\
+                 \"session_id\":\"h-steer-second-repo-1\",\"is_error\":false}\r\n",
+            )
+            .expect("write stub");
+            path
+        } else {
+            let path = stub_dir.path().join("stub.sh");
+            std::fs::write(
+                &path,
+                "#!/bin/sh\necho '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\
+                 \"ok\",\"session_id\":\"h-steer-second-repo-1\",\"is_error\":false}'\n",
+            )
+            .expect("write stub");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod stub");
+            }
+            path
+        };
+        unsafe { std::env::set_var("JUNTO_HARNESS_CMD", &stub) };
+
+        let fx = host_with_entry(assertion()).await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        attach_and_mount_repo(&fx, home.path(), workspace.path()).await;
+
+        let launched = launch_session(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LaunchForm {
+                intent: "do the stub thing".into(),
+                workspace: String::new(),
+                agent: String::new(),
+                mode: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(launched.status(), StatusCode::SEE_OTHER);
+
+        let Resolution::Resolved { ledger, id, .. } = fx.host.resolve("web-test").await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+        let mut session_id = None;
+        for _ in 0..100 {
+            let view = ledger.lock().await.project(&id).await.unwrap();
+            if let Some((sid, _)) = view
+                .sessions
+                .iter()
+                .find(|(_, s)| s.state == junto_kernel::SessionState::Done)
+            {
+                session_id = Some(*sid);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let session_id = session_id.expect("launch turn reached done");
+
+        // A second Repo subject, deliberately never mounted here.
+        let second_uri =
+            junto_kernel::Uri::new(format!("git+https://example.com/second-{}.git", fx.channel))
+                .expect("valid uri");
+        let second_subject =
+            junto_kernel::Subject::new(junto_kernel::SubjectKind::Repo, second_uri);
+        let ledger_handle = fx
+            .host
+            .ledger_for(fx._dirs[0].path())
+            .await
+            .expect("ledger");
+        ledger_handle
+            .lock()
+            .await
+            .append(LedgerEntry {
+                signature: None,
+                id: EntryId::new(),
+                channel: fx.channel,
+                author: Member::human("Web User", "web@example.com"),
+                timestamp: Timestamp::now(),
+                payload: EntryPayload::SubjectAttached {
+                    subject: second_subject,
+                },
+            })
+            .await
+            .expect("attach a second, deliberately unmounted repo subject");
+
+        let steered = steer_session(
+            State(fx.host.clone()),
+            Path(("web-test".into(), session_id.to_string())),
+            Form(SteerForm {
+                message: "keep going".into(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            steered.status(),
+            StatusCode::SEE_OTHER,
+            "the mounted Repo subject must win even with a second, unmounted one present"
+        );
+
+        // Wait for the resumed turn to also land before tearing env down.
+        let mut turns_done = 0;
+        for _ in 0..100 {
+            let view = ledger.lock().await.project(&id).await.unwrap();
+            turns_done = view
+                .entries
+                .iter()
+                .filter(|entry| {
+                    matches!(
+                        &entry.payload,
+                        EntryPayload::SessionUpdated { target, state, .. }
+                            if *target == session_id && *state == junto_kernel::SessionState::Done
+                    )
+                })
+                .count();
+            if turns_done >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(turns_done >= 2, "the resumed turn must also complete");
+
+        unsafe { std::env::remove_var("JUNTO_HARNESS_CMD") };
+    }
+
+    #[tokio::test]
+    async fn a_live_steer_succeeds_even_with_an_unmounted_repo_subject_present() {
+        // Fix round 3, finding 1 (second half): the mount checks must run
+        // only in the between-turns resume path, never ahead of the
+        // live/landed routing — a running turn is steered purely over the
+        // control channel and touches no workspace at all. Attach a Repo
+        // subject this machine has no mount for — the exact shape that
+        // *would* refuse if the check ran here (see
+        // `steering_refuses_when_the_channel_now_carries_an_unmounted_repo_subject`)
+        // — then register a live feed and steer: it must succeed, proving
+        // the check never runs on this path at all.
+        let fx = host_with_entry(session_started()).await;
+        let uri = junto_kernel::Uri::new(format!("git+https://example.com/{}.git", fx.channel))
+            .expect("valid uri");
+        let subject = junto_kernel::Subject::new(junto_kernel::SubjectKind::Repo, uri);
+        let ledger = fx
+            .host
+            .ledger_for(fx._dirs[0].path())
+            .await
+            .expect("ledger");
+        ledger
+            .lock()
+            .await
+            .append(LedgerEntry {
+                signature: None,
+                id: EntryId::new(),
+                channel: fx.channel,
+                author: Member::human("Web User", "web@example.com"),
+                timestamp: Timestamp::now(),
+                payload: EntryPayload::SubjectAttached { subject },
+            })
+            .await
+            .expect("attach a repo subject, deliberately never mounted");
+
+        let _rx = fx
+            .host
+            .live()
+            .begin(fx.host.clone(), "web-test".into(), fx.target, true);
+
+        let steered = steer_session(
+            State(fx.host.clone()),
+            Path(("web-test".into(), fx.target.to_string())),
+            Form(SteerForm {
+                message: "keep going".into(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            steered.status(),
+            StatusCode::SEE_OTHER,
+            "a live steer must succeed without ever consulting mount state, even where the \
+             between-turns refusal would otherwise fire"
+        );
+    }
+
+    #[tokio::test]
+    async fn launching_with_a_typed_path_and_mode_outcome_launches_not_refuses() {
+        // Fix round 3, finding 2: the `(false, None)` arm attaches a Repo
+        // subject and remembers its mount, but `view` was projected before
+        // that write. Evaluating the Diff-capability gate against the
+        // stale `view` reported no subject at all and refused
+        // `mode=outcome` with "mount a Repo subject" — exactly what the
+        // human just did. A bare channel, a typed path to a real git
+        // repo, `mode=outcome` must launch.
+        let home = crate::host::test_home::HomeGuard::new();
+        let stub_dir = tempfile::tempdir().expect("stub dir");
+        let stub = if cfg!(windows) {
+            let path = stub_dir.path().join("stub.cmd");
+            std::fs::write(
+                &path,
+                "@echo {\"type\":\"result\",\"subtype\":\"success\",\"result\":\"ok\",\
+                 \"session_id\":\"h-typed-outcome-1\",\"is_error\":false}\r\n",
+            )
+            .expect("write stub");
+            path
+        } else {
+            let path = stub_dir.path().join("stub.sh");
+            std::fs::write(
+                &path,
+                "#!/bin/sh\necho '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\
+                 \"ok\",\"session_id\":\"h-typed-outcome-1\",\"is_error\":false}'\n",
+            )
+            .expect("write stub");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod stub");
+            }
+            path
+        };
+        unsafe { std::env::set_var("JUNTO_HARNESS_CMD", &stub) };
+
+        let fx = host_with_entry(assertion()).await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        let origin = "https://example.com/acme/widgets.git";
+        assert!(
+            StdCommand::new("git")
+                .args(["remote", "add", "origin", origin])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git remote add")
+                .success()
+        );
+
+        // No fixture attached a subject: the channel starts bare.
+        let (_, before, _) = project(&fx.host, "web-test").await.expect("project");
+        assert!(
+            before.subjects.is_empty(),
+            "the channel starts with no subject"
+        );
+
+        let response = launch_session(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LaunchForm {
+                intent: "grade a real change".into(),
+                workspace: workspace.path().display().to_string(),
+                agent: String::new(),
+                mode: "outcome".into(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::SEE_OTHER,
+            "a typed path just attached must launch the Outcome loop, not refuse itself"
+        );
+
+        let Resolution::Resolved { ledger, id, .. } = fx.host.resolve("web-test").await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+        let mut terminal = false;
+        for _ in 0..200 {
+            let view = ledger.lock().await.project(&id).await.unwrap();
+            if view
+                .sessions
+                .iter()
+                .any(|(_, s)| s.state != junto_kernel::SessionState::Working)
+            {
+                terminal = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(terminal, "the outcome loop must reach a terminal state");
+        let _ = home;
+
+        unsafe { std::env::remove_var("JUNTO_HARNESS_CMD") };
+    }
+
+    #[tokio::test]
+    async fn launching_with_a_typed_path_and_no_subject_attaches_one_and_mounts_it() {
+        // The write path this channel needed: typing a path when nothing is
+        // mounted derives a Subject from the repo's `origin`, attaches it,
+        // remembers the mount, and launches — instead of refusing.
+        let home = crate::host::test_home::HomeGuard::new();
+        let stub_dir = tempfile::tempdir().expect("stub dir");
+        let stub = if cfg!(windows) {
+            let path = stub_dir.path().join("stub.cmd");
+            std::fs::write(
+                &path,
+                "@echo {\"type\":\"result\",\"subtype\":\"success\",\"result\":\"attach work \
+                 done\",\"session_id\":\"h-attach-1\",\"is_error\":false}\r\n",
+            )
+            .expect("write stub");
+            path
+        } else {
+            let path = stub_dir.path().join("stub.sh");
+            std::fs::write(
+                &path,
+                "#!/bin/sh\necho '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"attach \
+                 work done\",\"session_id\":\"h-attach-1\",\"is_error\":false}'\n",
+            )
+            .expect("write stub");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod stub");
+            }
+            path
+        };
+        unsafe { std::env::set_var("JUNTO_HARNESS_CMD", &stub) };
+
+        let fx = host_with_entry(assertion()).await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        let origin = "https://example.com/acme/widgets.git";
+        assert!(
+            StdCommand::new("git")
+                .args(["remote", "add", "origin", origin])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git remote add")
+                .success()
+        );
+
+        // No fixture attached a subject: the channel starts bare.
+        let (_, before, _) = project(&fx.host, "web-test").await.expect("project");
+        assert!(
+            before.subjects.is_empty(),
+            "the channel starts with no subject"
+        );
+
+        let response = launch_session(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LaunchForm {
+                intent: "do the stub thing".into(),
+                workspace: workspace.path().display().to_string(),
+                agent: String::new(),
+                mode: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::SEE_OTHER,
+            "a typed path with no mountable subject now attaches and launches, not refuses"
+        );
+
+        let (_, view, _) = project(&fx.host, "web-test").await.expect("project");
+        assert_eq!(view.subjects.len(), 1, "exactly one subject was attached");
+        let (_, subject) = &view.subjects[0];
+        assert_eq!(subject.kind, SubjectKind::Repo);
+        assert_eq!(
+            subject.uri.as_str(),
+            origin,
+            "the derived subject's uri is the repo's origin remote"
+        );
+
+        let mounted = crate::mounts::mount_path(home.path(), &subject.uri)
+            .expect("reading mounts")
+            .expect("the subject's mount was remembered");
+        assert_eq!(mounted, dunce::canonicalize(workspace.path()).unwrap());
+
+        // Poll the projection until the background turn lands, confirming a
+        // session actually launched (not just a redirect).
+        let Resolution::Resolved { ledger, id, .. } = fx.host.resolve("web-test").await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+        let mut done = false;
+        for _ in 0..100 {
+            let view = ledger.lock().await.project(&id).await.unwrap();
+            if view
+                .sessions
+                .iter()
+                .any(|(_, s)| s.state == junto_kernel::SessionState::Done)
+            {
+                done = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(done, "the launched session reached done");
+
+        unsafe { std::env::remove_var("JUNTO_HARNESS_CMD") };
+    }
+
+    #[tokio::test]
+    async fn launching_with_a_typed_path_that_is_not_a_git_repo_is_refused() {
+        // A typo'd or non-repo directory must refuse, not silently attach a
+        // `file://` Subject the session runner can never diff or execute in.
+        let home = crate::host::test_home::HomeGuard::new();
+        let fx = host_with_entry(assertion()).await;
+        let not_a_repo = tempfile::tempdir().expect("a plain, non-repo directory");
+
+        let response = launch_session(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LaunchForm {
+                intent: "do the stub thing".into(),
+                workspace: not_a_repo.path().display().to_string(),
+                agent: String::new(),
+                mode: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let (_, view, _) = project(&fx.host, "web-test").await.expect("project");
+        assert!(
+            view.subjects.is_empty(),
+            "no subject was attached for a non-repo path"
+        );
+        let _ = home;
+    }
+
+    #[tokio::test]
+    async fn launching_with_a_typed_path_when_the_subject_is_already_attached_elsewhere_does_not_duplicate_it()
+     {
+        // The teammate's-machine case: the channel already carries the
+        // Subject (attached by whoever synced first), but this machine has
+        // never mounted it — `mounts_for` skips subjects it has no mount
+        // for, so `resolve_channel_mount` reports `None` exactly as it
+        // would for a channel with no Subject at all. Typing the local
+        // clone's path must mount the existing Subject, not attach a
+        // second, duplicate one.
+        let home = crate::host::test_home::HomeGuard::new();
+        let fx = host_with_entry(assertion()).await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        let origin = "https://example.com/acme/widgets.git";
+        assert!(
+            StdCommand::new("git")
+                .args(["remote", "add", "origin", origin])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git remote add")
+                .success()
+        );
+
+        // The far side: the Subject is already attached (as if this entry
+        // arrived by sync from a teammate), never mounted on this machine.
+        let founder = Member::human("Web User", "web@example.com");
+        let uri = junto_kernel::Uri::new(origin).expect("valid uri");
+        let subject = junto_kernel::Subject::new(junto_kernel::SubjectKind::Repo, uri.clone());
+        fx.host
+            .attach_subject("web-test", subject, founder, crate::host::WriteAuth::Human)
+            .await
+            .expect("attach subject");
+
+        let (_, before, _) = project(&fx.host, "web-test").await.expect("project");
+        assert_eq!(before.subjects.len(), 1, "the subject is already attached");
+        assert!(
+            crate::mounts::mount_path(home.path(), &uri)
+                .unwrap()
+                .is_none(),
+            "this machine has not mounted it yet"
+        );
+
+        let response = launch_session(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LaunchForm {
+                intent: "do the stub thing".into(),
+                workspace: workspace.path().display().to_string(),
+                agent: String::new(),
+                mode: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::SEE_OTHER,
+            "the already-attached subject's local clone launches"
+        );
+
+        let (_, after, _) = project(&fx.host, "web-test").await.expect("project");
+        assert_eq!(
+            after.subjects.len(),
+            1,
+            "the already-attached subject must not be duplicated"
+        );
+        let mounted = crate::mounts::mount_path(home.path(), &uri)
+            .expect("reading mounts")
+            .expect("the mount was remembered on this machine");
+        assert_eq!(mounted, dunce::canonicalize(workspace.path()).unwrap());
+    }
+
+    #[tokio::test]
+    async fn launching_with_a_typed_path_and_no_origin_remote_falls_back_to_the_crates_file_uri_convention()
+     {
+        // A repo with no `origin` has no portable identity to offer, so the
+        // fallback records a `file://` uri — but it must spell it the one
+        // way the crate already does (`store_artifact` in `launch.rs`,
+        // decoded by `file_uri_to_path`), not a second, divergent spelling.
+        let home = crate::host::test_home::HomeGuard::new();
+        let fx = host_with_entry(assertion()).await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        // Deliberately no `git remote add origin`.
+
+        let response = launch_session(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LaunchForm {
+                intent: "do the stub thing".into(),
+                workspace: workspace.path().display().to_string(),
+                agent: String::new(),
+                mode: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let (_, view, _) = project(&fx.host, "web-test").await.expect("project");
+        assert_eq!(view.subjects.len(), 1);
+        let (_, subject) = &view.subjects[0];
+        let canonical = dunce::canonicalize(workspace.path()).unwrap();
+        let expected = format!(
+            "file:///{}",
+            canonical.display().to_string().replace('\\', "/")
+        );
+        assert_eq!(
+            subject.uri.as_str(),
+            expected,
+            "must spell the fallback exactly like `store_artifact`'s `file:///` convention, \
+             not a second, divergent spelling"
+        );
+        let decoded =
+            file_uri_to_path(subject.uri.as_str()).expect("the crate's own decoder reads it back");
+        assert_eq!(decoded, canonical);
+
+        let _ = home;
     }
 
     #[tokio::test]
@@ -4042,7 +6107,11 @@ mod tests {
             Resolution::NotFound
         ));
 
-        // Renaming onto a taken name is a conflict.
+        // Renaming onto a name already used elsewhere is now allowed (spec
+        // §2 drops uniqueness). Resolution prefers the channel opened more
+        // recently, not the one renamed most recently: "other" was opened
+        // after "web-test"/"better-name" was, so it still wins the name
+        // "other" even though the rename lands last.
         let response = open_channel(
             State(fx.host.clone()),
             Form(OpenChannelForm {
@@ -4061,7 +6130,16 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let Resolution::Resolved { id: other_id, .. } = fx.host.resolve("other").await.unwrap()
+        else {
+            panic!("'other' resolves");
+        };
+        assert_ne!(
+            other_id, fx.channel,
+            "resolution prefers the channel opened more recently over the one renamed more \
+             recently"
+        );
     }
 
     #[tokio::test]
@@ -4101,7 +6179,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_taken_name_is_a_conflict() {
+    async fn a_taken_name_is_allowed() {
         let fx = host_with_entry(assertion()).await;
         let response = open_channel(
             State(fx.host.clone()),
@@ -4111,9 +6189,18 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let page = body_text(response).await;
-        assert!(page.contains("web-test"), "{page}");
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .expect("redirect target")
+            .to_string();
+        assert_ne!(
+            location,
+            format!("/channels/{}", fx.channel),
+            "the duplicate open mints its own channel, distinct from the fixture's"
+        );
     }
 
     #[tokio::test]
@@ -4286,6 +6373,8 @@ mod tests {
             sessions: Default::default(),
             closed: false,
             lineage: Vec::new(),
+            subjects: Vec::new(),
+            channel_standing: ChannelStanding::Scratch,
         };
         let html = crate::render::channel_html(
             &[],

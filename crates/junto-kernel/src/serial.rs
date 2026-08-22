@@ -83,7 +83,7 @@ mod tests {
         let target = EntryId::new();
 
         assert_round_trips(&entry(EntryPayload::ChannelOpened {
-            name: "junto-dev".into(),
+            name: Some("junto-dev".into()),
         }));
         assert_round_trips(&entry(EntryPayload::MemberAdded {
             member: Member::agent("Claude Code", "claude-code@anthropic.com"),
@@ -227,6 +227,63 @@ mod tests {
             description: "the fix as a unified diff".into(),
             provenance: vec![provenance_with_digest()],
         }));
+        assert_round_trips(&entry(EntryPayload::SubjectAttached {
+            subject: crate::Subject::new(
+                crate::SubjectKind::Repo,
+                Uri::new("git+https://github.com/dcieslak19973/junto.git").expect("valid uri"),
+            ),
+        }));
+        // A Subject with a pinned digest (exercises the Some(digest) branch).
+        assert_round_trips(&entry(EntryPayload::SubjectAttached {
+            subject: crate::Subject::with_digest(
+                crate::SubjectKind::Document,
+                Uri::new("file:///notes/spec.md").expect("valid uri"),
+                ContentDigest::new("sha256:deadbeef").expect("valid digest"),
+            ),
+        }));
+        assert_round_trips(&entry(EntryPayload::SubjectDetached { target }));
+    }
+
+    #[test]
+    fn an_unnamed_channel_omits_the_name_from_its_canonical_bytes() {
+        let unnamed = entry(EntryPayload::ChannelOpened { name: None });
+        assert_round_trips(&unnamed);
+        let text =
+            String::from_utf8(unnamed.to_canonical_bytes().expect("serialize")).expect("utf8");
+        assert!(
+            !text.contains("\"name\":"),
+            "an absent name must not appear in the canonical bytes \
+             (checked as the JSON key, since the author's `display_name` \
+             field also contains the substring \"name\"): {text}"
+        );
+    }
+
+    #[test]
+    fn a_named_channels_canonical_bytes_are_unchanged_by_the_name_becoming_optional() {
+        let named = entry(EntryPayload::ChannelOpened {
+            name: Some("junto-dev".into()),
+        });
+        let text = String::from_utf8(named.to_canonical_bytes().expect("serialize")).expect("utf8");
+        assert!(
+            text.contains(r#""name":"junto-dev""#),
+            "a present name must serialize exactly as before: {text}"
+        );
+    }
+
+    #[test]
+    fn an_absent_subject_digest_is_omitted_from_the_canonical_bytes() {
+        let without = entry(EntryPayload::SubjectAttached {
+            subject: crate::Subject::new(
+                crate::SubjectKind::Document,
+                Uri::new("file:///notes/spec.md").expect("valid uri"),
+            ),
+        });
+        let bytes = without.to_canonical_bytes().expect("serialize");
+        let text = String::from_utf8(bytes).expect("utf8");
+        assert!(
+            !text.contains("digest"),
+            "an absent digest must not appear in the canonical bytes: {text}"
+        );
     }
 
     #[test]

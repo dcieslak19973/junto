@@ -1,10 +1,10 @@
 //! Launching Agent Sessions from the surface (`docs/adr/0023`).
 //!
-//! The **Workspace** is the machine-local mapping channel → repo(s) — where a
-//! channel's Agent Sessions execute (`~/.junto/workspaces.toml`). Paths never
-//! enter the ledger: they are machine facts and don't sync. The harness
-//! session-id mapping (`~/.junto/harness-sessions.toml`) is machine-local for
-//! the same reason.
+//! Where a session executes is resolved through `crate::mounts` (the
+//! machine-local **Mount** store, `~/.junto/mounts.toml`) against the
+//! channel's projected Subjects; paths never enter the ledger — they are
+//! machine facts and don't sync. The harness session-id mapping
+//! (`~/.junto/harness-sessions.toml`) is machine-local for the same reason.
 //!
 //! A turn runs the harness over **ACP** (`docs/adr/0024`, see [`crate::acp`])
 //! when available, falling back to the **`claude -p` oneshot-exec** CLI here.
@@ -28,8 +28,8 @@ use sha2::Digest as _;
 use tokio::sync::{broadcast, mpsc};
 
 use junto_kernel::{
-    ChannelId, ContentDigest, EntryId, EntryPayload, LedgerEntry, Member, ProvenanceRef,
-    SessionState, Timestamp, Uri,
+    ChannelId, ChannelView, ContentDigest, EntryId, EntryPayload, LedgerEntry, Member,
+    ProvenanceRef, SessionState, Timestamp, Uri,
 };
 
 use crate::host::Host;
@@ -401,107 +401,6 @@ fn harness_command(workspace: &Path) -> tokio::process::Command {
 
 /// How long a turn may run before the host kills it (docs/adr/0023).
 pub(crate) const TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
-
-// ---- the Workspace store (channel → repos; machine config) ----
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct WorkspacesFile {
-    #[serde(default)]
-    workspaces: Vec<WorkspaceRecord>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct WorkspaceRecord {
-    channel: ChannelId,
-    /// List-shaped so one channel can span several repos later; v1 uses
-    /// exactly one (docs/adr/0023).
-    repos: Vec<PathBuf>,
-}
-
-fn workspaces_path(junto_home: &Path) -> PathBuf {
-    junto_home.join("workspaces.toml")
-}
-
-/// The stored workspace repo for a channel, if one was remembered.
-pub fn workspace_for(junto_home: &Path, channel: &ChannelId) -> Result<Option<PathBuf>> {
-    let path = workspaces_path(junto_home);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let text =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let file: WorkspacesFile =
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-    Ok(file
-        .workspaces
-        .into_iter()
-        .find(|record| record.channel == *channel)
-        .and_then(|record| record.repos.into_iter().next()))
-}
-
-/// Every remembered (channel → repo) mapping. Used to infer a default
-/// workspace for a fresh channel from what's been used recently elsewhere.
-pub fn all_workspaces(junto_home: &Path) -> Result<Vec<(ChannelId, PathBuf)>> {
-    let path = workspaces_path(junto_home);
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let text =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let file: WorkspacesFile =
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-    Ok(file
-        .workspaces
-        .into_iter()
-        .filter_map(|record| {
-            record
-                .repos
-                .into_iter()
-                .next()
-                .map(|repo| (record.channel, repo))
-        })
-        .collect())
-}
-
-/// Remember (or update) a channel's workspace repo.
-pub fn remember_workspace(junto_home: &Path, channel: &ChannelId, repo: &Path) -> Result<()> {
-    let repo = dunce::canonicalize(repo)
-        .with_context(|| format!("workspace repo {} not found", repo.display()))?;
-    if !repo.join(".git").exists() {
-        bail!(
-            "{} is not a git repository (v1 workspaces must be git repos — diff capture \
-             depends on it; docs/adr/0023)",
-            repo.display()
-        );
-    }
-    let path = workspaces_path(junto_home);
-    let mut file: WorkspacesFile = if path.exists() {
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?
-    } else {
-        WorkspacesFile::default()
-    };
-    match file
-        .workspaces
-        .iter_mut()
-        .find(|record| record.channel == *channel)
-    {
-        Some(record) => record.repos = vec![repo],
-        None => file.workspaces.push(WorkspaceRecord {
-            channel: *channel,
-            repos: vec![repo],
-        }),
-    }
-    std::fs::create_dir_all(junto_home)
-        .with_context(|| format!("creating {}", junto_home.display()))?;
-    std::fs::write(
-        &path,
-        toml::to_string_pretty(&file).context("serializing workspaces")?,
-    )
-    .with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
-}
 
 // ---- the harness session-id mapping (junto session → harness session) ----
 
@@ -1407,7 +1306,18 @@ struct WorkspaceDiff {
 
 /// The workspace's uncommitted changes (`git diff HEAD` + untracked names),
 /// or `None` when clean — see [`WorkspaceDiff`] for the paired commit oid.
+///
+/// Refuses to touch a `session_workdir` scratch directory before invoking
+/// git at all: git's repository discovery walks *up* the tree, so `git -C
+/// <scratch dir> ...` would silently bind to whatever repository happens
+/// to enclose `<junto_home>/scratch` (e.g. `$JUNTO_HOME` sitting inside a
+/// work tree) and report *that* repo's uncommitted changes — a real
+/// data-integrity bug (a session's diff artifact showing someone else's
+/// changes), not a cosmetic one.
 fn workspace_diff(workspace: &Path) -> Option<WorkspaceDiff> {
+    if crate::host::junto_home().is_ok_and(|home| is_scratch_workdir(&home, workspace)) {
+        return None;
+    }
     let run = |args: &[&str]| -> Option<String> {
         let mut command = std::process::Command::new("git");
         command.arg("-C").arg(workspace).args(args);
@@ -1482,6 +1392,9 @@ fn workspace_commit(workspace: &Path) -> Option<String> {
 /// plane entry or the workspace has no commits yet — never fabricates an
 /// oid (see [`workspace_commit`]).
 fn push_begin_worktree_diff(host: &Host, session: EntryId, workspace: &Path) {
+    if crate::host::junto_home().is_ok_and(|home| is_scratch_workdir(&home, workspace)) {
+        return;
+    }
     if let Some(live) = host.live_plane().get(session)
         && let Some(commit) = workspace_commit(workspace)
     {
@@ -1510,8 +1423,19 @@ pub(crate) struct BranchPlan {
 /// Create `junto/<session>` off the workspace's current HEAD and switch to it,
 /// recording the base for later. The worker commits onto this branch; a later
 /// slice pushes it and opens the PR. Best-effort: callers log and continue if
-/// the workspace isn't a usable git repo.
+/// the workspace isn't a usable git repo — including a `session_workdir`
+/// scratch directory, refused here (before any git command runs, same
+/// reason and same pattern as [`workspace_diff`]'s and
+/// [`push_begin_worktree_diff`]'s guards) rather than left to whatever
+/// repository git's upward discovery happens to find enclosing it.
 pub(crate) fn prepare_pr_branch(workspace: &Path, session: EntryId) -> Result<BranchPlan> {
+    if crate::host::junto_home().is_ok_and(|home| is_scratch_workdir(&home, workspace)) {
+        bail!(
+            "workspace {} is a scratch directory (no Diff capability) — nothing to prepare a \
+             PR branch for",
+            workspace.display()
+        );
+    }
     let git = |args: &[&str]| -> Result<std::process::Output> {
         let mut command = std::process::Command::new("git");
         command.arg("-C").arg(workspace).args(args);
@@ -1645,18 +1569,119 @@ fn snippet(text: &str, limit: usize) -> String {
     s
 }
 
+/// The first mounted subject on this machine carrying `capability` — the
+/// shared search [`session_workdir`] (`Capability::Execute`),
+/// [`executable_mount`], and [`diff_capable`] (`Capability::Diff`) all run
+/// over `view`'s subjects, in canonical attachment order.
+///
+/// # Errors
+///
+/// Returns an error when the mount store cannot be read.
+fn mount_with_capability(
+    junto_home: &Path,
+    view: &ChannelView,
+    capability: crate::mounts::Capability,
+) -> Result<Option<PathBuf>> {
+    let subjects: Vec<_> = view.subjects.iter().map(|(_, s)| s.clone()).collect();
+    let mounts = crate::mounts::mounts_for(junto_home, &subjects)?;
+    for subject in &subjects {
+        let mount = mounts.iter().find(|m| m.uri == subject.uri);
+        if crate::mounts::capabilities(subject, mount).contains(&capability)
+            && let Some(mount) = mount
+        {
+            return Ok(Some(mount.path.clone()));
+        }
+    }
+    Ok(None)
+}
+
+/// The first `Execute`-capable mounted subject, if any — the mount-only
+/// half of [`session_workdir`], exposed so `crate::web`'s read-only
+/// prefills (`channel_mount`, the start-work form) can preview the same
+/// resolution `session_workdir` will make, without its scratch-directory
+/// side effect (there is nothing to preview for a scratch dir: it does not
+/// exist until a session mints one).
+///
+/// # Errors
+///
+/// Returns an error when the mount store cannot be read.
+pub(crate) fn executable_mount(junto_home: &Path, view: &ChannelView) -> Result<Option<PathBuf>> {
+    mount_with_capability(junto_home, view, crate::mounts::Capability::Execute)
+}
+
+/// Whether `view` has a subject on this machine carrying `Capability::Diff`
+/// — the condition [`prepare_pr_branch`] and the Outcome loop's grading
+/// both need (`crate::web::launch_session` refuses `mode=outcome` without
+/// it). Checked directly against `crate::mounts::capabilities` rather than
+/// inferred from a resolved workspace's path, so the gate holds regardless
+/// of how that workspace was produced.
+///
+/// # Errors
+///
+/// Returns an error when the mount store cannot be read.
+pub(crate) fn diff_capable(junto_home: &Path, view: &ChannelView) -> Result<bool> {
+    Ok(mount_with_capability(junto_home, view, crate::mounts::Capability::Diff)?.is_some())
+}
+
+/// Where a session's agent should run.
+///
+/// The first `Execute`-capable mounted subject wins (spec §1) — the same
+/// subject [`crate::mounts::capabilities`] reports as executable, given
+/// whatever this machine has mounted for it. A channel with none — a
+/// Document subject, or no subject at all — is not a refusal: it gets a
+/// fresh, per-session scratch directory under `<junto_home>/scratch/<session>`,
+/// deliberately never a git repository. This is the mechanism that makes a
+/// repo-free channel work: nothing past this call requires git.
+///
+/// The **sole** authority on where a session runs: every caller that needs
+/// to know a session's workspace — `launch`, `launch_outcome`,
+/// `steer_session` — calls this, with the same `(junto_home, view,
+/// session)`, rather than re-deriving it. Two call sites disagreeing on
+/// where a session lives (fix round 1, finding 2/round 2's root cause) is
+/// exactly the bug this contract exists to prevent.
+///
+/// # Errors
+///
+/// Returns an error when the mount store cannot be read, or the scratch
+/// directory cannot be created.
+pub fn session_workdir(junto_home: &Path, view: &ChannelView, session: EntryId) -> Result<PathBuf> {
+    if let Some(path) = mount_with_capability(junto_home, view, crate::mounts::Capability::Execute)?
+    {
+        return Ok(path);
+    }
+    let scratch = junto_home.join("scratch").join(session.to_string());
+    std::fs::create_dir_all(&scratch)
+        .with_context(|| format!("creating scratch dir {}", scratch.display()))?;
+    Ok(scratch)
+}
+
+/// Whether `workspace` is one of `session_workdir`'s own scratch
+/// directories rather than a mounted subject. `Capability::Diff` — the
+/// condition [`prepare_pr_branch`] needs, and the Outcome loop needs to run
+/// at all (`crate::web::launch_session` refuses `mode=outcome` here) —
+/// can only hold for a mounted `Repo` subject (`crate::mounts::capabilities`),
+/// and `session_workdir`'s only two possible outputs are such a mount or a
+/// scratch directory under `<junto_home>/scratch`, so this prefix check is
+/// exact, not a heuristic.
+pub(crate) fn is_scratch_workdir(junto_home: &Path, workspace: &Path) -> bool {
+    workspace.starts_with(junto_home.join("scratch"))
+}
+
 /// Launch a new Agent Session: append `SessionStarted` (authored as the
-/// harness member), then run the first turn in the background. Returns the
-/// new session's entry id immediately — the page shows the live state.
+/// harness member), then run the first turn in the background. `session` is
+/// minted by the caller (`crate::web::launch_session`) rather than here, so
+/// it can resolve that same id's workdir (`session_workdir`) before the
+/// session exists in the ledger. Returns the session's entry id — the page
+/// shows the live state.
 pub async fn launch(
     host: std::sync::Arc<Host>,
     channel: ChannelId,
     channel_ref: String,
+    session: EntryId,
     workspace: PathBuf,
     intent: String,
     agent: crate::agent::Agent,
 ) -> Result<EntryId> {
-    let session = EntryId::new();
     append(
         &host,
         &channel_ref,
@@ -1675,7 +1700,7 @@ pub async fn launch(
 
     let prompt = format!(
         "{intent}\n\n(Launched from junto channel '{channel_ref}'; junto session {session}. \
-         Do the work in this repository.)"
+         Do the work in this workspace.)"
     );
     spawn_turn(
         host,
@@ -2068,17 +2093,20 @@ pub(crate) const PR_OPEN_GATE_KIND: &str = "code-pr.open-pr";
 /// Launch an **Outcome-driven** Agent Session — the code-PR push-gate. The
 /// worker does the work; junto verifies it (mechanical checks + the Grader);
 /// findings feed back until the Outcome is satisfied or the iteration budget
-/// runs out, at which point it escalates to a human Gate. Returns the new
-/// session id immediately; the loop runs in the background.
+/// runs out, at which point it escalates to a human Gate. `session` is
+/// minted by the caller for the same reason `launch` takes it: so it can
+/// resolve the same id's workdir (`session_workdir`) before the session
+/// exists in the ledger. Returns the session id; the loop runs in the
+/// background.
 pub async fn launch_outcome(
     host: std::sync::Arc<Host>,
     channel: ChannelId,
     channel_ref: String,
+    session: EntryId,
     workspace: PathBuf,
     intent: String,
     agent: crate::agent::Agent,
 ) -> Result<EntryId> {
-    let session = EntryId::new();
     append(
         &host,
         &channel_ref,
@@ -2154,7 +2182,14 @@ fn spawn_outcome_loop(
 
         // Prepare a PR branch the worker commits onto (the push-gate's
         // deliverable). Best-effort: without it, grading falls back to the
-        // working-tree diff. workspace_diff self-discovers the recorded base.
+        // working-tree diff. workspace_diff self-discovers the recorded
+        // base. `web::launch_session` refuses `mode=outcome` for a
+        // workspace with no `Capability::Diff` before this loop ever
+        // starts, so this always has a real repo to work with in
+        // practice; `prepare_pr_branch` still self-guards against a
+        // scratch directory as defense in depth (same pattern as
+        // `workspace_diff`/`push_begin_worktree_diff`), so a failure here
+        // is a genuine git error, not a scratch dir slipping through.
         let branch_plan = match prepare_pr_branch(&workspace, session) {
             Ok(plan) => {
                 tracing::info!(
@@ -2262,6 +2297,9 @@ async fn run_worker_turn(
     feedback: Option<&str>,
     harness_session: &mut Option<String>,
 ) {
+    // The Outcome loop always runs a mounted Repo subject (`Capability::Diff`
+    // — `crate::web::launch_session` refuses `mode=outcome` in a scratch
+    // directory), so this prompt can promise a branch and a PR unconditionally.
     let prompt = match feedback {
         None => format!(
             "{intent}\n\n(Launched from junto channel '{channel_ref}'; junto session \
@@ -2728,10 +2766,16 @@ async fn try_execute_pr_gate(host: &Host, channel: ChannelId, proposal: EntryId)
         return Ok(());
     }
 
-    // Recover the workspace, branch, and session (the branch name carries it).
+    // Recover the workspace, branch, and session (the branch name carries
+    // it). `executable_mount` — the same `Capability::Execute`-filtered
+    // search `session_workdir` runs — not `mounts_for(...).next()`: a PR
+    // gate only ever opens for an Outcome-loop session, which only ever
+    // ran on a mounted Repo subject, so this is never actually a
+    // different answer here, but it stops relying on "first mount of any
+    // kind" coincidentally being right.
     let home = crate::host::junto_home()?;
-    let Some(workspace) = workspace_for(&home, &channel)? else {
-        bail!("no workspace is mapped for channel {channel}");
+    let Some(workspace) = executable_mount(&home, &view)? else {
+        bail!("channel {channel} has no subject to run in — attach one first");
     };
     let Some(branch) = current_branch(&workspace) else {
         return Ok(());
@@ -3320,36 +3364,6 @@ mod tests {
     }
 
     #[test]
-    fn workspace_store_remembers_and_updates() {
-        let home = HomeGuard::new();
-        let channel = ChannelId::new();
-        assert!(workspace_for(home.path(), &channel).unwrap().is_none());
-
-        let repo_a = git_repo();
-        remember_workspace(home.path(), &channel, repo_a.path()).unwrap();
-        let stored = workspace_for(home.path(), &channel).unwrap().unwrap();
-        assert_eq!(stored, dunce::canonicalize(repo_a.path()).unwrap());
-
-        // Updating replaces, not duplicates; other channels are untouched.
-        let repo_b = git_repo();
-        remember_workspace(home.path(), &channel, repo_b.path()).unwrap();
-        let stored = workspace_for(home.path(), &channel).unwrap().unwrap();
-        assert_eq!(stored, dunce::canonicalize(repo_b.path()).unwrap());
-
-        let other = ChannelId::new();
-        assert!(workspace_for(home.path(), &other).unwrap().is_none());
-    }
-
-    #[test]
-    fn non_git_workspaces_are_refused() {
-        let home = HomeGuard::new();
-        let channel = ChannelId::new();
-        let plain = tempfile::tempdir().unwrap();
-        let err = remember_workspace(home.path(), &channel, plain.path()).unwrap_err();
-        assert!(err.to_string().contains("not a git repository"), "{err}");
-    }
-
-    #[test]
     fn acp_config_carries_claude_extras_but_mcp_crosses_to_any_harness() {
         let agent = crate::agent::Agent {
             slug: "reviewer".into(),
@@ -3687,6 +3701,230 @@ mod tests {
                 .unwrap()
                 .as_str()
                 .ends_with("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_channel_with_no_executable_subject_runs_in_a_scratch_directory() {
+        let home = HomeGuard::new();
+        let session = EntryId::new();
+        let view = channel_view_with_subjects(&[]).await;
+
+        let dir = session_workdir(home.path(), &view, session).expect("a workdir");
+        assert!(dir.exists(), "the scratch directory must be created");
+        assert!(
+            dir.starts_with(home.path().join("scratch")),
+            "scratch dirs live under the junto home, not in a repo: {}",
+            dir.display()
+        );
+        assert!(
+            !dir.join(".git").exists(),
+            "a scratch dir is deliberately not a git repo"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mounted_repo_subject_wins_over_the_scratch_directory() {
+        let home = HomeGuard::new();
+        let repo = git_repo();
+        let uri = junto_kernel::Uri::new("https://example.com/a.git").expect("valid uri");
+        crate::mounts::remember_mount(home.path(), &uri, repo.path()).unwrap();
+
+        let subject = junto_kernel::Subject::new(junto_kernel::SubjectKind::Repo, uri);
+        let view = channel_view_with_subjects(&[subject]).await;
+
+        let dir = session_workdir(home.path(), &view, EntryId::new()).expect("a workdir");
+        assert_eq!(dir, dunce::canonicalize(repo.path()).unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_unmounted_document_subject_still_runs_in_a_scratch_directory() {
+        // The other half of Task 6's motivating case (a research/document
+        // channel, spec §1): a Document subject never carries
+        // `Capability::Execute`, mounted or not (`mounts::capabilities`
+        // only grants it to a mounted `Repo`), so a channel whose only
+        // subject is a Document must land in scratch exactly like a
+        // channel with no subject at all — never refused.
+        let home = HomeGuard::new();
+        let uri = junto_kernel::Uri::new("file:///notes/spec.md").expect("valid uri");
+        let subject = junto_kernel::Subject::new(junto_kernel::SubjectKind::Document, uri);
+        let view = channel_view_with_subjects(&[subject]).await;
+
+        let dir = session_workdir(home.path(), &view, EntryId::new()).expect("a workdir");
+        assert!(
+            dir.starts_with(home.path().join("scratch")),
+            "an unmounted document subject has nothing to run a session in: {}",
+            dir.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_capable_is_false_for_a_mounted_document_subject() {
+        // Fix round 3, finding 3: a direct, discriminating unit test of
+        // `diff_capable` itself — the round-2 web-layer test
+        // (`outcome_mode_refuses_with_a_mounted_document_subject`) passes
+        // against the old scratch-path gate too, now that `session_workdir`
+        // is the sole authority (round 2, finding 1), so it no longer
+        // proves this function specifically matters. This does: a mounted
+        // Document subject is a real, non-scratch directory, but
+        // `mounts::capabilities` never grants it `Capability::Diff`.
+        let home = HomeGuard::new();
+        let doc_dir = tempfile::tempdir().unwrap();
+        let uri = junto_kernel::Uri::new("file:///notes/spec.md").expect("valid uri");
+        crate::mounts::remember_mount(home.path(), &uri, doc_dir.path()).unwrap();
+        let subject = junto_kernel::Subject::new(junto_kernel::SubjectKind::Document, uri);
+        let view = channel_view_with_subjects(&[subject]).await;
+
+        assert!(
+            !diff_capable(home.path(), &view).expect("reading mounts"),
+            "a mounted Document subject must never report Diff capability"
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_capable_is_true_for_a_mounted_repo_subject() {
+        let home = HomeGuard::new();
+        let repo = git_repo();
+        let uri = junto_kernel::Uri::new("https://example.com/a.git").expect("valid uri");
+        crate::mounts::remember_mount(home.path(), &uri, repo.path()).unwrap();
+        let subject = junto_kernel::Subject::new(junto_kernel::SubjectKind::Repo, uri);
+        let view = channel_view_with_subjects(&[subject]).await;
+
+        assert!(
+            diff_capable(home.path(), &view).expect("reading mounts"),
+            "a mounted Repo subject must report Diff capability"
+        );
+    }
+
+    /// A `ChannelView` carrying just the subjects a workdir test needs.
+    ///
+    /// Built through the kernel's in-memory substrate rather than a git-refs
+    /// one: `session_workdir` reads only `view.subjects`, so an in-memory
+    /// ledger is the honest minimum here.
+    async fn channel_view_with_subjects(subjects: &[junto_kernel::Subject]) -> ChannelView {
+        use junto_kernel::{
+            ChannelId, EntryId, EntryPayload, InMemorySubstrate, Ledger, LedgerEntry, Member,
+            Timestamp,
+        };
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let dan = Member::human("Dan", "dan@example.com");
+        let mut millis: i64 = 1;
+        let mut payloads = vec![EntryPayload::ChannelOpened {
+            name: Some("workdir".into()),
+        }];
+        for subject in subjects {
+            payloads.push(EntryPayload::SubjectAttached {
+                subject: subject.clone(),
+            });
+        }
+        for payload in payloads {
+            ledger
+                .append(LedgerEntry {
+                    signature: None,
+                    id: EntryId::new(),
+                    channel,
+                    author: dan.clone(),
+                    timestamp: Timestamp::from_millis(millis),
+                    payload,
+                })
+                .await
+                .expect("append entry");
+            millis += 1;
+        }
+        ledger.project(&channel).await.expect("project")
+    }
+
+    #[test]
+    fn a_mounted_repo_workspace_is_not_a_scratch_workdir() {
+        let home = HomeGuard::new();
+        let repo = git_repo();
+        assert!(
+            !is_scratch_workdir(home.path(), repo.path()),
+            "a real mount must never be mistaken for a scratch dir"
+        );
+    }
+
+    #[test]
+    fn a_workdir_under_the_scratch_root_is_a_scratch_workdir() {
+        let home = HomeGuard::new();
+        let scratch = home.path().join("scratch").join(EntryId::new().to_string());
+        std::fs::create_dir_all(&scratch).unwrap();
+        assert!(
+            is_scratch_workdir(home.path(), &scratch),
+            "session_workdir's own scratch fallback must be recognized as one"
+        );
+    }
+
+    #[test]
+    fn workspace_diff_never_touches_a_scratch_directory_even_when_it_is_a_repo() {
+        // Fix round 1, finding 4: `git -C <dir> ...` walks *up* the tree to
+        // find an enclosing repository, so a bare `is_scratch_workdir` check
+        // placed too late — after some git command already ran — would
+        // still have leaked whatever git found along the way. Prove the
+        // guard fires before any git command runs at all by making the
+        // scratch dir *itself* a dirty git repo: if the guard didn't
+        // short-circuit first, `workspace_diff` would happily report these
+        // very real changes.
+        let home = HomeGuard::new();
+        let scratch = home.path().join("scratch").join(EntryId::new().to_string());
+        std::fs::create_dir_all(&scratch).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&scratch)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(scratch.join("dirty.txt"), "uncommitted").unwrap();
+        assert!(
+            workspace_diff(&scratch).is_none(),
+            "a scratch directory must never be diffed, even when it happens to be a repo"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_begin_worktree_diff_is_a_no_op_for_a_scratch_directory() {
+        // The same leak, at the live-plane tap: without the guard, a
+        // scratch session's begin-time push would carry the enclosing (or,
+        // as here, the scratch dir's own) repository's real commit oid and
+        // diff text into the ledger-adjacent live document.
+        let home = HomeGuard::new();
+        let scratch = home.path().join("scratch").join(EntryId::new().to_string());
+        std::fs::create_dir_all(&scratch).unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&scratch)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        std::fs::write(scratch.join("README.md"), "x").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+
+        let host = crate::host::Host::fixed(vec![]);
+        let session = EntryId::new();
+        let _rx = host.live().begin(host.clone(), "c".into(), session, false);
+
+        push_begin_worktree_diff(&host, session, &scratch);
+
+        let live = host
+            .live_plane()
+            .get(session)
+            .expect("session registered by begin");
+        assert_eq!(
+            live.doc.worktree_len(),
+            0,
+            "a scratch directory has no repository to report a commit or diff from"
         );
     }
 }

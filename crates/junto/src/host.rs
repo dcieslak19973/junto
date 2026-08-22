@@ -8,9 +8,11 @@
 //!
 //! Channel addressing (`docs/adr/0014`/`0016`): a channel's id is minted at
 //! open time; its name is a label bound by the `ChannelOpened` genesis entry,
-//! unique only within its home substrate. The host resolves a bare name across
-//! all registered substrates — ambiguity is an error asking for
-//! qualification — and a raw id always resolves.
+//! not required to be unique anywhere (`docs/adr/0014`'s amendment, spec §2's
+//! collapse). The host resolves a bare name across all registered substrates
+//! by picking the most recently opened match — ties broken by `EntryId`, the
+//! same order `LedgerEntry::canonical_cmp` uses, so every replica resolves
+//! identically — and a raw id always resolves.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -19,7 +21,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use junto_kernel::{
     ChannelId, ChannelView, EntryId, EntryPayload, GateStatus, Ledger, LedgerEntry, Member,
-    MemberKind, PublicKey, Standing, SubstrateProvider, Timestamp,
+    MemberKind, PublicKey, Standing, Subject, SubstrateProvider, Timestamp,
 };
 use junto_substrate_git::GitRefsSubstrate;
 use serde::{Deserialize, Serialize};
@@ -239,7 +241,8 @@ impl AttentionGroup {
 
 /// The result of resolving a user-supplied channel reference.
 pub enum Resolution {
-    /// Exactly one channel matched, in its home substrate's ledger.
+    /// The channel resolution settled on — by raw id, or by name (the most
+    /// recently opened match, when more than one channel shares the name).
     Resolved {
         /// The home substrate repo (e.g. for deriving a default author from
         /// its git config).
@@ -249,8 +252,6 @@ pub enum Resolution {
     },
     /// No registered substrate has a channel by that name or id.
     NotFound,
-    /// The name exists in more than one substrate; the caller must qualify.
-    Ambiguous(Vec<PathBuf>),
 }
 
 /// The singleton host's shared state.
@@ -483,7 +484,12 @@ impl Host {
     }
 
     /// Resolve a channel reference — a name bound by a genesis entry, or a raw
-    /// channel id — to its home substrate and id (`docs/adr/0014`).
+    /// channel id — to its home substrate and id (`docs/adr/0014`). Names are
+    /// no longer unique (`docs/adr/0014`'s amendment, spec §2's collapse): a
+    /// name match picks the most recently **opened** channel, breaking a
+    /// timestamp tie by `EntryId` the same way [`LedgerEntry::canonical_cmp`]
+    /// does, so every replica resolves an ambiguous name identically without
+    /// asking anyone to qualify it.
     pub async fn resolve(&self, channel: &str) -> Result<Resolution> {
         // A raw id resolves directly: ids are globally unique, so the first
         // substrate containing it is *the* substrate.
@@ -502,34 +508,58 @@ impl Host {
             return Ok(Resolution::NotFound);
         }
 
-        let mut matches = Vec::new();
-        for summary in self.inventory().await? {
-            if summary.name.as_deref() == Some(channel) {
-                matches.push(summary);
+        // Every genesis whose *current* projected name matches, kept only as
+        // (substrate, id, genesis) — `canonical_cmp` needs the genesis entry
+        // itself, not just its timestamp, to break a same-millisecond tie.
+        let mut best: Option<(PathBuf, ChannelId, LedgerEntry)> = None;
+        for repo in self.substrate_paths()? {
+            let ledger = self.ledger_for(&repo).await?;
+            let guard = ledger.lock().await;
+            for id in guard.substrate().channels().await? {
+                let view = guard.project(&id).await?;
+                if view.name.as_deref() != Some(channel) {
+                    continue;
+                }
+                let Some(genesis) = view
+                    .entries
+                    .iter()
+                    .find(|entry| matches!(entry.payload, EntryPayload::ChannelOpened { .. }))
+                    .cloned()
+                else {
+                    continue;
+                };
+                let wins = match &best {
+                    Some((_, _, current)) => {
+                        genesis.canonical_cmp(current) == std::cmp::Ordering::Greater
+                    }
+                    None => true,
+                };
+                if wins {
+                    best = Some((repo.clone(), id, genesis));
+                }
             }
         }
-        match matches.len() {
-            0 => Ok(Resolution::NotFound),
-            1 => {
-                let hit = matches.remove(0);
-                let ledger = self.ledger_for(&hit.substrate).await?;
+        match best {
+            Some((substrate, id, _)) => {
+                let ledger = self.ledger_for(&substrate).await?;
                 Ok(Resolution::Resolved {
-                    substrate: hit.substrate,
+                    substrate,
                     ledger,
-                    id: hit.id,
+                    id,
                 })
             }
-            _ => Ok(Resolution::Ambiguous(
-                matches.into_iter().map(|hit| hit.substrate).collect(),
-            )),
+            None => Ok(Resolution::NotFound),
         }
     }
 
     /// Open a channel (`docs/adr/0014`/`0016`): mint its id (or accept a
-    /// declared one — the grandfathering path for pre-0014 records), enforce
-    /// name uniqueness within the home substrate, and append the
-    /// `ChannelOpened` genesis entry. The opener is the **founding member**
-    /// (`docs/adr/0017`), so their member code is minted alongside.
+    /// declared one — the grandfathering path for pre-0014 records) and
+    /// append the `ChannelOpened` genesis entry. Names are not unique
+    /// (`docs/adr/0014`'s amendment, spec §2's collapse) — two channels may
+    /// share a name in the same home substrate; [`Host::resolve`] picks the
+    /// most recently opened match deterministically. The opener is the
+    /// **founding member** (`docs/adr/0017`), so their member code is minted
+    /// alongside.
     ///
     /// `repo`: the home substrate; may be omitted when the host serves exactly
     /// one.
@@ -568,19 +598,21 @@ impl Host {
         };
 
         let ledger = self.ledger_for(&repo).await?;
-        // Hold the ledger lock across the uniqueness check *and* the append so
-        // two concurrent opens of the same name cannot both pass the check.
+        // Hold the ledger lock across the declared-id genesis check *and* the
+        // append, so two concurrent grandfathering opens of the same
+        // declared id cannot both pass the check.
         let mut guard = ledger.lock().await;
-        for id in guard.substrate().channels().await? {
-            let view = guard.project(&id).await?;
-            if view.name.as_deref() == Some(name) {
-                bail!(
-                    "channel '{name}' already exists in {} (id {id})",
-                    repo.display()
-                );
-            }
-            if declared_id == Some(id) && view.name.is_some() {
-                bail!("channel {id} already has a genesis naming it");
+        // The grandfathering path only: a declared pre-0014 id must not
+        // already carry a genesis (name-agnostic — an unnamed genesis is
+        // still a genesis, spec §2's collapse).
+        if let Some(declared) = declared_id {
+            let view = guard.project(&declared).await?;
+            if view
+                .entries
+                .iter()
+                .any(|entry| matches!(entry.payload, EntryPayload::ChannelOpened { .. }))
+            {
+                bail!("channel {declared} already has a genesis");
             }
         }
 
@@ -596,7 +628,7 @@ impl Host {
             author: opened_by.clone(),
             timestamp: Timestamp::now(),
             payload: EntryPayload::ChannelOpened {
-                name: name.to_string(),
+                name: Some(name.to_string()),
             },
         };
         self.sign_entry(&mut genesis);
@@ -627,10 +659,6 @@ impl Host {
         let (ledger, id) = match resolution {
             Resolution::Resolved { ledger, id, .. } => (ledger, id),
             Resolution::NotFound => bail!("no channel '{channel}' in any registered substrate"),
-            Resolution::Ambiguous(substrates) => bail!(
-                "channel name '{channel}' exists in several substrates ({substrates:?}); \
-                 address it by id"
-            ),
         };
         let mut guard = ledger.lock().await;
         let view = guard.project(&id).await?;
@@ -912,6 +940,61 @@ impl Host {
         Ok(())
     }
 
+    /// Attach a **Subject** — something this channel is about (spec §1) — by
+    /// recording one `SubjectAttached` entry. Returns the attachment's entry
+    /// id, which is what a later `SubjectDetached` targets.
+    ///
+    /// **Idempotent**: if the channel already carries a subject with this
+    /// uri, nothing is appended — the existing attachment's `EntryId` is
+    /// returned instead. This is enforced here, under the ledger lock,
+    /// against a *fresh* (uncached) projection, not left to callers: a
+    /// handler-side check against a cached view cannot see an attach that
+    /// landed via `junto sync` in another process within the projection
+    /// cache's TTL, or a concurrent call racing this one, so the guard has
+    /// to live at the write boundary to actually close those windows. The
+    /// record is append-only with no `SubjectDetached` write surface yet, so
+    /// a duplicate here would be permanent — worth the extra fold every
+    /// caller inherits.
+    ///
+    /// The subject's URI is portable by construction; where *this* machine
+    /// keeps it is a Mount, machine-local and never recorded.
+    ///
+    /// Dispatches through [`Host::check_write_auth`], the same guardrail
+    /// [`Host::diverge`]/[`Host::converge`] use, so both write surfaces
+    /// (`docs/adr/0021`) are served without re-implementing authorization.
+    ///
+    /// # Errors
+    /// Refuses an author who is not in the channel's Party, or whose member
+    /// code is missing or wrong on the agent surface (`docs/adr/0017`/`0021`);
+    /// also errors if `channel` does not resolve.
+    pub async fn attach_subject(
+        &self,
+        channel: &str,
+        subject: Subject,
+        author: Member,
+        auth: WriteAuth<'_>,
+    ) -> Result<EntryId> {
+        let (_substrate, ledger, channel_id) = self.resolve_for_write(channel).await?;
+        let mut guard = ledger.lock().await;
+        let view = guard.project_fresh(&channel_id).await?;
+        self.check_write_auth(&view, &author, &auth)?;
+        if let Some((existing, _)) = view.subjects.iter().find(|(_, s)| s.uri == subject.uri) {
+            return Ok(*existing);
+        }
+        let mut entry = LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel: channel_id,
+            author,
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::SubjectAttached { subject },
+        };
+        self.sign_entry(&mut entry);
+        let id = entry.id;
+        guard.append(entry).await?;
+        Ok(id)
+    }
+
     /// Resolve a **target** channel reference for [`Host::converge`]: its id,
     /// plus its local ledger if this host hosts it. A raw id that isn't hosted
     /// here resolves to the id alone — the far side reconciles later
@@ -920,10 +1003,6 @@ impl Host {
     async fn resolve_target(&self, target: &str) -> Result<(ChannelId, Option<SharedLedger>)> {
         match self.resolve(target).await? {
             Resolution::Resolved { ledger, id, .. } => Ok((id, Some(ledger))),
-            Resolution::Ambiguous(substrates) => bail!(
-                "channel name '{target}' exists in several substrates ({substrates:?}); \
-                 address it by id"
-            ),
             Resolution::NotFound => match target.parse::<ChannelId>() {
                 Ok(id) => Ok((id, None)),
                 Err(_) => bail!(
@@ -1043,8 +1122,8 @@ impl Host {
         }
     }
 
-    /// Resolve a channel reference for a write op, turning the not-found /
-    /// ambiguous cases into clear errors (the shape diverge/converge share).
+    /// Resolve a channel reference for a write op, turning the not-found
+    /// case into a clear error (the shape diverge/converge share).
     async fn resolve_for_write(&self, channel: &str) -> Result<(PathBuf, SharedLedger, ChannelId)> {
         match self.resolve(channel).await? {
             Resolution::Resolved {
@@ -1053,10 +1132,6 @@ impl Host {
                 id,
             } => Ok((substrate, ledger, id)),
             Resolution::NotFound => bail!("no channel '{channel}' in any registered substrate"),
-            Resolution::Ambiguous(substrates) => bail!(
-                "channel name '{channel}' exists in several substrates ({substrates:?}); \
-                 address it by id"
-            ),
         }
     }
 
@@ -1320,7 +1395,13 @@ fn summarize(id: &ChannelId, view: &ChannelView, substrate: &Path) -> ChannelSum
 /// most telling text.
 fn preview(entry: &LedgerEntry) -> String {
     let (kind, text) = match &entry.payload {
-        EntryPayload::ChannelOpened { name } => ("genesis", format!("channel '{name}' opened")),
+        EntryPayload::ChannelOpened { name } => (
+            "genesis",
+            match name {
+                Some(name) => format!("channel '{name}' opened"),
+                None => "channel opened".to_string(),
+            },
+        ),
         EntryPayload::MemberAdded { member } => ("member added", member.display_name.clone()),
         EntryPayload::ChannelClosed { rationale } => ("closed", rationale.clone()),
         EntryPayload::ChannelReopened { rationale } => ("reopened", rationale.clone()),
@@ -1348,6 +1429,13 @@ fn preview(entry: &LedgerEntry) -> String {
         EntryPayload::SessionStarted { intent } => ("session started", intent.clone()),
         EntryPayload::SessionUpdated { note, .. } => ("session updated", note.clone()),
         EntryPayload::ArtifactAttached { description, .. } => ("artifact", description.clone()),
+        // Provisional copy — the surface plan owns subject rendering.
+        EntryPayload::SubjectAttached { subject } => (
+            "subject attached",
+            format!("{:?} {}", subject.kind, subject.uri.as_str()),
+        ),
+        // Provisional copy — the surface plan owns subject rendering.
+        EntryPayload::SubjectDetached { target } => ("subject detached", target.to_string()),
     };
     const LIMIT: usize = 160;
     let snippet: String = text.chars().take(LIMIT).collect();
@@ -1399,7 +1487,7 @@ pub(crate) mod test_home {
 #[cfg(test)]
 mod lineage_tests {
     use super::*;
-    use junto_kernel::{ApprovalRequirement, LineageDirection, LineageRelation};
+    use junto_kernel::{ApprovalRequirement, LineageDirection, LineageRelation, SubjectKind, Uri};
     use std::process::Command as StdCommand;
     use tempfile::TempDir;
 
@@ -1448,6 +1536,125 @@ mod lineage_tests {
         };
         let view = ledger.lock().await.project(&id).await.unwrap();
         (id, view)
+    }
+
+    /// Two channels may share a name after the collapse (spec §2, ADR 0014's
+    /// amendment) — `open_channel`'s old substrate-wide uniqueness scan no
+    /// longer refuses the second open.
+    #[tokio::test]
+    async fn two_channels_may_share_a_name_and_both_open() {
+        let (_dirs, host) = lineage_host(1);
+        let first = host
+            .open_channel(None, "auth stuff", dan(), None)
+            .await
+            .expect("open");
+        let second = host
+            .open_channel(None, "auth stuff", dan(), None)
+            .await
+            .expect("a duplicate name must be allowed after the collapse (spec §2)");
+        assert_ne!(first.id, second.id);
+        // Both live on: a raw-id resolve finds each one.
+        assert!(matches!(
+            host.resolve(&first.id.to_string()).await.unwrap(),
+            Resolution::Resolved { id, .. } if id == first.id
+        ));
+        assert!(matches!(
+            host.resolve(&second.id.to_string()).await.unwrap(),
+            Resolution::Resolved { id, .. } if id == second.id
+        ));
+    }
+
+    /// Resolving a shared name picks the channel with the later genesis
+    /// timestamp — "most recently opened" — regardless of which one a
+    /// caller renamed most recently.
+    #[tokio::test]
+    async fn resolving_a_shared_name_prefers_the_later_genesis_timestamp() {
+        let (dirs, host) = lineage_host(1);
+        let substrate = host.substrate_paths().unwrap()[0].clone();
+        let ledger = host.ledger_for(&substrate).await.unwrap();
+        let older = ChannelId::default();
+        let newer = ChannelId::default();
+        ledger
+            .lock()
+            .await
+            .append(LedgerEntry {
+                signature: None,
+                id: EntryId::new(),
+                channel: older,
+                author: dan(),
+                timestamp: Timestamp::from_millis(1_000),
+                payload: EntryPayload::ChannelOpened {
+                    name: Some("auth stuff".into()),
+                },
+            })
+            .await
+            .unwrap();
+        ledger
+            .lock()
+            .await
+            .append(LedgerEntry {
+                signature: None,
+                id: EntryId::new(),
+                channel: newer,
+                author: dan(),
+                timestamp: Timestamp::from_millis(2_000),
+                payload: EntryPayload::ChannelOpened {
+                    name: Some("auth stuff".into()),
+                },
+            })
+            .await
+            .unwrap();
+        let _ = &dirs;
+
+        let Resolution::Resolved { id, .. } = host.resolve("auth stuff").await.unwrap() else {
+            panic!("'auth stuff' resolves");
+        };
+        assert_eq!(id, newer, "resolution prefers the later genesis");
+    }
+
+    /// When two genesis entries land in the same millisecond, resolution
+    /// still picks deterministically — by `EntryId`, the same tie-break
+    /// [`LedgerEntry::canonical_cmp`] uses — so every replica agrees.
+    #[tokio::test]
+    async fn resolving_a_shared_name_breaks_a_timestamp_tie_by_entry_id() {
+        let (dirs, host) = lineage_host(1);
+        let substrate = host.substrate_paths().unwrap()[0].clone();
+        let ledger = host.ledger_for(&substrate).await.unwrap();
+        let channel_a = ChannelId::default();
+        let channel_b = ChannelId::default();
+        let entry_a = LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel: channel_a,
+            author: dan(),
+            timestamp: Timestamp::from_millis(1_000),
+            payload: EntryPayload::ChannelOpened {
+                name: Some("auth stuff".into()),
+            },
+        };
+        let entry_b = LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel: channel_b,
+            author: dan(),
+            timestamp: Timestamp::from_millis(1_000),
+            payload: EntryPayload::ChannelOpened {
+                name: Some("auth stuff".into()),
+            },
+        };
+        let expected = if entry_a.canonical_cmp(&entry_b) == std::cmp::Ordering::Greater {
+            channel_a
+        } else {
+            channel_b
+        };
+        ledger.lock().await.append(entry_a).await.unwrap();
+        ledger.lock().await.append(entry_b).await.unwrap();
+        let _ = &dirs;
+
+        let Resolution::Resolved { id, .. } = host.resolve("auth stuff").await.unwrap() else {
+            panic!("'auth stuff' resolves");
+        };
+        assert_eq!(id, expected, "the greater canonical_cmp genesis wins");
     }
 
     /// `docs/adr/0033` end to end through the host: opening a channel keys
@@ -2119,6 +2326,77 @@ mod lineage_tests {
     }
 
     #[tokio::test]
+    async fn attaching_a_subject_records_it_and_projects_it() {
+        let (_dirs, host) = lineage_host(1);
+        host.open_channel(None, "subjects", dan(), None)
+            .await
+            .unwrap();
+
+        let subject = Subject::new(
+            SubjectKind::Repo,
+            Uri::new("git+https://example.com/a.git").expect("valid uri"),
+        );
+        let id = host
+            .attach_subject("subjects", subject.clone(), dan(), WriteAuth::Human)
+            .await
+            .expect("attach");
+
+        let (_, view) = project(&host, "subjects").await;
+        assert_eq!(view.subjects, vec![(id, subject)]);
+    }
+
+    #[tokio::test]
+    async fn attaching_a_subject_refuses_a_non_member() {
+        let (_dirs, host) = lineage_host(1);
+        host.open_channel(None, "subjects", dan(), None)
+            .await
+            .unwrap();
+
+        let stranger = Member::human("Stranger", "stranger@example.com");
+        let subject = Subject::new(
+            SubjectKind::Repo,
+            Uri::new("git+https://example.com/a.git").expect("valid uri"),
+        );
+        let err = host
+            .attach_subject("subjects", subject, stranger, WriteAuth::Human)
+            .await
+            .expect_err("a non-member must not attach a subject");
+        assert!(format!("{err}").to_lowercase().contains("member"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn attaching_the_same_subject_twice_is_idempotent() {
+        let (_dirs, host) = lineage_host(1);
+        host.open_channel(None, "subjects", dan(), None)
+            .await
+            .unwrap();
+
+        let subject = Subject::new(
+            SubjectKind::Repo,
+            Uri::new("git+https://example.com/a.git").expect("valid uri"),
+        );
+        let first = host
+            .attach_subject("subjects", subject.clone(), dan(), WriteAuth::Human)
+            .await
+            .expect("first attach");
+        let second = host
+            .attach_subject("subjects", subject.clone(), dan(), WriteAuth::Human)
+            .await
+            .expect("second attach is a no-op, not an error");
+        assert_eq!(
+            first, second,
+            "a repeat attach of the same uri returns the existing attachment's id"
+        );
+
+        let (_, view) = project(&host, "subjects").await;
+        assert_eq!(
+            view.subjects,
+            vec![(first, subject)],
+            "the channel carries exactly one subject, not a duplicate"
+        );
+    }
+
+    #[tokio::test]
     async fn converge_closes_source_and_records_both_edges() {
         let (dirs, host) = lineage_host(1);
         host.open_channel(None, "src", dan(), None).await.unwrap();
@@ -2418,6 +2696,42 @@ mod lineage_tests {
                 .unwrap()
                 .is_empty(),
             "the 30-day bound drops the unreconciled edge"
+        );
+    }
+
+    /// The old guard checked `view.name.is_some()` as a genesis-presence
+    /// proxy — sound only while every genesis carried a name. An unnamed
+    /// genesis (spec §2's collapse) made that proxy false for a channel that
+    /// already has one, silently letting the grandfathering path append a
+    /// second `ChannelOpened`. The guard must be name-agnostic.
+    #[tokio::test]
+    async fn open_channel_refuses_a_second_genesis_for_an_unnamed_channel() {
+        let (dirs, host) = lineage_host(1);
+        let substrate = host.substrate_paths().unwrap()[0].clone();
+        let ledger = host.ledger_for(&substrate).await.unwrap();
+        let id = ChannelId::default();
+        ledger
+            .lock()
+            .await
+            .append(LedgerEntry {
+                signature: None,
+                id: EntryId::new(),
+                channel: id,
+                author: dan(),
+                timestamp: Timestamp::now(),
+                payload: EntryPayload::ChannelOpened { name: None },
+            })
+            .await
+            .unwrap();
+        let _ = &dirs;
+
+        let err = host
+            .open_channel(Some(&substrate), "grandfathered", dan(), Some(id))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("channel {id} already has a genesis")
         );
     }
 }

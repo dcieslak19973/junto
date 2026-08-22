@@ -15,6 +15,7 @@ use crate::{
     gate::ApprovalRequirement,
     ids::ChannelId,
     session::{SessionState, SessionView},
+    subject::Subject,
 };
 
 /// Whether a proposal's [`ApprovalRequirement`] is satisfied by the set of
@@ -45,6 +46,23 @@ pub enum Standing {
     Parked,
     /// Superseded by a [`EntryPayload::Correction`].
     Superseded,
+}
+
+/// A whole channel's derived standing (spec §2) — the filter that lets
+/// channels be cheap without drowning recall.
+///
+/// Derived by projection from entries the ledger already holds: no new entry
+/// kind, no user action, nothing to declare. A channel that has produced
+/// nothing verified is invisible to the brief, so opening one costs nothing
+/// epistemically. **Existence and standing are different things.**
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelStanding {
+    /// Nothing ratified and not closed — visible to its author only.
+    Scratch,
+    /// At least one ratified entry: it has produced something. Feeds recall.
+    Standing,
+    /// Closed or converged. Feeds recall as history.
+    Settled,
 }
 
 /// Whether a [`LineageEdge`] is a divergence or a convergence (`docs/adr/0027`).
@@ -147,7 +165,9 @@ pub type Keyring = std::collections::HashMap<String, Vec<KeyGrant>>;
 pub struct ChannelView {
     /// The channel's human-facing name, from its `ChannelOpened` genesis entry
     /// (`docs/adr/0014`/`0016`). `None` if no genesis is present (an unopened
-    /// dogfood-era channel, or a record synced before its genesis arrived).
+    /// dogfood-era channel, or a record synced before its genesis arrived), or
+    /// if the genesis itself carries no name — an unnamed channel, opened by
+    /// a human's first message and not yet named (the collapse, spec §2).
     /// If concurrent opens left multiple geneses, the canonically first wins —
     /// deterministic on every replica, like all projection.
     pub name: Option<String>,
@@ -216,6 +236,15 @@ pub struct ChannelView {
     /// to this channel — the reciprocal entry in `other`'s ledger is the host's
     /// concern, not the projection's.
     pub lineage: Vec<LineageEdge>,
+    /// The Subjects this channel is about (spec §1), in canonical attachment
+    /// order, each paired with the id of the `SubjectAttached` entry that
+    /// introduced it. Detached subjects are folded out; both entries stay in
+    /// [`entries`](ChannelView::entries), because the record is append-only.
+    /// Members only, like every other fold (`docs/adr/0017`).
+    pub subjects: Vec<(EntryId, Subject)>,
+    /// This channel's derived standing (spec §2). Recall and the focus board
+    /// filter on it so that cheap channels cost nothing.
+    pub channel_standing: ChannelStanding,
 }
 
 impl ChannelView {
@@ -422,6 +451,7 @@ impl<S: SubstrateProvider> Ledger<S> {
         let gate_executions = Self::project_gate_executions(&recognized);
         let sessions = Self::project_sessions(&recognized);
         let lineage = Self::project_lineage(&recognized);
+        let subjects = Self::project_subjects(&recognized);
         // The current name: the (canonically first) genesis binding, unless a
         // later Correction targeting the genesis superseded it — rename is a
         // corrective entry, not mutable metadata (docs/adr/0014/0016).
@@ -429,14 +459,14 @@ impl<S: SubstrateProvider> Ledger<S> {
             EntryPayload::ChannelOpened { name } => Some((entry.id, name.clone())),
             _ => None,
         });
-        let name = genesis.map(|(genesis_id, mut name)| {
+        let name = genesis.and_then(|(genesis_id, mut name)| {
             for entry in &recognized {
                 if let EntryPayload::Correction {
                     target, statement, ..
                 } = &entry.payload
                     && *target == genesis_id
                 {
-                    name = statement.clone();
+                    name = Some(statement.clone());
                 }
             }
             name
@@ -451,6 +481,7 @@ impl<S: SubstrateProvider> Ledger<S> {
                 _ => None,
             })
             .unwrap_or(false);
+        let channel_standing = Self::project_channel_standing(&standings, closed);
 
         let view = ChannelView {
             name,
@@ -465,6 +496,8 @@ impl<S: SubstrateProvider> Ledger<S> {
             sessions,
             closed,
             lineage,
+            subjects,
+            channel_standing,
         };
         if let Ok(mut cache) = self.cache.lock() {
             cache.insert(*channel, (std::time::Instant::now(), view.clone()));
@@ -799,7 +832,9 @@ impl<S: SubstrateProvider> Ledger<S> {
                 | EntryPayload::GateExecuted { .. }
                 | EntryPayload::SessionStarted { .. }
                 | EntryPayload::SessionUpdated { .. }
-                | EntryPayload::ArtifactAttached { .. } => continue,
+                | EntryPayload::ArtifactAttached { .. }
+                | EntryPayload::SubjectAttached { .. }
+                | EntryPayload::SubjectDetached { .. } => continue,
             };
             if let Some(target) = entry.payload.target()
                 && let Some(slot) = standings.get_mut(&target)
@@ -809,6 +844,23 @@ impl<S: SubstrateProvider> Ledger<S> {
         }
 
         standings
+    }
+
+    /// Derive the channel's standing from what its ledger already contains.
+    fn project_channel_standing(
+        standings: &HashMap<EntryId, Standing>,
+        closed: bool,
+    ) -> ChannelStanding {
+        if closed {
+            return ChannelStanding::Settled;
+        }
+        if standings
+            .values()
+            .any(|standing| *standing == Standing::Ratified)
+        {
+            return ChannelStanding::Standing;
+        }
+        ChannelStanding::Scratch
     }
 
     /// Fold the proposal gate statuses out of an ordered list of *recognized*
@@ -917,14 +969,42 @@ impl<S: SubstrateProvider> Ledger<S> {
 
         sessions
     }
+
+    /// Fold the live Subjects out of an ordered list of *recognized* entries.
+    /// Two passes: collect the attachments in canonical order, then drop the
+    /// ones any `SubjectDetached` targets, regardless of the detachment's own
+    /// position relative to its target. This is deliberately
+    /// **order-insensitive**: a detachment withdraws its target outright, so
+    /// replicas must agree on the live set even when clocks skew or two
+    /// entries' timestamps collide, and tie-breaking on canonical order
+    /// would let that agreement drift.
+    fn project_subjects(entries: &[&LedgerEntry]) -> Vec<(EntryId, Subject)> {
+        let mut attached: Vec<(EntryId, Subject)> = Vec::new();
+        let mut detached: HashSet<EntryId> = HashSet::new();
+        for entry in entries {
+            match &entry.payload {
+                EntryPayload::SubjectAttached { subject } => {
+                    attached.push((entry.id, subject.clone()));
+                }
+                EntryPayload::SubjectDetached { target } => {
+                    detached.insert(*target);
+                }
+                _ => {}
+            }
+        }
+        attached
+            .into_iter()
+            .filter(|(id, _)| !detached.contains(id))
+            .collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::{
-        ApprovalRequirement, EntryId, EntryPayload, GateStatus, InMemorySubstrate, KeyGrant,
-        Ledger, LedgerEntry, LineageDirection, LineageEdge, LineageRelation, Member, SessionState,
-        Standing, Timestamp, ids::ChannelId,
+        ApprovalRequirement, ChannelStanding, EntryId, EntryPayload, GateStatus, InMemorySubstrate,
+        KeyGrant, Ledger, LedgerEntry, LineageDirection, LineageEdge, LineageRelation, Member,
+        SessionState, Standing, Subject, SubjectKind, Timestamp, Uri, ids::ChannelId,
     };
 
     /// Build an entry with explicit id/timestamp/author for deterministic tests.
@@ -954,6 +1034,170 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn detaching_a_subject_removes_it_but_keeps_both_entries() {
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let dan = Member::human("Dan", "dan@example.com");
+
+        // One author throughout: `project_subjects` folds recognized entries
+        // only, and the genesis author is the founding member (ADR 0017).
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                dan.clone(),
+                1,
+                EntryPayload::ChannelOpened {
+                    name: Some("subjects".into()),
+                },
+            ))
+            .await
+            .expect("append genesis");
+
+        let repo = Subject::new(
+            SubjectKind::Repo,
+            Uri::new("git+https://example.com/a.git").expect("valid uri"),
+        );
+        let doc = Subject::new(
+            SubjectKind::Document,
+            Uri::new("file:///notes/spec.md").expect("valid uri"),
+        );
+
+        let repo_attach = EntryId::new();
+        ledger
+            .append(entry(
+                repo_attach,
+                channel,
+                dan.clone(),
+                2,
+                EntryPayload::SubjectAttached {
+                    subject: repo.clone(),
+                },
+            ))
+            .await
+            .expect("attach repo");
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                dan.clone(),
+                3,
+                EntryPayload::SubjectAttached {
+                    subject: doc.clone(),
+                },
+            ))
+            .await
+            .expect("attach doc");
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                dan.clone(),
+                4,
+                EntryPayload::SubjectDetached {
+                    target: repo_attach,
+                },
+            ))
+            .await
+            .expect("detach repo");
+
+        let view = ledger.project(&channel).await.expect("project");
+        let subjects: Vec<_> = view.subjects.iter().map(|(_, s)| s.clone()).collect();
+        assert_eq!(subjects, vec![doc], "the detached repo must not project");
+        assert_eq!(
+            view.entries.len(),
+            4,
+            "append-only: genesis plus three entries all stay in the log"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_channel_with_no_subjects_projects_an_empty_list() {
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let dan = Member::human("Dan", "dan@example.com");
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                dan,
+                1,
+                EntryPayload::ChannelOpened {
+                    name: Some("empty".into()),
+                },
+            ))
+            .await
+            .expect("append genesis");
+        let view = ledger.project(&channel).await.expect("project");
+        assert!(view.subjects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn subjects_project_in_canonical_order_paired_with_their_attaching_entry_id() {
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let dan = Member::human("Dan", "dan@example.com");
+
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                dan.clone(),
+                1,
+                EntryPayload::ChannelOpened {
+                    name: Some("subjects".into()),
+                },
+            ))
+            .await
+            .expect("append genesis");
+
+        let repo = Subject::new(
+            SubjectKind::Repo,
+            Uri::new("git+https://example.com/a.git").expect("valid uri"),
+        );
+        let doc = Subject::new(
+            SubjectKind::Document,
+            Uri::new("file:///notes/spec.md").expect("valid uri"),
+        );
+
+        let repo_attach = EntryId::new();
+        ledger
+            .append(entry(
+                repo_attach,
+                channel,
+                dan.clone(),
+                2,
+                EntryPayload::SubjectAttached {
+                    subject: repo.clone(),
+                },
+            ))
+            .await
+            .expect("attach repo");
+
+        let doc_attach = EntryId::new();
+        ledger
+            .append(entry(
+                doc_attach,
+                channel,
+                dan,
+                3,
+                EntryPayload::SubjectAttached {
+                    subject: doc.clone(),
+                },
+            ))
+            .await
+            .expect("attach doc");
+
+        let view = ledger.project(&channel).await.expect("project");
+        assert_eq!(
+            view.subjects,
+            vec![(repo_attach, repo), (doc_attach, doc)],
+            "each subject must pair with the id of the entry that attached it, \
+             in canonical attachment order"
+        );
+    }
+
     /// `docs/adr/0033` — verification is a projection fact. A channel whose
     /// keyed founder signs projects `verified`; a tampered or unsigned entry
     /// lands in `unverified` but still folds (never a drop, never a gate).
@@ -970,7 +1214,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         genesis.sign(&key).unwrap();
 
@@ -1030,7 +1276,9 @@ mod tests {
                 channel,
                 dan.clone(),
                 0,
-                EntryPayload::ChannelOpened { name: "ch".into() },
+                EntryPayload::ChannelOpened {
+                    name: Some("ch".into()),
+                },
             ))
             .await
             .unwrap();
@@ -1056,7 +1304,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         genesis.sign(&founder_key).unwrap();
         let mut grant = entry(
@@ -1108,7 +1358,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         genesis.sign(&founder_key).unwrap();
         let mut grant = entry(
@@ -1153,7 +1405,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         genesis.sign(&founder_key).unwrap();
         let mut grant = entry(
@@ -1199,7 +1453,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         genesis.sign(&founder_key).unwrap();
         let mut grant = entry(
@@ -1247,7 +1503,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         // The founder's own second device, enrolled via a self-authored
         // MemberAdded carrying k2 (see spec "Enrollment flow").
@@ -1299,7 +1557,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         // First, the founder legitimately adds the outsider to the roster...
         let add_outsider = entry(
@@ -1346,7 +1606,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         let add_keyless = entry(
             EntryId::new(),
@@ -1386,7 +1648,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         // Same email, two different devices, both authored by the founder.
         let member = Member::human("Mia", "mia@example.com");
@@ -1455,7 +1719,7 @@ mod tests {
                 bob.clone(),
                 2,
                 EntryPayload::ChannelOpened {
-                    name: "later".into(),
+                    name: Some("later".into()),
                 },
             ))
             .await
@@ -1467,7 +1731,7 @@ mod tests {
                 alice.clone(),
                 1,
                 EntryPayload::ChannelOpened {
-                    name: "first".into(),
+                    name: Some("first".into()),
                 },
             ))
             .await
@@ -1518,7 +1782,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         genesis.sign(&founder_key).unwrap();
 
@@ -1622,7 +1888,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         genesis.sign(&founder_key).unwrap();
 
@@ -1700,7 +1968,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         genesis.sign(&founder_key).unwrap();
 
@@ -1799,7 +2069,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         genesis.sign(&k1).unwrap();
 
@@ -2249,7 +2521,7 @@ mod tests {
                 alice,
                 1,
                 EntryPayload::ChannelOpened {
-                    name: "slice-8".into(),
+                    name: Some("slice-8".into()),
                 },
             ))
             .await
@@ -2504,7 +2776,7 @@ mod tests {
                 dan.clone(),
                 0,
                 EntryPayload::ChannelOpened {
-                    name: "first-name".into(),
+                    name: Some("first-name".into()),
                 },
             ))
             .await
@@ -2560,7 +2832,7 @@ mod tests {
                 bob,
                 2,
                 EntryPayload::ChannelOpened {
-                    name: "later-name".into(),
+                    name: Some("later-name".into()),
                 },
             ))
             .await
@@ -2572,7 +2844,7 @@ mod tests {
                 alice,
                 1,
                 EntryPayload::ChannelOpened {
-                    name: "first-name".into(),
+                    name: Some("first-name".into()),
                 },
             ))
             .await
@@ -2911,7 +3183,9 @@ mod tests {
     // ---- the Party & membership filter (docs/adr/0017) ----
 
     fn genesis(name: &str) -> EntryPayload {
-        EntryPayload::ChannelOpened { name: name.into() }
+        EntryPayload::ChannelOpened {
+            name: Some(name.into()),
+        }
     }
 
     fn member_added(member: &Member) -> EntryPayload {
@@ -3343,7 +3617,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         let grant_id = EntryId::new();
         let grant = entry(
@@ -3435,7 +3711,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         let grant_id = EntryId::new();
         let grant = entry(
@@ -3516,7 +3794,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         let grant_id = EntryId::new();
         let grant = entry(
@@ -3609,7 +3889,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         let member = Member::human("Mia", "mia@example.com");
         let device1_id = EntryId::new();
@@ -3690,7 +3972,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         let member = Member::human("Alice", "alice@example.com");
         let device_a_id = EntryId::new();
@@ -3786,7 +4070,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         let member = Member::human("Alice", "alice@example.com");
         let device_a_id = EntryId::new();
@@ -3879,7 +4165,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         let member = Member::human("Alice", "alice@example.com");
         let device_a_id = EntryId::new();
@@ -3970,7 +4258,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         let member = Member::human("Alice", "alice@example.com");
         let device_a_id = EntryId::new();
@@ -4049,7 +4339,9 @@ mod tests {
             channel,
             dan.clone(),
             2,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         let grant = entry(
             EntryId::new(),
@@ -4104,7 +4396,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         let grant_id = EntryId::new();
         let grant = entry(
@@ -4136,5 +4430,101 @@ mod tests {
             view.party.iter().any(|m| m.email == "worker@agents.junto"),
             "revocation retires keys; it must never remove the member from the party"
         );
+    }
+
+    /// Build a channel whose genesis is authored by `dan`, then run `body`'s
+    /// extra entries through it. Kept local to these three tests rather than
+    /// added to the module's shared fixtures — `entry` and `assertion` are the
+    /// only helpers this module has, and it stays that way.
+    async fn standing_of(extra: Vec<EntryPayload>) -> ChannelStanding {
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let dan = Member::human("Dan", "dan@example.com");
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                dan.clone(),
+                1,
+                EntryPayload::ChannelOpened {
+                    name: Some("standing".into()),
+                },
+            ))
+            .await
+            .expect("append genesis");
+        for (offset, payload) in extra.into_iter().enumerate() {
+            let millis = 2 + i64::try_from(offset).expect("small offset");
+            ledger
+                .append(entry(EntryId::new(), channel, dan.clone(), millis, payload))
+                .await
+                .expect("append entry");
+        }
+        ledger
+            .project(&channel)
+            .await
+            .expect("project")
+            .channel_standing
+    }
+
+    #[tokio::test]
+    async fn a_channel_with_nothing_ratified_is_scratch_and_stays_out_of_recall() {
+        let standing = standing_of(vec![assertion("a half-formed thought")]).await;
+        assert_eq!(standing, ChannelStanding::Scratch);
+    }
+
+    #[tokio::test]
+    async fn one_ratified_entry_promotes_a_channel_to_standing() {
+        // The ratification must target the assertion's real id, so this test
+        // builds its entries directly rather than through `standing_of`.
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let dan = Member::human("Dan", "dan@example.com");
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                dan.clone(),
+                1,
+                EntryPayload::ChannelOpened {
+                    name: Some("standing".into()),
+                },
+            ))
+            .await
+            .expect("append genesis");
+        let claim = EntryId::new();
+        ledger
+            .append(entry(
+                claim,
+                channel,
+                dan.clone(),
+                2,
+                assertion("a real finding"),
+            ))
+            .await
+            .expect("append assertion");
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                dan.clone(),
+                3,
+                EntryPayload::Ratification {
+                    target: claim,
+                    rationale: "checked".into(),
+                },
+            ))
+            .await
+            .expect("append ratification");
+        let view = ledger.project(&channel).await.expect("project");
+        assert_eq!(view.channel_standing, ChannelStanding::Standing);
+    }
+
+    #[tokio::test]
+    async fn closing_a_channel_settles_it_even_with_nothing_ratified() {
+        let standing = standing_of(vec![EntryPayload::ChannelClosed {
+            rationale: "abandoned".into(),
+        }])
+        .await;
+        assert_eq!(standing, ChannelStanding::Settled);
     }
 }

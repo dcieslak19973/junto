@@ -192,7 +192,9 @@ mod tests {
             gate_executions: std::collections::HashMap::new(),
             sessions: std::collections::HashMap::new(),
             closed: false,
+            channel_standing: junto_kernel::ChannelStanding::Scratch,
             lineage: Vec::new(),
+            subjects: Vec::new(),
         }
     }
 
@@ -215,7 +217,9 @@ mod tests {
             gate_executions: std::collections::HashMap::new(),
             sessions: std::collections::HashMap::new(),
             closed: false,
+            channel_standing: junto_kernel::ChannelStanding::Scratch,
             lineage: Vec::new(),
+            subjects: Vec::new(),
         }
     }
 
