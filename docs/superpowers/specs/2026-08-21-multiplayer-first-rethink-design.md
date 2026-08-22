@@ -135,6 +135,14 @@ Derived by projection from state the ledger already holds — no new entry kind,
 
 [ADR 0014:16](../../adr/0014-channel-identity-is-minted-names-are-substrate-scoped-labels.md) makes a name unique per home substrate. With cheap threads you will have twelve called "auth stuff". 0014 already did the hard part — *"the name is a human-facing label, not identity"* — so we drop only the uniqueness rule layered on top: resolution returns most-recent-match and disambiguates in the surface.
 
+### The noun stays `Channel` (Dan, 2026-08-21)
+
+The collapse is **semantic, not lexical**. A channel becomes what a thread is — cheap, unceremonious, repo-free, born from a message, related to its siblings by lineage — and keeps its name in the kernel, the corpus, the code, and the surface.
+
+Rejected: renaming the kernel noun to `Thread` (ripples through [ADR 0025](../../adr/0025-align-terminology-on-anthropic-managed-agents.md)'s terminology alignment, every doc in the corpus, and every type name, to buy a word the competitors happen to use); and renaming only the user-facing surface while the kernel says `Channel` (cheap, but it opens a permanent gap between what the product says and what the record, the docs, and the agents say — the drift `CLAUDE.md:125` forbids when it requires that *"names carry the ubiquitous language"*).
+
+**Consequence for everything downstream:** do not use "thread" as a synonym for a channel in code, entries, ADRs, or UI copy. Where this document's prose says "thread" it means "a channel after the collapse"; normalize that as the work lands. Recorded at `febe66f2`.
+
 ### Lineage becomes the primary birth channel
 
 Already built ([0027](../../adr/0027-channel-lineage-is-diverge-converge-edge-entries.md)/[0028](../../adr/0028-eventually-consistent-lineage-reconciliation.md), PR #51). Under the collapse, `diverge` stops being a special side-quest gesture and becomes the ordinary way one thread spawns another. No code change — promotion from feature to organizing relation.
