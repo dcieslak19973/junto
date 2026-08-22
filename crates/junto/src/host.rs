@@ -536,8 +536,13 @@ impl Host {
                     repo.display()
                 );
             }
-            if declared_id == Some(id) && view.name.is_some() {
-                bail!("channel {id} already has a genesis naming it");
+            if declared_id == Some(id)
+                && view
+                    .entries
+                    .iter()
+                    .any(|e| matches!(e.payload, EntryPayload::ChannelOpened { .. }))
+            {
+                bail!("channel {id} already has a genesis");
             }
         }
 
@@ -2395,6 +2400,42 @@ mod lineage_tests {
                 .unwrap()
                 .is_empty(),
             "the 30-day bound drops the unreconciled edge"
+        );
+    }
+
+    /// The old guard checked `view.name.is_some()` as a genesis-presence
+    /// proxy — sound only while every genesis carried a name. An unnamed
+    /// genesis (spec §2's collapse) made that proxy false for a channel that
+    /// already has one, silently letting the grandfathering path append a
+    /// second `ChannelOpened`. The guard must be name-agnostic.
+    #[tokio::test]
+    async fn open_channel_refuses_a_second_genesis_for_an_unnamed_channel() {
+        let (dirs, host) = lineage_host(1);
+        let substrate = host.substrate_paths().unwrap()[0].clone();
+        let ledger = host.ledger_for(&substrate).await.unwrap();
+        let id = ChannelId::default();
+        ledger
+            .lock()
+            .await
+            .append(LedgerEntry {
+                signature: None,
+                id: EntryId::new(),
+                channel: id,
+                author: dan(),
+                timestamp: Timestamp::now(),
+                payload: EntryPayload::ChannelOpened { name: None },
+            })
+            .await
+            .unwrap();
+        let _ = &dirs;
+
+        let err = host
+            .open_channel(Some(&substrate), "grandfathered", dan(), Some(id))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("channel {id} already has a genesis")
         );
     }
 }

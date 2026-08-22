@@ -1,4 +1,4 @@
-//! The canonical byte form of a [`LedgerEntry`] — junto's durable record format.
+﻿//! The canonical byte form of a [`LedgerEntry`] — junto's durable record format.
 //!
 //! Entries are stored under git refs (`refs/junto/*`, hard constraint #3) and
 //! will eventually be content-addressed, so their byte form must be
