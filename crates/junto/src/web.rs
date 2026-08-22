@@ -47,6 +47,7 @@ pub fn router(host: Arc<Host>) -> Router {
         .route("/agents/{slug}/delete", post(delete_agent))
         .route("/channels", post(open_channel))
         .route("/repos", post(setup_repo))
+        .route("/invites", post(mint_invite))
         .route("/channels/{channel}", get(channel_page))
         .route("/channels/{channel}/sessions", post(launch_session))
         .route(
@@ -2258,6 +2259,138 @@ impl KeyGrantDto {
     }
 }
 
+/// The form body for minting a multi-channel enrollment invite: `channel`
+/// may repeat, one value per channel the invite should cover. Read as raw
+/// pairs ([`InviteForm::from_pairs`]), the same technique `save_agent`
+/// already uses for its `skill`/`plugin_path` rows — axum's typed `Form`
+/// can't collect duplicate keys into a `Vec`.
+struct InviteForm {
+    member: String,
+    channel: Vec<String>,
+}
+
+impl InviteForm {
+    fn from_pairs(pairs: &[(String, String)]) -> Self {
+        InviteForm {
+            member: field(pairs, "member").to_string(),
+            channel: all_fields(pairs, "channel"),
+        }
+    }
+}
+
+/// Mint a founder-issued, multi-channel enrollment invite over HTTP
+/// (device-key-enrollment plan) — the human-surface counterpart of `junto
+/// invite` (`main.rs::mint_invite`). The authority rules are **identical**
+/// to that CLI path on purpose: both surfaces mint the same kind of bearer
+/// grant, and any drift between them would let one surface issue an
+/// invite the other would refuse.
+///
+/// `invites::prune` runs first (this is the human surface's most likely
+/// "actively enrolling" moment, mirroring why the CLI prunes here too),
+/// then every named channel is resolved and re-projected with
+/// [`project_fresh`] (not the cached [`project`] — a `revoke-member` in a
+/// separate process must be visible to the very next mint) and checked
+/// with [`crate::identity::require_founder`] — **before** a token is
+/// minted or any record is issued. An invite the caller cannot complete
+/// for even one named channel is refused whole, nothing left behind (400
+/// for a malformed/empty channel set, 403 naming the offending channel for
+/// an authority failure). Two spellings of the same channel (a name and
+/// its id) collapse to one record, deduped on the canonical id, first-seen
+/// order.
+async fn mint_invite(
+    State(host): State<Arc<Host>>,
+    Form(pairs): Form<Vec<(String, String)>>,
+) -> Response {
+    let form = InviteForm::from_pairs(&pairs);
+
+    let junto_home = match crate::host::junto_home() {
+        Ok(home) => home,
+        Err(err) => return internal(err.to_string()),
+    };
+    if let Err(err) = crate::invites::prune(&junto_home) {
+        return internal(err.to_string());
+    }
+
+    if form.channel.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "an invite must name at least one channel".to_string(),
+        )
+            .into_response();
+    }
+    if form.channel.len() > crate::enroll::MAX_INVITE_CHANNELS {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "an invite may name at most {} channels",
+                crate::enroll::MAX_INVITE_CHANNELS
+            ),
+        )
+            .into_response();
+    }
+
+    // Resolve every channel and prove founder authority on every one
+    // BEFORE minting a token or issuing any record — the all-or-nothing
+    // rule (see the doc comment above).
+    let mut canonical_channels: Vec<String> = Vec::new();
+    for channel in &form.channel {
+        let (id, view, substrate) = match project_fresh(&host, channel).await {
+            Ok(projected) => projected,
+            Err(response) => return response,
+        };
+        let caller = match crate::host::git_user(&substrate) {
+            Ok(member) => member,
+            Err(err) => return internal(err.to_string()),
+        };
+        if let Err(err) = crate::identity::require_founder(&view, &caller, channel) {
+            return (StatusCode::FORBIDDEN, err.to_string()).into_response();
+        }
+        let canonical = id.to_string();
+        if !canonical_channels.contains(&canonical) {
+            canonical_channels.push(canonical);
+        }
+    }
+
+    let token = crate::enroll::mint_invite_token();
+    let expires_at = Timestamp::now().as_millis() + crate::enroll::MAX_INVITE_TTL_MS;
+    for canonical in &canonical_channels {
+        if let Err(err) =
+            crate::invites::issue(&junto_home, &token, &form.member, canonical, expires_at)
+        {
+            return internal(err.to_string());
+        }
+    }
+
+    let payload = crate::enroll::InvitePayload {
+        v: crate::enroll::PAYLOAD_VERSION,
+        invite_token: token,
+        member_email: form.member,
+        channels: canonical_channels.clone(),
+        expires_at,
+    };
+    let url = match crate::enroll::encode_invite(&payload) {
+        Ok(url) => url,
+        Err(err) => return internal(err.to_string()),
+    };
+
+    axum::Json(InviteMintedDto {
+        url,
+        expires_at,
+        channels: canonical_channels,
+    })
+    .into_response()
+}
+
+/// `POST /invites`' response: the shareable `junto://invite?code=…` URI,
+/// its expiry, and the resolved canonical channel ids it covers — so the
+/// caller can show what it actually granted, not just what it typed.
+#[derive(Serialize)]
+struct InviteMintedDto {
+    url: String,
+    expires_at: i64,
+    channels: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3776,5 +3909,151 @@ mod tests {
             std::env::remove_var("GIT_CONFIG_GLOBAL");
             std::env::remove_var("GIT_CONFIG_SYSTEM");
         }
+    }
+
+    /// A test host with one repo whose git user is "Web User"
+    /// <web@example.com>: two channels that user founded ("chan-a",
+    /// "chan-b"), and one ("not-mine") founded by someone else — so
+    /// `mint_invite`'s per-channel authority check has something to
+    /// refuse. `member_home` is pinned to the same directory `HomeGuard`
+    /// points `JUNTO_HOME` at, so `Host`'s own party-keying and
+    /// `mint_invite`'s direct `crate::host::junto_home()` calls
+    /// (`invites.toml`) land in one place.
+    struct InviteFixture {
+        _home: crate::host::test_home::HomeGuard,
+        _dirs: Vec<TempDir>,
+        host: Arc<Host>,
+    }
+
+    async fn invite_fixture() -> InviteFixture {
+        let home = crate::host::test_home::HomeGuard::new();
+        let repo = tempfile::tempdir().expect("repo dir");
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(repo.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        for (key, value) in [("user.name", "Web User"), ("user.email", "web@example.com")] {
+            assert!(
+                StdCommand::new("git")
+                    .args(["config", key, value])
+                    .current_dir(repo.path())
+                    .status()
+                    .expect("git config")
+                    .success()
+            );
+        }
+        let host = Host::fixed_with_member_home(
+            vec![repo.path().to_path_buf()],
+            Some(home.path().to_path_buf()),
+        );
+        let founder = Member::human("Web User", "web@example.com");
+        host.open_channel(None, "chan-a", founder.clone(), None)
+            .await
+            .expect("open chan-a");
+        host.open_channel(None, "chan-b", founder.clone(), None)
+            .await
+            .expect("open chan-b");
+        host.open_channel(
+            None,
+            "not-mine",
+            Member::human("Other", "other@example.com"),
+            None,
+        )
+        .await
+        .expect("open not-mine");
+        InviteFixture {
+            _home: home,
+            _dirs: vec![repo],
+            host,
+        }
+    }
+
+    #[tokio::test]
+    async fn post_invites_mints_one_token_covering_every_channel() {
+        let fx = invite_fixture().await;
+        let Resolution::Resolved { id: chan_a_id, .. } = fx.host.resolve("chan-a").await.unwrap()
+        else {
+            panic!("chan-a resolves");
+        };
+        let Resolution::Resolved { id: chan_b_id, .. } = fx.host.resolve("chan-b").await.unwrap()
+        else {
+            panic!("chan-b resolves");
+        };
+        let mut expected = vec![chan_a_id.to_string(), chan_b_id.to_string()];
+        expected.sort();
+
+        let pairs = vec![
+            ("member".to_string(), "eve@example.com".to_string()),
+            ("channel".to_string(), "chan-a".to_string()),
+            ("channel".to_string(), "chan-b".to_string()),
+        ];
+        let response = mint_invite(State(fx.host.clone()), Form(pairs)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_text(response).await;
+        let json: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+
+        let url = json["url"].as_str().expect("url string").to_string();
+        let decoded = crate::enroll::decode_invite(&url).expect("decodes");
+        assert_eq!(decoded.member_email, "eve@example.com");
+        let mut decoded_channels = decoded.channels.clone();
+        decoded_channels.sort();
+        assert_eq!(decoded_channels, expected);
+
+        let mut json_channels: Vec<String> = json["channels"]
+            .as_array()
+            .expect("channels array")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        json_channels.sort();
+        assert_eq!(json_channels, expected);
+
+        let junto_home = crate::host::junto_home().unwrap();
+        let mut covers = crate::invites::channels_for(&junto_home, &decoded.invite_token).unwrap();
+        covers.sort();
+        assert_eq!(covers, expected, "channels_for recovers both channels");
+    }
+
+    #[tokio::test]
+    async fn post_invites_issues_nothing_when_one_channel_is_not_the_callers() {
+        let fx = invite_fixture().await;
+        let pairs = vec![
+            ("member".to_string(), "eve@example.com".to_string()),
+            ("channel".to_string(), "chan-a".to_string()),
+            ("channel".to_string(), "not-mine".to_string()),
+        ];
+        let response = mint_invite(State(fx.host.clone()), Form(pairs)).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = body_text(response).await;
+        assert!(
+            body.contains("not-mine"),
+            "names the offending channel: {body}"
+        );
+
+        // All-or-nothing: nothing was issued, not even for "chan-a", which
+        // the caller *did* found — so `invites.toml` was never written.
+        let junto_home = crate::host::junto_home().unwrap();
+        assert!(
+            !junto_home.join("invites.toml").exists(),
+            "no record issued for any channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_invites_refuses_an_empty_channel_set() {
+        let fx = invite_fixture().await;
+        let pairs = vec![("member".to_string(), "eve@example.com".to_string())];
+        let response = mint_invite(State(fx.host.clone()), Form(pairs)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let junto_home = crate::host::junto_home().unwrap();
+        assert!(
+            !junto_home.join("invites.toml").exists(),
+            "nothing issued for an empty channel set"
+        );
     }
 }
