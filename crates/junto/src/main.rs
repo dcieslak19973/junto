@@ -1093,11 +1093,18 @@ async fn brief(dir: PathBuf, out: &mut impl std::io::Write) -> Result<()> {
                         // single-channel check.
                         if view.channel_standing != ChannelStanding::Scratch {
                             let name = view.name.clone().unwrap_or_else(|| channel.clone());
-                            writeln!(
+                            // Best-effort like every other failure in this
+                            // function (module doc): a write failure must
+                            // not turn a SessionStart hook into a non-zero
+                            // exit, and must not skip the remaining bound
+                            // channels.
+                            if let Err(err) = writeln!(
                                 out,
                                 "{}",
                                 render::brief_markdown(&name, &id, &view, &lineage)
-                            )?;
+                            ) {
+                                eprintln!("junto brief: writing '{channel}': {err}");
+                            }
                         }
                     }
                     Err(err) => eprintln!("junto brief: projecting '{channel}': {err}"),
@@ -1367,15 +1374,10 @@ mod tests {
         );
     }
 
-    /// The counterpart to the scratch skip above: once a bound channel
-    /// earns standing (a ratified entry), the brief actually prints it —
-    /// guards against a filter bug that suppresses everything.
-    #[tokio::test]
-    async fn brief_prints_a_bound_channel_that_has_earned_standing() {
-        let _home = crate::host::test_home::HomeGuard::new();
-        let (repo, id) = setup_channel("ratified-only").await;
-        let host = host::Host::fixed(vec![repo.path().to_path_buf()]);
-        let ledger = host.ledger_for(repo.path()).await.unwrap();
+    /// Give `id` (already opened in `repo`'s substrate) one ratified entry
+    /// — the minimal way a test-fixture channel earns `ChannelStanding::Standing`.
+    async fn ratify_a_channel(host: &host::Host, repo: &Path, id: ChannelId) {
+        let ledger = host.ledger_for(repo).await.unwrap();
         let decision = EntryId::new();
         ledger
             .lock()
@@ -1411,6 +1413,17 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    /// The counterpart to the scratch skip above: once a bound channel
+    /// earns standing (a ratified entry), the brief actually prints it —
+    /// guards against a filter bug that suppresses everything.
+    #[tokio::test]
+    async fn brief_prints_a_bound_channel_that_has_earned_standing() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (repo, id) = setup_channel("ratified-only").await;
+        let host = host::Host::fixed(vec![repo.path().to_path_buf()]);
+        ratify_a_channel(&host, repo.path(), id).await;
 
         let checkout = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -1427,6 +1440,44 @@ mod tests {
             printed.contains("ratified-only"),
             "a channel with a ratified entry must print in the brief: {printed}"
         );
+    }
+
+    /// A writer whose every `write` fails — pins `brief`'s documented
+    /// contract (module doc above `brief`: "the exit is always success")
+    /// against the one failure mode fix round 1 introduced when it started
+    /// writing through an `impl Write` instead of `println!`.
+    struct FailingWriter;
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A broken output stream must not make `brief` return `Err` — it is a
+    /// SessionStart hook, and a write failure is exactly the kind of
+    /// best-effort failure every other step in `brief` already degrades on
+    /// (an `eprintln!` and keep going), not one that should be the sole
+    /// exception.
+    #[tokio::test]
+    async fn brief_returns_ok_even_when_its_writer_fails() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (repo, id) = setup_channel("write-fails").await;
+        let host = host::Host::fixed(vec![repo.path().to_path_buf()]);
+        ratify_a_channel(&host, repo.path(), id).await;
+
+        let checkout = tempfile::tempdir().unwrap();
+        std::fs::write(
+            checkout.path().join(binding::PROJECT_BINDING),
+            "channels = [\"write-fails\"]\n",
+        )
+        .unwrap();
+        brief(checkout.path().to_path_buf(), &mut FailingWriter)
+            .await
+            .unwrap();
     }
 
     fn build_enroll_url(
