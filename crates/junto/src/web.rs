@@ -34,6 +34,7 @@ use axum::{
 use junto_kernel::{ChannelId, ChannelView, EntryId, EntryPayload, LedgerEntry, Timestamp};
 use serde::{Deserialize, Serialize};
 
+use crate::RedeemOutcome;
 use crate::host::{Host, Resolution};
 use crate::render;
 
@@ -49,6 +50,8 @@ pub fn router(host: Arc<Host>) -> Router {
         .route("/repos", post(setup_repo))
         .route("/invites", post(mint_invite))
         .route("/devices/enroll", post(enroll_device))
+        .route("/devices/preview", post(preview_enrollment))
+        .route("/members", post(redeem_enrollment_endpoint))
         .route("/channels/{channel}", get(channel_page))
         .route("/channels/{channel}/sessions", post(launch_session))
         .route(
@@ -2537,6 +2540,232 @@ struct EnrolledDto {
     transport_fingerprint: String,
 }
 
+/// Decode `code` as a `junto://enroll?code=…` URI, or a 400 response
+/// distinguishing an expired code from every other malformed shape — the
+/// same distinction [`enroll_device`] draws.
+// Response-as-error, cold Err path — same reasoning as `project` above.
+#[allow(clippy::result_large_err)]
+fn decode_enroll_or_400(code: &str) -> Result<crate::enroll::EnrollPayload, Response> {
+    crate::enroll::decode_enroll(code).map_err(|err| {
+        let message = if err.to_string().contains("expired") {
+            "this invite has expired; ask the founder to mint a fresh one".to_string()
+        } else {
+            format!("invalid enroll code: {err}")
+        };
+        (StatusCode::BAD_REQUEST, message).into_response()
+    })
+}
+
+/// The form body of `POST /members`: a redeemed device's enroll code plus
+/// the kind of member it should become (device-key-enrollment plan, Task
+/// 9). `kind` is deliberately a plain `String`, not `MemberKind` itself —
+/// ADR 0035 forbids defaulting *the member kind*, so both a missing and
+/// an unrecognized value are refused by the handler with the identical
+/// 400 (`#[serde(default)]` only lets an absent field reach that check
+/// instead of axum's own 422 form-rejection — the value itself is never
+/// defaulted to `"human"` or anything else).
+#[derive(Debug, Deserialize)]
+struct RedeemForm {
+    enroll: String,
+    #[serde(default)]
+    kind: String,
+}
+
+/// `POST /members`'s response: one outcome per channel the invite covered
+/// (device-key-enrollment plan, Task 9) — one invite may cover several
+/// channels (Task 3), so this is never collapsed to a single pass/fail.
+#[derive(Serialize)]
+struct RedeemedDto {
+    outcomes: Vec<RedeemOutcomeDto>,
+}
+
+/// One channel's outcome, in [`RedeemOutcome`]'s own vocabulary: `result`
+/// is the variant in snake_case (`granted`, `already_a_member`,
+/// `invite_already_used`, `not_founder`, `failed`); `detail` carries
+/// `Failed`'s message (`None` for every other variant). `channel` is
+/// always the canonical id; `channel_name` is resolved for display.
+#[derive(Serialize)]
+struct RedeemOutcomeDto {
+    channel: String,
+    channel_name: Option<String>,
+    result: String,
+    detail: Option<String>,
+}
+
+impl RedeemOutcomeDto {
+    fn from_outcome(
+        channel: String,
+        channel_name: Option<String>,
+        outcome: &RedeemOutcome,
+    ) -> Self {
+        let (result, detail): (&str, Option<String>) = match outcome {
+            RedeemOutcome::Granted => ("granted", None),
+            RedeemOutcome::AlreadyAMember => ("already_a_member", None),
+            RedeemOutcome::InviteAlreadyUsed => ("invite_already_used", None),
+            RedeemOutcome::NotFounder => ("not_founder", None),
+            RedeemOutcome::Failed(reason) => ("failed", Some(reason.clone())),
+        };
+        RedeemOutcomeDto {
+            channel,
+            channel_name,
+            result: result.to_string(),
+            detail,
+        }
+    }
+}
+
+/// `POST /members` — redeem an enrollment across every channel its invite
+/// still covers (device-key-enrollment plan, Task 9): the HTTP
+/// counterpart of `junto add-member --enroll`, a thin shell over
+/// [`crate::redeem_enrollment`] (Task 4's engine — decode, parse `kind`,
+/// call, serialize; never reimplemented or forked here). `granted_by` is
+/// always `None`: the CLI's `--author-name`/`--author-email` override has
+/// no HTTP equivalent, so every redeemed channel grants as this
+/// machine's git identity in its own home substrate, exactly the engine's
+/// keyless-path default.
+///
+/// `kind` is parsed strictly before the engine ever runs — `"human"` or
+/// `"agent"`, nothing else, never defaulted (ADR 0035) — so a bad kind
+/// burns no invite record. 200 when at least one channel was granted; 409
+/// when none were (the whole set was already used or refused) — either
+/// way the body carries every channel's own outcome, never collapsed to
+/// one pass/fail. An invite whose token covers no channel at all (the
+/// engine's own empty-set refusal) is reported the same way: 409, with
+/// [`crate::invite_exhausted_message`]'s text as the body.
+async fn redeem_enrollment_endpoint(
+    State(host): State<Arc<Host>>,
+    Form(form): Form<RedeemForm>,
+) -> Response {
+    let payload = match decode_enroll_or_400(&form.enroll) {
+        Ok(payload) => payload,
+        Err(response) => return response,
+    };
+    let kind = match form.kind.as_str() {
+        "human" => junto_kernel::MemberKind::Human,
+        "agent" => junto_kernel::MemberKind::Agent,
+        "" => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "kind is required and must be 'human' or 'agent' — it is never defaulted \
+                 (docs/adr/0035)"
+                    .to_string(),
+            )
+                .into_response();
+        }
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("kind must be 'human' or 'agent', not '{other}'"),
+            )
+                .into_response();
+        }
+    };
+
+    let outcomes = match crate::redeem_enrollment(&host, &payload, kind, None).await {
+        Ok(outcomes) => outcomes,
+        Err(err) => return (StatusCode::CONFLICT, err.to_string()).into_response(),
+    };
+
+    let mut granted_any = false;
+    let mut dtos = Vec::with_capacity(outcomes.len());
+    for (channel, outcome) in &outcomes {
+        if *outcome == RedeemOutcome::Granted {
+            granted_any = true;
+        }
+        let channel_name = project(&host, channel)
+            .await
+            .ok()
+            .and_then(|(_, view, _)| view.name);
+        dtos.push(RedeemOutcomeDto::from_outcome(
+            channel.clone(),
+            channel_name,
+            outcome,
+        ));
+    }
+
+    let status = if granted_any {
+        StatusCode::OK
+    } else {
+        StatusCode::CONFLICT
+    };
+    (status, axum::Json(RedeemedDto { outcomes: dtos })).into_response()
+}
+
+/// The form body of `POST /devices/preview`: just the enroll code — no
+/// `kind`, since this endpoint mints and appends nothing.
+#[derive(Debug, Deserialize)]
+struct PreviewForm {
+    enroll: String,
+}
+
+/// `POST /devices/preview`'s response: what an enroll code would grant if
+/// redeemed right now (device-key-enrollment plan, Task 9).
+#[derive(Serialize)]
+struct EnrollPreviewDto {
+    email: String,
+    display_name: String,
+    fingerprint: String,
+    channels: Vec<PreviewChannelDto>,
+}
+
+#[derive(Serialize)]
+struct PreviewChannelDto {
+    id: String,
+    name: Option<String>,
+}
+
+/// `POST /devices/preview` — the read-only look at what an enroll code
+/// would grant (device-key-enrollment plan, Task 9): decodes the payload
+/// and answers from [`crate::invites::channels_for`] plus the payload's
+/// own email/display-name/fingerprint. **Appends nothing and consumes
+/// nothing** — never calls [`crate::redeem_enrollment`] or
+/// `invites::consume`. This exists because the founder must see what they
+/// are about to grant *before* anything is appended, and the channel set
+/// deliberately never travels inside the code itself.
+///
+/// An empty channel set is a 409 carrying
+/// [`crate::invite_exhausted_message`]'s exact text — the same refusal
+/// [`redeem_enrollment_endpoint`] gives for the identical condition, since
+/// one `channels_for` read cannot tell "never issued here" apart from
+/// "already fully redeemed".
+async fn preview_enrollment(
+    State(host): State<Arc<Host>>,
+    Form(form): Form<PreviewForm>,
+) -> Response {
+    let payload = match decode_enroll_or_400(&form.enroll) {
+        Ok(payload) => payload,
+        Err(response) => return response,
+    };
+    let junto_home = match crate::host::junto_home() {
+        Ok(home) => home,
+        Err(err) => return internal(err.to_string()),
+    };
+    let channels = match crate::invites::channels_for(&junto_home, &payload.invite_token) {
+        Ok(channels) => channels,
+        Err(err) => return internal(err.to_string()),
+    };
+    if channels.is_empty() {
+        return (StatusCode::CONFLICT, crate::invite_exhausted_message()).into_response();
+    }
+
+    let mut dtos = Vec::with_capacity(channels.len());
+    for channel in channels {
+        let name = project(&host, &channel)
+            .await
+            .ok()
+            .and_then(|(_, view, _)| view.name);
+        dtos.push(PreviewChannelDto { id: channel, name });
+    }
+
+    axum::Json(EnrollPreviewDto {
+        email: payload.email.clone(),
+        display_name: payload.display_name.clone(),
+        fingerprint: crate::identity::fingerprint(&payload.public_key),
+        channels: dtos,
+    })
+    .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4394,5 +4623,300 @@ mod tests {
             !junto_home.join("keys.toml").exists(),
             "no key minted for an expired invite"
         );
+    }
+
+    /// A test host with one repo whose git user founds two channels
+    /// ("chan-a", "chan-b") — an invite token covering both, issued
+    /// straight through `crate::invites::issue` (not `mint_invite`, since
+    /// these tests exercise only the redemption side), plus the device
+    /// keypair a redemption enrolls.
+    struct RedeemFixture {
+        _home: crate::host::test_home::HomeGuard,
+        _dirs: Vec<TempDir>,
+        host: Arc<Host>,
+        chan_a: ChannelId,
+        chan_b: ChannelId,
+    }
+
+    async fn redeem_fixture() -> RedeemFixture {
+        let home = crate::host::test_home::HomeGuard::new();
+        let repo = tempfile::tempdir().expect("repo dir");
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(repo.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        for (key, value) in [("user.name", "Web User"), ("user.email", "web@example.com")] {
+            assert!(
+                StdCommand::new("git")
+                    .args(["config", key, value])
+                    .current_dir(repo.path())
+                    .status()
+                    .expect("git config")
+                    .success()
+            );
+        }
+        let host = Host::fixed_with_member_home(
+            vec![repo.path().to_path_buf()],
+            Some(home.path().to_path_buf()),
+        );
+        let founder = Member::human("Web User", "web@example.com");
+        let chan_a = host
+            .open_channel(None, "chan-a", founder.clone(), None)
+            .await
+            .expect("open chan-a")
+            .id;
+        let chan_b = host
+            .open_channel(None, "chan-b", founder.clone(), None)
+            .await
+            .expect("open chan-b")
+            .id;
+        RedeemFixture {
+            _home: home,
+            _dirs: vec![repo],
+            host,
+            chan_a,
+            chan_b,
+        }
+    }
+
+    /// Issue `token` (covering `fx`'s two channels) for `email`, and encode
+    /// the matching enroll payload for `key`/`transport_key`.
+    fn issue_two_channel_invite(
+        fx: &RedeemFixture,
+        email: &str,
+        key: &junto_kernel::SigningKey,
+        transport_key: &junto_kernel::SigningKey,
+    ) -> String {
+        let junto_home = crate::host::junto_home().unwrap();
+        let token = crate::enroll::mint_invite_token();
+        let expires_at = Timestamp::now().as_millis() + 60_000;
+        for channel in [fx.chan_a.to_string(), fx.chan_b.to_string()] {
+            crate::invites::issue(&junto_home, &token, email, &channel, expires_at).expect("issue");
+        }
+        let payload = crate::enroll::EnrollPayload {
+            v: crate::enroll::PAYLOAD_VERSION,
+            invite_token: token,
+            email: email.to_string(),
+            display_name: "Eve".to_string(),
+            public_key: key.public_key(),
+            transport_public_key: transport_key.public_key(),
+            expires_at,
+        };
+        crate::enroll::encode_enroll(&payload).expect("encodes")
+    }
+
+    #[tokio::test]
+    async fn post_members_grants_every_channel_and_reports_each() {
+        let fx = redeem_fixture().await;
+        let key = junto_kernel::SigningKey::from_secret_bytes([7; 32]);
+        let transport_key = junto_kernel::SigningKey::from_secret_bytes([8; 32]);
+        let url = issue_two_channel_invite(&fx, "eve@example.com", &key, &transport_key);
+
+        let response = redeem_enrollment_endpoint(
+            State(fx.host.clone()),
+            Form(RedeemForm {
+                enroll: url,
+                kind: "human".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_text(response).await;
+        let json: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        let outcomes = json["outcomes"].as_array().expect("outcomes array");
+        assert_eq!(outcomes.len(), 2, "{outcomes:?}");
+        for outcome in outcomes {
+            assert_eq!(outcome["result"], "granted", "{outcome:?}");
+        }
+
+        for channel in [fx.chan_a, fx.chan_b] {
+            let (_, view, _) = project(&fx.host, &channel.to_string())
+                .await
+                .expect("projects");
+            let grants = view.keyring.get("eve@example.com").expect("eve has grants");
+            assert!(
+                grants
+                    .iter()
+                    .any(|g| g.key == key.public_key() && g.retired_at.is_none()),
+                "channel {channel} holds eve's key as an ACTIVE grant: {grants:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn post_members_returns_409_with_outcomes_when_nothing_could_be_granted() {
+        // A stale, already-consumed record sharing a (channel, member) pair
+        // with a fresh, still-covered duplicate is the one way
+        // `RedeemOutcome::InviteAlreadyUsed` is reachable now that
+        // `AlreadyAMember` is decided first (see
+        // `main.rs`'s `a_stale_consumed_duplicate_record_reports_invite_already_used`,
+        // which this mirrors for both of this fixture's channels): the
+        // fresh duplicate keeps `channels_for` naming the channel, but
+        // `consume` lands on the stale, already-used record first.
+        let fx = redeem_fixture().await;
+        let key = junto_kernel::SigningKey::from_secret_bytes([7; 32]);
+        let transport_key = junto_kernel::SigningKey::from_secret_bytes([8; 32]);
+        let junto_home = crate::host::junto_home().unwrap();
+        let token = crate::enroll::mint_invite_token();
+        let expires_at = Timestamp::now().as_millis() + 60_000;
+        for channel in [fx.chan_a.to_string(), fx.chan_b.to_string()] {
+            crate::invites::issue(&junto_home, &token, "eve@example.com", &channel, expires_at)
+                .expect("issue first record");
+            crate::invites::issue(&junto_home, &token, "eve@example.com", &channel, expires_at)
+                .expect("issue duplicate record");
+            assert!(matches!(
+                crate::invites::consume(&junto_home, &token, "eve@example.com", &channel)
+                    .expect("consume"),
+                crate::invites::Consumed::Ok
+            ));
+        }
+        let payload = crate::enroll::EnrollPayload {
+            v: crate::enroll::PAYLOAD_VERSION,
+            invite_token: token,
+            email: "eve@example.com".to_string(),
+            display_name: "Eve".to_string(),
+            public_key: key.public_key(),
+            transport_public_key: transport_key.public_key(),
+            expires_at,
+        };
+        let url = crate::enroll::encode_enroll(&payload).expect("encodes");
+
+        let response = redeem_enrollment_endpoint(
+            State(fx.host.clone()),
+            Form(RedeemForm {
+                enroll: url,
+                kind: "human".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = body_text(response).await;
+        let json: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        let outcomes = json["outcomes"].as_array().expect("outcomes array");
+        assert_eq!(outcomes.len(), 2, "{outcomes:?}");
+        for outcome in outcomes {
+            assert_eq!(outcome["result"], "invite_already_used", "{outcome:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn post_members_refuses_a_missing_or_unknown_kind() {
+        let fx = redeem_fixture().await;
+        let key = junto_kernel::SigningKey::from_secret_bytes([7; 32]);
+        let transport_key = junto_kernel::SigningKey::from_secret_bytes([8; 32]);
+        let url = issue_two_channel_invite(&fx, "eve@example.com", &key, &transport_key);
+
+        // kind absent from the wire: `#[serde(default)]` lets extraction
+        // succeed (kind == ""), so it is the *handler* that refuses with
+        // 400 — never axum's own 422 form-rejection, and never defaulted
+        // to "human" (ADR 0035).
+        let body = format!("enroll={url}");
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(axum::body::Body::from(body))
+            .expect("request");
+        let Form(form) =
+            <Form<RedeemForm> as axum::extract::FromRequest<()>>::from_request(request, &())
+                .await
+                .expect("deserializes; kind defaults to empty, not an error");
+        assert_eq!(form.kind, "");
+        let response = redeem_enrollment_endpoint(State(fx.host.clone()), Form(form)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // kind="person": the handler itself refuses, never defaulting.
+        let response = redeem_enrollment_endpoint(
+            State(fx.host.clone()),
+            Form(RedeemForm {
+                enroll: url,
+                kind: "person".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn post_devices_preview_shows_the_channel_set_without_consuming_it() {
+        let fx = redeem_fixture().await;
+        let key = junto_kernel::SigningKey::from_secret_bytes([7; 32]);
+        let transport_key = junto_kernel::SigningKey::from_secret_bytes([8; 32]);
+        let url = issue_two_channel_invite(&fx, "eve@example.com", &key, &transport_key);
+
+        let response = preview_enrollment(
+            State(fx.host.clone()),
+            Form(PreviewForm {
+                enroll: url.clone(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_text(response).await;
+        let json: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(json["email"], "eve@example.com");
+        assert_eq!(
+            json["fingerprint"],
+            crate::identity::fingerprint(&key.public_key())
+        );
+        let mut channels: Vec<String> = json["channels"]
+            .as_array()
+            .expect("channels array")
+            .iter()
+            .map(|c| c["id"].as_str().unwrap().to_string())
+            .collect();
+        channels.sort();
+        let mut expected = vec![fx.chan_a.to_string(), fx.chan_b.to_string()];
+        expected.sort();
+        assert_eq!(channels, expected, "{body}");
+
+        // Redeem for real: BOTH channels still grantable — the preview
+        // consumed nothing.
+        let redeemed = redeem_enrollment_endpoint(
+            State(fx.host.clone()),
+            Form(RedeemForm {
+                enroll: url,
+                kind: "human".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(redeemed.status(), StatusCode::OK);
+        let redeemed_json: serde_json::Value =
+            serde_json::from_str(&body_text(redeemed).await).expect("valid json");
+        let outcomes = redeemed_json["outcomes"].as_array().expect("outcomes");
+        assert_eq!(outcomes.len(), 2, "{outcomes:?}");
+        for outcome in outcomes {
+            assert_eq!(outcome["result"], "granted", "{outcome:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn post_devices_preview_409s_when_the_token_covers_nothing() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let key = junto_kernel::SigningKey::from_secret_bytes([7; 32]);
+        let transport_key = junto_kernel::SigningKey::from_secret_bytes([8; 32]);
+        let payload = crate::enroll::EnrollPayload {
+            v: crate::enroll::PAYLOAD_VERSION,
+            invite_token: crate::enroll::mint_invite_token(),
+            email: "eve@example.com".to_string(),
+            display_name: "Eve".to_string(),
+            public_key: key.public_key(),
+            transport_public_key: transport_key.public_key(),
+            expires_at: Timestamp::now().as_millis() + 60_000,
+        };
+        let url = crate::enroll::encode_enroll(&payload).expect("encodes");
+
+        let host = Host::fixed_with_member_home(vec![], Some(_home.path().to_path_buf()));
+        let response = preview_enrollment(State(host), Form(PreviewForm { enroll: url })).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = body_text(response).await;
+        assert!(body.contains("never"), "{body}");
+        assert!(body.contains("already"), "{body}");
     }
 }

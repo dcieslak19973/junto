@@ -533,7 +533,7 @@ fn member_code_line(code: &str, newly_minted: bool) -> String {
 /// CLI, and the HTTP redemption endpoint (a later task) will render for
 /// its own response body.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum RedeemOutcome {
+pub(crate) enum RedeemOutcome {
     /// The channel's `MemberAdded` was appended.
     Granted,
     /// The email was already on the channel's roster with an ACTIVE grant
@@ -572,6 +572,18 @@ fn redeem_line(channel: &str, outcome: &RedeemOutcome) -> String {
     }
 }
 
+/// The refusal when an enroll code's invite token covers nothing this
+/// machine can redeem (device-key-enrollment plan, Task 4/9): a shared
+/// function, not a duplicated literal, so `redeem_enrollment`'s own
+/// refusal and the `/devices/preview` HTTP endpoint (`web.rs`, Task 9)
+/// can never drift onto two different explanations for the same read.
+pub(crate) fn invite_exhausted_message() -> String {
+    "this enroll code's invite token matches nothing this machine can redeem: it was never \
+     issued here, or every channel it covered has already redeemed; ask the founder to run \
+     `junto invite` again if you still need access"
+        .to_string()
+}
+
 /// Redeem `payload`'s invite across every channel it still covers
 /// (device-key-enrollment plan, Task 4): the engine `add_member`'s
 /// `--enroll` path calls, and the HTTP redemption endpoint (a later
@@ -594,7 +606,7 @@ fn redeem_line(channel: &str, outcome: &RedeemOutcome) -> String {
 /// sees the whole picture, and can decide (as `add_member` does) whether
 /// the run as a whole succeeded. See [`redeem_one_channel`] for the
 /// per-channel ordering.
-async fn redeem_enrollment(
+pub(crate) async fn redeem_enrollment(
     host: &host::Host,
     payload: &enroll::EnrollPayload,
     kind: MemberKind,
@@ -603,11 +615,7 @@ async fn redeem_enrollment(
     let junto_home = host::junto_home()?;
     let channels = invites::channels_for(&junto_home, &payload.invite_token)?;
     if channels.is_empty() {
-        bail!(
-            "this enroll code's invite token matches nothing this machine can redeem: it was \
-             never issued here, or every channel it covered has already redeemed; ask the \
-             founder to run `junto invite` again if you still need access"
-        );
+        bail!(invite_exhausted_message());
     }
 
     let member = match kind {
