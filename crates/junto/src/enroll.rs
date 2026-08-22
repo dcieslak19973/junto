@@ -4,8 +4,9 @@
 //! Two codes carry a new device into a channel:
 //!
 //! - **invite**, minted by a founder (`junto invite`): a bearer grant that
-//!   `member_email` may join `channel`, proven by presenting
-//!   [`InvitePayload::invite_token`]. The token is a secret — anyone holding
+//!   `member_email` may join every channel in `channels`, proven by
+//!   presenting [`InvitePayload::invite_token`]. The token is a secret —
+//!   anyone holding
 //!   the decoded payload can redeem the grant it names (`invites::consume`
 //!   is the redemption check) — so this code must be delivered only to the
 //!   intended member.
@@ -65,11 +66,16 @@ pub const MAX_CODE_CHARS: usize = 132_096;
 /// content (e.g. a `channel` name someone pasted a book into).
 pub const MAX_FIELD_CHARS: usize = 4_096;
 
+/// Maximum number of channels a single invite may name — a founder
+/// ticking more than 32 channels in one pass is a mistake, and an
+/// unbounded set makes redemption fan out unboundedly.
+pub const MAX_INVITE_CHANNELS: usize = 32;
+
 /// The current version this crate produces and accepts. `decode_invite` and
 /// `decode_enroll` reject any other value in a payload's `v` field, so a
 /// future format change can be introduced without a mis-parsed old payload
 /// silently passing as valid.
-const PAYLOAD_VERSION: u8 = 1;
+const PAYLOAD_VERSION: u8 = 2;
 
 /// The payload behind a `junto://invite?code=…` URI — see the module docs
 /// for what it grants and why [`invite_token`](Self::invite_token) is a
@@ -79,7 +85,8 @@ pub struct InvitePayload {
     pub v: u8,
     pub invite_token: String,
     pub member_email: String,
-    pub channel: String,
+    #[serde(default)]
+    pub channels: Vec<String>,
     pub expires_at: i64,
 }
 
@@ -132,11 +139,15 @@ pub fn decode_invite(url: &str) -> Result<InvitePayload> {
     let payload: InvitePayload =
         serde_json::from_str(&json).context("parsing invite payload JSON")?;
     check_version(payload.v)?;
-    check_field_bounds([
-        ("invite_token", payload.invite_token.as_str()),
-        ("member_email", payload.member_email.as_str()),
-        ("channel", payload.channel.as_str()),
-    ])?;
+    check_channel_set(&payload.channels)?;
+    check_field_bounds(
+        [
+            ("invite_token", payload.invite_token.as_str()),
+            ("member_email", payload.member_email.as_str()),
+        ]
+        .into_iter()
+        .chain(payload.channels.iter().map(|c| ("channel", c.as_str()))),
+    )?;
     check_expiry(payload.expires_at)?;
     Ok(payload)
 }
@@ -180,7 +191,24 @@ fn decode_code(url: &str, host: &str) -> Result<String> {
 
 fn check_version(v: u8) -> Result<()> {
     if v != PAYLOAD_VERSION {
-        bail!("unsupported payload version {v} (expected {PAYLOAD_VERSION})");
+        bail!(
+            "unsupported payload version {v} (expected {PAYLOAD_VERSION}) — this code came \
+             from an older junto; mint a new one"
+        );
+    }
+    Ok(())
+}
+
+/// Refuse an invite naming no channels — redemption would burn a token
+/// and grant nothing — or naming more than `MAX_INVITE_CHANNELS`. Each
+/// channel's own length is bounded separately, by `check_field_bounds`
+/// alongside `invite_token` and `member_email`.
+fn check_channel_set(channels: &[String]) -> Result<()> {
+    if channels.is_empty() {
+        bail!("an invite must name at least one channel");
+    }
+    if channels.len() > MAX_INVITE_CHANNELS {
+        bail!("an invite may name at most {MAX_INVITE_CHANNELS} channels");
     }
     Ok(())
 }
@@ -226,17 +254,17 @@ mod tests {
 
     fn sample_invite() -> InvitePayload {
         InvitePayload {
-            v: 1,
+            v: PAYLOAD_VERSION,
             invite_token: mint_invite_token(),
             member_email: "dan@example.com".to_string(),
-            channel: "junto-dev".to_string(),
+            channels: vec!["junto-dev".to_string()],
             expires_at: Timestamp::now().as_millis() + 60_000,
         }
     }
 
     fn sample_enroll() -> EnrollPayload {
         EnrollPayload {
-            v: 1,
+            v: PAYLOAD_VERSION,
             invite_token: mint_invite_token(),
             email: "dan@example.com".to_string(),
             display_name: "Dan's Laptop".to_string(),
@@ -300,7 +328,7 @@ mod tests {
     #[test]
     fn a_wrong_version_is_refused() {
         let mut p = sample_invite();
-        p.v = 2;
+        p.v = PAYLOAD_VERSION + 1;
         let url = encode_invite(&p).unwrap();
         assert!(decode_invite(&url).is_err());
     }
@@ -318,7 +346,7 @@ mod tests {
     #[test]
     fn a_field_beyond_the_bound_is_refused() {
         let mut p = sample_invite();
-        p.channel = "x".repeat(MAX_FIELD_CHARS + 1);
+        p.channels = vec!["x".repeat(MAX_FIELD_CHARS + 1)];
         let url = encode_invite(&p).unwrap();
         assert!(decode_invite(&url).is_err());
     }
@@ -383,5 +411,63 @@ mod tests {
         assert_eq!(url.len(), MAX_CODE_CHARS);
         let err = decode_invite(&url).unwrap_err();
         assert!(!err.to_string().contains("exceeds"));
+    }
+
+    #[test]
+    fn a_v2_invite_round_trips_a_multi_channel_set() {
+        let mut p = sample_invite();
+        p.channels = vec!["one".to_string(), "two".to_string(), "three".to_string()];
+        let url = encode_invite(&p).unwrap();
+        assert!(url.starts_with("junto://invite?code="));
+        assert_eq!(
+            decode_invite(&url).unwrap(),
+            p,
+            "the whole set survives the round trip"
+        );
+    }
+
+    #[test]
+    fn an_empty_channel_set_is_refused() {
+        // An invite that grants nothing is a bug in the caller, not a valid code:
+        // redemption would burn a token and append nothing.
+        let mut p = sample_invite();
+        p.channels = Vec::new();
+        let url = encode_invite(&p).unwrap();
+        let err = decode_invite(&url).unwrap_err().to_string();
+        assert!(err.contains("at least one channel"), "{err}");
+    }
+
+    #[test]
+    fn a_channel_set_beyond_the_cap_is_refused() {
+        let mut p = sample_invite();
+        p.channels = (0..MAX_INVITE_CHANNELS + 1)
+            .map(|i| format!("c{i}"))
+            .collect();
+        let url = encode_invite(&p).unwrap();
+        let err = decode_invite(&url).unwrap_err().to_string();
+        assert!(err.contains(&MAX_INVITE_CHANNELS.to_string()), "{err}");
+    }
+
+    #[test]
+    fn a_channel_name_beyond_the_field_bound_is_refused() {
+        // The per-element bound, not the set bound: one absurd element in an
+        // otherwise sane set. A mutation that only checks the Vec length passes
+        // the test above and fails this one.
+        let mut p = sample_invite();
+        p.channels = vec!["fine".to_string(), "x".repeat(MAX_FIELD_CHARS + 1)];
+        let url = encode_invite(&p).unwrap();
+        assert!(decode_invite(&url).is_err());
+    }
+
+    #[test]
+    fn a_v1_invite_is_refused_with_instructions_to_mint_a_new_one() {
+        // Hand-build a v1 body: the struct can no longer express it.
+        let body = r#"{"v":1,"invite_token":"t","member_email":"dan@x.com","channel":"junto-dev","expires_at":0}"#;
+        let url = format!(
+            "junto://invite?code={}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(body)
+        );
+        let err = decode_invite(&url).unwrap_err().to_string();
+        assert!(err.contains("mint a new one"), "{err}");
     }
 }

@@ -657,10 +657,11 @@ async fn invite(channel: String, member: String) -> Result<()> {
         expires_at,
     )?;
     let url = enroll::encode_invite(&enroll::InvitePayload {
-        v: 1,
+        v: 2,
         invite_token: token,
         member_email: member,
-        channel: canonical_channel,
+        // Task 3/4 replaces this
+        channels: vec![canonical_channel],
         expires_at,
     })?;
     println!("{}", invite_line(&url, expires_at));
@@ -684,7 +685,7 @@ fn enroll_payload_from_invite(
     name: &str,
 ) -> enroll::EnrollPayload {
     enroll::EnrollPayload {
-        v: 1,
+        v: 2,
         invite_token: invite.invite_token.clone(),
         email: invite.member_email.clone(),
         display_name: name.to_string(),
@@ -1235,15 +1236,15 @@ mod tests {
     #[test]
     fn enroll_payload_carries_the_invites_email_and_token_verbatim() {
         let invite = enroll::InvitePayload {
-            v: 1,
+            v: 2,
             invite_token: "tok-abc-123".to_string(),
             member_email: "dan@example.com".to_string(),
-            channel: "junto-dev".to_string(),
+            channels: vec!["junto-dev".to_string()],
             expires_at: 1_700_000_000_000,
         };
         let key = PublicKey::new(format!("ed25519:{}", "a".repeat(64))).unwrap();
         let payload = enroll_payload_from_invite(&invite, &key, "Dan's Laptop");
-        assert_eq!(payload.v, 1);
+        assert_eq!(payload.v, 2);
         assert_eq!(payload.invite_token, invite.invite_token);
         assert_eq!(payload.email, invite.member_email);
         assert_eq!(payload.public_key, key);
@@ -1352,7 +1353,7 @@ mod tests {
         expires_at: i64,
     ) -> String {
         enroll::encode_enroll(&enroll::EnrollPayload {
-            v: 1,
+            v: 2,
             invite_token: token.to_string(),
             email: email.to_string(),
             display_name: display_name.to_string(),
