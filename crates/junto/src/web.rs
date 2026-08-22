@@ -2900,7 +2900,7 @@ impl RedeemOutcomeDto {
 /// way the body carries every channel's own outcome, never collapsed to
 /// one pass/fail. An invite whose token covers no channel at all (the
 /// engine's own empty-set refusal) is reported the same way: 409, with
-/// [`crate::invite_exhausted_message`]'s text as the body.
+/// [`crate::InviteExhausted`]'s shared wording as the body.
 async fn redeem_enrollment_endpoint(
     State(host): State<Arc<Host>>,
     Form(form): Form<RedeemForm>,
@@ -2933,19 +2933,20 @@ async fn redeem_enrollment_endpoint(
     let outcomes = match crate::redeem_enrollment(&host, &payload, kind, None).await {
         Ok(outcomes) => outcomes,
         Err(err) => {
-            let message = err.to_string();
             // The engine's only `bail!` is the exhausted-invite refusal
             // (`channels_for` returned nothing to redeem) — every other
             // `Err` is a genuine failure (e.g. an unreadable invite store),
-            // which `preview_enrollment` already reports as `internal`, not
-            // 409. Compared by exact text against the shared constant
-            // (`crate::invite_exhausted_message`) rather than by variant,
-            // since `redeem_enrollment`'s `Result` carries no error enum —
-            // see its own doc comment.
-            if message == crate::invite_exhausted_message() {
-                return (StatusCode::CONFLICT, message).into_response();
+            // which `preview_enrollment` already reports as `internal`,
+            // not 409. Downcast against the typed sentinel
+            // (`crate::InviteExhausted`), not a string comparison: a
+            // `.context(..)` added to the `?` sites above the engine's
+            // `bail!`, or a second `bail!` reusing the same wording
+            // deeper in the engine, would silently reclassify a string
+            // match but cannot fool a downcast.
+            if err.downcast_ref::<crate::InviteExhausted>().is_some() {
+                return (StatusCode::CONFLICT, err.to_string()).into_response();
             }
-            return internal(message);
+            return internal(err.to_string());
         }
     };
 
@@ -3006,11 +3007,10 @@ struct PreviewChannelDto {
 /// are about to grant *before* anything is appended, and the channel set
 /// deliberately never travels inside the code itself.
 ///
-/// An empty channel set is a 409 carrying
-/// [`crate::invite_exhausted_message`]'s exact text — the same refusal
-/// [`redeem_enrollment_endpoint`] gives for the identical condition, since
-/// one `channels_for` read cannot tell "never issued here" apart from
-/// "already fully redeemed".
+/// An empty channel set is a 409 carrying [`crate::InviteExhausted`]'s
+/// shared wording — the same refusal [`redeem_enrollment_endpoint`] gives
+/// for the identical condition, since one `channels_for` read cannot tell
+/// "never issued here" apart from "already fully redeemed".
 async fn preview_enrollment(
     State(host): State<Arc<Host>>,
     Form(form): Form<PreviewForm>,
@@ -3028,7 +3028,7 @@ async fn preview_enrollment(
         Err(err) => return internal(err.to_string()),
     };
     if channels.is_empty() {
-        return (StatusCode::CONFLICT, crate::invite_exhausted_message()).into_response();
+        return (StatusCode::CONFLICT, crate::InviteExhausted.to_string()).into_response();
     }
 
     let mut dtos = Vec::with_capacity(channels.len());
@@ -5133,6 +5133,91 @@ mod tests {
         let body = body_text(response).await;
         let json: serde_json::Value =
             serde_json::from_str(&body).expect("still valid JSON after prettify_errors");
+        let outcomes = json["outcomes"].as_array().expect("outcomes array");
+        assert_eq!(outcomes.len(), 2, "{outcomes:?}");
+        for outcome in outcomes {
+            assert_eq!(outcome["result"], "invite_already_used", "{outcome:?}");
+        }
+    }
+
+    /// A raw HTTP/1.1 POST over a plain `TcpStream` — no HTTP-client
+    /// dependency, just the `tokio::net`/`io-util` primitives already in
+    /// this crate's dependency tree. Returns (status, content-type, body).
+    async fn http_post(
+        addr: std::net::SocketAddr,
+        path: &str,
+        body: &str,
+    ) -> (u16, String, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let request = format!(
+            "POST {path} HTTP/1.1\r\n\
+             Host: {addr}\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {body}",
+            body.len()
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write request");
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).await.expect("read response");
+        let text = String::from_utf8_lossy(&raw).into_owned();
+        let (head, body) = text.split_once("\r\n\r\n").expect("header/body split");
+        let status = head
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse::<u16>().ok())
+            .expect("numeric status code");
+        let content_type = head
+            .lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("content-type:"))
+            .and_then(|line| line.split_once(':'))
+            .map(|(_, value)| value.trim().to_string())
+            .unwrap_or_default();
+        (status, content_type, body.to_string())
+    }
+
+    /// Serve `host`'s real router on an ephemeral localhost port — mirrors
+    /// `live_ws.rs`'s own `serve_router` test helper (same crate, same
+    /// pattern), so this needs no `tower`/HTTP-client dependency.
+    async fn serve_router(host: Arc<Host>) -> std::net::SocketAddr {
+        let app = router(host);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        addr
+    }
+
+    /// Finding 1 residual (review round 2): the handler+layer composition
+    /// test above pins the layer FUNCTION but not the WIRING — re-pointing
+    /// the route, or moving prettification off `map_response`, would leave
+    /// that test green while the wire body is destroyed again. This drives
+    /// the actual composed `router()` over a real socket, so it only
+    /// passes when `/members` is wired through the real `prettify_errors`
+    /// layer end to end.
+    #[tokio::test]
+    async fn post_members_409_json_survives_the_real_router_over_the_wire() {
+        let fx = redeem_fixture().await;
+        let url = stale_duplicate_invite_enroll_url(&fx);
+        let addr = serve_router(fx.host.clone()).await;
+
+        let body = format!("enroll={url}&kind=human");
+        let (status, content_type, body) = http_post(addr, "/members", &body).await;
+
+        assert_eq!(status, 409);
+        assert_eq!(content_type, "application/json");
+        let json: serde_json::Value =
+            serde_json::from_str(&body).expect("still valid JSON over the wire");
         let outcomes = json["outcomes"].as_array().expect("outcomes array");
         assert_eq!(outcomes.len(), 2, "{outcomes:?}");
         for outcome in outcomes {

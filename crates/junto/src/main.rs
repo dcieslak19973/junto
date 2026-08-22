@@ -572,17 +572,32 @@ fn redeem_line(channel: &str, outcome: &RedeemOutcome) -> String {
     }
 }
 
-/// The refusal when an enroll code's invite token covers nothing this
-/// machine can redeem (device-key-enrollment plan, Task 4/9): a shared
-/// function, not a duplicated literal, so `redeem_enrollment`'s own
-/// refusal and the `/devices/preview` HTTP endpoint (`web.rs`, Task 9)
-/// can never drift onto two different explanations for the same read.
-pub(crate) fn invite_exhausted_message() -> String {
-    "this enroll code's invite token matches nothing this machine can redeem: it was never \
-     issued here, or every channel it covered has already redeemed; ask the founder to run \
-     `junto invite` again if you still need access"
-        .to_string()
+/// Sentinel marking [`redeem_enrollment`]'s one legitimate refusal — the
+/// presented invite token covers no channel this machine can redeem
+/// (device-key-enrollment plan, Task 4/9). A typed marker, not a string
+/// comparison: `web.rs`'s `/members` endpoint downcasts for this
+/// (`err.downcast_ref::<InviteExhausted>()`) to tell this ONE 409 apart
+/// from every other `Err` (a genuine failure, e.g. an unreadable invite
+/// store, mapped to 500) — a string match on this struct's `Display`
+/// text would silently drift out of sync the moment a `.context(..)`
+/// landed on the `?` sites above this `bail!`, or a second `bail!` reused
+/// the same wording deeper in the engine. `/devices/preview` (`web.rs`,
+/// Task 9) shares the identical wording by displaying this same type,
+/// never a duplicated literal.
+#[derive(Debug)]
+pub(crate) struct InviteExhausted;
+
+impl std::fmt::Display for InviteExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "this enroll code's invite token matches nothing this machine can redeem: it was \
+             never issued here, or every channel it covered has already redeemed; ask the \
+             founder to run `junto invite` again if you still need access",
+        )
+    }
 }
+
+impl std::error::Error for InviteExhausted {}
 
 /// Redeem `payload`'s invite across every channel it still covers
 /// (device-key-enrollment plan, Task 4): the engine `add_member`'s
@@ -615,7 +630,7 @@ pub(crate) async fn redeem_enrollment(
     let junto_home = host::junto_home()?;
     let channels = invites::channels_for(&junto_home, &payload.invite_token)?;
     if channels.is_empty() {
-        bail!(invite_exhausted_message());
+        bail!(InviteExhausted);
     }
 
     let member = match kind {
