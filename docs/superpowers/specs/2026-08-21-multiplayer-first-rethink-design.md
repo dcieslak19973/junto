@@ -41,7 +41,7 @@ Dead-ends checked before proposing (all four in `junto-dev`): `779ad00e`, `4dd4c
 | | **Subject** | **Mount** |
 |---|---|---|
 | What | what the thread is *about* | how *this machine* resolves it |
-| Example | `git+https://github.com/dcieslak19973/junto.git` · `jira:PROJ-412` · `slack:T123/C456` · `doc:sha256:ab3f…` | `D:\git\junto` · *(none)* · *(none)* · `D:\notes\spec.md` |
+| Example | `https://github.com/dcieslak19973/junto.git` · `jira:PROJ-412` · `slack:T123/C456` · `doc:sha256:ab3f…` | `D:\git\junto` · *(none)* · *(none)* · `D:\notes\spec.md` |
 | Lives in | the ledger — durable, portable, synced | `~/.junto/mounts.toml` — machine-local, never synced |
 | Cardinality | 0..N per thread | 0..1 per subject, per machine |
 
