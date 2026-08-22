@@ -233,6 +233,14 @@ mod tests {
                 Uri::new("git+https://github.com/dcieslak19973/junto.git").expect("valid uri"),
             ),
         }));
+        // A Subject with a pinned digest (exercises the Some(digest) branch).
+        assert_round_trips(&entry(EntryPayload::SubjectAttached {
+            subject: crate::Subject::with_digest(
+                crate::SubjectKind::Document,
+                Uri::new("file:///notes/spec.md").expect("valid uri"),
+                ContentDigest::new("sha256:deadbeef").expect("valid digest"),
+            ),
+        }));
         assert_round_trips(&entry(EntryPayload::SubjectDetached { target }));
     }
 

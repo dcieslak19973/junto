@@ -2084,11 +2084,11 @@ impl EntryDto {
             } => ("artifact", format!("{kind}: {description}")),
             // Provisional copy — the surface plan owns subject rendering.
             EntryPayload::SubjectAttached { subject } => (
-                "subject attached",
-                format!("{:?}: {}", subject.kind, subject.uri.as_str()),
+                "subject",
+                format!("attached {:?}: {}", subject.kind, subject.uri.as_str()),
             ),
             // Provisional copy — the surface plan owns subject rendering.
-            EntryPayload::SubjectDetached { target } => ("subject detached", target.to_string()),
+            EntryPayload::SubjectDetached { target } => ("subject", format!("detached {target}")),
         };
         let status = match &entry.payload {
             EntryPayload::Assertion { .. } | EntryPayload::Correction { .. } => view

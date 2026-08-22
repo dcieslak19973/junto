@@ -819,7 +819,7 @@ fn describe_markdown(entry: &LedgerEntry, view: &ChannelView) -> String {
         }
         // Provisional copy — the surface plan owns subject rendering.
         EntryPayload::SubjectDetached { target } => {
-            format!("**subject detached** of `{target}`")
+            format!("**subject detachment** of `{target}`")
         }
         EntryPayload::ChannelClosed { rationale } => {
             format!("**channel closed** — {rationale}")
@@ -2598,10 +2598,10 @@ fn backticks_to_code(text: &str) -> String {
 fn entry_family(payload: &EntryPayload) -> &'static str {
     match payload {
         EntryPayload::Assertion { .. } | EntryPayload::Proposal { .. } => "fam-decision",
-        // Provisional copy — the surface plan owns subject rendering.
         EntryPayload::SessionStarted { .. }
         | EntryPayload::SessionUpdated { .. }
         | EntryPayload::ArtifactAttached { .. }
+        // Provisional copy — the surface plan owns subject rendering.
         | EntryPayload::SubjectAttached { .. }
         | EntryPayload::SubjectDetached { .. } => "fam-work",
         EntryPayload::ChannelOpened { .. }
