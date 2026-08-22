@@ -1,10 +1,10 @@
 //! Launching Agent Sessions from the surface (`docs/adr/0023`).
 //!
-//! The **Workspace** is the machine-local mapping channel → repo(s) — where a
-//! channel's Agent Sessions execute (`~/.junto/workspaces.toml`). Paths never
-//! enter the ledger: they are machine facts and don't sync. The harness
-//! session-id mapping (`~/.junto/harness-sessions.toml`) is machine-local for
-//! the same reason.
+//! Where a session executes is resolved through `crate::mounts` (the
+//! machine-local **Mount** store, `~/.junto/mounts.toml`) against the
+//! channel's projected Subjects; paths never enter the ledger — they are
+//! machine facts and don't sync. The harness session-id mapping
+//! (`~/.junto/harness-sessions.toml`) is machine-local for the same reason.
 //!
 //! A turn runs the harness over **ACP** (`docs/adr/0024`, see [`crate::acp`])
 //! when available, falling back to the **`claude -p` oneshot-exec** CLI here.
@@ -401,107 +401,6 @@ fn harness_command(workspace: &Path) -> tokio::process::Command {
 
 /// How long a turn may run before the host kills it (docs/adr/0023).
 pub(crate) const TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
-
-// ---- the Workspace store (channel → repos; machine config) ----
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct WorkspacesFile {
-    #[serde(default)]
-    workspaces: Vec<WorkspaceRecord>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct WorkspaceRecord {
-    channel: ChannelId,
-    /// List-shaped so one channel can span several repos later; v1 uses
-    /// exactly one (docs/adr/0023).
-    repos: Vec<PathBuf>,
-}
-
-fn workspaces_path(junto_home: &Path) -> PathBuf {
-    junto_home.join("workspaces.toml")
-}
-
-/// The stored workspace repo for a channel, if one was remembered.
-pub fn workspace_for(junto_home: &Path, channel: &ChannelId) -> Result<Option<PathBuf>> {
-    let path = workspaces_path(junto_home);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let text =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let file: WorkspacesFile =
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-    Ok(file
-        .workspaces
-        .into_iter()
-        .find(|record| record.channel == *channel)
-        .and_then(|record| record.repos.into_iter().next()))
-}
-
-/// Every remembered (channel → repo) mapping. Used to infer a default
-/// workspace for a fresh channel from what's been used recently elsewhere.
-pub fn all_workspaces(junto_home: &Path) -> Result<Vec<(ChannelId, PathBuf)>> {
-    let path = workspaces_path(junto_home);
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let text =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let file: WorkspacesFile =
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-    Ok(file
-        .workspaces
-        .into_iter()
-        .filter_map(|record| {
-            record
-                .repos
-                .into_iter()
-                .next()
-                .map(|repo| (record.channel, repo))
-        })
-        .collect())
-}
-
-/// Remember (or update) a channel's workspace repo.
-pub fn remember_workspace(junto_home: &Path, channel: &ChannelId, repo: &Path) -> Result<()> {
-    let repo = dunce::canonicalize(repo)
-        .with_context(|| format!("workspace repo {} not found", repo.display()))?;
-    if !repo.join(".git").exists() {
-        bail!(
-            "{} is not a git repository (v1 workspaces must be git repos — diff capture \
-             depends on it; docs/adr/0023)",
-            repo.display()
-        );
-    }
-    let path = workspaces_path(junto_home);
-    let mut file: WorkspacesFile = if path.exists() {
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?
-    } else {
-        WorkspacesFile::default()
-    };
-    match file
-        .workspaces
-        .iter_mut()
-        .find(|record| record.channel == *channel)
-    {
-        Some(record) => record.repos = vec![repo],
-        None => file.workspaces.push(WorkspaceRecord {
-            channel: *channel,
-            repos: vec![repo],
-        }),
-    }
-    std::fs::create_dir_all(junto_home)
-        .with_context(|| format!("creating {}", junto_home.display()))?;
-    std::fs::write(
-        &path,
-        toml::to_string_pretty(&file).context("serializing workspaces")?,
-    )
-    .with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
-}
 
 // ---- the harness session-id mapping (junto session → harness session) ----
 
@@ -2730,8 +2629,10 @@ async fn try_execute_pr_gate(host: &Host, channel: ChannelId, proposal: EntryId)
 
     // Recover the workspace, branch, and session (the branch name carries it).
     let home = crate::host::junto_home()?;
-    let Some(workspace) = workspace_for(&home, &channel)? else {
-        bail!("no workspace is mapped for channel {channel}");
+    let subjects: Vec<_> = view.subjects.iter().map(|(_, s)| s.clone()).collect();
+    let mounts = crate::mounts::mounts_for(&home, &subjects)?;
+    let Some(workspace) = mounts.into_iter().next().map(|mount| mount.path) else {
+        bail!("channel {channel} has no subject to run in — attach one first");
     };
     let Some(branch) = current_branch(&workspace) else {
         return Ok(());
@@ -3317,36 +3218,6 @@ mod tests {
         // pairing the two together in one call is meant to prevent.
         let base_sha = pr_branch_base(repo.path()).expect("base sha recorded");
         assert_eq!(diff.commit.as_deref(), Some(base_sha.as_str()));
-    }
-
-    #[test]
-    fn workspace_store_remembers_and_updates() {
-        let home = HomeGuard::new();
-        let channel = ChannelId::new();
-        assert!(workspace_for(home.path(), &channel).unwrap().is_none());
-
-        let repo_a = git_repo();
-        remember_workspace(home.path(), &channel, repo_a.path()).unwrap();
-        let stored = workspace_for(home.path(), &channel).unwrap().unwrap();
-        assert_eq!(stored, dunce::canonicalize(repo_a.path()).unwrap());
-
-        // Updating replaces, not duplicates; other channels are untouched.
-        let repo_b = git_repo();
-        remember_workspace(home.path(), &channel, repo_b.path()).unwrap();
-        let stored = workspace_for(home.path(), &channel).unwrap().unwrap();
-        assert_eq!(stored, dunce::canonicalize(repo_b.path()).unwrap());
-
-        let other = ChannelId::new();
-        assert!(workspace_for(home.path(), &other).unwrap().is_none());
-    }
-
-    #[test]
-    fn non_git_workspaces_are_refused() {
-        let home = HomeGuard::new();
-        let channel = ChannelId::new();
-        let plain = tempfile::tempdir().unwrap();
-        let err = remember_workspace(home.path(), &channel, plain.path()).unwrap_err();
-        assert!(err.to_string().contains("not a git repository"), "{err}");
     }
 
     #[test]

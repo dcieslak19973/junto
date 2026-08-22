@@ -138,6 +138,44 @@ pub(crate) async fn project_fresh(
     Ok((id, view, substrate))
 }
 
+/// The first path this machine has mounted for any of a channel's projected
+/// Subjects, if any — best-effort, like the workspace prefill it replaces.
+/// `None` covers both "no subject is attached yet" and "a subject is
+/// attached but nothing here is mounted to it"; callers that only prefill a
+/// form don't need to tell those apart.
+fn channel_mount(junto_home: &std::path::Path, view: &ChannelView) -> Option<std::path::PathBuf> {
+    let subjects: Vec<_> = view.subjects.iter().map(|(_, s)| s.clone()).collect();
+    crate::mounts::mounts_for(junto_home, &subjects)
+        .ok()?
+        .into_iter()
+        .next()
+        .map(|mount| mount.path)
+}
+
+/// The workspace a write action needs, or a clear, loud refusal.
+///
+/// A channel with no attached, mounted Subject has nothing to run a session
+/// in. Synthesizing a URI here to paper over that (e.g. keying `mounts.toml`
+/// on the channel id) would just re-create the channel→path coupling this
+/// store exists to remove, under a new name — so this refuses instead of
+/// guessing. `Host::attach_subject` (a follow-up) is what actually closes
+/// the gap: attach a Subject, then mount it.
+// Same Response-as-error idiom as `project`/`project_fresh`; see the
+// rationale above `project`.
+#[allow(clippy::result_large_err)]
+fn required_mount(
+    junto_home: &std::path::Path,
+    view: &ChannelView,
+) -> Result<std::path::PathBuf, Response> {
+    channel_mount(junto_home, view).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "channel has no subject to run in — attach one first",
+        )
+            .into_response()
+    })
+}
+
 // Same Response-as-error idiom, same cold Err path, and both callers above
 // already carry this allow — boxing here would only add a deref at each of
 // them. See the rationale above `project`.
@@ -578,7 +616,7 @@ async fn channel_page(State(host): State<Arc<Host>>, Path(channel): Path<String>
             // (docs/adr/0023); best-effort, like the nav.
             let workspace = crate::host::junto_home()
                 .ok()
-                .and_then(|home| crate::launch::workspace_for(&home, &id).ok().flatten());
+                .and_then(|home| channel_mount(&home, &view));
             Html(render::channel_html(
                 &nav,
                 &name,
@@ -678,27 +716,22 @@ async fn launch_session(
         }
     }
     let workspace = if form.workspace.trim().is_empty() {
-        match crate::launch::workspace_for(&junto_home, &id) {
-            Ok(Some(workspace)) => workspace,
-            Ok(None) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    "no workspace is remembered for this channel — fill in the workspace \
-                     repo path (it will be remembered)",
-                )
-                    .into_response();
-            }
-            Err(err) => return internal(format!("reading workspaces: {err}")),
+        match required_mount(&junto_home, &view) {
+            Ok(workspace) => workspace,
+            Err(response) => return response,
         }
     } else {
-        let typed = std::path::PathBuf::from(form.workspace.trim());
-        if let Err(err) = crate::launch::remember_workspace(&junto_home, &id, &typed) {
-            return (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response();
-        }
-        match crate::launch::workspace_for(&junto_home, &id) {
-            Ok(Some(workspace)) => workspace,
-            _ => return internal("workspace vanished after remembering".into()),
-        }
+        // A typed path can no longer be remembered directly: doing so would
+        // require synthesizing a Subject URI for a path that has none,
+        // which re-creates the channel→path coupling the Mount store exists
+        // to remove, under a new name. `Host::attach_subject` (a follow-up)
+        // is what actually closes this — attach a Subject, then mount it.
+        return (
+            StatusCode::BAD_REQUEST,
+            "typing a workspace path is not supported yet — attach a subject to this channel \
+             first",
+        )
+            .into_response();
     };
     // "outcome" runs the code-PR push-gate (the verify/Grader loop, docs/adr/0025);
     // otherwise a single turn (docs/adr/0023).
@@ -786,16 +819,9 @@ async fn steer_session(
         Ok(home) => home,
         Err(err) => return internal(format!("no junto home: {err}")),
     };
-    let workspace = match crate::launch::workspace_for(&junto_home, &id) {
-        Ok(Some(workspace)) => workspace,
-        Ok(None) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                "no workspace is remembered for this channel on this machine",
-            )
-                .into_response();
-        }
-        Err(err) => return internal(format!("reading workspaces: {err}")),
+    let workspace = match required_mount(&junto_home, &view) {
+        Ok(workspace) => workspace,
+        Err(response) => return response,
     };
     // One steer box, routed on liveness: a running turn is steered in place over
     // the control channel; a turn that has already landed is resumed (docs/adr/
@@ -1716,46 +1742,30 @@ async fn substrates_json(State(host): State<Arc<Host>>) -> Response {
     axum::Json(paths).into_response()
 }
 
-/// Distinct **workspace repos**, most-recently-used first — the launch form's
-/// inferred default + suggestions for a fresh channel (so the user rarely has
-/// to pick a directory). Ordered by the last activity of the channel each repo
-/// is bound to.
-async fn workspaces_json(State(host): State<Arc<Host>>) -> Response {
+/// Distinct **mounted paths** on this machine — the launch form's
+/// suggestions for a fresh channel (so the user rarely has to pick a
+/// directory from scratch). Sorted by path for a stable, deterministic order.
+///
+/// The prior recency ranking (most-recently-used channel first) cannot be
+/// reproduced from the Mount store: mounts are keyed by Subject URI, not by
+/// channel, so channels no longer own paths and there is no channel-recency
+/// signal left to rank by. Giving the picker a *meaningful* order again
+/// (e.g. last-mounted time) is the surface plan's call, not invented here.
+async fn workspaces_json() -> Response {
     let junto_home = match crate::host::junto_home() {
         Ok(home) => home,
         Err(err) => return internal(format!("no junto home: {err}")),
     };
-    let mappings = match crate::launch::all_workspaces(&junto_home) {
-        Ok(mappings) => mappings,
-        Err(err) => return internal(format!("reading workspaces: {err}")),
+    let mounts = match crate::mounts::all_mounts(&junto_home) {
+        Ok(mounts) => mounts,
+        Err(err) => return internal(format!("reading mounts: {err}")),
     };
-    // Channel id → last activity, for recency ordering.
-    let activity: std::collections::HashMap<String, i64> = host
-        .inventory()
-        .await
-        .unwrap_or_default()
+    let mut repos: Vec<String> = mounts
         .into_iter()
-        .map(|s| {
-            (
-                s.id.to_string(),
-                s.last_activity.map(|t| t.as_millis()).unwrap_or(0),
-            )
-        })
+        .map(|mount| mount.path.display().to_string())
         .collect();
-    // Newest channel's repo first; dedup repos keeping their best (latest) rank.
-    let mut ranked: Vec<(i64, String)> = mappings
-        .into_iter()
-        .map(|(channel, repo)| {
-            let when = activity.get(&channel.to_string()).copied().unwrap_or(0);
-            (when, repo.display().to_string())
-        })
-        .collect();
-    ranked.sort_by_key(|entry| std::cmp::Reverse(entry.0));
-    let mut seen = std::collections::HashSet::new();
-    let repos: Vec<String> = ranked
-        .into_iter()
-        .filter_map(|(_, repo)| seen.insert(repo.clone()).then_some(repo))
-        .collect();
+    repos.sort();
+    repos.dedup();
     axum::Json(repos).into_response()
 }
 
@@ -1918,7 +1928,7 @@ async fn channel_view_json(State(host): State<Arc<Host>>, Path(channel): Path<St
             // form pre-fill it instead of asking the user to pick a directory.
             dto.workspace = crate::host::junto_home()
                 .ok()
-                .and_then(|home| crate::launch::workspace_for(&home, &id).ok().flatten())
+                .and_then(|home| channel_mount(&home, &view))
                 .map(|repo| repo.display().to_string());
             axum::Json(dto).into_response()
         }
@@ -2284,6 +2294,41 @@ mod tests {
             channel,
             target,
         }
+    }
+
+    /// Attach a Repo Subject to `fx`'s channel and mount it to `path` on
+    /// this machine — the real write path a launch now needs
+    /// (`required_mount`, since a typed form path alone is refused).
+    /// `Host::attach_subject` (a follow-up task) will wrap the first half of
+    /// this; until then the entry is appended directly, exactly as this
+    /// module's other fixtures append entries the host has no wrapper for.
+    async fn attach_and_mount_repo(
+        fx: &WebFixture,
+        junto_home: &std::path::Path,
+        path: &std::path::Path,
+    ) {
+        let uri = junto_kernel::Uri::new(format!("git+https://example.com/{}.git", fx.channel))
+            .expect("valid uri");
+        let subject = junto_kernel::Subject::new(junto_kernel::SubjectKind::Repo, uri.clone());
+        let ledger = fx
+            .host
+            .ledger_for(fx._dirs[0].path())
+            .await
+            .expect("ledger");
+        ledger
+            .lock()
+            .await
+            .append(LedgerEntry {
+                signature: None,
+                id: EntryId::new(),
+                channel: fx.channel,
+                author: Member::human("Web User", "web@example.com"),
+                timestamp: Timestamp::now(),
+                payload: EntryPayload::SubjectAttached { subject },
+            })
+            .await
+            .expect("attach subject");
+        crate::mounts::remember_mount(junto_home, &uri, path).expect("remember mount");
     }
 
     fn assertion() -> EntryPayload {
@@ -2698,7 +2743,9 @@ mod tests {
             .add_member("web-test", &founder, crate::launch::harness_member(), None)
             .await
             .expect("grant the harness membership");
-        // A workspace repo for the session to run in.
+        // A workspace repo for the session to run in — attached as a Repo
+        // Subject and mounted here, the write path `required_mount` now
+        // requires (a typed form path is refused; see `launch_session`).
         let workspace = tempfile::tempdir().expect("workspace");
         assert!(
             StdCommand::new("git")
@@ -2708,13 +2755,14 @@ mod tests {
                 .expect("git init")
                 .success()
         );
+        attach_and_mount_repo(&fx, home.path(), workspace.path()).await;
 
         let response = launch_session(
             State(fx.host.clone()),
             Path("web-test".into()),
             Form(LaunchForm {
                 intent: "do the stub thing".into(),
-                workspace: workspace.path().display().to_string(),
+                workspace: String::new(),
                 agent: String::new(),
                 mode: String::new(),
             }),
@@ -2792,7 +2840,7 @@ mod tests {
         // starting work should bring the harness in (a founder-authored
         // MemberAdded) rather than reject the launch — the new-channel
         // papercut (docs/adr/0017).
-        let _home = crate::host::test_home::HomeGuard::new();
+        let home = crate::host::test_home::HomeGuard::new();
         let stub_dir = tempfile::tempdir().expect("stub dir");
         let stub = if cfg!(windows) {
             let path = stub_dir.path().join("stub.cmd");
@@ -2834,13 +2882,14 @@ mod tests {
                 .expect("git init")
                 .success()
         );
+        attach_and_mount_repo(&fx, home.path(), workspace.path()).await;
 
         let response = launch_session(
             State(fx.host.clone()),
             Path("web-test".into()),
             Form(LaunchForm {
                 intent: "start in a fresh channel".into(),
-                workspace: workspace.path().display().to_string(),
+                workspace: String::new(),
                 agent: String::new(),
                 mode: String::new(),
             }),

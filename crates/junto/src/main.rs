@@ -23,6 +23,7 @@ mod live_plane;
 mod live_ws;
 mod mcp;
 mod members;
+mod mounts;
 mod outcome;
 mod pending_lineage;
 mod render;
