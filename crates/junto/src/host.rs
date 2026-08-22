@@ -1589,7 +1589,12 @@ mod lineage_tests {
     /// case: an agent runs on this machine by construction, so first-use
     /// minting is legitimate — and that must mint BOTH halves, not just
     /// the signing key, giving `keys::has_transport_key` its first real
-    /// caller.
+    /// caller. Asserted at BOTH layers: `has_transport_key` pins that the
+    /// key was minted on disk, and the projected grant pins that it was
+    /// actually attached to the member and published — a mutation that
+    /// drops the `member.with_transport_key(key.public_key())` attach
+    /// (leaving the mint side effect intact) would still pass the first
+    /// assertion alone.
     #[tokio::test]
     async fn add_member_keyless_still_mints_for_a_local_agent() {
         let (dirs, host) = lineage_host(1);
@@ -1605,6 +1610,17 @@ mod lineage_tests {
         assert!(
             crate::keys::has_transport_key(member_home(&dirs), "worker@agents.junto").unwrap(),
             "the transport half is minted alongside the signing key on the same local path"
+        );
+        let (_, view) = project(&host, "acme").await;
+        let grant = view
+            .keyring
+            .get("worker@agents.junto")
+            .and_then(|grants| grants.first())
+            .expect("worker has a keyring grant");
+        assert!(
+            grant.transport_key.is_some(),
+            "the minted transport key must actually be attached to the grant, not just \
+             written to keys.toml: {grant:?}"
         );
     }
 
