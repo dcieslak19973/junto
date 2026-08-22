@@ -4219,39 +4219,61 @@ fn describe_failed_response(status: u16, content_type: Option<&str>, body: &str)
     format!("request failed ({status}); see the host log for details")
 }
 
+/// The `post_json`/`post_json_result_accepting` parse decision, factored
+/// out of the network call so it's unit-testable: on a 2xx status, a body
+/// that fails to parse as `T` genuinely is a bug worth surfacing as a
+/// parse error; on an accepted non-2xx status (`post_json_result_accepting`'s
+/// `extra_status`), a body that fails to parse as `T` is expected — that
+/// status is only sometimes structured (e.g. `POST /members`'s 409 is
+/// `{"outcomes":[…]}"` for a rejected-but-recorded outcome, but the
+/// router's HTML error page for a stale invite) — so it degrades through
+/// `describe_failed_response` instead of reporting a raw parse error.
+fn parse_or_describe<T: DeserializeOwned>(
+    status: u16,
+    content_type: Option<&str>,
+    body: &str,
+    what: &str,
+) -> Result<T, String> {
+    match serde_json::from_str::<T>(body) {
+        Ok(value) => Ok(value),
+        Err(err) if (200..300).contains(&status) => {
+            Err(format!("{what}: couldn't parse the response: {err}"))
+        }
+        Err(_) => Err(describe_failed_response(status, content_type, body)),
+    }
+}
+
 /// Shared POST → `Result<T, String>` core behind `post_json_result` and
-/// `post_json_result_accepting`: parses `T` from the body when `accept`
-/// returns true for the response's status, else degrades through
-/// `describe_failed_response`. The two callers differ only in which
-/// statuses carry a `T` to parse — never in how a genuine failure is
-/// reported.
+/// `post_json_result_accepting`: reads the response once, then hands the
+/// status/content-type/body to `parse_or_describe` when `accept` returns
+/// true for the status, else straight to `describe_failed_response`. The
+/// two callers differ only in which statuses carry a `T` to parse — never
+/// in how a genuine failure is reported.
 async fn post_json<T: DeserializeOwned>(
     url: &str,
     form: &[(&str, String)],
     what: &str,
     accept: impl Fn(u16) -> bool,
 ) -> Result<T, String> {
-    match reqwest::Client::new().post(url).form(form).send().await {
-        Ok(resp) if accept(resp.status().as_u16()) => resp
-            .json::<T>()
-            .await
-            .map_err(|err| format!("{what}: couldn't parse the response: {err}")),
-        Ok(resp) => {
-            let status = resp.status().as_u16();
-            let content_type = resp
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string);
-            let body = resp.text().await.unwrap_or_default();
-            Err(describe_failed_response(
-                status,
-                content_type.as_deref(),
-                &body,
-            ))
-        }
-        Err(err) => Err(format!("{what}: request failed: {err}")),
+    let resp = match reqwest::Client::new().post(url).form(form).send().await {
+        Ok(resp) => resp,
+        Err(err) => return Err(format!("{what}: request failed: {err}")),
+    };
+    let status = resp.status().as_u16();
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let body = resp.text().await.unwrap_or_default();
+    if !accept(status) {
+        return Err(describe_failed_response(
+            status,
+            content_type.as_deref(),
+            &body,
+        ));
     }
+    parse_or_describe(status, content_type.as_deref(), &body, what)
 }
 
 /// Shared POST → `Result<T, String>` helper: parses a JSON body into `T`
@@ -5097,6 +5119,44 @@ mod tests {
         assert!(
             !html.to_lowercase().contains("html"),
             "no mention of the wrapper format: {html}"
+        );
+    }
+
+    #[test]
+    fn parse_or_describe_degrades_an_unparseable_accepted_non_2xx_body() {
+        // An accepted non-2xx status (e.g. `POST /members`'s 409) is only
+        // SOMETIMES structured — a stale invite's refusal arrives as the
+        // router's HTML error page, not `{"outcomes":[…]}`. That must
+        // degrade through `describe_failed_response`'s human sentence,
+        // never a raw serde parse-error string or markup.
+        let result: Result<serde_json::Value, String> = parse_or_describe(
+            409,
+            Some("text/html; charset=utf-8"),
+            "<html><body>this invite has expired</body></html>",
+            "members",
+        );
+        let err = result.expect_err("an HTML body never parses as JSON");
+        assert!(
+            !err.contains("couldn't parse"),
+            "not a developer-facing parse-error string: {err}"
+        );
+        assert!(
+            !err.contains('<'),
+            "no raw markup leaks into the panel: {err}"
+        );
+        assert_eq!(err, "request failed (409); see the host log for details");
+    }
+
+    #[test]
+    fn parse_or_describe_reports_a_parse_error_for_a_malformed_2xx_body() {
+        // A 2xx that fails to parse as `T` genuinely is a bug — still
+        // worth surfacing as a parse error, unlike the accepted-non-2xx case.
+        let result: Result<serde_json::Value, String> =
+            parse_or_describe(200, Some("application/json"), "not json", "join");
+        let err = result.expect_err("malformed JSON never parses");
+        assert!(
+            err.contains("couldn't parse"),
+            "surfaced as a parse error: {err}"
         );
     }
 
