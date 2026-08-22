@@ -3849,6 +3849,7 @@ mod tests {
             sessions: HashMap::new(),
             closed: false,
             lineage: Vec::new(),
+            subjects: Vec::new(),
         }
     }
 
@@ -4312,6 +4313,7 @@ mod tests {
             sessions: Default::default(),
             closed: false,
             lineage: Vec::new(),
+            subjects: Vec::new(),
         };
         let brief = brief_markdown("t", &ChannelId::new(), &view, &Default::default());
 
@@ -4351,6 +4353,7 @@ mod tests {
             sessions: Default::default(),
             closed: false,
             lineage: Vec::new(),
+            subjects: Vec::new(),
         };
         let brief = brief_markdown("t", &ChannelId::new(), &view, &Default::default());
 

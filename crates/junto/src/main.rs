@@ -1847,6 +1847,7 @@ mod tests {
             sessions: std::collections::HashMap::new(),
             closed: false,
             lineage: Vec::new(),
+            subjects: Vec::new(),
         }
     }
 

@@ -3278,6 +3278,7 @@ mod tests {
             sessions: Default::default(),
             closed: false,
             lineage: Vec::new(),
+            subjects: Vec::new(),
         };
         let html = crate::render::channel_html(
             &[],

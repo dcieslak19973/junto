@@ -15,6 +15,7 @@ use crate::{
     gate::ApprovalRequirement,
     ids::ChannelId,
     session::{SessionState, SessionView},
+    subject::Subject,
 };
 
 /// Whether a proposal's [`ApprovalRequirement`] is satisfied by the set of
@@ -209,6 +210,12 @@ pub struct ChannelView {
     /// to this channel — the reciprocal entry in `other`'s ledger is the host's
     /// concern, not the projection's.
     pub lineage: Vec<LineageEdge>,
+    /// The Subjects this channel is about (spec §1), in canonical attachment
+    /// order, each paired with the id of the `SubjectAttached` entry that
+    /// introduced it. Detached subjects are folded out; both entries stay in
+    /// [`entries`](ChannelView::entries), because the record is append-only.
+    /// Members only, like every other fold (`docs/adr/0017`).
+    pub subjects: Vec<(EntryId, Subject)>,
 }
 
 impl ChannelView {
@@ -415,6 +422,7 @@ impl<S: SubstrateProvider> Ledger<S> {
         let gate_executions = Self::project_gate_executions(&recognized);
         let sessions = Self::project_sessions(&recognized);
         let lineage = Self::project_lineage(&recognized);
+        let subjects = Self::project_subjects(&recognized);
         // The current name: the (canonically first) genesis binding, unless a
         // later Correction targeting the genesis superseded it — rename is a
         // corrective entry, not mutable metadata (docs/adr/0014/0016).
@@ -458,6 +466,7 @@ impl<S: SubstrateProvider> Ledger<S> {
             sessions,
             closed,
             lineage,
+            subjects,
         };
         if let Ok(mut cache) = self.cache.lock() {
             cache.insert(*channel, (std::time::Instant::now(), view.clone()));
@@ -910,6 +919,29 @@ impl<S: SubstrateProvider> Ledger<S> {
 
         sessions
     }
+
+    /// Fold the live Subjects out of an ordered list of *recognized* entries.
+    /// Two passes, mirroring `project_sessions`: collect the attachments in
+    /// canonical order, then drop the ones a later `SubjectDetached` targets.
+    fn project_subjects(entries: &[&LedgerEntry]) -> Vec<(EntryId, Subject)> {
+        let mut attached: Vec<(EntryId, Subject)> = Vec::new();
+        let mut detached: HashSet<EntryId> = HashSet::new();
+        for entry in entries {
+            match &entry.payload {
+                EntryPayload::SubjectAttached { subject } => {
+                    attached.push((entry.id, subject.clone()));
+                }
+                EntryPayload::SubjectDetached { target } => {
+                    detached.insert(*target);
+                }
+                _ => {}
+            }
+        }
+        attached
+            .into_iter()
+            .filter(|(id, _)| !detached.contains(id))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -917,7 +949,7 @@ mod tests {
     use crate::{
         ApprovalRequirement, EntryId, EntryPayload, GateStatus, InMemorySubstrate, KeyGrant,
         Ledger, LedgerEntry, LineageDirection, LineageEdge, LineageRelation, Member, SessionState,
-        Standing, Timestamp, ids::ChannelId,
+        Standing, Subject, SubjectKind, Timestamp, Uri, ids::ChannelId,
     };
 
     /// Build an entry with explicit id/timestamp/author for deterministic tests.
@@ -945,6 +977,105 @@ mod tests {
             provenance: Vec::new(),
             frame: None,
         }
+    }
+
+    #[tokio::test]
+    async fn detaching_a_subject_removes_it_but_keeps_both_entries() {
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let dan = Member::human("Dan", "dan@example.com");
+
+        // One author throughout: `project_subjects` folds recognized entries
+        // only, and the genesis author is the founding member (ADR 0017).
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                dan.clone(),
+                1,
+                EntryPayload::ChannelOpened {
+                    name: "subjects".into(),
+                },
+            ))
+            .await
+            .expect("append genesis");
+
+        let repo = Subject::new(
+            SubjectKind::Repo,
+            Uri::new("git+https://example.com/a.git").expect("valid uri"),
+        );
+        let doc = Subject::new(
+            SubjectKind::Document,
+            Uri::new("file:///notes/spec.md").expect("valid uri"),
+        );
+
+        let repo_attach = EntryId::new();
+        ledger
+            .append(entry(
+                repo_attach,
+                channel,
+                dan.clone(),
+                2,
+                EntryPayload::SubjectAttached {
+                    subject: repo.clone(),
+                },
+            ))
+            .await
+            .expect("attach repo");
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                dan.clone(),
+                3,
+                EntryPayload::SubjectAttached {
+                    subject: doc.clone(),
+                },
+            ))
+            .await
+            .expect("attach doc");
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                dan.clone(),
+                4,
+                EntryPayload::SubjectDetached {
+                    target: repo_attach,
+                },
+            ))
+            .await
+            .expect("detach repo");
+
+        let view = ledger.project(&channel).await.expect("project");
+        let subjects: Vec<_> = view.subjects.iter().map(|(_, s)| s.clone()).collect();
+        assert_eq!(subjects, vec![doc], "the detached repo must not project");
+        assert_eq!(
+            view.entries.len(),
+            4,
+            "append-only: genesis plus three entries all stay in the log"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_channel_with_no_subjects_projects_an_empty_list() {
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let dan = Member::human("Dan", "dan@example.com");
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                dan,
+                1,
+                EntryPayload::ChannelOpened {
+                    name: "empty".into(),
+                },
+            ))
+            .await
+            .expect("append genesis");
+        let view = ledger.project(&channel).await.expect("project");
+        assert!(view.subjects.is_empty());
     }
 
     /// `docs/adr/0033` — verification is a projection fact. A channel whose
