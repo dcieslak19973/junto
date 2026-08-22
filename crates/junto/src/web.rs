@@ -76,6 +76,7 @@ pub fn router(host: Arc<Host>) -> Router {
         .route("/channels/{channel}/converge", post(converge_channel))
         .route("/channels/{channel}/brief", get(channel_brief))
         .route("/channels/{channel}/view.json", get(channel_view_json))
+        .route("/channels/{channel}/keys.json", get(keys_json))
         .route("/channels.json", get(channels_json))
         .route("/lineage.json", get(lineage_json))
         .route("/focus.json", get(focus_json))
@@ -2138,6 +2139,127 @@ fn lineage_label(edge: &junto_kernel::LineageEdge) -> String {
     }
 }
 
+/// A channel's key grants, as fingerprints — the host's read surface for
+/// "whose devices are these" (device-key-enrollment plan, Task 6). Today
+/// only the CLI's `keys list` and the live-WebSocket handshake read
+/// `ChannelView::keyring`; this is what lets a non-terminal surface (a
+/// native GUI) show a member's devices at all. Uses [`project_fresh`], not
+/// [`project`]: a `revoke-member`/`retire-device` run in a separate `junto`
+/// process must be visible to the very next refresh, not hidden behind this
+/// process's cached fold. Read-only — revocation stays a CLI/MCP act.
+async fn keys_json(State(host): State<Arc<Host>>, Path(channel): Path<String>) -> Response {
+    match project_fresh(&host, &channel).await {
+        Ok((_id, view, substrate)) => {
+            // Best-effort: a host with no git config still answers with a
+            // roster, just no identity of its own (the brief's rule).
+            let viewer = crate::host::git_user(&substrate).ok();
+            let viewer_is_founder = viewer
+                .as_ref()
+                .is_some_and(|member| crate::identity::is_founder(&view, &member.email));
+            let dto = KeysDto {
+                founder_email: view
+                    .party
+                    .first()
+                    .map(|f| f.email.clone())
+                    .unwrap_or_default(),
+                viewer_email: viewer.map(|member| member.email),
+                viewer_is_founder,
+                members: view
+                    .party
+                    .iter()
+                    .map(|member| KeyMemberDto::from_member(member, &view))
+                    .collect(),
+            };
+            axum::Json(dto).into_response()
+        }
+        Err(response) => response,
+    }
+}
+
+#[derive(Serialize)]
+struct KeysDto {
+    founder_email: String,
+    /// The git identity this host writes as — the surface needs it to know
+    /// whose devices these are. `None` when `git_user` fails (no git
+    /// config); the endpoint still answers 200, since reading a roster
+    /// needs no identity of its own.
+    viewer_email: Option<String>,
+    /// Whether that identity may perform the founder-only acts, so the GUI
+    /// shows or hides them instead of guessing. `false` whenever
+    /// `viewer_email` is `None`.
+    viewer_is_founder: bool,
+    /// `view.party` order — founder first, one row per email, same
+    /// ordering the party projection guarantees everywhere else.
+    members: Vec<KeyMemberDto>,
+}
+
+#[derive(Serialize)]
+struct KeyMemberDto {
+    display_name: String,
+    email: String,
+    /// "human" | "agent" — lowercase, like `EntryDto`'s `kind`/`status`.
+    kind: String,
+    /// Keyring order (canonical entry order) — stable across replicas.
+    devices: Vec<KeyGrantDto>,
+    /// Every grant retired: this email is revoked as of the latest
+    /// retirement (`docs/adr/0035`'s all-retired rule — the same predicate
+    /// `live_ws`'s handshake checks, never re-derived differently). `false`
+    /// for a member with no grants at all.
+    revoked: bool,
+}
+
+impl KeyMemberDto {
+    fn from_member(member: &junto_kernel::Member, view: &ChannelView) -> Self {
+        let grants = view.keyring.get(&member.email);
+        let revoked = grants.is_some_and(|grants| {
+            !grants.is_empty() && grants.iter().all(|g| g.retired_at.is_some())
+        });
+        KeyMemberDto {
+            display_name: member.display_name.clone(),
+            email: member.email.clone(),
+            kind: match member.kind {
+                junto_kernel::MemberKind::Human => "human",
+                junto_kernel::MemberKind::Agent => "agent",
+            }
+            .to_string(),
+            devices: grants
+                .map(|grants| grants.iter().map(KeyGrantDto::from_grant).collect())
+                .unwrap_or_default(),
+            revoked,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct KeyGrantDto {
+    /// 16 hex chars of the signing key ([`crate::identity::fingerprint`]).
+    /// Never the whole public key.
+    fingerprint: String,
+    /// 16 hex chars of the device's transport key (`docs/adr/0033` two-key
+    /// separation). `None` for a grant made before transport keys existed,
+    /// or a keyless member's grant.
+    transport_fingerprint: Option<String>,
+    /// The entry id that authorized this key — `retire-device`'s `--grant`
+    /// handle.
+    granted_by: String,
+    /// Epoch millis, when retired.
+    retired_at: Option<i64>,
+}
+
+impl KeyGrantDto {
+    fn from_grant(grant: &junto_kernel::KeyGrant) -> Self {
+        KeyGrantDto {
+            fingerprint: crate::identity::fingerprint(&grant.key),
+            transport_fingerprint: grant
+                .transport_key
+                .as_ref()
+                .map(crate::identity::fingerprint),
+            granted_by: grant.granted_by.to_string(),
+            retired_at: grant.retired_at.map(|ts| ts.as_millis()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3295,5 +3417,267 @@ mod tests {
             html.contains("recording\\u2026"),
             "act feedback script present"
         );
+    }
+
+    /// A test host whose founder has two grants on their own email: one
+    /// from the channel genesis (no transport key — pre-Task-16), one an
+    /// explicit second device carrying both halves. The founder granting
+    /// their own second device is `Host::add_member`'s self-grant path
+    /// (`docs/adr/0033`): a founder's second device is admitted exactly
+    /// like anyone else's.
+    struct KeysFixture {
+        _dirs: Vec<TempDir>,
+        host: Arc<Host>,
+        founder: Member,
+        device_key: junto_kernel::PublicKey,
+        device_transport_key: junto_kernel::PublicKey,
+    }
+
+    async fn host_with_two_grants() -> KeysFixture {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(dir.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        for (key, value) in [("user.name", "Web User"), ("user.email", "web@example.com")] {
+            assert!(
+                StdCommand::new("git")
+                    .args(["config", key, value])
+                    .current_dir(dir.path())
+                    .status()
+                    .expect("git config")
+                    .success()
+            );
+        }
+        let member_home = tempfile::tempdir().expect("member home");
+        let host = Host::fixed_with_member_home(
+            vec![dir.path().to_path_buf()],
+            Some(member_home.path().to_path_buf()),
+        );
+        let founder = Member::human("Web User", "web@example.com");
+        host.open_channel(None, "keys-test", founder.clone(), None)
+            .await
+            .expect("open channel");
+        let device_key = junto_kernel::SigningKey::from_secret_bytes([9; 32]);
+        let device_transport_key = junto_kernel::SigningKey::from_secret_bytes([10; 32]);
+        host.add_member(
+            "keys-test",
+            &founder,
+            founder.clone(),
+            Some(device_key.public_key()),
+            Some(device_transport_key.public_key()),
+        )
+        .await
+        .expect("grant a second device to the founder's own email");
+        KeysFixture {
+            _dirs: vec![dir, member_home],
+            host,
+            founder,
+            device_key: device_key.public_key(),
+            device_transport_key: device_transport_key.public_key(),
+        }
+    }
+
+    /// Retire a grant by appending the founder-authored `Park` that
+    /// `retire-device` itself constructs (main.rs) — the only way
+    /// `KeyGrant::retired_at` is ever set.
+    async fn park_grant(host: &Host, founder: &Member, target: EntryId) {
+        let (id, _view, _substrate) = match project_fresh(host, "keys-test").await {
+            Ok(projected) => projected,
+            Err(_) => panic!("'keys-test' must project"),
+        };
+        let mut park = LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel: id,
+            author: founder.clone(),
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::Park {
+                target,
+                rationale: "device lost".into(),
+            },
+        };
+        host.sign_entry(&mut park);
+        let Resolution::Resolved { ledger, .. } = host.resolve("keys-test").await.unwrap() else {
+            panic!("channel 'keys-test' resolves");
+        };
+        ledger.lock().await.append(park).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn keys_json_lists_devices_by_fingerprint_and_never_the_whole_key() {
+        let fx = host_with_two_grants().await;
+        let (_id, view, _substrate) = match project_fresh(&fx.host, "keys-test").await {
+            Ok(projected) => projected,
+            Err(_) => panic!("'keys-test' must project"),
+        };
+        let grants = view
+            .keyring
+            .get("web@example.com")
+            .expect("founder has grants");
+        assert_eq!(grants.len(), 2, "genesis grant + the explicit device grant");
+        let genesis_key = grants[0].key.clone();
+        let device_grant_id = grants[1].granted_by;
+
+        // Retire the second (explicit device) grant only — one active, one
+        // retired, matching the brief's fixture.
+        park_grant(&fx.host, &fx.founder, device_grant_id).await;
+
+        let response = keys_json(State(fx.host.clone()), Path("keys-test".into())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_text(response).await;
+
+        let genesis_fingerprint = crate::identity::fingerprint(&genesis_key);
+        let device_fingerprint = crate::identity::fingerprint(&fx.device_key);
+        let transport_fingerprint = crate::identity::fingerprint(&fx.device_transport_key);
+        assert!(
+            body.contains(&genesis_fingerprint),
+            "genesis grant's fingerprint present: {body}"
+        );
+        assert!(
+            body.contains(&device_fingerprint),
+            "device grant's fingerprint present: {body}"
+        );
+        assert!(
+            body.contains(&transport_fingerprint),
+            "device transport fingerprint present: {body}"
+        );
+
+        // Never the whole public key — the security property this endpoint
+        // exists to uphold.
+        assert!(
+            !body.contains(genesis_key.as_str()),
+            "the genesis signing key must never appear whole: {body}"
+        );
+        assert!(
+            !body.contains(fx.device_key.as_str()),
+            "the device signing key must never appear whole: {body}"
+        );
+        assert!(
+            !body.contains(fx.device_transport_key.as_str()),
+            "the device transport key must never appear whole: {body}"
+        );
+
+        let json: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(json["viewer_is_founder"], true);
+        assert_eq!(json["viewer_email"], "web@example.com");
+        let founder_dto = json["members"]
+            .as_array()
+            .expect("members array")
+            .iter()
+            .find(|m| m["email"] == "web@example.com")
+            .expect("founder present in members");
+        let devices = founder_dto["devices"].as_array().expect("devices array");
+        assert_eq!(devices.len(), 2);
+        let retired_count = devices
+            .iter()
+            .filter(|d| !d["retired_at"].is_null())
+            .count();
+        assert_eq!(retired_count, 1, "exactly one grant retired: {devices:?}");
+        assert_eq!(
+            founder_dto["revoked"], false,
+            "one grant is still active, so the email is not revoked"
+        );
+    }
+
+    #[tokio::test]
+    async fn keys_json_marks_an_email_revoked_only_when_every_grant_is_retired() {
+        let fx = host_with_two_grants().await;
+        let (_id, view, _substrate) = match project_fresh(&fx.host, "keys-test").await {
+            Ok(projected) => projected,
+            Err(_) => panic!("'keys-test' must project"),
+        };
+        let grants = view
+            .keyring
+            .get("web@example.com")
+            .expect("founder has grants")
+            .clone();
+        assert_eq!(grants.len(), 2, "genesis grant + the explicit device grant");
+
+        // Park both grants — every device retired.
+        for grant in &grants {
+            park_grant(&fx.host, &fx.founder, grant.granted_by).await;
+        }
+
+        let response = keys_json(State(fx.host.clone()), Path("keys-test".into())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_text(response).await;
+        let json: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        let founder_dto = json["members"]
+            .as_array()
+            .expect("members array")
+            .iter()
+            .find(|m| m["email"] == "web@example.com")
+            .expect("a fully revoked member stays in the party (ADR 0035)");
+        assert_eq!(founder_dto["revoked"], true);
+        assert_eq!(
+            founder_dto["devices"]
+                .as_array()
+                .expect("devices array")
+                .len(),
+            2,
+            "both retired grants still list as devices"
+        );
+    }
+
+    #[tokio::test]
+    async fn keys_json_gives_a_keyless_member_empty_devices() {
+        // A member with no grants at all — appended directly on the ledger
+        // so no key is ever minted for them (unlike `Host::add_member`,
+        // which mints one for an agent when none is supplied).
+        let fx = host_with_two_grants().await;
+        let (id, _view, _substrate) = match project_fresh(&fx.host, "keys-test").await {
+            Ok(projected) => projected,
+            Err(_) => panic!("'keys-test' must project"),
+        };
+        let mut add = LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel: id,
+            author: fx.founder.clone(),
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::MemberAdded {
+                member: Member::human("Keyless", "keyless@example.com"),
+            },
+        };
+        fx.host.sign_entry(&mut add);
+        let Resolution::Resolved { ledger, .. } = fx.host.resolve("keys-test").await.unwrap()
+        else {
+            panic!("channel 'keys-test' resolves");
+        };
+        ledger.lock().await.append(add).await.unwrap();
+
+        let response = keys_json(State(fx.host.clone()), Path("keys-test".into())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_text(response).await;
+        let json: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        let keyless_dto = json["members"]
+            .as_array()
+            .expect("members array")
+            .iter()
+            .find(|m| m["email"] == "keyless@example.com")
+            .expect("the keyless member is still in the party");
+        assert_eq!(
+            keyless_dto["devices"]
+                .as_array()
+                .expect("devices array")
+                .len(),
+            0
+        );
+        assert_eq!(keyless_dto["revoked"], false);
+    }
+
+    #[tokio::test]
+    async fn keys_json_404s_for_an_unknown_channel_like_the_other_json_routes() {
+        let fx = host_with_entry(assertion()).await;
+        let keys_response = keys_json(State(fx.host.clone()), Path("no-such-channel".into())).await;
+        let view_response =
+            channel_view_json(State(fx.host.clone()), Path("no-such-channel".into())).await;
+        assert_eq!(keys_response.status(), view_response.status());
+        assert_eq!(keys_response.status(), StatusCode::NOT_FOUND);
     }
 }
