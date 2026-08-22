@@ -14,7 +14,7 @@
 
 - **CI gate (binding):** `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
 - **`crates/junto-iced` is NOT in the root workspace.** `--workspace` never builds or tests it. Its gate is `cargo clippy --manifest-path crates/junto-iced/Cargo.toml --all-targets -- -D warnings` and `cargo test --manifest-path crates/junto-iced/Cargo.toml`. Same for `cargo fmt` (`--manifest-path`).
-- **No kernel change.** `crates/junto-kernel` is not modified by any task in this plan. No new entry kinds; `KeyGrant`/`Keyring`/`Member` are untouched.
+- **Kernel changes are confined to Task 16, and only the two fields it names.** Every other task leaves `crates/junto-kernel` untouched: no new entry kinds, no other shape change. Task 16 adds `Member.transport_public_key` and `KeyGrant.transport_key`, both with `#[serde(skip_serializing_if = "Option::is_none", default)]` so **every existing entry still deserializes and re-canonicalizes byte-identically** — the same additive pattern `Member.public_key`, `LedgerEntry.signature`, `Proposal.kind` and `Assertion.frame` already use. `serial.rs`'s round-trip tests are the gate on that claim.
 - **No new dependencies** in any crate.
 - **Secrets never leave the machine.** No code may write, print, transmit, or accept a private key or seed outside `<junto-home>/keys.toml` on the machine that minted it. Only `POST /devices/enroll` may cause a mint, and only for the email its decoded invite carries.
 - **`--kind` never defaults** (ADR 0035). Neither does `rationale` on any revoke/retire path.
@@ -466,8 +466,11 @@ struct KeyMemberDto {
 
 #[derive(Serialize)]
 struct KeyGrantDto {
-    /// 16 hex chars. Never the whole public key.
+    /// 16 hex chars of the signing key. Never the whole public key.
     fingerprint: String,
+    /// 16 hex chars of the device's transport key (Task 16). `None` for a
+    /// grant made before transport keys existed.
+    transport_fingerprint: Option<String>,
     granted_by: String,
     /// Epoch millis, when retired.
     retired_at: Option<i64>,
@@ -564,12 +567,12 @@ git commit -m "feat(host): mint a multi-channel enrollment invite over HTTP"
 - Consumes: `enroll::{decode_invite, encode_enroll, EnrollPayload}`, `keys::signing_key`, `host::junto_home`, `host::git_user`, `identity::fingerprint`.
 - Produces:
   - `struct EnrollForm { invite: String, name: Option<String> }`
-  - `#[derive(Serialize)] struct EnrolledDto { url: String, email: String, fingerprint: String }`
+  - `#[derive(Serialize)] struct EnrolledDto { url: String, email: String, fingerprint: String, transport_fingerprint: String }`
   - Route: `.route("/devices/enroll", post(enroll_device))`.
 
 Rules — read these twice, this is the one endpoint that creates secret material:
 - The email comes **only** from the decoded invite. The form carries no email field, and adding one is prohibited; `name` supplies the display name only, defaulting to `git_user`'s name and then to the email's local part.
-- `keys::signing_key(&junto_home()?, &invite.member_email)` mints-or-reuses on **this** machine. The response carries the public fingerprint and the `junto://enroll?code=…` URI. No secret, no seed, no full key in the response, the logs, or an error message.
+- `keys::signing_key(&junto_home()?, &invite.member_email)` **and** `keys::transport_key(…)` (Task 16) mint-or-reuse on **this** machine: a device holds two distinct keypairs, and the enroll payload publishes both public halves. The response carries both fingerprints and the `junto://enroll?code=…` URI. No secret, no seed, no full key in the response, the logs, or an error message.
 - No founder check and no member-code check: the invite token is the authorization, and the caller is at this machine's localhost (ADR 0012).
 - A malformed or expired invite is a 400 whose message distinguishes the two.
 
@@ -794,7 +797,7 @@ git commit -m "feat(surface): show unverified entries natively, not just on the 
 - Produces:
   - `App` fields: `join_invite: String`, `join_pending: bool`, `join_error: Option<String>`, `join_result: Option<EnrolledDto>`.
   - `Message` variants: `JoinInviteChanged(String)`, `JoinSubmit`, `JoinDone(Result<EnrolledDto, String>)`, `CopyText(String)`.
-  - `#[derive(Deserialize, Clone, Debug)] struct EnrolledDto { url: String, email: String, fingerprint: String }` — mirrors Task 8's response.
+  - `#[derive(Deserialize, Clone, Debug)] struct EnrolledDto { url: String, email: String, fingerprint: String, transport_fingerprint: String }` — mirrors Task 8's response.
   - `fn post_device_enroll(base: String, invite: String, name: Option<String>) -> Task<Message>` — modelled on `post_save_agent` (3920) and `simple_post_result` (3967), but parsing a JSON body; add `fn post_json_result<T: DeserializeOwned>(url: String, form: Vec<(&'static str, String)>, what: &'static str) -> Result<T, String>` beside `simple_post_result` and reuse it in Tasks 13.
 
 Rules: the section shows the git identity (`SettingsDto.identity`), whether this machine holds a key for it (`load_signing_key(email).is_some()` — never mint from the GUI), and that key's fingerprint (derive the same 16 chars the host does: strip `ed25519:`, take 16). The join box takes a pasted invite, disables its button while `join_pending`, and on success shows the enroll code with a copy button plus the literal line `your secret key never leaves this machine`. Errors render in the panel, never a dialog. Reuse `admin_card`, `chip_style`, and the existing `add_btn`/`remove_btn` visual vocabulary.
@@ -853,8 +856,8 @@ Rules:
 ```rust
 #[test]
 fn device_line_reads_active_and_retired_differently() {
-    let active = KeyGrantDto { fingerprint: "abc".into(), granted_by: "e1".into(), retired_at: None };
-    let retired = KeyGrantDto { fingerprint: "abc".into(), granted_by: "e1".into(), retired_at: Some(1_781_000_000_000) };
+    let active = KeyGrantDto { fingerprint: "abc".into(), transport_fingerprint: Some("def".into()), granted_by: "e1".into(), retired_at: None };
+    let retired = KeyGrantDto { fingerprint: "abc".into(), transport_fingerprint: None, granted_by: "e1".into(), retired_at: Some(1_781_000_000_000) };
     assert!(device_line(&active).contains("active"));
     assert!(device_line(&retired).contains("retired"));
     assert!(device_line(&retired).contains("2026"));
@@ -958,9 +961,143 @@ git commit -m "test: end-to-end device pairing across two homes and both surface
 
 ---
 
+### Task 16: two keys per device — signing and transport
+
+**Files:**
+- Modify: `crates/junto-kernel/src/member.rs` (`Member.transport_public_key`, `with_transport_key`)
+- Modify: `crates/junto-kernel/src/ledger.rs` (`KeyGrant.transport_key`; `project_keyring` fills it)
+- Modify: `crates/junto/src/keys.rs` (`KeyRecord.transport_secret`, `transport_key`, `has_transport_key`)
+- Modify: `crates/junto/src/enroll.rs` (`EnrollPayload.transport_public_key`)
+- Modify: `crates/junto/src/main.rs` (`enroll` mints both; `enroll_payload_from_invite` carries both; `add_member` passes both; `keys_list_lines` prints both fingerprints)
+- Modify: `crates/junto/src/host.rs` (`Host::add_member` takes the pair)
+
+**Why this task exists, and why now:** federation transport is settling on **iroh**, which addresses peers by an Ed25519 public key. A `KeyGrant` already publishes one, so the ledger is nearly the peer address book — but reusing one keypair for both entry signing and the QUIC/TLS handshake violates key separation. So a device mints **two** keypairs and publishes both public halves in the same grant. The ceremony does not change at all: same one paste, same one confirmation, same screens. This lands now because `PAYLOAD_VERSION` is already moving to 2 on this branch and nothing has shipped; doing it later is a second enrollment migration across every device, which the 600-second TTL makes impossible to shim. Requested by the parallel *Multiplayer-first rethink* session (channel `3c38ead9-4907-4646-99b7-23b21933da35`).
+
+**Interfaces:**
+- Consumes: Task 1's v2 envelope (the `EnrollPayload` field lands inside the same version, not a third one).
+- Produces:
+  - `Member.transport_public_key: Option<PublicKey>` — `#[serde(skip_serializing_if = "Option::is_none", default)]`, documented exactly like its `public_key` neighbour, plus `pub fn with_transport_key(self, key: PublicKey) -> Self` beside `with_key`.
+  - `KeyGrant.transport_key: Option<PublicKey>` — the transport half of the device this grant admitted; `None` for a grant made before this field existed, and for a keyless member.
+  - `keys::transport_key(junto_home: &Path, email: &str) -> Result<SigningKey>` and `keys::has_transport_key(junto_home: &Path, email: &str) -> Result<bool>`, mirroring `signing_key`/`has_signing_key`. `KeyRecord` gains `#[serde(default, skip_serializing_if = "Option::is_none")] transport_secret: Option<String>`.
+  - `EnrollPayload.transport_public_key: PublicKey` — required, not optional: a device enrolling under v2 always has both.
+  - `Host::add_member(&self, channel, granted_by, member, key: Option<PublicKey>, transport_key: Option<PublicKey>)`.
+
+Rules, and the traps in them:
+- **Never rotate an existing signing key.** An existing `keys.toml` record has no `transport_secret`; `transport_key` mints one and writes it back **beside** the untouched `secret`. A device that re-enrolls keeps signing with the key its past entries were signed by — rotating it would flip every one of those entries to `unverified`.
+- **The two keys are distinct.** Assert it in a test: `signing_key(home, email).public_key() != transport_key(home, email).public_key()`. That is the entire point of the change; a copy-paste implementation that returns the same secret twice would pass everything else.
+- **`project_keyring` fills `transport_key` from the same `MemberAdded`** it already reads `public_key` from, under the identical founder-only rule. A grant contributes only when `public_key` is present — a member carrying *only* a transport key is not a grant, and never verifies anything.
+- **The transport key is never a verification key.** `project_unverified` keeps checking signatures against `KeyGrant.key` only. Verifying against `transport_key` would defeat the separation this task exists to create.
+- Both are Ed25519, so `PublicKey`/`SigningKey` are reused as-is — **no new dependency**, and iroh is not added here (this task only publishes the key material a later transport slice will consume).
+
+- [ ] **Step 1: Write the failing tests.** In `member.rs`:
+
+```rust
+#[test]
+fn a_member_without_a_transport_key_serializes_exactly_as_before() {
+    // The byte-identity guard for every entry ever written. A Member carrying
+    // only a signing key must produce JSON with NO transport_public_key key at
+    // all — dropping skip_serializing_if would break every existing entry's
+    // canonical bytes and thus every existing signature.
+    let m = Member::human("Dan", "dan@x.com").with_key(sample_public_key());
+    let json = serde_json::to_string(&m).unwrap();
+    assert!(!json.contains("transport"), "{json}");
+}
+
+#[test]
+fn with_transport_key_carries_both_halves() {
+    let signing = sample_public_key();
+    let transport = other_public_key();
+    let m = Member::human("Dan", "dan@x.com").with_key(signing.clone()).with_transport_key(transport.clone());
+    assert_eq!(m.public_key, Some(signing));
+    assert_eq!(m.transport_public_key, Some(transport));
+}
+```
+
+In `ledger.rs`:
+
+```rust
+#[tokio::test]
+async fn a_grant_carries_the_devices_transport_key() {
+    // Founder-authored MemberAdded carrying both halves → one grant holding
+    // both. The transport key rides the grant, so a peer can find it.
+}
+
+#[tokio::test]
+async fn a_grant_from_a_signing_only_member_has_no_transport_key() {
+    // Pre-Task-16 grants (and any keyless enrollment) project transport_key:
+    // None rather than failing — the record is append-only and old grants stay
+    // valid.
+}
+
+#[tokio::test]
+async fn an_entry_never_verifies_against_a_transport_key() {
+    // Sign an entry with the TRANSPORT key of a member whose grant carries
+    // both halves; it must project as unverified. This is the key-separation
+    // guarantee, and the one mistake that would silently undo this task.
+}
+```
+
+In `keys.rs`:
+
+```rust
+#[test]
+fn a_device_holds_two_distinct_keys() {
+    let home = tempfile::tempdir().unwrap();
+    let signing = signing_key(home.path(), "dan@x.com").unwrap();
+    let transport = transport_key(home.path(), "dan@x.com").unwrap();
+    assert_ne!(signing.public_key(), transport.public_key());
+}
+
+#[test]
+fn minting_a_transport_key_leaves_an_existing_signing_key_untouched() {
+    // The rotation trap: a keys.toml written before this change has a secret
+    // and no transport_secret. Minting the transport half must not touch the
+    // signing half, or every entry that device ever signed goes unverified.
+    let home = tempfile::tempdir().unwrap();
+    let before = signing_key(home.path(), "dan@x.com").unwrap().to_secret_hex();
+    let _ = transport_key(home.path(), "dan@x.com").unwrap();
+    assert_eq!(signing_key(home.path(), "dan@x.com").unwrap().to_secret_hex(), before);
+}
+
+#[test]
+fn has_transport_key_is_false_before_minting_and_true_after() {
+    let home = tempfile::tempdir().unwrap();
+    signing_key(home.path(), "dan@x.com").unwrap();
+    assert!(!has_transport_key(home.path(), "dan@x.com").unwrap());
+    transport_key(home.path(), "dan@x.com").unwrap();
+    assert!(has_transport_key(home.path(), "dan@x.com").unwrap());
+}
+```
+
+In `enroll.rs`:
+
+```rust
+#[test]
+fn an_enroll_payload_carries_both_public_halves_and_no_secret() {
+    let url = encode_enroll(&sample_enroll()).unwrap();
+    let decoded = decode_enroll(&url).unwrap();
+    assert_ne!(decoded.public_key, decoded.transport_public_key);
+    // Neither secret may appear anywhere in the code that crosses machines.
+    assert!(!url.contains(&sample_signing_secret_hex()));
+    assert!(!url.contains(&sample_transport_secret_hex()));
+}
+```
+
+- [ ] **Step 2: Run to verify failure** — `cargo test -p junto-kernel transport`, `cargo test -p junto keys::`, `cargo test -p junto enroll::` → FAIL (fields do not exist).
+- [ ] **Step 3: Implement** the two kernel fields, `project_keyring`'s fill, the `keys.rs` pair, the `EnrollPayload` field, and the call-site changes in `main.rs`/`host.rs`. `keys_list_lines` gains the transport fingerprint as a second 16-hex column, labelled, so `junto keys list` shows which device is reachable.
+- [ ] **Step 4: Run the full gate** — `cargo test --workspace` (this changes a kernel type every crate reads: the whole suite is the gate), plus `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`. `serial.rs`'s round-trip tests must pass **unchanged**; if any needs editing, stop and report it as a finding — that would mean the byte-identity claim is false.
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/junto-kernel/src/member.rs crates/junto-kernel/src/ledger.rs crates/junto/src/keys.rs crates/junto/src/enroll.rs crates/junto/src/main.rs crates/junto/src/host.rs
+git commit -m "feat(kernel): a device publishes a transport key beside its signing key"
+```
+
+---
+
 ## Self-Review (performed at write time)
 
 - **Spec coverage:** envelope v2 → T1; `channels_for` + store → T2; CLI invite multi-channel → T3; CLI redeem + per-channel outcomes → T4; shared founder guard (spec's "reuse `require_founder` so CLI and endpoints cannot drift") → T5; `keys.json` → T6; `POST /invites` → T7; `POST /devices/enroll` → T8; `POST /members` → T9; retire/revoke endpoints → T10; `unverified` badges → T11; Settings "this device" → T12; members disclosure + invite + redeem + countdown → T13; ADR + docs → T14; two-home end-to-end + real GUI run → T15. Non-goals respected: no deep links, no QR, no device naming, no cross-channel revocation, no identity writes on the web pages, no automation of the human confirmation.
 - **Type consistency:** `InvitePayload.channels` defined T1, consumed T3/T7/T8; `channels_for` defined T2, consumed T4/T9; `RedeemOutcome`/`redeem_enrollment` defined T4, consumed T9; `identity::{is_founder, fingerprint, grants_to_park}` defined T5, consumed T6/T7/T10; `KeysDto`/`KeyMemberDto`/`KeyGrantDto` defined T6, mirrored T13; `InviteMintedDto` defined T7, mirrored T13; `EnrolledDto` defined T8, mirrored T12; `RedeemedDto`/`RedeemOutcomeDto` defined T9, mirrored T13; `post_json_result` defined T12, reused T13; `EntryDto.unverified` defined T11 on both sides.
-- **Sequencing:** T1→T2 independent of each other but both precede T3/T4. T5 precedes T6-T10 (they call its helpers). T4 precedes T9 (shared engine). T6/T7/T8/T9/T10 are independent of one another and can run in parallel. T11 is independent of all endpoints. T12 precedes T13 (`post_json_result`). T14/T15 last. T1 deliberately leaves `main.rs` failing to compile until T3/T4 — an executor must run T1→T4 as a block before expecting a green `cargo test -p junto`.
+- **Sequencing:** T1→T2 independent of each other but both precede T3/T4. **T16 runs after T2 and before T3** (out of numeric order, deliberately: it changes `EnrollPayload` and `Host::add_member`, so landing it before the CLI cutover avoids writing T3/T4 twice). T5 precedes T6-T10 (they call its helpers). T4 precedes T9 (shared engine). T6/T7/T8/T9/T10 are independent of one another and can run in parallel. T11 is independent of all endpoints. T12 precedes T13 (`post_json_result`). T14/T15 last.
 - **Known risks carried:** T10 appends `Park` entries on the shared write path and T11 changes a DTO every surface reads, so both name the full-workspace suite as their gate. T13 is the largest single task; if it needs splitting during execution, the seam is (a) the read-only disclosure and (b) the four act forms.
