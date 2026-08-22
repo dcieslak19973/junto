@@ -138,18 +138,33 @@ pub(crate) async fn project_fresh(
     Ok((id, view, substrate))
 }
 
+/// The refusal every write-side mount lookup gives when a channel has no
+/// attached, mounted Subject to run in.
+const NO_MOUNTABLE_SUBJECT: &str = "channel has no subject to run in — attach one first";
+
 /// The first path this machine has mounted for any of a channel's projected
-/// Subjects, if any — best-effort, like the workspace prefill it replaces.
-/// `None` covers both "no subject is attached yet" and "a subject is
-/// attached but nothing here is mounted to it"; callers that only prefill a
-/// form don't need to tell those apart.
-fn channel_mount(junto_home: &std::path::Path, view: &ChannelView) -> Option<std::path::PathBuf> {
+/// Subjects — or the error reading the mount store itself, kept distinct
+/// from "nothing is mounted" so a write-side caller can tell an unreadable
+/// `mounts.toml` (a real failure) apart from a channel with no mountable
+/// subject (a refusal, not a failure).
+// Same Response-as-error idiom as `project`/`project_fresh`; see the
+// rationale above `project`.
+#[allow(clippy::result_large_err)]
+fn resolve_channel_mount(
+    junto_home: &std::path::Path,
+    view: &ChannelView,
+) -> Result<Option<std::path::PathBuf>, Response> {
     let subjects: Vec<_> = view.subjects.iter().map(|(_, s)| s.clone()).collect();
     crate::mounts::mounts_for(junto_home, &subjects)
-        .ok()?
-        .into_iter()
-        .next()
-        .map(|mount| mount.path)
+        .map(|mounts| mounts.into_iter().next().map(|mount| mount.path))
+        .map_err(|err| internal(format!("reading mounts: {err}")))
+}
+
+/// [`resolve_channel_mount`], collapsed to `None` on any failure — for
+/// read-only callers that only prefill a form and would rather show it
+/// empty than surface a 500 for an unreadable mount store.
+fn channel_mount(junto_home: &std::path::Path, view: &ChannelView) -> Option<std::path::PathBuf> {
+    resolve_channel_mount(junto_home, view).ok().flatten()
 }
 
 /// The workspace a write action needs, or a clear, loud refusal.
@@ -167,13 +182,8 @@ fn required_mount(
     junto_home: &std::path::Path,
     view: &ChannelView,
 ) -> Result<std::path::PathBuf, Response> {
-    channel_mount(junto_home, view).ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            "channel has no subject to run in — attach one first",
-        )
-            .into_response()
-    })
+    resolve_channel_mount(junto_home, view)?
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, NO_MOUNTABLE_SUBJECT).into_response())
 }
 
 // Same Response-as-error idiom, same cold Err path, and both callers above
@@ -637,7 +647,8 @@ struct LaunchForm {
     /// What the agent should do — becomes the session's intent and the
     /// harness prompt.
     intent: String,
-    /// The workspace repo; empty falls back to the remembered mapping.
+    /// The workspace repo; empty (or unchanged from the prefilled, already
+    /// mounted value) resolves through this machine's Mount store instead.
     #[serde(default)]
     workspace: String,
     /// Which agent runs it (its slug); empty/unknown → the default agent
@@ -651,8 +662,10 @@ struct LaunchForm {
 }
 
 /// Launch an Agent Session from the channel page: resolve the workspace
-/// (remembering a newly typed one), check the agent's member is in the
-/// Party, and spawn the first turn in the background.
+/// through this machine's Mount store (the form may resubmit the prefilled
+/// mount unchanged, but cannot remember a new one — see `required_mount`),
+/// check the agent's member is in the Party, and spawn the first turn in
+/// the background.
 async fn launch_session(
     State(host): State<Arc<Host>>,
     Path(channel): Path<String>,
@@ -715,23 +728,33 @@ async fn launch_session(
             return (StatusCode::FORBIDDEN, format!("{err:#}")).into_response();
         }
     }
-    let workspace = if form.workspace.trim().is_empty() {
-        match required_mount(&junto_home, &view) {
-            Ok(workspace) => workspace,
-            Err(response) => return response,
+    let mounted = match resolve_channel_mount(&junto_home, &view) {
+        Ok(mounted) => mounted,
+        Err(response) => return response,
+    };
+    let typed = form.workspace.trim();
+    let workspace = match (typed.is_empty(), mounted) {
+        (true, Some(path)) => path,
+        (true, None) => return (StatusCode::BAD_REQUEST, NO_MOUNTABLE_SUBJECT).into_response(),
+        // The form prefills the resolved mount (`channel_mount`,
+        // `render::channel_html`'s start-work form); a submission carrying
+        // that value back unchanged is not a new path, so accept it exactly
+        // as the empty-field case above would.
+        (false, Some(path)) if path == std::path::Path::new(typed) => path,
+        (false, _) => {
+            // A genuinely different typed path can't be remembered
+            // directly: doing so would require synthesizing a Subject URI
+            // for a path that has none, which re-creates the channel→path
+            // coupling the Mount store exists to remove, under a new name.
+            // `Host::attach_subject` (a follow-up) is what actually closes
+            // this — attach a Subject, then mount it.
+            return (
+                StatusCode::BAD_REQUEST,
+                "typing a new workspace path is not supported yet — attach a subject to this \
+                 channel first",
+            )
+                .into_response();
         }
-    } else {
-        // A typed path can no longer be remembered directly: doing so would
-        // require synthesizing a Subject URI for a path that has none,
-        // which re-creates the channel→path coupling the Mount store exists
-        // to remove, under a new name. `Host::attach_subject` (a follow-up)
-        // is what actually closes this — attach a Subject, then mount it.
-        return (
-            StatusCode::BAD_REQUEST,
-            "typing a workspace path is not supported yet — attach a subject to this channel \
-             first",
-        )
-            .into_response();
     };
     // "outcome" runs the code-PR push-gate (the verify/Grader loop, docs/adr/0025);
     // otherwise a single turn (docs/adr/0023).
@@ -2832,6 +2855,121 @@ mod tests {
         );
 
         unsafe { std::env::remove_var("JUNTO_HARNESS_CMD") };
+    }
+
+    #[tokio::test]
+    async fn launch_accepts_the_forms_prefilled_value_when_it_matches_the_resolved_mount() {
+        // `render::channel_html` prefills the workspace field with
+        // `channel_mount`'s resolved path; submitting that value back
+        // unchanged must launch, not refuse it as a fresh, unmountable typed
+        // path. This guards the bug where `launch_session` refused every
+        // submission (empty *and* the prefilled round-trip alike) because
+        // any non-empty field was treated as "a new typed path".
+        let home = crate::host::test_home::HomeGuard::new();
+        let stub_dir = tempfile::tempdir().expect("stub dir");
+        let stub = if cfg!(windows) {
+            let path = stub_dir.path().join("stub.cmd");
+            std::fs::write(
+                &path,
+                "@echo {\"type\":\"result\",\"subtype\":\"success\",\"result\":\"ok\",\
+                 \"session_id\":\"h-prefill-1\",\"is_error\":false}\r\n",
+            )
+            .expect("write stub");
+            path
+        } else {
+            let path = stub_dir.path().join("stub.sh");
+            std::fs::write(
+                &path,
+                "#!/bin/sh\necho '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"ok\",\
+                 \"session_id\":\"h-prefill-1\",\"is_error\":false}'\n",
+            )
+            .expect("write stub");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod stub");
+            }
+            path
+        };
+        unsafe { std::env::set_var("JUNTO_HARNESS_CMD", &stub) };
+
+        let fx = host_with_entry(assertion()).await;
+        let founder = Member::human("Web User", "web@example.com");
+        fx.host
+            .add_member("web-test", &founder, crate::launch::harness_member(), None)
+            .await
+            .expect("grant the harness membership");
+        let workspace = tempfile::tempdir().expect("workspace");
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        attach_and_mount_repo(&fx, home.path(), workspace.path()).await;
+
+        // Exactly what the rendered start-work form would have prefilled.
+        let (_, view, _) = project(&fx.host, "web-test").await.expect("project");
+        let mounted = channel_mount(home.path(), &view).expect("mount resolved");
+
+        let response = launch_session(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LaunchForm {
+                intent: "do the stub thing".into(),
+                workspace: mounted.display().to_string(),
+                agent: String::new(),
+                mode: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::SEE_OTHER,
+            "the unchanged prefill must launch, not be refused as a new path"
+        );
+
+        unsafe { std::env::remove_var("JUNTO_HARNESS_CMD") };
+    }
+
+    #[tokio::test]
+    async fn launch_refuses_a_typed_path_that_differs_from_the_resolved_mount() {
+        // The fix for accepting the unchanged prefill above must not widen
+        // into accepting *any* typed path — only the one already mounted.
+        let home = crate::host::test_home::HomeGuard::new();
+        let fx = host_with_entry(assertion()).await;
+        let founder = Member::human("Web User", "web@example.com");
+        fx.host
+            .add_member("web-test", &founder, crate::launch::harness_member(), None)
+            .await
+            .expect("grant the harness membership");
+        let workspace = tempfile::tempdir().expect("workspace");
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        attach_and_mount_repo(&fx, home.path(), workspace.path()).await;
+
+        let other = tempfile::tempdir().expect("a different, unmounted directory");
+        let response = launch_session(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LaunchForm {
+                intent: "do the stub thing".into(),
+                workspace: other.path().display().to_string(),
+                agent: String::new(),
+                mode: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

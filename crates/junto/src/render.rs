@@ -2310,7 +2310,7 @@ pub fn channel_html(
              <input name=\"intent\" placeholder=\"what should the agent do? e.g. fix the flaky \
              sync test\" required>\
              <input name=\"workspace\" value=\"{workspace}\" placeholder=\"workspace repo path \
-             (remembered after first launch)\"{ws_required}>\
+             (mount it on this machine first)\"{ws_required}>\
              {harness_picker}\
              <label class=\"mode\" title=\"verify each change against the rubric and re-run until it passes (docs/adr/0025)\">\
              <input type=\"checkbox\" name=\"mode\" value=\"outcome\"> code-PR push-gate (verify loop)</label>\
