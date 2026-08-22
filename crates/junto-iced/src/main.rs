@@ -254,6 +254,10 @@ struct Pane {
     /// disclosure's data (device-key-enrollment plan, Task 13). `None`
     /// until the first fetch lands.
     keys: Option<KeysDto>,
+    /// The last `keys.json` fetch's error, if it failed — rendered by the
+    /// disclosure instead of silently reading as "no members" (a fetch
+    /// failure and a genuinely empty roster must never look the same).
+    keys_error: Option<String>,
     /// Whether the members disclosure is expanded.
     members_open: bool,
     /// The founder identity act currently open in this pane, if any — the
@@ -1731,10 +1735,14 @@ impl App {
             }
             // --- members & devices disclosure: invite / redeem / retire / revoke ---
             Message::KeysFetched(pane, result) => {
-                if let Some(state) = self.panes.get_mut(pane)
-                    && let Ok(dto) = result
-                {
-                    state.keys = Some(dto);
+                if let Some(state) = self.panes.get_mut(pane) {
+                    match result {
+                        Ok(dto) => {
+                            state.keys = Some(dto);
+                            state.keys_error = None;
+                        }
+                        Err(err) => state.keys_error = Some(err),
+                    }
                 }
                 Task::none()
             }
@@ -1750,9 +1758,18 @@ impl App {
                     return Task::none();
                 };
                 // Toggle off if the same form is already open — same
-                // pattern as `LifecycleSelect`.
+                // pattern as `LifecycleSelect`. Closing runs the same
+                // cleanup as `IdentityCancel`: a minted code must never
+                // outlive the form that shows it, or the countdown-tick
+                // subscription (gated on the form being open) and the
+                // retained code disagree.
                 if state.identity_form.as_ref() == Some(&form) {
                     state.identity_form = None;
+                    state.identity_error = None;
+                    state.invite_minted = None;
+                    state.redeem_preview = None;
+                    state.redeem_outcomes.clear();
+                    state.identity_notice = None;
                 } else {
                     let is_invite = form == IdentityForm::Invite;
                     let current_channel = state.channel.clone();
@@ -1812,6 +1829,12 @@ impl App {
                 let Some(state) = self.panes.get_mut(pane) else {
                     return Task::none();
                 };
+                // A second submit while one is already in flight must never
+                // reach the network — retire/revoke/invite all append to the
+                // ledger, and a double-fire would double-park or double-mint.
+                if state.identity_pending {
+                    return Task::none();
+                }
                 let Some(form) = state.identity_form.clone() else {
                     return Task::none();
                 };
@@ -2301,15 +2324,17 @@ impl App {
         // agents work and sync pulls entries (panes are left alone).
         let tick =
             iced::time::every(std::time::Duration::from_secs(20)).map(|_| Message::AutoRefresh);
-        // The invite countdown's 1-second tick — live ONLY while some pane
-        // has a minted, unexpired invite on screen, so the app never wakes
-        // every second once the code is dismissed or has expired.
+        // The invite countdown's 1-second tick — live ONLY while some
+        // pane has its invite form open AND showing a minted, unexpired
+        // code, so the app never wakes every second once the form is
+        // closed, dismissed, or the code has expired.
         let now = now_millis();
         let counting_down = self.panes.iter().any(|(_, state)| {
-            state
-                .invite_minted
-                .as_ref()
-                .is_some_and(|dto| now < dto.expires_at)
+            invite_countdown_live(
+                state.identity_form.as_ref() == Some(&IdentityForm::Invite),
+                state.invite_minted.as_ref().map(|dto| dto.expires_at),
+                now,
+            )
         });
         let countdown_tick = counting_down
             .then(|| iced::time::every(std::time::Duration::from_secs(1)).map(|_| Message::Tick));
@@ -3077,7 +3102,10 @@ fn lifecycle_form(id: pane_grid::Pane, pane: &Pane, kind: LifecycleKind) -> Elem
 /// loaded.
 fn members_disclosure<'a>(id: pane_grid::Pane, pane: &'a Pane) -> Element<'a, Message> {
     let Some(keys) = &pane.keys else {
-        return text("members · loading…").size(12).color(MUTED).into();
+        return match &pane.keys_error {
+            Some(err) => text(format!("members: {err}")).size(12).color(RED).into(),
+            None => text("members · loading…").size(12).color(MUTED).into(),
+        };
     };
     let device_count: usize = keys.members.iter().map(|m| m.devices.len()).sum();
     let header = button(
@@ -3093,6 +3121,9 @@ fn members_disclosure<'a>(id: pane_grid::Pane, pane: &'a Pane) -> Element<'a, Me
     .style(|_t, _s| chip_style(MUTED, false));
 
     let mut col = column![header].spacing(6);
+    if let Some(err) = &pane.keys_error {
+        col = col.push(text(format!("⚠ {err}")).size(11).color(RED));
+    }
     if pane.members_open {
         for member in &keys.members {
             col = col.push(member_row(id, pane, keys, member));
@@ -3947,6 +3978,16 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
+/// Whether the invite countdown's 1-second tick should be running for one
+/// pane: only while its invite form is open AND a minted, unexpired code
+/// is actually on screen — never merely because a code is retained in
+/// state (`Message::IdentitySelect`'s toggle-off already clears it on
+/// close, but this predicate stays defensive so the subscription and the
+/// visible form can never disagree about whether it should be ticking).
+fn invite_countdown_live(form_open: bool, expires_at: Option<i64>, now: i64) -> bool {
+    form_open && expires_at.is_some_and(|expires_at| now < expires_at)
+}
+
 /// One device row: `fingerprint · granted <entry-id-prefix> · active`, or
 /// `· retired <iso-date>`. Never says anything else — a retired grant is
 /// not the same as a removed member (`docs/adr/0035`).
@@ -4491,6 +4532,7 @@ impl Pane {
             brief_md: None,
             brief_text: None,
             keys: None,
+            keys_error: None,
             members_open: false,
             identity_form: None,
             identity_pending: false,
@@ -6189,5 +6231,25 @@ mod tests {
         assert_eq!(countdown(1_000, 0), "expires in 0:01");
         assert_eq!(countdown(0, 0), "expired");
         assert_eq!(countdown(-5_000, 0), "expired");
+    }
+
+    #[test]
+    fn invite_countdown_live_requires_both_an_open_form_and_an_unexpired_code() {
+        assert!(
+            !invite_countdown_live(false, Some(60_000), 0),
+            "a closed form never ticks, even with an unexpired code retained in state"
+        );
+        assert!(
+            !invite_countdown_live(true, None, 0),
+            "an open form with no minted code never ticks"
+        );
+        assert!(
+            !invite_countdown_live(true, Some(0), 0),
+            "an open form with an expired code never ticks"
+        );
+        assert!(
+            invite_countdown_live(true, Some(60_000), 0),
+            "an open form with an unexpired code ticks"
+        );
     }
 }
