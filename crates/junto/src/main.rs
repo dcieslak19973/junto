@@ -181,19 +181,23 @@ enum Command {
     },
     /// Mint a founder-issued enrollment invite (device-key-enrollment
     /// plan, Task 6): the first leg of the three-step exchange that lets a
-    /// new device join without a private key ever leaving it. Only the
-    /// channel's founding member may issue one — an invite the caller
-    /// cannot themselves complete would send the recipient through the
-    /// whole exchange to fail at `junto add-member`.
+    /// new device join without a private key ever leaving it. One invite
+    /// may cover several channels (Task 3): `--channel` is repeatable, and
+    /// founder authority is required on every one of them before anything
+    /// is minted — an invite the caller cannot themselves complete for
+    /// even one channel would send the recipient through the whole
+    /// exchange to fail at `junto add-member`.
     Invite {
         /// The new member's email — the invite is a grant for exactly this
         /// identity; `junto enroll` reads it back off the invite, never
         /// re-typed by the enrolling device.
         #[arg(long)]
         member: String,
-        /// Channel name or id to invite them into.
-        #[arg(long)]
-        channel: String,
+        /// Channel name or id to invite them into. Repeatable — one
+        /// invite may name several channels, capped at
+        /// `enroll::MAX_INVITE_CHANNELS`.
+        #[arg(long = "channel", required = true, num_args = 1..)]
+        channel: Vec<String>,
     },
     /// Mint this device's own keypair and emit its public half
     /// (device-key-enrollment plan, Task 7): the second leg of the
@@ -595,49 +599,56 @@ fn member_code_for(email: &str) -> Result<Option<String>> {
 }
 
 /// `junto invite` — mint a founder-issued enrollment invite
-/// (device-key-enrollment plan, Task 6). Refuses if the channel does not
-/// exist, or if the caller (this machine's git user) is not the channel's
-/// founding member (`view.party.first()`) — an invite the caller cannot
-/// themselves complete is worse than an error.
+/// (device-key-enrollment plan, Task 6). One invite may cover several
+/// channels (Task 3): every one is resolved to its canonical id and
+/// checked with `require_founder` BEFORE a token is minted or anything is
+/// written — an invite the caller cannot complete for even one channel is
+/// refused whole, nothing issued, nothing printed. Two names (or a name
+/// and its id) that address the same channel collapse to a single record,
+/// in first-seen order, so redemption never reports the same channel
+/// twice. Refuses more than `enroll::MAX_INVITE_CHANNELS` channels here
+/// too, rather than minting a code `decode_invite` would only reject
+/// later.
 ///
 /// Prunes `invites.toml` first (final fix wave, finding 1): every call
-/// appends a new record, so without this the file would grow without
+/// appends new records, so without this the file would grow without
 /// bound (`invites::prune`'s own doc comment) — `invite` is the one
 /// command guaranteed to run whenever a human is actively using this
 /// mechanism, so it is the natural place to reclaim long-expired ones.
-async fn invite(channel: String, member: String) -> Result<()> {
+async fn invite(channels: Vec<String>, member: String) -> Result<()> {
     invites::prune(&host::junto_home()?)?;
-    let host = host::Host::from_registry(host::junto_home()?);
-    let (substrate, ledger, id) = match host.resolve(&channel).await? {
-        host::Resolution::Resolved {
-            substrate,
-            ledger,
-            id,
-        } => (substrate, ledger, id),
-        host::Resolution::NotFound => {
-            bail!("no channel '{channel}' in any registered substrate")
-        }
-        host::Resolution::Ambiguous(substrates) => bail!(
-            "channel name '{channel}' exists in several substrates ({substrates:?}); \
-             address it by id"
-        ),
-    };
-    let view = ledger.lock().await.project(&id).await?;
-    let Some(founder) = view.party.first() else {
+    if channels.len() > enroll::MAX_INVITE_CHANNELS {
         bail!(
-            "channel '{channel}' has no genesis, so it has no founding member to issue \
-             invites (membership is not enforced on pre-genesis channels)"
-        );
-    };
-    let caller = host::git_user(&substrate)?;
-    if founder.email != caller.email {
-        bail!(
-            "only the founding member ({} <{}>) can issue invites for '{channel}' \
-             (docs/adr/0017)",
-            founder.display_name,
-            founder.email
+            "an invite may name at most {} channels",
+            enroll::MAX_INVITE_CHANNELS
         );
     }
+
+    let host = host::Host::from_registry(host::junto_home()?);
+    // Resolve every channel and prove founder authority on every one
+    // BEFORE minting a token or issuing any record (see doc comment
+    // above) — an invite the caller cannot complete for even one channel
+    // must leave nothing behind.
+    let mut canonical_channels: Vec<String> = Vec::new();
+    for channel in &channels {
+        let (substrate, ledger, id) = resolve_channel(&host, channel).await?;
+        let view = ledger.lock().await.project(&id).await?;
+        let caller = host::git_user(&substrate)?;
+        require_founder(&view, &caller, channel)?;
+        // The invite's channel field carries RESOLVED ids, not whatever
+        // the caller typed (a name or an id): `invites::consume` (Task 8)
+        // compares exactly, so an invite minted with `--channel <name>`
+        // must match an enrollment completed against `--channel <id>` for
+        // the same channel — otherwise the two legs of one exchange land
+        // on different strings and redemption fails with a misleading
+        // `WrongChannel`. Dedupe here, on the canonical id, so two
+        // spellings of one channel never produce two records.
+        let canonical = id.to_string();
+        if !canonical_channels.contains(&canonical) {
+            canonical_channels.push(canonical);
+        }
+    }
+
     if member.chars().count() > enroll::MAX_FIELD_CHARS {
         bail!(
             "--member exceeds the {}-char limit",
@@ -647,36 +658,29 @@ async fn invite(channel: String, member: String) -> Result<()> {
 
     let token = enroll::mint_invite_token();
     let expires_at = Timestamp::now().as_millis() + enroll::MAX_INVITE_TTL_MS;
-    // The invite's channel field carries the RESOLVED id, not whatever the
-    // caller typed (a name or an id): `invites::consume` (Task 8) compares
-    // it exactly, so an invite minted with `--channel <name>` must match an
-    // enrollment completed against `--channel <id>` for the same channel —
-    // otherwise the two legs of one exchange land on different strings and
-    // redemption fails with a misleading `WrongChannel`.
-    let canonical_channel = id.to_string();
-    invites::issue(
-        &host::junto_home()?,
-        &token,
-        &member,
-        &canonical_channel,
-        expires_at,
-    )?;
+    for canonical in &canonical_channels {
+        invites::issue(&host::junto_home()?, &token, &member, canonical, expires_at)?;
+    }
     let url = enroll::encode_invite(&enroll::InvitePayload {
         v: enroll::PAYLOAD_VERSION,
         invite_token: token,
         member_email: member,
-        // Task 3/4 replaces this
-        channels: vec![canonical_channel],
+        channels: canonical_channels.clone(),
         expires_at,
     })?;
-    println!("{}", invite_line(&url, expires_at));
+    println!("{}", invite_line(&url, expires_at, &canonical_channels));
     Ok(())
 }
 
-/// Format `junto invite`'s output: the shareable URI plus a human-readable
-/// expiry, pinned so this shape is testable without a CLI harness.
-fn invite_line(url: &str, expires_at: i64) -> String {
-    format!("{url}\n(expires {})", render::iso_utc(expires_at))
+/// Format `junto invite`'s output: the shareable URI, every channel it
+/// covers, and a human-readable expiry, pinned so this shape is testable
+/// without a CLI harness.
+fn invite_line(url: &str, expires_at: i64, channels: &[String]) -> String {
+    format!(
+        "{url}\n(covers {})\n(expires {})",
+        channels.join(", "),
+        render::iso_utc(expires_at)
+    )
 }
 
 /// Build the `junto enroll` response payload from a validated invite. The
@@ -1247,12 +1251,53 @@ mod tests {
         // `iso_utc` to its raw-millis fallback must fail this test too, not
         // just pin "invite_line calls iso_utc".
         let expires_at = 1_700_000_000_000;
-        let line = invite_line(url, expires_at);
+        let line = invite_line(url, expires_at, &["acme".to_string()]);
         assert!(line.contains(url), "line should contain the URI: {line}");
         assert!(
             line.contains("2023-11-14 22:13 UTC"),
             "line should contain a human-readable expiry: {line}"
         );
+    }
+
+    /// The flag is repeatable and the parse keeps order and multiplicity.
+    #[test]
+    fn invite_accepts_repeated_channel_flags() {
+        let cli = Cli::try_parse_from([
+            "junto",
+            "invite",
+            "--member",
+            "dan@x.com",
+            "--channel",
+            "one",
+            "--channel",
+            "two",
+        ])
+        .expect("parses");
+        let Command::Invite { channel, .. } = cli.command else {
+            panic!("expected invite");
+        };
+        assert_eq!(channel, vec!["one".to_string(), "two".to_string()]);
+    }
+
+    /// `--channel` with no value at all is still refused at parse time: an
+    /// invite for zero channels grants nothing.
+    #[test]
+    fn invite_requires_at_least_one_channel() {
+        assert!(Cli::try_parse_from(["junto", "invite", "--member", "dan@x.com"]).is_err());
+    }
+
+    /// The printed line names every channel, so the founder can see what
+    /// they are about to hand over before they paste it.
+    #[test]
+    fn invite_line_names_every_channel_and_the_expiry() {
+        let line = invite_line(
+            "junto://invite?code=abc",
+            1_781_000_000_000,
+            &["alpha".to_string(), "beta".to_string()],
+        );
+        assert!(line.contains("junto://invite?code=abc"), "{line}");
+        assert!(line.contains("alpha") && line.contains("beta"), "{line}");
+        assert!(line.contains("2026"), "{line}");
     }
 
     #[test]
@@ -1318,6 +1363,38 @@ mod tests {
             .await
             .unwrap();
         (repo, opened.id)
+    }
+
+    /// Register a fresh substrate repo and open `name` in it, founded by
+    /// `founder` rather than the repo's own git identity, by appending the
+    /// `ChannelOpened` genesis directly onto a fresh ledger — mirrors
+    /// `grant_key`'s direct-append approach below, since `git_repo()`'s
+    /// identity is fixed for the whole suite and cannot be swapped
+    /// mid-test. Lets a test put a channel's founder at odds with the
+    /// git user `host::git_user` will read back for that repo (device-
+    /// key-enrollment plan, Task 3's all-or-nothing `invite` rule).
+    async fn setup_channel_with_founder(
+        name: &str,
+        founder: Member,
+    ) -> (tempfile::TempDir, ChannelId) {
+        let repo = git_repo();
+        let junto_home = host::junto_home().unwrap();
+        host::register_substrate(&junto_home, repo.path()).unwrap();
+        let fixed = host::Host::fixed(vec![repo.path().to_path_buf()]);
+        let ledger = fixed.ledger_for(repo.path()).await.unwrap();
+        let id = ChannelId::new();
+        let genesis = LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel: id,
+            author: founder,
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::ChannelOpened {
+                name: name.to_string(),
+            },
+        };
+        ledger.lock().await.append(genesis).await.unwrap();
+        (repo, id)
     }
 
     /// `docs/adr/0027`'s hazard, reproduced exactly as `brief` hits it: the
@@ -2310,9 +2387,12 @@ mod tests {
         )
         .unwrap();
 
-        invite(channel_id.to_string(), "someone@example.com".to_string())
-            .await
-            .unwrap();
+        invite(
+            vec![channel_id.to_string()],
+            "someone@example.com".to_string(),
+        )
+        .await
+        .unwrap();
 
         assert!(matches!(
             invites::consume(
@@ -2328,6 +2408,83 @@ mod tests {
             invites::consume(&junto_home, &live, "live@example.com", "some-other-channel").unwrap(),
             invites::Consumed::Ok
         ));
+    }
+
+    /// Founder authority is checked for EVERY channel before a token
+    /// exists: a caller who founds one of two channels gets nothing
+    /// issued at all — `invites.toml` gains no record for either channel.
+    #[tokio::test]
+    async fn invite_issues_nothing_when_the_caller_does_not_found_every_channel() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (_repo_mine, _mine_id) = setup_channel("mine").await;
+        let (_repo_theirs, _theirs_id) =
+            setup_channel_with_founder("theirs", Member::human("Carol", "carol@example.com")).await;
+
+        let err = invite(
+            vec!["mine".to_string(), "theirs".to_string()],
+            "someone@example.com".to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("theirs"),
+            "error should name the channel the caller does not found: {err}"
+        );
+
+        let invites_path = host::junto_home().unwrap().join("invites.toml");
+        assert!(
+            !invites_path.exists(),
+            "a caller who does not found every channel must get nothing issued"
+        );
+    }
+
+    /// One token, one record per channel — the shape `channels_for` reads
+    /// back. `alpha` is named twice (once more than needed) to pin the
+    /// dedupe rule: it must still produce exactly one record.
+    #[tokio::test]
+    async fn invite_issues_one_record_per_channel_for_a_single_token() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (_repo_a, id_a) = setup_channel("alpha").await;
+        let (_repo_b, id_b) = setup_channel("beta").await;
+
+        invite(
+            vec!["alpha".to_string(), "beta".to_string(), "alpha".to_string()],
+            "someone@example.com".to_string(),
+        )
+        .await
+        .unwrap();
+
+        // `invite()` only prints its token (never returns it), so read the
+        // store back directly rather than decoding the printed URL — the
+        // stored `token_sha256` is exactly the fact "one token, N records"
+        // rests on.
+        let junto_home = host::junto_home().unwrap();
+        let raw = std::fs::read_to_string(junto_home.join("invites.toml")).unwrap();
+        let doc: toml::Value = toml::from_str(&raw).unwrap();
+        let records = doc["invites"].as_array().unwrap();
+        assert_eq!(
+            records.len(),
+            2,
+            "dedupe must collapse the repeated 'alpha' flag into one record: {records:?}"
+        );
+        let tokens: std::collections::HashSet<&str> = records
+            .iter()
+            .map(|r| r["token_sha256"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            tokens.len(),
+            1,
+            "one token must cover every channel: {records:?}"
+        );
+        let channels: std::collections::HashSet<String> = records
+            .iter()
+            .map(|r| r["channel"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            channels,
+            [id_a.to_string(), id_b.to_string()].into_iter().collect(),
+            "the store must name exactly the two canonical ids"
+        );
     }
 
     #[test]

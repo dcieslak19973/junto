@@ -1994,7 +1994,7 @@ mod tests {
                 "invite" => {
                     let channel = std::env::var("JUNTO_E2E_CHANNEL").expect("channel env");
                     let member = std::env::var("JUNTO_E2E_MEMBER").expect("member env");
-                    crate::invite(channel, member)
+                    crate::invite(vec![channel], member)
                         .await
                         .expect("worker: invite");
                 }
