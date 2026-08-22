@@ -139,7 +139,6 @@ pub fn all_mounts(junto_home: &Path) -> Result<Vec<Mount>> {
 /// ledger would smuggle machine facts into the record (spec §1). They are
 /// recomputed at use time from the kind and the mount, and resolve against the
 /// **executing host**, not the viewing human (spec §4).
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Capability {
     /// Fetch its current state.
@@ -157,7 +156,6 @@ pub enum Capability {
 }
 
 /// The capability set for a subject on this machine.
-#[allow(dead_code)]
 #[must_use]
 pub fn capabilities(subject: &Subject, mount: Option<&Mount>) -> BTreeSet<Capability> {
     let mut caps = BTreeSet::new();
