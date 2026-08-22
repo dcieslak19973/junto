@@ -973,6 +973,7 @@ mod tests {
             &Member::human("Dan", "dan@x.com"),
             Member::human("Dan", "dan@x.com"),
             Some(key_b.public_key()),
+            None,
         )
         .await
         .expect("enroll dan's second device");
@@ -1034,6 +1035,7 @@ mod tests {
             &Member::human("Dan", "dan@x.com"),
             Member::human("Dan", "dan@x.com"),
             Some(key_b.public_key()),
+            None,
         )
         .await
         .expect("enroll dan's second device");
@@ -1149,6 +1151,7 @@ mod tests {
             &founder,
             Member::human("Alice", "alice@example.com"),
             Some(key_a.public_key()),
+            None,
         )
         .await
         .expect("enroll alice's first device");
@@ -1157,6 +1160,7 @@ mod tests {
             &founder,
             Member::human("Alice", "alice@example.com"),
             Some(key_b.public_key()),
+            None,
         )
         .await
         .expect("enroll alice's second device");
@@ -2121,6 +2125,7 @@ mod tests {
                 &Member::human("Dan", "dan@x.com"),
                 Member::agent("Worker", "worker@agents.junto"),
                 None,
+                None,
             )
             .await
             .expect("keyless control grant");
@@ -2261,6 +2266,7 @@ mod tests {
                 &Member::human("Dan", "dan@x.com"),
                 Member::human("Alice", "alice@example.com"),
                 Some(key_b.public_key()),
+                None,
             )
             .await
             .expect("grant alice's second device");
@@ -2455,6 +2461,7 @@ mod tests {
             &founder,
             Member::human("Alice", "alice@example.com"),
             Some(alice_key.public_key()),
+            None,
         )
         .await
         .expect("grant alice a device");

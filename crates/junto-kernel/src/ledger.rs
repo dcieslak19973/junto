@@ -100,6 +100,13 @@ pub struct LineageEdge {
 pub struct KeyGrant {
     /// The granted public key.
     pub key: crate::PublicKey,
+    /// The transport half of the device this grant admitted
+    /// (`docs/adr/0033` two-key separation) — federation transport (iroh)
+    /// addresses this device with it. `None` for a grant made before this
+    /// field existed, and for a keyless member. Never consulted by
+    /// [`Ledger::project_unverified`]: it verifies signatures against
+    /// [`Self::key`] only.
+    pub transport_key: Option<crate::PublicKey>,
     /// The entry that authorized this key — the `ChannelOpened` genesis for
     /// the founder's own key, or the founder-authored `MemberAdded` that
     /// enrolled it.
@@ -549,6 +556,7 @@ impl<S: SubstrateProvider> Ledger<S> {
                             .or_default()
                             .push(KeyGrant {
                                 key,
+                                transport_key: entry.author.transport_public_key.clone(),
                                 granted_by: entry.id,
                                 retired_at: None,
                             });
@@ -563,6 +571,7 @@ impl<S: SubstrateProvider> Ledger<S> {
                             .or_default()
                             .push(KeyGrant {
                                 key,
+                                transport_key: member.transport_public_key.clone(),
                                 granted_by: entry.id,
                                 retired_at: None,
                             });
@@ -1077,6 +1086,148 @@ mod tests {
         let view = ledger.project(&channel).await.unwrap();
         assert!(!view.unverified.contains(&own_id));
         assert!(view.unverified.contains(&crossed_id));
+    }
+
+    /// A founder-authored `MemberAdded` carrying both halves folds into one
+    /// grant holding both — the transport key rides the grant, so a peer can
+    /// find it.
+    #[tokio::test]
+    async fn a_grant_carries_the_devices_transport_key() {
+        let founder_key = crate::SigningKey::from_secret_bytes([1; 32]);
+        let signing_key = crate::SigningKey::from_secret_bytes([2; 32]);
+        let transport_key = crate::SigningKey::from_secret_bytes([3; 32]);
+        let dan = Member::human("Dan", "dan@example.com").with_key(founder_key.public_key());
+        let agent = Member::agent("Worker", "worker@agents.junto")
+            .with_key(signing_key.public_key())
+            .with_transport_key(transport_key.public_key());
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+
+        let mut genesis = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            1,
+            EntryPayload::ChannelOpened { name: "ch".into() },
+        );
+        genesis.sign(&founder_key).unwrap();
+        let mut grant = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            2,
+            EntryPayload::MemberAdded {
+                member: agent.clone(),
+            },
+        );
+        grant.sign(&founder_key).unwrap();
+
+        for e in [genesis, grant] {
+            ledger.append(e).await.unwrap();
+        }
+        let view = ledger.project(&channel).await.unwrap();
+        let grants = view
+            .keyring
+            .get("worker@agents.junto")
+            .expect("worker has a grant");
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].key, signing_key.public_key());
+        assert_eq!(grants[0].transport_key, Some(transport_key.public_key()));
+    }
+
+    /// Pre-Task-16 grants (and any keyless enrollment) project
+    /// `transport_key: None` rather than failing — the record is
+    /// append-only and old grants stay valid.
+    #[tokio::test]
+    async fn a_grant_from_a_signing_only_member_has_no_transport_key() {
+        let founder_key = crate::SigningKey::from_secret_bytes([1; 32]);
+        let signing_key = crate::SigningKey::from_secret_bytes([2; 32]);
+        let dan = Member::human("Dan", "dan@example.com").with_key(founder_key.public_key());
+        let agent =
+            Member::agent("Worker", "worker@agents.junto").with_key(signing_key.public_key());
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+
+        let mut genesis = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            1,
+            EntryPayload::ChannelOpened { name: "ch".into() },
+        );
+        genesis.sign(&founder_key).unwrap();
+        let mut grant = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            2,
+            EntryPayload::MemberAdded {
+                member: agent.clone(),
+            },
+        );
+        grant.sign(&founder_key).unwrap();
+
+        for e in [genesis, grant] {
+            ledger.append(e).await.unwrap();
+        }
+        let view = ledger.project(&channel).await.unwrap();
+        let grants = view
+            .keyring
+            .get("worker@agents.junto")
+            .expect("worker has a grant");
+        assert_eq!(grants[0].transport_key, None);
+    }
+
+    /// Sign an entry with the TRANSPORT key of a member whose grant carries
+    /// both halves; it must project as unverified. This is the
+    /// key-separation guarantee, and the one mistake that would silently
+    /// undo this task.
+    #[tokio::test]
+    async fn an_entry_never_verifies_against_a_transport_key() {
+        let founder_key = crate::SigningKey::from_secret_bytes([1; 32]);
+        let signing_key = crate::SigningKey::from_secret_bytes([2; 32]);
+        let transport_key = crate::SigningKey::from_secret_bytes([3; 32]);
+        let dan = Member::human("Dan", "dan@example.com").with_key(founder_key.public_key());
+        let agent = Member::agent("Worker", "worker@agents.junto")
+            .with_key(signing_key.public_key())
+            .with_transport_key(transport_key.public_key());
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+
+        let mut genesis = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            1,
+            EntryPayload::ChannelOpened { name: "ch".into() },
+        );
+        genesis.sign(&founder_key).unwrap();
+        let mut grant = entry(
+            EntryId::new(),
+            channel,
+            dan.clone(),
+            2,
+            EntryPayload::MemberAdded {
+                member: agent.clone(),
+            },
+        );
+        grant.sign(&founder_key).unwrap();
+
+        let bad_id = EntryId::new();
+        let mut bad = entry(
+            bad_id,
+            channel,
+            agent.clone(),
+            3,
+            assertion("signed with the transport key"),
+        );
+        bad.sign(&transport_key).unwrap();
+
+        for e in [genesis, grant, bad] {
+            ledger.append(e).await.unwrap();
+        }
+        let view = ledger.project(&channel).await.unwrap();
+        assert!(view.unverified.contains(&bad_id));
     }
 
     /// The keyring accumulates every key ever granted for an email, not just

@@ -413,7 +413,7 @@ async fn add_member(
     // invite token below is already burned, so every failure from here on
     // must say so (see `spent_token_context`).
     let mut enrolled = false;
-    let (member, key) = match enroll_url {
+    let (member, key, transport_key) = match enroll_url {
         Some(url) => {
             let payload = enroll::decode_enroll(&url).map_err(|err| {
                 if err.to_string().contains("expired") {
@@ -454,7 +454,11 @@ async fn add_member(
                 "agent" => Member::agent(&payload.display_name, &payload.email),
                 other => bail!("--kind must be 'human' or 'agent', not '{other}'"),
             };
-            (member, Some(payload.public_key.clone()))
+            (
+                member,
+                Some(payload.public_key.clone()),
+                Some(payload.transport_public_key.clone()),
+            )
         }
         None => {
             let email = email.expect("clap requires email unless --enroll is passed");
@@ -465,7 +469,7 @@ async fn add_member(
                 "agent" => Member::agent(&name, &email),
                 other => bail!("--kind must be 'human' or 'agent', not '{other}'"),
             };
-            (member, None)
+            (member, None, None)
         }
     };
     let email = member.email.clone();
@@ -497,7 +501,8 @@ async fn add_member(
     };
     let granted_by = spent_token_context(granted_by, enrolled)?;
     let minted = spent_token_context(
-        host.add_member(&channel, &granted_by, member, key).await,
+        host.add_member(&channel, &granted_by, member, key, transport_key)
+            .await,
         enrolled,
     )?;
     println!("added {email} to channel '{channel}'");
@@ -678,10 +683,12 @@ fn invite_line(url: &str, expires_at: i64) -> String {
 /// invite token is echoed back verbatim (proves which grant this answers),
 /// the email comes from the invite itself — never re-typed by the device,
 /// which would defeat `invites::consume`'s `WrongMember` check — and
-/// `public_key` is the freshly minted (or reused) key's public half.
+/// `public_key`/`transport_public_key` are the freshly minted (or reused)
+/// keys' public halves (`docs/adr/0033` two-key separation).
 fn enroll_payload_from_invite(
     invite: &enroll::InvitePayload,
     key: &PublicKey,
+    transport_key: &PublicKey,
     name: &str,
 ) -> enroll::EnrollPayload {
     enroll::EnrollPayload {
@@ -690,6 +697,7 @@ fn enroll_payload_from_invite(
         email: invite.member_email.clone(),
         display_name: name.to_string(),
         public_key: key.clone(),
+        transport_public_key: transport_key.clone(),
         expires_at: invite.expires_at,
     }
 }
@@ -720,7 +728,13 @@ async fn enroll(invite_url: String, name: Option<String>) -> Result<()> {
         }
     };
     let key = keys::signing_key(&host::junto_home()?, &invite.member_email)?;
-    let payload = enroll_payload_from_invite(&invite, &key.public_key(), &display_name);
+    let transport_key = keys::transport_key(&host::junto_home()?, &invite.member_email)?;
+    let payload = enroll_payload_from_invite(
+        &invite,
+        &key.public_key(),
+        &transport_key.public_key(),
+        &display_name,
+    );
     let url = enroll::encode_enroll(&payload)?;
     println!("{url}");
     println!("this device's private key never leaves this machine — do not copy or share it");
@@ -889,11 +903,15 @@ fn fingerprint(key: &PublicKey) -> String {
 }
 
 /// The formatted lines `junto keys list` prints, one per grant: member,
-/// fingerprint (never the full public key), the granting entry id
-/// (`retire-device`'s `--grant` handle), and `active` or its retirement
-/// timestamp (device-key-enrollment plan, Task 9). Pure and sorted by
-/// email so it is testable without capturing stdout — `keys_list` prints
-/// exactly what this returns.
+/// signing fingerprint (never the full public key), the transport
+/// fingerprint labelled `transport=` (or `transport=none` for a grant made
+/// before Task 16, or a keyless member) so a reader can tell which device
+/// is reachable over a federation transport (`docs/adr/0033` two-key
+/// separation), the granting entry id (`retire-device`'s `--grant`
+/// handle), and `active` or its retirement timestamp (device-key-
+/// enrollment plan, Task 9). Pure and sorted by email so it is testable
+/// without capturing stdout — `keys_list` prints exactly what this
+/// returns.
 fn keys_list_lines(view: &ChannelView, member: Option<&str>) -> Vec<String> {
     let mut emails: Vec<&String> = match member {
         Some(email) => view
@@ -912,8 +930,12 @@ fn keys_list_lines(view: &ChannelView, member: Option<&str>) -> Vec<String> {
                 Some(ts) => format!("retired {}", render::iso_utc(ts.as_millis())),
                 None => "active".to_string(),
             };
+            let transport = grant
+                .transport_key
+                .as_ref()
+                .map_or_else(|| "none".to_string(), fingerprint);
             lines.push(format!(
-                "{email}  {}  granted_by={}  {status}",
+                "{email}  {}  transport={transport}  granted_by={}  {status}",
                 fingerprint(&grant.key),
                 grant.granted_by
             ));
@@ -1243,13 +1265,14 @@ mod tests {
             expires_at: 1_700_000_000_000,
         };
         let key = PublicKey::new(format!("ed25519:{}", "a".repeat(64))).unwrap();
-        let payload = enroll_payload_from_invite(&invite, &key, "Dan's Laptop");
+        let transport_key = PublicKey::new(format!("ed25519:{}", "b".repeat(64))).unwrap();
+        let payload = enroll_payload_from_invite(&invite, &key, &transport_key, "Dan's Laptop");
         assert_eq!(payload.v, enroll::PAYLOAD_VERSION);
         assert_eq!(payload.invite_token, invite.invite_token);
         assert_eq!(payload.email, invite.member_email);
         assert_eq!(payload.public_key, key);
+        assert_eq!(payload.transport_public_key, transport_key);
         assert_eq!(payload.display_name, "Dan's Laptop");
-        assert_eq!(payload.expires_at, invite.expires_at);
     }
 
     fn git_repo() -> tempfile::TempDir {
@@ -1358,6 +1381,7 @@ mod tests {
             email: email.to_string(),
             display_name: display_name.to_string(),
             public_key: key.clone(),
+            transport_public_key: PublicKey::new(format!("ed25519:{}", "9".repeat(64))).unwrap(),
             expires_at,
         })
         .unwrap()
@@ -1871,16 +1895,19 @@ mod tests {
             vec![
                 KeyGrant {
                     key: key.clone(),
+                    transport_key: None,
                     granted_by: retired_id,
                     retired_at: Some(Timestamp::from_millis(10)),
                 },
                 KeyGrant {
                     key: key.clone(),
+                    transport_key: None,
                     granted_by: active_a,
                     retired_at: None,
                 },
                 KeyGrant {
                     key,
+                    transport_key: None,
                     granted_by: active_b,
                     retired_at: None,
                 },
@@ -2171,6 +2198,7 @@ mod tests {
             "alice@example.com".to_string(),
             vec![junto_kernel::KeyGrant {
                 key,
+                transport_key: None,
                 granted_by: grant_id,
                 retired_at: None,
             }],
@@ -2199,6 +2227,7 @@ mod tests {
             "bob@example.com".to_string(),
             vec![junto_kernel::KeyGrant {
                 key,
+                transport_key: None,
                 granted_by: grant_id,
                 retired_at: Some(Timestamp::from_millis(1_700_000_000_000)),
             }],
@@ -2223,6 +2252,7 @@ mod tests {
             "alice@example.com".to_string(),
             vec![junto_kernel::KeyGrant {
                 key: key_a,
+                transport_key: None,
                 granted_by: EntryId::new(),
                 retired_at: None,
             }],
@@ -2231,6 +2261,7 @@ mod tests {
             "bob@example.com".to_string(),
             vec![junto_kernel::KeyGrant {
                 key: key_b,
+                transport_key: None,
                 granted_by: EntryId::new(),
                 retired_at: None,
             }],
@@ -2319,11 +2350,13 @@ mod tests {
             vec![
                 KeyGrant {
                     key: key.clone(),
+                    transport_key: None,
                     granted_by: EntryId::new(),
                     retired_at: Some(Timestamp::from_millis(10)),
                 },
                 KeyGrant {
                     key,
+                    transport_key: None,
                     granted_by: EntryId::new(),
                     retired_at: None,
                 },
@@ -2344,11 +2377,13 @@ mod tests {
             vec![
                 KeyGrant {
                     key: key.clone(),
+                    transport_key: None,
                     granted_by: EntryId::new(),
                     retired_at: Some(Timestamp::from_millis(10)),
                 },
                 KeyGrant {
                     key,
+                    transport_key: None,
                     granted_by: EntryId::new(),
                     retired_at: Some(Timestamp::from_millis(20)),
                 },

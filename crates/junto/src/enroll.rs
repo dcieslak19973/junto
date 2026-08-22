@@ -99,6 +99,10 @@ pub struct EnrollPayload {
     pub email: String,
     pub display_name: String,
     pub public_key: PublicKey,
+    /// The device's transport public key (`docs/adr/0033` two-key
+    /// separation) — required, not optional: a device enrolling under v2
+    /// always mints both keypairs in the same step.
+    pub transport_public_key: PublicKey,
     pub expires_at: i64,
 }
 
@@ -262,15 +266,40 @@ mod tests {
         }
     }
 
+    fn sample_signing_secret_hex() -> String {
+        "a".repeat(64)
+    }
+
+    fn sample_transport_secret_hex() -> String {
+        "b".repeat(64)
+    }
+
     fn sample_enroll() -> EnrollPayload {
         EnrollPayload {
             v: PAYLOAD_VERSION,
             invite_token: mint_invite_token(),
             email: "dan@example.com".to_string(),
             display_name: "Dan's Laptop".to_string(),
-            public_key: PublicKey::new(format!("ed25519:{}", "a".repeat(64))).unwrap(),
+            public_key: junto_kernel::SigningKey::from_secret_hex(&sample_signing_secret_hex())
+                .unwrap()
+                .public_key(),
+            transport_public_key: junto_kernel::SigningKey::from_secret_hex(
+                &sample_transport_secret_hex(),
+            )
+            .unwrap()
+            .public_key(),
             expires_at: Timestamp::now().as_millis() + 60_000,
         }
+    }
+
+    #[test]
+    fn an_enroll_payload_carries_both_public_halves_and_no_secret() {
+        let url = encode_enroll(&sample_enroll()).unwrap();
+        let decoded = decode_enroll(&url).unwrap();
+        assert_ne!(decoded.public_key, decoded.transport_public_key);
+        // Neither secret may appear anywhere in the code that crosses machines.
+        assert!(!url.contains(&sample_signing_secret_hex()));
+        assert!(!url.contains(&sample_transport_secret_hex()));
     }
 
     #[test]
