@@ -5988,4 +5988,330 @@ mod tests {
             "nothing appended for a refused caller"
         );
     }
+
+    /// Sign `assertion()` as `author` with `key`, stamped `timestamp`, and
+    /// append it directly to `ledger` — the shape a device's own process
+    /// would append with, bypassing [`Host::sign_entry`] entirely (which
+    /// signs with the *caller's* home, never a remote device's).
+    async fn sign_and_append(
+        ledger: &crate::host::SharedLedger,
+        channel: ChannelId,
+        author: &Member,
+        key: &junto_kernel::SigningKey,
+        timestamp: Timestamp,
+    ) -> EntryId {
+        let mut entry = LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel,
+            author: author.clone(),
+            timestamp,
+            payload: assertion(),
+        };
+        entry.sign(key).expect("sign with the device's own key");
+        let id = entry.id;
+        ledger.lock().await.append(entry).await.expect("append");
+        id
+    }
+
+    /// The device-key-enrollment plan's end-to-end proof (Task 15): two
+    /// `junto_home`s on one machine standing in for two machines — the
+    /// founder's own, and the enrolling device's — sharing one substrate
+    /// repo, exactly as they would share a real git remote. Walks the
+    /// whole three-step exchange over HTTP (`POST /invites` → `POST
+    /// /devices/enroll` against the SECOND home → `POST /members`), then
+    /// both post-grant lifecycle acts (`retire-device`, `revoke-member`),
+    /// asserting every consequence the brief names: (a) both invited
+    /// channels' keyrings hold the new grant, (b) an entry signed by the
+    /// device's own key projects verified in both, (c) the founder's
+    /// machine never minted or held a key for the enrolled email, (d)
+    /// `keys.json` shows the enrolled device with the right fingerprints
+    /// on both channels, (e) retiring one channel's grant leaves the
+    /// other channel's grant still verifying entries signed after that
+    /// retirement, and (f) revoking the member on that other channel
+    /// unrecognizes a later entry from the same device while an earlier
+    /// one keeps the standing it already had.
+    ///
+    /// Every entry "signed by the device" here is appended straight to
+    /// the shared ledger with the device's own [`junto_kernel::
+    /// SigningKey`] — never through [`Host::sign_entry`], which would
+    /// sign with the *founder's* home and could never touch the device's
+    /// actual key. Timestamps that must land on a specific side of a
+    /// retirement/revocation cutoff are constructed explicitly
+    /// ([`Timestamp::from_millis`]) rather than left to `Timestamp::now`'s
+    /// wall-clock resolution — real time could tie the cutoff on a fast
+    /// machine, and the fold's `>` comparison is what is under test here,
+    /// not the system clock.
+    #[tokio::test]
+    async fn pairing_end_to_end() {
+        let home = crate::host::test_home::HomeGuard::new();
+        let device_home = tempfile::tempdir().expect("device home");
+
+        let repo = tempfile::tempdir().expect("repo dir");
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(repo.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        for (key, value) in [
+            ("user.name", "Founder"),
+            ("user.email", "founder@example.com"),
+        ] {
+            assert!(
+                StdCommand::new("git")
+                    .args(["config", key, value])
+                    .current_dir(repo.path())
+                    .status()
+                    .expect("git config")
+                    .success()
+            );
+        }
+
+        let host = Host::fixed_with_member_home(
+            vec![repo.path().to_path_buf()],
+            Some(home.path().to_path_buf()),
+        );
+        let founder = Member::human("Founder", "founder@example.com");
+        let chan_a = host
+            .open_channel(None, "chan-a", founder.clone(), None)
+            .await
+            .expect("open chan-a")
+            .id;
+        let chan_b = host
+            .open_channel(None, "chan-b", founder.clone(), None)
+            .await
+            .expect("open chan-b")
+            .id;
+
+        // --- leg 1: `POST /invites`, on the founder's own home, for both
+        // channels at once.
+        let pairs = vec![
+            ("member".to_string(), "eve@example.com".to_string()),
+            ("channel".to_string(), "chan-a".to_string()),
+            ("channel".to_string(), "chan-b".to_string()),
+        ];
+        let invite_response = mint_invite(State(host.clone()), Form(pairs)).await;
+        assert_eq!(invite_response.status(), StatusCode::OK);
+        let invite_json: serde_json::Value =
+            serde_json::from_str(&body_text(invite_response).await).expect("valid json");
+        let invite_url = invite_json["url"].as_str().expect("invite url").to_string();
+
+        // --- leg 2: `POST /devices/enroll`, against the SECOND home — the
+        // device's own machine, standing in for a real second one.
+        unsafe { std::env::set_var("JUNTO_HOME", device_home.path()) };
+        let enroll_response = enroll_device(Form(EnrollForm {
+            invite: invite_url,
+            name: Some("Eve's Laptop".to_string()),
+        }))
+        .await;
+        assert_eq!(enroll_response.status(), StatusCode::OK);
+        let enroll_json: serde_json::Value =
+            serde_json::from_str(&body_text(enroll_response).await).expect("valid json");
+        let enroll_url = enroll_json["url"].as_str().expect("enroll url").to_string();
+        // The device's own keys, minted on ITS home just now — never the
+        // founder's — so the test can sign as the device below, and (c)
+        // below can prove the founder's own store never learned them.
+        let device_signing_key = crate::keys::signing_key(device_home.path(), "eve@example.com")
+            .expect("the device's own signing key");
+        let device_transport_key =
+            crate::keys::transport_key(device_home.path(), "eve@example.com")
+                .expect("the device's own transport key");
+
+        // --- leg 3: `POST /members`, back on the founder's own home — the
+        // founder is the one with authority to grant.
+        unsafe { std::env::set_var("JUNTO_HOME", home.path()) };
+        let redeem_response = redeem_enrollment_endpoint(
+            State(host.clone()),
+            Form(RedeemForm {
+                enroll: enroll_url,
+                kind: "human".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(redeem_response.status(), StatusCode::OK);
+        let redeem_json: serde_json::Value =
+            serde_json::from_str(&body_text(redeem_response).await).expect("valid json");
+        let outcomes = redeem_json["outcomes"].as_array().expect("outcomes array");
+        assert_eq!(outcomes.len(), 2, "{outcomes:?}");
+        for outcome in outcomes {
+            assert_eq!(outcome["result"], "granted", "{outcome:?}");
+        }
+
+        // (a) both channels' keyrings hold the new grant.
+        let (_, view_a, _) = project_fresh(&host, "chan-a")
+            .await
+            .expect("chan-a projects");
+        let (_, view_b, _) = project_fresh(&host, "chan-b")
+            .await
+            .expect("chan-b projects");
+        let active_grant = |view: &ChannelView| {
+            view.keyring
+                .get("eve@example.com")
+                .and_then(|grants| grants.iter().find(|g| g.retired_at.is_none()))
+                .cloned()
+                .expect("an active grant for eve")
+        };
+        let grant_a = active_grant(&view_a);
+        let grant_b = active_grant(&view_b);
+        assert_eq!(grant_a.key, device_signing_key.public_key());
+        assert_eq!(grant_b.key, device_signing_key.public_key());
+        assert_eq!(
+            grant_a.transport_key.as_ref(),
+            Some(&device_transport_key.public_key())
+        );
+        assert_eq!(
+            grant_b.transport_key.as_ref(),
+            Some(&device_transport_key.public_key())
+        );
+
+        // (b) an entry signed by the device's own key projects VERIFIED in
+        // both channels.
+        let eve = Member::human("Eve's Laptop", "eve@example.com");
+        let ledger = host.ledger_for(repo.path()).await.expect("ledger");
+        let verified_a =
+            sign_and_append(&ledger, chan_a, &eve, &device_signing_key, Timestamp::now()).await;
+        let verified_b =
+            sign_and_append(&ledger, chan_b, &eve, &device_signing_key, Timestamp::now()).await;
+        let (_, view_a, _) = project_fresh(&host, "chan-a")
+            .await
+            .expect("chan-a projects");
+        let (_, view_b, _) = project_fresh(&host, "chan-b")
+            .await
+            .expect("chan-b projects");
+        for (view, id) in [(&view_a, verified_a), (&view_b, verified_b)] {
+            assert!(!view.unrecognized.contains(&id), "{id} recognized");
+            assert!(!view.unverified.contains(&id), "{id} verified");
+        }
+
+        // (c) the founder's own keys.toml holds no key for the enrolled
+        // email — it was minted on the device's home, never here.
+        assert!(
+            !crate::keys::has_signing_key(home.path(), "eve@example.com")
+                .expect("read the founder's keys.toml"),
+            "the founder's machine must never have minted or received eve's key"
+        );
+
+        // (d) keys.json shows the enrolled device with the right
+        // fingerprints, on both channels — and its `granted_by` handle is
+        // exactly the grant id the retire step below targets.
+        let signing_fp = crate::identity::fingerprint(&device_signing_key.public_key());
+        let transport_fp = crate::identity::fingerprint(&device_transport_key.public_key());
+        for (channel, grant) in [("chan-a", &grant_a), ("chan-b", &grant_b)] {
+            let keys_response = keys_json(State(host.clone()), Path(channel.into())).await;
+            assert_eq!(keys_response.status(), StatusCode::OK);
+            let json: serde_json::Value =
+                serde_json::from_str(&body_text(keys_response).await).expect("valid json");
+            let eve_member = json["members"]
+                .as_array()
+                .expect("members array")
+                .iter()
+                .find(|m| m["email"] == "eve@example.com")
+                .unwrap_or_else(|| panic!("eve is on {channel}'s roster"));
+            let devices = eve_member["devices"].as_array().expect("devices array");
+            assert_eq!(devices.len(), 1, "{devices:?}");
+            assert_eq!(devices[0]["fingerprint"], signing_fp);
+            assert_eq!(devices[0]["transport_fingerprint"], transport_fp);
+            assert_eq!(devices[0]["granted_by"], grant.granted_by.to_string());
+        }
+
+        // --- `POST /channels/chan-a/keys/{grant}/retire` on ONE grant —
+        // the other channel's grant must be unaffected.
+        let retire_response = retire_device(
+            State(host.clone()),
+            Path(("chan-a".to_string(), grant_a.granted_by.to_string())),
+            Form(RationaleForm {
+                rationale: "eve's laptop was lost".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(retire_response.status(), StatusCode::OK);
+
+        let (_, view_a, _) = project_fresh(&host, "chan-a")
+            .await
+            .expect("chan-a projects");
+        assert!(
+            view_a
+                .keyring
+                .get("eve@example.com")
+                .expect("eve still has a grant on chan-a")
+                .iter()
+                .all(|g| g.retired_at.is_some()),
+            "chan-a's grant is retired"
+        );
+
+        // The other channel's grant still verifies a freshly signed entry.
+        let still_verified_b =
+            sign_and_append(&ledger, chan_b, &eve, &device_signing_key, Timestamp::now()).await;
+        let (_, view_b, _) = project_fresh(&host, "chan-b")
+            .await
+            .expect("chan-b projects");
+        assert!(!view_b.unrecognized.contains(&still_verified_b));
+        assert!(!view_b.unverified.contains(&still_verified_b));
+        assert!(
+            view_b
+                .keyring
+                .get("eve@example.com")
+                .expect("eve still has a grant on chan-b")
+                .iter()
+                .any(|g| g.retired_at.is_none()),
+            "chan-b's grant was never touched by chan-a's retirement"
+        );
+
+        // --- `POST /channels/chan-b/members/eve@example.com/revoke` — a
+        // later entry from the same device unrecognizes; an earlier one
+        // keeps the standing it already had.
+        let earlier =
+            sign_and_append(&ledger, chan_b, &eve, &device_signing_key, Timestamp::now()).await;
+        let revoke_response = revoke_member(
+            State(host.clone()),
+            Path(("chan-b".to_string(), "eve@example.com".to_string())),
+            Form(RationaleForm {
+                rationale: "eve is leaving".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(revoke_response.status(), StatusCode::OK);
+
+        let (_, view_b, _) = project_fresh(&host, "chan-b")
+            .await
+            .expect("chan-b projects");
+        let cutoff = view_b
+            .keyring
+            .get("eve@example.com")
+            .expect("eve's grants")
+            .iter()
+            .filter_map(|g| g.retired_at)
+            .max()
+            .expect("revoke retired eve's chan-b grant");
+        // A full minute past the retirement, so this can never tie the
+        // cutoff regardless of how coarse the system clock is — the
+        // fold's `>` comparison is what is under test, not real time.
+        let later_ts = Timestamp::from_millis(cutoff.as_millis() + 60_000);
+        let later = sign_and_append(&ledger, chan_b, &eve, &device_signing_key, later_ts).await;
+
+        let (_, view_b, _) = project_fresh(&host, "chan-b")
+            .await
+            .expect("chan-b projects");
+        assert!(
+            !view_b.unrecognized.contains(&earlier),
+            "the earlier entry, stamped before the revoke, stays recognized"
+        );
+        assert_eq!(
+            view_b.standings.get(&earlier),
+            Some(&Standing::Provisional),
+            "the earlier entry keeps the standing it already had"
+        );
+        assert!(
+            view_b.unrecognized.contains(&later),
+            "a later entry from the revoked device is unrecognized"
+        );
+        assert_eq!(
+            view_b.standings.get(&later),
+            None,
+            "an unrecognized entry carries no standing at all"
+        );
+    }
 }

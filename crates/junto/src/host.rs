@@ -703,10 +703,11 @@ impl Host {
                     "{} has no signing key on this machine, and none was supplied — a human \
                      member's key must come from their own device, not be minted here. This \
                      requires terminal access: run `junto invite --member {} --channel \
-                     {channel}`, have them run `junto enroll --invite <url>`, then finish with \
-                     `junto add-member --enroll <their-enroll-url> --channel {channel}`. A \
-                     caller without terminal access (e.g. over MCP) cannot complete this \
-                     exchange itself — hand it off to someone who can run those commands",
+                     {channel}`, have them run `junto enroll --invite <url>` on their own \
+                     machine, then finish with `junto add-member --enroll <their-enroll-url> \
+                     --kind human`. A caller without terminal access (e.g. over MCP) cannot \
+                     complete this exchange itself — hand it off to someone who can run those \
+                     commands",
                     member.email,
                     member.email
                 );
