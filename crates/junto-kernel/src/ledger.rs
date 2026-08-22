@@ -921,8 +921,14 @@ impl<S: SubstrateProvider> Ledger<S> {
     }
 
     /// Fold the live Subjects out of an ordered list of *recognized* entries.
-    /// Two passes, mirroring `project_sessions`: collect the attachments in
-    /// canonical order, then drop the ones a later `SubjectDetached` targets.
+    /// Two passes: collect the attachments in canonical order, then drop the
+    /// ones any `SubjectDetached` targets, regardless of the detachment's own
+    /// position relative to its target. This is deliberately
+    /// **order-insensitive** — unlike `project_sessions`, which only applies
+    /// a `SessionUpdated` that comes after its session's start — because a
+    /// detachment withdraws its target outright: replicas must agree on the
+    /// live set even when clocks skew or two entries' timestamps collide,
+    /// and tie-breaking on canonical order would let that agreement drift.
     fn project_subjects(entries: &[&LedgerEntry]) -> Vec<(EntryId, Subject)> {
         let mut attached: Vec<(EntryId, Subject)> = Vec::new();
         let mut detached: HashSet<EntryId> = HashSet::new();
@@ -1076,6 +1082,71 @@ mod tests {
             .expect("append genesis");
         let view = ledger.project(&channel).await.expect("project");
         assert!(view.subjects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn subjects_project_in_canonical_order_paired_with_their_attaching_entry_id() {
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let dan = Member::human("Dan", "dan@example.com");
+
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                dan.clone(),
+                1,
+                EntryPayload::ChannelOpened {
+                    name: "subjects".into(),
+                },
+            ))
+            .await
+            .expect("append genesis");
+
+        let repo = Subject::new(
+            SubjectKind::Repo,
+            Uri::new("git+https://example.com/a.git").expect("valid uri"),
+        );
+        let doc = Subject::new(
+            SubjectKind::Document,
+            Uri::new("file:///notes/spec.md").expect("valid uri"),
+        );
+
+        let repo_attach = EntryId::new();
+        ledger
+            .append(entry(
+                repo_attach,
+                channel,
+                dan.clone(),
+                2,
+                EntryPayload::SubjectAttached {
+                    subject: repo.clone(),
+                },
+            ))
+            .await
+            .expect("attach repo");
+
+        let doc_attach = EntryId::new();
+        ledger
+            .append(entry(
+                doc_attach,
+                channel,
+                dan,
+                3,
+                EntryPayload::SubjectAttached {
+                    subject: doc.clone(),
+                },
+            ))
+            .await
+            .expect("attach doc");
+
+        let view = ledger.project(&channel).await.expect("project");
+        assert_eq!(
+            view.subjects,
+            vec![(repo_attach, repo), (doc_attach, doc)],
+            "each subject must pair with the id of the entry that attached it, \
+             in canonical attachment order"
+        );
     }
 
     /// `docs/adr/0033` — verification is a projection fact. A channel whose
