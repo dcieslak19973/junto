@@ -397,11 +397,12 @@ async fn main() -> Result<()> {
 /// thing the payload cannot supply (the device proves it holds a
 /// keypair, not who holds it), so it is still taken from `--kind`,
 /// exactly as on the keyless path below. `--author-name`/`--author-email`
-/// apply only to the keyless path: `redeem_enrollment` has no per-call
-/// override slot (deliberately — the HTTP redemption endpoint that
-/// reuses it has no CLI flags to thread through), so the granter on
-/// every redeemed channel is always this machine's git identity in that
-/// channel's own home substrate.
+/// apply on BOTH paths (review round 2): built once, up front, and
+/// threaded into `redeem_enrollment` as an explicit override so a
+/// founder whose git config does not name the granting identity can
+/// still complete an enrollment — `None` falls back to this machine's
+/// git identity in each channel's own home substrate, exactly
+/// `Host::add_member`'s own keyless-path default.
 // Every parameter is a distinct clap flag on `Command::AddMember`; a struct
 // would just be `Command::AddMember`'s own fields duplicated one call site
 // away — no clarity gained.
@@ -423,6 +424,11 @@ async fn add_member(
         "agent" => MemberKind::Agent,
         other => bail!("--kind must be 'human' or 'agent', not '{other}'"),
     };
+    let author_override = match (author_name, author_email) {
+        (Some(name), Some(email)) => Some(Member::human(name, email)),
+        (None, None) => None,
+        _ => bail!("pass both --author-name and --author-email, or neither"),
+    };
 
     if let Some(url) = enroll_url {
         let payload = enroll::decode_enroll(&url).map_err(|err| {
@@ -435,7 +441,14 @@ async fn add_member(
                 err
             }
         })?;
-        let outcomes = redeem_enrollment(&host, &payload, member_kind).await?;
+        // Snapshot BEFORE the run: `redeem_enrollment` returns no `Minted`
+        // (its return type is the fixed `(host, payload, kind, granted_by)
+        // -> Vec<(String, RedeemOutcome)>` contract), so whether the code
+        // is newly minted is read back from its own existence now vs.
+        // after — the code itself is a per-identity-per-machine artifact
+        // (`docs/adr/0017`), unaffected by which channel(s) granted.
+        let had_code_before = member_code_for(&payload.email)?.is_some();
+        let outcomes = redeem_enrollment(&host, &payload, member_kind, author_override).await?;
         let mut granted_any = false;
         for (channel, outcome) in &outcomes {
             println!("{}", redeem_line(channel, outcome));
@@ -446,10 +459,6 @@ async fn add_member(
         if !granted_any {
             bail!("no channel was granted membership — see the outcomes above for why");
         }
-        // The member code is the same machine-local artifact regardless of
-        // which channel(s) actually appended — mint is per identity per
-        // machine (`docs/adr/0017`), not per channel — so one lookup after
-        // the loop, rather than per-channel, covers every granted channel.
         if let Some(code) = member_code_for(&payload.email)? {
             if let Some(checkout) = checkout {
                 let checkout = dunce::canonicalize(&checkout)
@@ -462,12 +471,7 @@ async fn add_member(
                     binding::LOCAL_BINDING
                 );
             } else {
-                println!(
-                    "their member code is {code} — hand it to them once (for an agent: pass \
-                     --checkout <dir> to write it into that checkout's {} so the session brief \
-                     carries it)",
-                    binding::LOCAL_BINDING
-                );
+                println!("{}", member_code_line(&code, !had_code_before));
             }
         }
         return Ok(());
@@ -482,10 +486,9 @@ async fn add_member(
         MemberKind::Agent => Member::agent(&name, &email),
     };
 
-    let granted_by = match (author_name, author_email) {
-        (Some(name), Some(email)) => Member::human(name, email),
-        (None, None) => host::git_user(&substrate)?,
-        _ => bail!("pass both --author-name and --author-email, or neither"),
+    let granted_by = match author_override {
+        Some(member) => member,
+        None => host::git_user(&substrate)?,
     };
     let minted = host
         .add_member(&channel, &granted_by, member, None, None)
@@ -500,17 +503,29 @@ async fn add_member(
             checkout.display(),
             binding::LOCAL_BINDING
         );
-    } else if minted.newly_minted {
-        println!(
-            "their member code is {} — hand it to them once (for an agent: pass --checkout \
-             <dir> to write it into that checkout's {} so the session brief carries it)",
-            minted.code,
-            binding::LOCAL_BINDING
-        );
     } else {
-        println!("they already had a member code on this machine; it still applies");
+        println!("{}", member_code_line(&minted.code, minted.newly_minted));
     }
     Ok(())
+}
+
+/// The line `add_member` prints for a member's machine-local code once a
+/// grant lands — `--checkout` bypasses this entirely (it writes the code
+/// into the checkout instead and prints its own line) — split out so the
+/// newly-minted-vs-already-had distinction (review round 2, restored
+/// after the multi-channel `--enroll` path briefly lost it) is testable
+/// without capturing stdout, which this crate carries no dependency for
+/// (see `git_repo`'s own test-module doc).
+fn member_code_line(code: &str, newly_minted: bool) -> String {
+    if newly_minted {
+        format!(
+            "their member code is {code} — hand it to them once (for an agent: pass --checkout \
+             <dir> to write it into that checkout's {} so the session brief carries it)",
+            binding::LOCAL_BINDING
+        )
+    } else {
+        "they already had a member code on this machine; it still applies".to_string()
+    }
 }
 
 /// One channel's result from [`redeem_enrollment`] (device-key-enrollment
@@ -528,8 +543,8 @@ enum RedeemOutcome {
     /// `Granted` that did not actually append anything.
     AlreadyAMember,
     /// `invites::consume` reported `AlreadyUsed` for this channel: a
-    /// second redemption of the same code, or a duplicate covered-channel
-    /// record for the same token.
+    /// duplicate covered-channel record for the same token whose earlier
+    /// twin was already consumed.
     InviteAlreadyUsed,
     /// The caller is not this channel's founding member. Refused WITHOUT
     /// consuming — the invite record stays live for a retry.
@@ -560,11 +575,19 @@ fn redeem_line(channel: &str, outcome: &RedeemOutcome) -> String {
 /// Redeem `payload`'s invite across every channel it still covers
 /// (device-key-enrollment plan, Task 4): the engine `add_member`'s
 /// `--enroll` path calls, and the HTTP redemption endpoint (a later
-/// task) will call verbatim. The channel set comes from
-/// `invites::channels_for` — an empty set is an error naming both
-/// possible causes, since that one read cannot distinguish them: a token
-/// this machine never issued, and a token every one of whose channels
-/// has already been redeemed, both read back as "nothing left to cover".
+/// task) will call too — passing `granted_by: None` there, since that
+/// surface has no CLI flags to build an override from. The channel set
+/// comes from `invites::channels_for` — an empty set is an error naming
+/// both possible causes, since that one read cannot distinguish them: a
+/// token this machine never issued, and a token every one of whose
+/// channels has already been redeemed, both read back as "nothing left
+/// to cover".
+///
+/// `granted_by`: `Some(member)` uses that identity as the granter on
+/// EVERY redeemed channel (review round 2 — `--author-name`/
+/// `--author-email` on the CLI); `None` falls back to
+/// `host::git_user(&substrate)` per channel, exactly `Host::add_member`'s
+/// own keyless-path default.
 ///
 /// Never `bail!`s mid-set: every channel in the covered set gets an
 /// outcome, in `channels_for`'s order — a partial run's caller still
@@ -575,6 +598,7 @@ async fn redeem_enrollment(
     host: &host::Host,
     payload: &enroll::EnrollPayload,
     kind: MemberKind,
+    granted_by: Option<Member>,
 ) -> Result<Vec<(String, RedeemOutcome)>> {
     let junto_home = host::junto_home()?;
     let channels = invites::channels_for(&junto_home, &payload.invite_token)?;
@@ -593,17 +617,29 @@ async fn redeem_enrollment(
 
     let mut outcomes = Vec::with_capacity(channels.len());
     for channel in channels {
-        let outcome = redeem_one_channel(host, &junto_home, payload, &member, &channel).await;
+        let outcome = redeem_one_channel(
+            host,
+            &junto_home,
+            payload,
+            &member,
+            &channel,
+            granted_by.as_ref(),
+        )
+        .await;
         outcomes.push((channel, outcome));
     }
     Ok(outcomes)
 }
 
 /// One channel of [`redeem_enrollment`]'s set, in the required order:
-/// resolve to the canonical id, project, check founder authority,
-/// `consume` for that id, then `Host::add_member`. A non-founder channel
-/// is refused before `consume` runs, so its record is never burned.
-/// Every other outcome consumes: `consume` immediately precedes
+/// resolve to the canonical id, project, check founder authority, decide
+/// `AlreadyAMember`, `consume` for that id, then `Host::add_member`.
+///
+/// `AlreadyAMember` is decided BEFORE `consume` (review round 2, finding
+/// 4: burn only what appends) — like `NotFounder`, it never touches the
+/// invite record, so a channel that needed no append stays retryable
+/// (harmless: re-pasting the same code just reports `AlreadyAMember`
+/// again). Every OTHER outcome consumes: `consume` immediately precedes
 /// `Host::add_member`, so a downstream append failure still burns that
 /// channel's record (fails closed, matching the single-channel path's
 /// original ordering, `spent_token_context`'s doc comment) — only that
@@ -614,6 +650,7 @@ async fn redeem_one_channel(
     payload: &enroll::EnrollPayload,
     member: &Member,
     channel: &str,
+    granted_by_override: Option<&Member>,
 ) -> RedeemOutcome {
     let (substrate, ledger, id) = match resolve_channel(host, channel).await {
         Ok(resolved) => resolved,
@@ -623,9 +660,12 @@ async fn redeem_one_channel(
         Ok(view) => view,
         Err(err) => return RedeemOutcome::Failed(err.to_string()),
     };
-    let granted_by = match host::git_user(&substrate) {
-        Ok(member) => member,
-        Err(err) => return RedeemOutcome::Failed(err.to_string()),
+    let granted_by = match granted_by_override {
+        Some(member) => member.clone(),
+        None => match host::git_user(&substrate) {
+            Ok(member) => member,
+            Err(err) => return RedeemOutcome::Failed(err.to_string()),
+        },
     };
     let Some(founder) = view.party.first() else {
         return RedeemOutcome::Failed(format!(
@@ -649,6 +689,9 @@ async fn redeem_one_channel(
                 .iter()
                 .any(|grant| grant.key == payload.public_key && grant.retired_at.is_none())
         });
+    if already_a_member {
+        return RedeemOutcome::AlreadyAMember;
+    }
 
     // Burn the invite record BEFORE recording the member: this fails
     // closed, exactly as the single-channel path always did.
@@ -667,15 +710,11 @@ async fn redeem_one_channel(
         }
     }
 
-    if already_a_member {
-        return RedeemOutcome::AlreadyAMember;
-    }
-
     // Finding 2, part 3 (final fix wave): re-enrolling a member who
     // currently has a revocation cutoff silently restores it — say so.
     // Printed only right before the append it warns about, never for a
-    // channel that turned out not to need one (`AlreadyAMember` above,
-    // `NotFounder` earlier).
+    // channel that turned out not to need one (`AlreadyAMember`,
+    // `NotFounder` above).
     if let Some(warning) = revocation_cutoff_warning(&view, &member.email, channel) {
         println!("{warning}");
     }
@@ -1869,22 +1908,59 @@ mod tests {
     }
 
     /// The core guarantee: a mixed run grants what it can, reports the
-    /// rest, and burns ONLY the granted channels — so the same enroll
-    /// code retries the remainder. `mine-a`/`mine-b` are founded by Dan
-    /// (the git identity every `setup_channel`/`setup_channel_with_founder`
-    /// repo shares); `theirs` is founded by Carol, so Dan cannot complete
-    /// it — issued directly via `invites::issue`, since `junto invite`
-    /// itself refuses a set the caller does not wholly found (Task 3).
+    /// rest, and burns ONLY the channels that actually appended — so the
+    /// same enroll code retries exactly the remainder. `mine-a`/`mine-b`
+    /// are founded by Dan (the git identity every `setup_channel`/
+    /// `setup_channel_with_founder` repo shares) and grant; `theirs` is
+    /// founded by Carol, so Dan cannot complete it — issued directly via
+    /// `invites::issue`, since `junto invite` itself refuses a set the
+    /// caller does not wholly found (Task 3); `already-mine` is founded
+    /// by Dan too, but alice already holds an ACTIVE grant for the
+    /// payload's own key there BEFORE this run, so it must report
+    /// `AlreadyAMember` and — review round 2, finding 4 — must NOT be
+    /// consumed either: `AlreadyAMember` appends nothing, so it stays
+    /// retryable exactly like `NotFounder`.
     #[tokio::test]
     async fn redeeming_a_mixed_set_burns_only_what_it_granted() {
         let _home = crate::host::test_home::HomeGuard::new();
         let (_repo_a, id_a) = setup_channel("mine-a").await;
         let (_repo_b, id_b) = setup_channel("mine-b").await;
+        let (repo_already, id_already) = setup_channel("already-mine").await;
         let (_repo_c, id_c) =
             setup_channel_with_founder("theirs", Member::human("Carol", "carol@example.com")).await;
 
+        let key = PublicKey::new(format!("ed25519:{}", "1".repeat(64))).unwrap();
+        let transport_key = PublicKey::new(format!("ed25519:{}", "2".repeat(64))).unwrap();
+
+        // Pre-seed "already-mine" with an ACTIVE grant for the payload's
+        // own key, directly (bypassing `Host::add_member`'s no-op guard —
+        // the same technique `grant_key` exists for).
+        let fixed_already = host::Host::fixed(vec![repo_already.path().to_path_buf()]);
+        let host::Resolution::Resolved {
+            ledger: already_ledger,
+            id: already_resolved_id,
+            ..
+        } = fixed_already
+            .resolve(&id_already.to_string())
+            .await
+            .unwrap()
+        else {
+            panic!("channel resolves");
+        };
+        grant_key(
+            &already_ledger,
+            already_resolved_id,
+            "alice@example.com",
+            &key,
+        )
+        .await;
+
         let minted = mint_invite(
-            vec!["mine-a".to_string(), "mine-b".to_string()],
+            vec![
+                "mine-a".to_string(),
+                "mine-b".to_string(),
+                "already-mine".to_string(),
+            ],
             "alice@example.com".to_string(),
         )
         .await
@@ -1899,8 +1975,6 @@ mod tests {
         )
         .unwrap();
 
-        let key = PublicKey::new(format!("ed25519:{}", "1".repeat(64))).unwrap();
-        let transport_key = PublicKey::new(format!("ed25519:{}", "2".repeat(64))).unwrap();
         let payload = enroll::EnrollPayload {
             v: enroll::PAYLOAD_VERSION,
             invite_token: minted.payload.invite_token.clone(),
@@ -1912,7 +1986,7 @@ mod tests {
         };
 
         let host = host::Host::from_registry(junto_home.clone());
-        let outcomes = redeem_enrollment(&host, &payload, MemberKind::Human)
+        let outcomes = redeem_enrollment(&host, &payload, MemberKind::Human, None)
             .await
             .unwrap();
         let outcome_map: std::collections::HashMap<&str, &RedeemOutcome> = outcomes
@@ -1931,31 +2005,38 @@ mod tests {
             outcome_map.get(id_c.to_string().as_str()),
             Some(&&RedeemOutcome::NotFounder)
         );
-
         assert_eq!(
-            invites::channels_for(&junto_home, &payload.invite_token).unwrap(),
-            vec![id_c.to_string()],
-            "only the unburned, non-founder channel should remain retryable"
+            outcome_map.get(id_already.to_string().as_str()),
+            Some(&&RedeemOutcome::AlreadyAMember)
+        );
+
+        let mut remaining = invites::channels_for(&junto_home, &payload.invite_token).unwrap();
+        remaining.sort();
+        let mut expected = vec![id_c.to_string(), id_already.to_string()];
+        expected.sort();
+        assert_eq!(
+            remaining, expected,
+            "only channels that did not append (NotFounder, AlreadyAMember) should remain \
+             retryable — the two that granted must be burned"
         );
     }
 
     /// One channel, redeemed twice within the same covered set — the
-    /// shape a duplicate `invites::issue` for the same (token, channel)
-    /// produces (e.g. a store bug, or a future caller issuing the same
-    /// token/channel pair twice). `channels_for` returns the channel in
-    /// the set twice; the first attempt grants, and the second must never
-    /// silently re-grant — it must report `InviteAlreadyUsed`, and the
-    /// keyring must still hold exactly one active grant.
+    /// shape a duplicate `invites::issue` for the same (token, channel,
+    /// member) triplet produces. The first attempt grants; since
+    /// `AlreadyAMember` is decided BEFORE `consume` (review round 2,
+    /// finding 4), the second attempt sees the just-granted member on
+    /// its own fresh projection and reports `AlreadyAMember` without
+    /// touching its own (still-unconsumed) invite record at all — never
+    /// a silent second grant, and never a burned record for a channel
+    /// that appended nothing.
     #[tokio::test]
-    async fn redeeming_the_same_code_twice_reports_already_used_not_a_silent_success() {
+    async fn redeeming_a_duplicate_covered_channel_reports_already_a_member_not_a_second_grant() {
         let _home = crate::host::test_home::HomeGuard::new();
         let (_repo, id) = setup_channel("acme").await;
         let junto_home = host::junto_home().unwrap();
         let token = enroll::mint_invite_token();
         let expires_at = Timestamp::now().as_millis() + enroll::MAX_INVITE_TTL_MS;
-        // Two records for the identical (token, channel, member) triplet —
-        // `channels_for` reads both back, so `redeem_enrollment` attempts
-        // this one channel twice in a single call.
         invites::issue(
             &junto_home,
             &token,
@@ -1977,7 +2058,7 @@ mod tests {
         let transport_key = PublicKey::new(format!("ed25519:{}", "8".repeat(64))).unwrap();
         let payload = enroll::EnrollPayload {
             v: enroll::PAYLOAD_VERSION,
-            invite_token: token,
+            invite_token: token.clone(),
             email: "alice@example.com".to_string(),
             display_name: "Alice".to_string(),
             public_key: key,
@@ -1986,14 +2067,14 @@ mod tests {
         };
         let host = host::Host::from_registry(junto_home.clone());
 
-        let outcomes = redeem_enrollment(&host, &payload, MemberKind::Human)
+        let outcomes = redeem_enrollment(&host, &payload, MemberKind::Human, None)
             .await
             .unwrap();
         assert_eq!(
             outcomes,
             vec![
                 (id.to_string(), RedeemOutcome::Granted),
-                (id.to_string(), RedeemOutcome::InviteAlreadyUsed),
+                (id.to_string(), RedeemOutcome::AlreadyAMember),
             ]
         );
 
@@ -2011,6 +2092,82 @@ mod tests {
             grants.iter().filter(|g| g.retired_at.is_none()).count(),
             1,
             "exactly one active grant, not two: {grants:?}"
+        );
+
+        // The second, un-attempted record was never consumed — a
+        // duplicate that resolves to `AlreadyAMember` burns nothing.
+        assert_eq!(
+            invites::channels_for(&junto_home, &token).unwrap(),
+            vec![id.to_string()],
+            "the un-consumed duplicate record stays retryable"
+        );
+    }
+
+    /// `consume`'s record lookup finds the FIRST matching (channel,
+    /// member) record regardless of its consumed state (invites.rs's
+    /// `.find()`), while `channels_for` filters consumed records out
+    /// before ever returning a channel string. A stale, already-consumed
+    /// record sharing a (channel, member) pair with a fresh, still-
+    /// covered one is exactly where those two reads can disagree:
+    /// `channels_for` still names the channel once (because of the fresh
+    /// record), but `consume` still lands on the stale one first — this
+    /// pins that `redeem_enrollment` surfaces that as `InviteAlreadyUsed`,
+    /// not a silent success, and is the one remaining way that outcome is
+    /// reachable now that `AlreadyAMember` is decided before `consume`.
+    #[tokio::test]
+    async fn a_stale_consumed_duplicate_record_reports_invite_already_used() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (_repo, id) = setup_channel("acme").await;
+        let junto_home = host::junto_home().unwrap();
+        let token = enroll::mint_invite_token();
+        let expires_at = Timestamp::now().as_millis() + enroll::MAX_INVITE_TTL_MS;
+        invites::issue(
+            &junto_home,
+            &token,
+            "alice@example.com",
+            &id.to_string(),
+            expires_at,
+        )
+        .unwrap();
+        invites::issue(
+            &junto_home,
+            &token,
+            "alice@example.com",
+            &id.to_string(),
+            expires_at,
+        )
+        .unwrap();
+        // The FIRST of the two records is consumed directly — as if an
+        // earlier redemption this run's own `channels_for` read never
+        // sees, because the SECOND record is still live.
+        assert!(matches!(
+            invites::consume(&junto_home, &token, "alice@example.com", &id.to_string()).unwrap(),
+            invites::Consumed::Ok
+        ));
+        assert_eq!(
+            invites::channels_for(&junto_home, &token).unwrap(),
+            vec![id.to_string()],
+            "the second record keeps the channel covered"
+        );
+
+        let key = PublicKey::new(format!("ed25519:{}", "3".repeat(64))).unwrap();
+        let transport_key = PublicKey::new(format!("ed25519:{}", "4".repeat(64))).unwrap();
+        let payload = enroll::EnrollPayload {
+            v: enroll::PAYLOAD_VERSION,
+            invite_token: token,
+            email: "alice@example.com".to_string(),
+            display_name: "Alice".to_string(),
+            public_key: key,
+            transport_public_key: transport_key,
+            expires_at,
+        };
+        let host = host::Host::from_registry(junto_home);
+        let outcomes = redeem_enrollment(&host, &payload, MemberKind::Human, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcomes,
+            vec![(id.to_string(), RedeemOutcome::InviteAlreadyUsed)]
         );
     }
 
@@ -2034,12 +2191,94 @@ mod tests {
             transport_public_key: transport_key,
             expires_at: Timestamp::now().as_millis() + enroll::MAX_INVITE_TTL_MS,
         };
-        let err = redeem_enrollment(&host, &payload, MemberKind::Human)
+        let err = redeem_enrollment(&host, &payload, MemberKind::Human, None)
             .await
             .unwrap_err();
         let text = err.to_string();
         assert!(text.contains("never issued"), "{text}");
         assert!(text.contains("already redeemed"), "{text}");
+    }
+
+    /// Review round 2, concern 1: `--author-name`/`--author-email` must
+    /// still work on `--enroll` — without an override, `redeem_enrollment`
+    /// falls back to this machine's git identity per channel, which is
+    /// Dan (`git_repo`'s fixed config) here, not this channel's real
+    /// founder Carol, so the first attempt must fail outright (no channel
+    /// granted). The SAME token still covers the channel afterward
+    /// (`NotFounder` never consumes), so the second attempt, now WITH
+    /// `--author-email carol@example.com`, redeems it.
+    #[tokio::test]
+    async fn add_member_enroll_honors_an_author_override_when_git_config_names_someone_else() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (repo, id) =
+            setup_channel_with_founder("acme", Member::human("Carol", "carol@example.com")).await;
+        let junto_home = host::junto_home().unwrap();
+        let token = enroll::mint_invite_token();
+        let expires_at = Timestamp::now().as_millis() + enroll::MAX_INVITE_TTL_MS;
+        invites::issue(
+            &junto_home,
+            &token,
+            "alice@example.com",
+            &id.to_string(),
+            expires_at,
+        )
+        .unwrap();
+        let key = PublicKey::new(format!("ed25519:{}", "c".repeat(64))).unwrap();
+        let url = build_enroll_url(&token, "alice@example.com", "Alice", &key, expires_at);
+
+        let without_override = add_member(
+            None,
+            None,
+            None,
+            Some("human".to_string()),
+            None,
+            None,
+            None,
+            Some(url.clone()),
+        )
+        .await;
+        assert!(
+            without_override.is_err(),
+            "Dan (this machine's git identity) is not this channel's founder"
+        );
+
+        add_member(
+            None,
+            None,
+            None,
+            Some("human".to_string()),
+            Some("Carol".to_string()),
+            Some("carol@example.com".to_string()),
+            None,
+            Some(url),
+        )
+        .await
+        .unwrap();
+
+        let fixed = host::Host::fixed(vec![repo.path().to_path_buf()]);
+        let host::Resolution::Resolved { ledger, id, .. } =
+            fixed.resolve(&id.to_string()).await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+        let view = ledger.lock().await.project(&id).await.unwrap();
+        assert!(
+            view.party.iter().any(|m| m.email == "alice@example.com"),
+            "the override let Carol grant alice's enrollment"
+        );
+    }
+
+    /// Review round 2, concern 5: `--enroll` briefly lost the newly-
+    /// minted-vs-already-had distinction when the multi-channel engine's
+    /// return type stopped carrying `members::Minted`. Pins that
+    /// `member_code_line` (which both paths now share) still reads
+    /// differently for the two cases.
+    #[test]
+    fn member_code_line_reads_differently_for_newly_minted_vs_already_had() {
+        let newly = member_code_line("ABC123", true);
+        let already = member_code_line("ABC123", false);
+        assert_ne!(newly, already);
+        assert!(newly.contains("ABC123"), "{newly}");
     }
 
     /// `--channel` no longer exists on the `--enroll` path (Task 4): the
