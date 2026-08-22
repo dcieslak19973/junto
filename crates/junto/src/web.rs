@@ -173,11 +173,14 @@ fn channel_mount(junto_home: &std::path::Path, view: &ChannelView) -> Option<std
 /// The workspace a write action needs, or a clear, loud refusal.
 ///
 /// A channel with no attached, mounted Subject has nothing to run a session
-/// in. Synthesizing a URI here to paper over that (e.g. keying `mounts.toml`
-/// on the channel id) would just re-create the channel→path coupling this
-/// store exists to remove, under a new name — so this refuses instead of
-/// guessing. `Host::attach_subject` (a follow-up) is what actually closes
-/// the gap: attach a Subject, then mount it.
+/// in. The one caller left, `steer_session`, cannot repair that itself: by
+/// the time a session exists to steer, it was already launched through a
+/// mount that resolved, so an unresolved mount here means something else
+/// changed (a revoked mount, a different machine) — not a fresh channel
+/// this call could bootstrap. `launch_session` is the write surface that
+/// attaches a Subject and remembers a mount when a channel starts with
+/// neither (`repo_subject_uri`, `Host::attach_subject`); this helper stays
+/// a pure refusal.
 // Same Response-as-error idiom as `project`/`project_fresh`; see the
 // rationale above `project`.
 #[allow(clippy::result_large_err)]
@@ -670,10 +673,19 @@ struct LaunchForm {
 /// portable identity to offer.
 ///
 /// # Errors
-/// Errors if `path` cannot be canonicalized (only reached by the fallback,
-/// when `origin` is absent) or if the resulting string is not a valid
-/// [`Uri`].
+/// Errors if `path` is not a git repository (`git -C <path> rev-parse
+/// --git-dir` fails) — a typo'd or non-repo directory refuses rather than
+/// silently recording a `file://` Subject the session runner cannot diff —
+/// or if the fallback path cannot be canonicalized, or if the resulting
+/// string is not a valid [`Uri`].
 fn repo_subject_uri(path: &std::path::Path) -> anyhow::Result<Uri> {
+    let mut probe = std::process::Command::new("git");
+    probe.arg("-C").arg(path).args(["rev-parse", "--git-dir"]);
+    crate::launch::no_console_window(&mut probe);
+    let is_repo = probe.output().is_ok_and(|out| out.status.success());
+    if !is_repo {
+        anyhow::bail!("'{}' is not a git repository", path.display());
+    }
     let mut command = std::process::Command::new("git");
     command
         .arg("-C")
@@ -691,9 +703,17 @@ fn repo_subject_uri(path: &std::path::Path) -> anyhow::Result<Uri> {
     let raw = match origin {
         Some(url) => url,
         None => {
+            // The same `file:///` spelling `store_artifact` (`launch.rs`)
+            // writes and `file_uri_to_path` decodes: forward slashes
+            // throughout, one more `/` than `file://` alone so a POSIX
+            // absolute path's own leading `/` lands where that decoder
+            // expects it.
             let canonical = dunce::canonicalize(path)
                 .map_err(|err| anyhow::anyhow!("canonicalizing {}: {err}", path.display()))?;
-            format!("file://{}", canonical.display())
+            format!(
+                "file:///{}",
+                canonical.display().to_string().replace('\\', "/")
+            )
         }
     };
     Ok(Uri::new(raw)?)
@@ -780,10 +800,14 @@ async fn launch_session(
         // that value back unchanged is not a new path, so accept it exactly
         // as the empty-field case above would.
         (false, Some(path)) if path == std::path::Path::new(typed) => path,
-        // Nothing is mountable yet: a typed path is this channel's first
-        // Subject. Derive its portable identity, attach it (the write path
-        // `Host::attach_subject` closes), and remember where this machine
-        // keeps it.
+        // `mounted` being `None` doesn't mean the channel has no Subject:
+        // `mounts_for` skips subjects this machine hasn't mounted (a
+        // teammate's checkout, `mounts.rs`'s "a teammate may hold a
+        // checkout you do not"), so a fresh clone of an already-attached
+        // repo lands here too — as does a retry after `remember_mount`
+        // below failed on a prior attempt that did attach. Attach only when
+        // the derived uri isn't already carried by the channel; either way,
+        // remember this machine's mount for it.
         (false, None) => {
             let repo_path = std::path::Path::new(typed);
             let uri = match repo_subject_uri(repo_path) {
@@ -796,20 +820,22 @@ async fn launch_session(
                         .into_response();
                 }
             };
-            let subject = Subject::new(SubjectKind::Repo, uri.clone());
-            let author = match crate::host::git_user(&substrate) {
-                Ok(author) => author,
-                Err(err) => {
-                    return internal(format!(
-                        "no author identity: {err} (set git config user.name / user.email)"
-                    ));
+            if !view.subjects.iter().any(|(_, subject)| subject.uri == uri) {
+                let subject = Subject::new(SubjectKind::Repo, uri.clone());
+                let author = match crate::host::git_user(&substrate) {
+                    Ok(author) => author,
+                    Err(err) => {
+                        return internal(format!(
+                            "no author identity: {err} (set git config user.name / user.email)"
+                        ));
+                    }
+                };
+                if let Err(err) = host
+                    .attach_subject(&channel, subject, author, WriteAuth::Human)
+                    .await
+                {
+                    return lineage_error(err);
                 }
-            };
-            if let Err(err) = host
-                .attach_subject(&channel, subject, author, WriteAuth::Human)
-                .await
-            {
-                return lineage_error(err);
             }
             if let Err(err) = crate::mounts::remember_mount(&junto_home, &uri, repo_path) {
                 return internal(format!("remembering mount: {err}"));
@@ -3248,6 +3274,168 @@ mod tests {
         assert!(done, "the launched session reached done");
 
         unsafe { std::env::remove_var("JUNTO_HARNESS_CMD") };
+    }
+
+    #[tokio::test]
+    async fn launching_with_a_typed_path_that_is_not_a_git_repo_is_refused() {
+        // A typo'd or non-repo directory must refuse, not silently attach a
+        // `file://` Subject the session runner can never diff or execute in.
+        let home = crate::host::test_home::HomeGuard::new();
+        let fx = host_with_entry(assertion()).await;
+        let not_a_repo = tempfile::tempdir().expect("a plain, non-repo directory");
+
+        let response = launch_session(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LaunchForm {
+                intent: "do the stub thing".into(),
+                workspace: not_a_repo.path().display().to_string(),
+                agent: String::new(),
+                mode: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let (_, view, _) = project(&fx.host, "web-test").await.expect("project");
+        assert!(
+            view.subjects.is_empty(),
+            "no subject was attached for a non-repo path"
+        );
+        let _ = home;
+    }
+
+    #[tokio::test]
+    async fn launching_with_a_typed_path_when_the_subject_is_already_attached_elsewhere_does_not_duplicate_it()
+     {
+        // The teammate's-machine case: the channel already carries the
+        // Subject (attached by whoever synced first), but this machine has
+        // never mounted it — `mounts_for` skips subjects it has no mount
+        // for, so `resolve_channel_mount` reports `None` exactly as it
+        // would for a channel with no Subject at all. Typing the local
+        // clone's path must mount the existing Subject, not attach a
+        // second, duplicate one.
+        let home = crate::host::test_home::HomeGuard::new();
+        let fx = host_with_entry(assertion()).await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        let origin = "https://example.com/acme/widgets.git";
+        assert!(
+            StdCommand::new("git")
+                .args(["remote", "add", "origin", origin])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git remote add")
+                .success()
+        );
+
+        // The far side: the Subject is already attached (as if this entry
+        // arrived by sync from a teammate), never mounted on this machine.
+        let founder = Member::human("Web User", "web@example.com");
+        let uri = junto_kernel::Uri::new(origin).expect("valid uri");
+        let subject = junto_kernel::Subject::new(junto_kernel::SubjectKind::Repo, uri.clone());
+        fx.host
+            .attach_subject("web-test", subject, founder, crate::host::WriteAuth::Human)
+            .await
+            .expect("attach subject");
+
+        let (_, before, _) = project(&fx.host, "web-test").await.expect("project");
+        assert_eq!(before.subjects.len(), 1, "the subject is already attached");
+        assert!(
+            crate::mounts::mount_path(home.path(), &uri)
+                .unwrap()
+                .is_none(),
+            "this machine has not mounted it yet"
+        );
+
+        let response = launch_session(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LaunchForm {
+                intent: "do the stub thing".into(),
+                workspace: workspace.path().display().to_string(),
+                agent: String::new(),
+                mode: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::SEE_OTHER,
+            "the already-attached subject's local clone launches"
+        );
+
+        let (_, after, _) = project(&fx.host, "web-test").await.expect("project");
+        assert_eq!(
+            after.subjects.len(),
+            1,
+            "the already-attached subject must not be duplicated"
+        );
+        let mounted = crate::mounts::mount_path(home.path(), &uri)
+            .expect("reading mounts")
+            .expect("the mount was remembered on this machine");
+        assert_eq!(mounted, dunce::canonicalize(workspace.path()).unwrap());
+    }
+
+    #[tokio::test]
+    async fn launching_with_a_typed_path_and_no_origin_remote_falls_back_to_the_crates_file_uri_convention()
+     {
+        // A repo with no `origin` has no portable identity to offer, so the
+        // fallback records a `file://` uri — but it must spell it the one
+        // way the crate already does (`store_artifact` in `launch.rs`,
+        // decoded by `file_uri_to_path`), not a second, divergent spelling.
+        let home = crate::host::test_home::HomeGuard::new();
+        let fx = host_with_entry(assertion()).await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        // Deliberately no `git remote add origin`.
+
+        let response = launch_session(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LaunchForm {
+                intent: "do the stub thing".into(),
+                workspace: workspace.path().display().to_string(),
+                agent: String::new(),
+                mode: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let (_, view, _) = project(&fx.host, "web-test").await.expect("project");
+        assert_eq!(view.subjects.len(), 1);
+        let (_, subject) = &view.subjects[0];
+        let canonical = dunce::canonicalize(workspace.path()).unwrap();
+        let expected = format!(
+            "file:///{}",
+            canonical.display().to_string().replace('\\', "/")
+        );
+        assert_eq!(
+            subject.uri.as_str(),
+            expected,
+            "must spell the fallback exactly like `store_artifact`'s `file:///` convention, \
+             not a second, divergent spelling"
+        );
+        let decoded =
+            file_uri_to_path(subject.uri.as_str()).expect("the crate's own decoder reads it back");
+        assert_eq!(decoded, canonical);
+
+        let _ = home;
     }
 
     #[tokio::test]
