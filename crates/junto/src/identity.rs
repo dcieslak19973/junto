@@ -19,13 +19,13 @@ pub(crate) fn is_founder(view: &ChannelView, email: &str) -> bool {
 }
 
 /// Refuse unless `caller` is `view`'s founding member (device-key-
-/// enrollment plan, Task 9) — revocation, like granting membership
-/// (`invite`, `add-member`), is a founder-only act.
+/// enrollment plan, Task 9) — granting membership, revoking keys, and
+/// every other founder-only act share this one guard.
 pub(crate) fn require_founder(view: &ChannelView, caller: &Member, channel: &str) -> Result<()> {
     let Some(founder) = view.party.first() else {
         bail!(
             "channel '{channel}' has no genesis, so it has no founding member to authorize \
-             revocation (membership is not enforced on pre-genesis channels)"
+             founder-only acts (membership is not enforced on pre-genesis channels)"
         );
     };
     if !is_founder(view, &caller.email) {
