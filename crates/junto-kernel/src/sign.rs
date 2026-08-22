@@ -26,8 +26,9 @@ const PREFIX: &str = "ed25519:";
 /// A member's public verifying key — `ed25519:<64 hex chars>`.
 ///
 /// Published **in the record** (on the genesis author and on `MemberAdded`
-/// members) so the party projection doubles as the keyring; validated on
-/// deserialize like the other record newtypes (`docs/adr/0008`).
+/// members) so the ledger's `Keyring` projection can fold every granted key
+/// per email; validated on deserialize like the other record newtypes
+/// (`docs/adr/0008`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct PublicKey(String);

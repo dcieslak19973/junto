@@ -106,34 +106,7 @@ pub(crate) async fn project(
     host: &Host,
     channel: &str,
 ) -> Result<(ChannelId, ChannelView, std::path::PathBuf), Response> {
-    let resolution = host
-        .resolve(channel)
-        .await
-        .map_err(|err| internal(format!("resolving '{channel}': {err}")))?;
-    let (ledger, id, substrate) = match resolution {
-        Resolution::Resolved {
-            ledger,
-            id,
-            substrate,
-        } => (ledger, id, substrate),
-        Resolution::NotFound => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                format!("no channel '{channel}' in any registered substrate"),
-            )
-                .into_response());
-        }
-        Resolution::Ambiguous(substrates) => {
-            return Err((
-                StatusCode::CONFLICT,
-                format!(
-                    "channel name '{channel}' exists in several substrates ({substrates:?}); \
-                     address it by id"
-                ),
-            )
-                .into_response());
-        }
-    };
+    let (ledger, id, substrate) = resolve_for_projection(host, channel).await?;
     let view = ledger
         .lock()
         .await
@@ -141,6 +114,62 @@ pub(crate) async fn project(
         .await
         .map_err(|err| internal(format!("projection failed: {err}")))?;
     Ok((id, view, substrate))
+}
+
+/// [`project`], but always re-folds from the substrate
+/// (`junto_kernel::Ledger::project_fresh`) instead of `project`'s cached
+/// read. The one caller: `crate::live_ws::live_session`'s handshake — see
+/// `Ledger::project_fresh`'s doc comment for why a long-running `junto
+/// serve` needs this specifically (a `revoke-member`/`retire-device` run
+/// in a separate process never invalidates this process's cache) and why
+/// every other reader here keeps using the cached [`project`].
+#[allow(clippy::result_large_err)]
+pub(crate) async fn project_fresh(
+    host: &Host,
+    channel: &str,
+) -> Result<(ChannelId, ChannelView, std::path::PathBuf), Response> {
+    let (ledger, id, substrate) = resolve_for_projection(host, channel).await?;
+    let view = ledger
+        .lock()
+        .await
+        .project_fresh(&id)
+        .await
+        .map_err(|err| internal(format!("projection failed: {err}")))?;
+    Ok((id, view, substrate))
+}
+
+// Same Response-as-error idiom, same cold Err path, and both callers above
+// already carry this allow — boxing here would only add a deref at each of
+// them. See the rationale above `project`.
+#[allow(clippy::result_large_err)]
+async fn resolve_for_projection(
+    host: &Host,
+    channel: &str,
+) -> Result<(crate::host::SharedLedger, ChannelId, std::path::PathBuf), Response> {
+    let resolution = host
+        .resolve(channel)
+        .await
+        .map_err(|err| internal(format!("resolving '{channel}': {err}")))?;
+    match resolution {
+        Resolution::Resolved {
+            ledger,
+            id,
+            substrate,
+        } => Ok((ledger, id, substrate)),
+        Resolution::NotFound => Err((
+            StatusCode::NOT_FOUND,
+            format!("no channel '{channel}' in any registered substrate"),
+        )
+            .into_response()),
+        Resolution::Ambiguous(substrates) => Err((
+            StatusCode::CONFLICT,
+            format!(
+                "channel name '{channel}' exists in several substrates ({substrates:?}); \
+                 address it by id"
+            ),
+        )
+            .into_response()),
+    }
 }
 
 fn internal(message: String) -> Response {
@@ -641,7 +670,10 @@ async fn launch_session(
                 ));
             }
         };
-        if let Err(err) = host.add_member(&channel, &granter, agent_member).await {
+        if let Err(err) = host
+            .add_member(&channel, &granter, agent_member, None)
+            .await
+        {
             return (StatusCode::FORBIDDEN, format!("{err:#}")).into_response();
         }
     }
@@ -2220,6 +2252,7 @@ mod tests {
             "web-test",
             &founder,
             Member::agent("Bot", "bot@example.com"),
+            None,
         )
         .await
         .expect("add bot");
@@ -2655,7 +2688,7 @@ mod tests {
         // The harness member must be in the Party for its entries to project.
         let founder = Member::human("Web User", "web@example.com");
         fx.host
-            .add_member("web-test", &founder, crate::launch::harness_member())
+            .add_member("web-test", &founder, crate::launch::harness_member(), None)
             .await
             .expect("grant the harness membership");
         // A workspace repo for the session to run in.
@@ -3232,6 +3265,7 @@ mod tests {
             gate_executions: Default::default(),
             entries: vec![entry.clone()],
             party: Vec::new(),
+            keyring: Default::default(),
             unrecognized: Default::default(),
             unverified: Default::default(),
             sessions: Default::default(),

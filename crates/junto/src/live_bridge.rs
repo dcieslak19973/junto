@@ -55,10 +55,18 @@ use crate::launch::NotLive;
 /// remote-CHOSEN byte on this path — the one exception is
 /// `annotation.author.email`, also rendered into the header: it carries no
 /// cap of its own because it needs none. `validate_annotation_update`
-/// requires it to equal the authenticated sender's own email, which must
-/// already be a key in the channel's keyring built from the party
-/// projection — so its length is fixed at member admission, by the gate,
-/// not chosen per annotation the way every capped field here is. Stating
+/// requires it to equal `sender_email` — the authenticated connection's
+/// own email, fixed once per connection at the handshake
+/// (`live_ws::authenticate`, checked against `ChannelView::party`) and
+/// never re-derived per annotation — and that email was itself set once,
+/// by the founder-authored `MemberAdded`/`ChannelOpened` entry that
+/// admitted the member (`ChannelView::party` and `ChannelView::keyring`
+/// are each folded from those same entries, independently — Task 10
+/// widened the keyring `authenticate` and this bridge's own signature
+/// check read from `view.party`'s first grant to `view.keyring`'s every
+/// ACTIVE one, but neither was ever "the party projection" itself). So
+/// its length is fixed at member admission, not chosen per annotation the
+/// way every capped field here is. Stating
 /// that any one of the four caps alone keeps the rendered message finite
 /// would be the same overclaim again.
 const MAX_ANNOTATION_BODY_BYTES: usize = 4096;

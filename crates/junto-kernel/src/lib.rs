@@ -40,7 +40,10 @@ pub use entry::{DecisionFrame, EntryPayload, FrameAct, FrameOption, LedgerEntry}
 pub use error::{Error, Result};
 pub use gate::{ApprovalRequirement, GateStatus};
 pub use ids::{ChannelId, EntryId};
-pub use ledger::{ChannelView, Ledger, LineageDirection, LineageEdge, LineageRelation, Standing};
+pub use ledger::{
+    ChannelView, KeyGrant, Keyring, Ledger, LineageDirection, LineageEdge, LineageRelation,
+    Standing,
+};
 pub use member::{Member, MemberKind};
 pub use provenance::{ContentDigest, ProvenanceRef, Uri};
 pub use session::{SessionState, SessionView};

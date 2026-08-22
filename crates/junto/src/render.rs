@@ -715,7 +715,7 @@ pub fn transcript_markdown(name: &str, id: &ChannelId, view: &ChannelView) -> St
         let when = entry.timestamp.as_millis();
         let who = format!("{} <{}>", entry.author.display_name, entry.author.email);
         let marker = if view.unrecognized.contains(&entry.id) {
-            " [unrecognized author — not in the party; excluded from projection]"
+            " [unrecognized author — not in the party, or revoked as of this entry's timestamp; excluded from projection]"
         } else {
             ""
         };
@@ -2788,8 +2788,9 @@ fn entry_card(entry: &LedgerEntry, view: &ChannelView, channel: &ChannelId) -> S
         .map(|label| format!("<span class=\"badge {label}\">{label}</span>"))
         .unwrap_or_default();
     let unrecognized_badge = if unrecognized {
-        "<span class=\"badge unrecognized\" title=\"author is not in the party; excluded \
-         from standings and gates (docs/adr/0017)\">unrecognized</span>"
+        "<span class=\"badge unrecognized\" title=\"author is not in the party, or was \
+         revoked as of this entry's timestamp; excluded from standings and gates \
+         (docs/adr/0017, docs/adr/0035)\">unrecognized</span>"
     } else {
         ""
     };
@@ -3572,8 +3573,10 @@ fn escape_html(text: &str) -> String {
     out
 }
 
-/// Epoch milliseconds → `YYYY-MM-DD HH:MM UTC` for the human page.
-fn iso_utc(millis: i64) -> String {
+/// Epoch milliseconds → `YYYY-MM-DD HH:MM UTC` — the human page's format,
+/// reused by `junto invite`'s printed expiry so the CLI and the web page
+/// render a timestamp the same way.
+pub(crate) fn iso_utc(millis: i64) -> String {
     match time::OffsetDateTime::from_unix_timestamp(millis.div_euclid(1000)) {
         Ok(dt) => format!(
             "{:04}-{:02}-{:02} {:02}:{:02} UTC",
@@ -3797,6 +3800,7 @@ mod tests {
             name: None,
             entries,
             party: Vec::new(),
+            keyring: Default::default(),
             unrecognized: std::collections::HashSet::new(),
             unverified: Default::default(),
             standings,
@@ -4259,6 +4263,7 @@ mod tests {
             name: Some("t".into()),
             entries,
             party: Vec::new(),
+            keyring: Default::default(),
             unrecognized: Default::default(),
             unverified: Default::default(),
             standings,
@@ -4297,6 +4302,7 @@ mod tests {
             name: Some("t".into()),
             entries,
             party: Vec::new(),
+            keyring: Default::default(),
             unrecognized: Default::default(),
             unverified: Default::default(),
             standings,

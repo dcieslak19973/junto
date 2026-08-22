@@ -34,6 +34,9 @@ dunce.workspace = true
 uuid.workspace = true
 # artifact content digests (docs/adr/0023 capture)
 sha2.workspace = true
+# base64url-encoding the enrollment envelope's JSON payload into the
+# `junto://invite|enroll?code=…` URI (device-key-enrollment plan, Task 4)
+base64.workspace = true
 # live-progress stream over SSE (docs/adr/0023): per-session broadcast → EventSource
 async-stream.workspace = true
 # render agent memos as CommonMark on the human surface (docs/adr/0023)
