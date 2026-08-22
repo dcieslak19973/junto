@@ -1423,8 +1423,19 @@ pub(crate) struct BranchPlan {
 /// Create `junto/<session>` off the workspace's current HEAD and switch to it,
 /// recording the base for later. The worker commits onto this branch; a later
 /// slice pushes it and opens the PR. Best-effort: callers log and continue if
-/// the workspace isn't a usable git repo.
+/// the workspace isn't a usable git repo — including a `session_workdir`
+/// scratch directory, refused here (before any git command runs, same
+/// reason and same pattern as [`workspace_diff`]'s and
+/// [`push_begin_worktree_diff`]'s guards) rather than left to whatever
+/// repository git's upward discovery happens to find enclosing it.
 pub(crate) fn prepare_pr_branch(workspace: &Path, session: EntryId) -> Result<BranchPlan> {
+    if crate::host::junto_home().is_ok_and(|home| is_scratch_workdir(&home, workspace)) {
+        bail!(
+            "workspace {} is a scratch directory (no Diff capability) — nothing to prepare a \
+             PR branch for",
+            workspace.display()
+        );
+    }
     let git = |args: &[&str]| -> Result<std::process::Output> {
         let mut command = std::process::Command::new("git");
         command.arg("-C").arg(workspace).args(args);
@@ -1558,6 +1569,60 @@ fn snippet(text: &str, limit: usize) -> String {
     s
 }
 
+/// The first mounted subject on this machine carrying `capability` — the
+/// shared search [`session_workdir`] (`Capability::Execute`),
+/// [`executable_mount`], and [`diff_capable`] (`Capability::Diff`) all run
+/// over `view`'s subjects, in canonical attachment order.
+///
+/// # Errors
+///
+/// Returns an error when the mount store cannot be read.
+fn mount_with_capability(
+    junto_home: &Path,
+    view: &ChannelView,
+    capability: crate::mounts::Capability,
+) -> Result<Option<PathBuf>> {
+    let subjects: Vec<_> = view.subjects.iter().map(|(_, s)| s.clone()).collect();
+    let mounts = crate::mounts::mounts_for(junto_home, &subjects)?;
+    for subject in &subjects {
+        let mount = mounts.iter().find(|m| m.uri == subject.uri);
+        if crate::mounts::capabilities(subject, mount).contains(&capability)
+            && let Some(mount) = mount
+        {
+            return Ok(Some(mount.path.clone()));
+        }
+    }
+    Ok(None)
+}
+
+/// The first `Execute`-capable mounted subject, if any — the mount-only
+/// half of [`session_workdir`], exposed so `crate::web`'s read-only
+/// prefills (`channel_mount`, the start-work form) can preview the same
+/// resolution `session_workdir` will make, without its scratch-directory
+/// side effect (there is nothing to preview for a scratch dir: it does not
+/// exist until a session mints one).
+///
+/// # Errors
+///
+/// Returns an error when the mount store cannot be read.
+pub(crate) fn executable_mount(junto_home: &Path, view: &ChannelView) -> Result<Option<PathBuf>> {
+    mount_with_capability(junto_home, view, crate::mounts::Capability::Execute)
+}
+
+/// Whether `view` has a subject on this machine carrying `Capability::Diff`
+/// — the condition [`prepare_pr_branch`] and the Outcome loop's grading
+/// both need (`crate::web::launch_session` refuses `mode=outcome` without
+/// it). Checked directly against `crate::mounts::capabilities` rather than
+/// inferred from a resolved workspace's path, so the gate holds regardless
+/// of how that workspace was produced.
+///
+/// # Errors
+///
+/// Returns an error when the mount store cannot be read.
+pub(crate) fn diff_capable(junto_home: &Path, view: &ChannelView) -> Result<bool> {
+    Ok(mount_with_capability(junto_home, view, crate::mounts::Capability::Diff)?.is_some())
+}
+
 /// Where a session's agent should run.
 ///
 /// The first `Execute`-capable mounted subject wins (spec §1) — the same
@@ -1568,20 +1633,21 @@ fn snippet(text: &str, limit: usize) -> String {
 /// deliberately never a git repository. This is the mechanism that makes a
 /// repo-free channel work: nothing past this call requires git.
 ///
+/// The **sole** authority on where a session runs: every caller that needs
+/// to know a session's workspace — `launch`, `launch_outcome`,
+/// `steer_session` — calls this, with the same `(junto_home, view,
+/// session)`, rather than re-deriving it. Two call sites disagreeing on
+/// where a session lives (fix round 1, finding 2/round 2's root cause) is
+/// exactly the bug this contract exists to prevent.
+///
 /// # Errors
 ///
 /// Returns an error when the mount store cannot be read, or the scratch
 /// directory cannot be created.
 pub fn session_workdir(junto_home: &Path, view: &ChannelView, session: EntryId) -> Result<PathBuf> {
-    let subjects: Vec<_> = view.subjects.iter().map(|(_, s)| s.clone()).collect();
-    let mounts = crate::mounts::mounts_for(junto_home, &subjects)?;
-    for subject in &subjects {
-        let mount = mounts.iter().find(|m| m.uri == subject.uri);
-        if crate::mounts::capabilities(subject, mount).contains(&crate::mounts::Capability::Execute)
-            && let Some(mount) = mount
-        {
-            return Ok(mount.path.clone());
-        }
+    if let Some(path) = mount_with_capability(junto_home, view, crate::mounts::Capability::Execute)?
+    {
+        return Ok(path);
     }
     let scratch = junto_home.join("scratch").join(session.to_string());
     std::fs::create_dir_all(&scratch)
@@ -2115,41 +2181,30 @@ fn spawn_outcome_loop(
         push_begin_worktree_diff(&host, session, &workspace);
 
         // Prepare a PR branch the worker commits onto (the push-gate's
-        // deliverable). Only meaningful where `Capability::Diff` holds — a
-        // `session_workdir` scratch directory is deliberately never a git
-        // repository (Task 6: a session runs without a repo), so skip
-        // straight past `prepare_pr_branch` instead of letting it fail
-        // loudly for a workspace that was never going to have a branch.
-        // Best-effort otherwise: without a branch, grading falls back to
-        // the working-tree diff either way. workspace_diff self-discovers
-        // the recorded base.
-        let scratch =
-            crate::host::junto_home().is_ok_and(|home| is_scratch_workdir(&home, &workspace));
-        let branch_plan = if scratch {
-            tracing::info!(
-                "outcome session {session}: workspace {} has no Diff capability (a \
-                 scratch dir, not a mounted repo) — skipping PR branch preparation, \
-                 grading the working-tree diff",
-                workspace.display()
-            );
-            None
-        } else {
-            match prepare_pr_branch(&workspace, session) {
-                Ok(plan) => {
-                    tracing::info!(
-                        "outcome session {session}: committing onto {} (off {})",
-                        plan.branch,
-                        plan.base
-                    );
-                    Some(plan)
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        "outcome session {session}: no PR branch ({err:#}); grading the \
-                         working-tree diff"
-                    );
-                    None
-                }
+        // deliverable). Best-effort: without it, grading falls back to the
+        // working-tree diff. workspace_diff self-discovers the recorded
+        // base. `web::launch_session` refuses `mode=outcome` for a
+        // workspace with no `Capability::Diff` before this loop ever
+        // starts, so this always has a real repo to work with in
+        // practice; `prepare_pr_branch` still self-guards against a
+        // scratch directory as defense in depth (same pattern as
+        // `workspace_diff`/`push_begin_worktree_diff`), so a failure here
+        // is a genuine git error, not a scratch dir slipping through.
+        let branch_plan = match prepare_pr_branch(&workspace, session) {
+            Ok(plan) => {
+                tracing::info!(
+                    "outcome session {session}: committing onto {} (off {})",
+                    plan.branch,
+                    plan.base
+                );
+                Some(plan)
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "outcome session {session}: no PR branch ({err:#}); grading the \
+                     working-tree diff"
+                );
+                None
             }
         };
 
@@ -2711,11 +2766,15 @@ async fn try_execute_pr_gate(host: &Host, channel: ChannelId, proposal: EntryId)
         return Ok(());
     }
 
-    // Recover the workspace, branch, and session (the branch name carries it).
+    // Recover the workspace, branch, and session (the branch name carries
+    // it). `executable_mount` — the same `Capability::Execute`-filtered
+    // search `session_workdir` runs — not `mounts_for(...).next()`: a PR
+    // gate only ever opens for an Outcome-loop session, which only ever
+    // ran on a mounted Repo subject, so this is never actually a
+    // different answer here, but it stops relying on "first mount of any
+    // kind" coincidentally being right.
     let home = crate::host::junto_home()?;
-    let subjects: Vec<_> = view.subjects.iter().map(|(_, s)| s.clone()).collect();
-    let mounts = crate::mounts::mounts_for(&home, &subjects)?;
-    let Some(workspace) = mounts.into_iter().next().map(|mount| mount.path) else {
+    let Some(workspace) = executable_mount(&home, &view)? else {
         bail!("channel {channel} has no subject to run in — attach one first");
     };
     let Some(branch) = current_branch(&workspace) else {
