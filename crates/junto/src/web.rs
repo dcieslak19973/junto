@@ -5119,6 +5119,32 @@ mod tests {
         );
     }
 
+    /// Finding 9c (final fix wave follow-up): `enroll_device`'s
+    /// `display_name` bound is implemented (matching `mint_invite`'s
+    /// `member` bound) but had no HTTP-surface test — this pins it at the
+    /// endpoint, not just via the CLI's `enroll_refuses_an_oversized_name`.
+    #[tokio::test]
+    async fn post_devices_enroll_refuses_an_oversized_name_before_minting() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let invite = valid_invite_payload("eve@example.com");
+        let url = crate::enroll::encode_invite(&invite).expect("encodes");
+
+        let response = enroll_device(Form(EnrollForm {
+            invite: url,
+            name: Some("x".repeat(crate::enroll::MAX_FIELD_CHARS + 1)),
+        }))
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_text(response).await;
+        assert!(body.contains("exceeds"), "{body}");
+
+        let junto_home = crate::host::junto_home().unwrap();
+        assert!(
+            !junto_home.join("keys.toml").exists(),
+            "no key minted for an oversized name"
+        );
+    }
+
     /// A test host with one repo whose git user founds two channels
     /// ("chan-a", "chan-b") — an invite token covering both, issued
     /// straight through `crate::invites::issue` (not `mint_invite`, since
@@ -5434,6 +5460,35 @@ mod tests {
         for outcome in outcomes {
             assert_eq!(outcome["result"], "invite_already_used", "{outcome:?}");
         }
+    }
+
+    /// Finding 1 residual (final fix wave follow-up): the router-level
+    /// test above proves the JSON-refusal pattern survives
+    /// `prettify_errors` over a real socket, but only for `/members` — the
+    /// assignment separately asked for the identical claim on a DIFFERENT
+    /// identity route. Drives `/invites`' 403 (a non-founder naming a
+    /// channel they don't own) through the real composed `router()`,
+    /// confirming the JSON body — and its `message` field — survives the
+    /// wire there too, not just on the one route already covered.
+    #[tokio::test]
+    async fn post_invites_403_json_survives_the_real_router_over_the_wire() {
+        let fx = invite_fixture().await;
+        let addr = serve_router(fx.host.clone()).await;
+
+        let body = "member=eve%40example.com&channel=chan-a&channel=not-mine";
+        let (status, content_type, body) = http_post(addr, "/invites", body).await;
+
+        assert_eq!(status, 403);
+        assert_eq!(content_type, "application/json");
+        let json: serde_json::Value =
+            serde_json::from_str(&body).expect("still valid JSON over the wire");
+        assert!(
+            json["message"]
+                .as_str()
+                .expect("message field")
+                .contains("not-mine"),
+            "{json:?}"
+        );
     }
 
     /// Finding 2 (review round 1): `redeem_enrollment` `?`s on
@@ -5953,6 +6008,78 @@ mod tests {
             entries_before,
             "nothing appended in either case"
         );
+    }
+
+    /// Finding 8 (final fix wave follow-up): `retire_device`'s
+    /// `retiring_would_strand_founder` guard is implemented and pinned by a
+    /// CLI test (`main.rs::retire_device_refuses_the_founders_only_grant`),
+    /// but had no HTTP-surface test. Drives the guard through the real
+    /// `retire_device` handler: refuses the founder's only active grant
+    /// (no Park appended), then confirms the ordinary case — a founder
+    /// with two active grants may still retire one.
+    #[tokio::test]
+    async fn post_retire_refuses_to_strand_the_founder_but_allows_a_grant_when_another_remains() {
+        let fx = revoke_fixture().await;
+        let (_, view, _) = project(&fx.host, &fx.channel.to_string())
+            .await
+            .expect("projects");
+        let founder_grants = view
+            .keyring
+            .get(&fx.founder.email)
+            .expect("founder has a genesis grant");
+        assert_eq!(
+            founder_grants.len(),
+            1,
+            "revoke_fixture grants the founder exactly one key at genesis"
+        );
+        let only_grant = founder_grants[0].granted_by;
+        let entries_before = view.entries.len();
+
+        let refused = retire_device(
+            State(fx.host.clone()),
+            Path((fx.channel.to_string(), only_grant.to_string())),
+            Form(RationaleForm {
+                rationale: "rotating".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+
+        let (_, view_after_refusal, _) = project(&fx.host, &fx.channel.to_string())
+            .await
+            .expect("projects");
+        assert_eq!(
+            view_after_refusal.entries.len(),
+            entries_before,
+            "no Park appended when the refusal fires"
+        );
+
+        // Grant the founder a second device, then retiring the first grant
+        // succeeds — ordinary rotation, another grant remains.
+        let second_key = junto_kernel::SigningKey::from_secret_bytes([11; 32]);
+        fx.host
+            .add_member(
+                "acme",
+                &fx.founder,
+                fx.founder.clone(),
+                Some(second_key.public_key()),
+                None,
+            )
+            .await
+            .expect("grant the founder a second device");
+
+        let allowed = retire_device(
+            State(fx.host.clone()),
+            Path((fx.channel.to_string(), only_grant.to_string())),
+            Form(RationaleForm {
+                rationale: "rotating".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(allowed.status(), StatusCode::OK);
+        let json: serde_json::Value =
+            serde_json::from_str(&body_text(allowed).await).expect("valid json");
+        assert_eq!(json["parked"], 1);
     }
 
     /// A host whose git identity is `caller_name`/`caller_email` — never

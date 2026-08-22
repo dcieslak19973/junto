@@ -637,6 +637,7 @@ struct EnrollPreviewDto {
     email: String,
     display_name: String,
     fingerprint: String,
+    transport_fingerprint: String,
     channels: Vec<PreviewChannelDto>,
 }
 
@@ -655,13 +656,17 @@ struct RedeemedDto {
 
 /// One channel's redeem outcome, mirrors `RedeemOutcomeDto`. `result` is
 /// snake_case: `granted` / `already_a_member` / `invite_already_used` /
-/// `not_founder` / `failed`.
+/// `not_founder` / `failed`. `warning` carries the ADR 0035 re-admission
+/// warning on a `granted` outcome (`None` otherwise) — the HTTP path's
+/// only way to see it, since there is no host log to read a CLI
+/// `println!` from.
 #[derive(Debug, Clone, Deserialize)]
 struct RedeemOutcomeDto {
     channel: String,
     channel_name: Option<String>,
     result: String,
     detail: Option<String>,
+    warning: Option<String>,
 }
 
 /// A founder identity act the members disclosure can perform
@@ -3318,6 +3323,10 @@ fn identity_form<'a>(
                             .size(11)
                             .color(color),
                     );
+                    if let Some(warning) = outcome.warning.as_deref() {
+                        outcomes =
+                            outcomes.push(text(format!("  {warning}")).size(10).color(YELLOW));
+                    }
                 }
                 col = col.push(outcomes);
             } else {
@@ -3336,8 +3345,11 @@ fn identity_form<'a>(
                         .join(", ");
                     col = col.push(
                         text(format!(
-                            "{} <{}> · {} · {channel_set}",
-                            preview.display_name, preview.email, preview.fingerprint
+                            "{} <{}> · {} · transport {} · {channel_set}",
+                            preview.display_name,
+                            preview.email,
+                            preview.fingerprint,
+                            preview.transport_fingerprint
                         ))
                         .size(11)
                         .color(MUTED),
