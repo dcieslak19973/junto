@@ -94,6 +94,8 @@ mod tests {
 }
 ```
 
+`serde_json` is a direct dependency of `junto-kernel` (`crates/junto-kernel/Cargo.toml`) — verified, so this test needs no `Cargo.toml` change.
+
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `rtk cargo test -p junto-kernel subject`
@@ -318,9 +320,27 @@ git commit -m "feat(kernel): SubjectAttached/SubjectDetached entry kinds"
 In `crates/junto-kernel/src/ledger.rs`, inside `mod tests`, following the pattern of the existing projection tests:
 
 ```rust
-    #[test]
-    fn detaching_a_subject_removes_it_but_keeps_both_entries() {
-        let (ledger, channel, author) = opened_channel();
+    #[tokio::test]
+    async fn detaching_a_subject_removes_it_but_keeps_both_entries() {
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let dan = Member::human("Dan", "dan@example.com");
+
+        // One author throughout: `project_subjects` folds recognized entries
+        // only, and the genesis author is the founding member (ADR 0017).
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                dan.clone(),
+                1,
+                EntryPayload::ChannelOpened {
+                    name: "subjects".into(),
+                },
+            ))
+            .await
+            .expect("append genesis");
+
         let repo = Subject::new(
             SubjectKind::Repo,
             Uri::new("git+https://example.com/a.git").expect("valid uri"),
@@ -330,30 +350,45 @@ In `crates/junto-kernel/src/ledger.rs`, inside `mod tests`, following the patter
             Uri::new("file:///notes/spec.md").expect("valid uri"),
         );
 
-        let repo_id = append(
-            &ledger,
-            &channel,
-            &author,
-            EntryPayload::SubjectAttached {
-                subject: repo.clone(),
-            },
-        );
-        append(
-            &ledger,
-            &channel,
-            &author,
-            EntryPayload::SubjectAttached {
-                subject: doc.clone(),
-            },
-        );
-        append(
-            &ledger,
-            &channel,
-            &author,
-            EntryPayload::SubjectDetached { target: repo_id },
-        );
+        let repo_attach = EntryId::new();
+        ledger
+            .append(entry(
+                repo_attach,
+                channel,
+                dan.clone(),
+                2,
+                EntryPayload::SubjectAttached {
+                    subject: repo.clone(),
+                },
+            ))
+            .await
+            .expect("attach repo");
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                dan.clone(),
+                3,
+                EntryPayload::SubjectAttached {
+                    subject: doc.clone(),
+                },
+            ))
+            .await
+            .expect("attach doc");
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                dan.clone(),
+                4,
+                EntryPayload::SubjectDetached {
+                    target: repo_attach,
+                },
+            ))
+            .await
+            .expect("detach repo");
 
-        let view = ledger.project(&channel).expect("project");
+        let view = ledger.project(&channel).await.expect("project");
         let subjects: Vec<_> = view.subjects.iter().map(|(_, s)| s.clone()).collect();
         assert_eq!(subjects, vec![doc], "the detached repo must not project");
         assert_eq!(
@@ -363,15 +398,31 @@ In `crates/junto-kernel/src/ledger.rs`, inside `mod tests`, following the patter
         );
     }
 
-    #[test]
-    fn a_channel_with_no_subjects_projects_an_empty_list() {
-        let (ledger, channel, _author) = opened_channel();
-        let view = ledger.project(&channel).expect("project");
+    #[tokio::test]
+    async fn a_channel_with_no_subjects_projects_an_empty_list() {
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let dan = Member::human("Dan", "dan@example.com");
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                dan,
+                1,
+                EntryPayload::ChannelOpened {
+                    name: "empty".into(),
+                },
+            ))
+            .await
+            .expect("append genesis");
+        let view = ledger.project(&channel).await.expect("project");
         assert!(view.subjects.is_empty());
     }
 ```
 
-If `opened_channel()` and `append()` helpers do not already exist in that test module under those names, use whatever the module's existing fixtures are called — read the top of `mod tests` in `ledger.rs` and reuse them verbatim rather than adding new ones.
+**Fixtures, verified — use these, do not invent others.** `mod tests` in `ledger.rs` provides exactly two helpers: `entry(id, channel, author, millis, payload)` at `:922` and `assertion(statement)` at `:939`. There is **no** `opened_channel()` and **no** `append()` helper. `Ledger::append` (`:293`) is `async` and takes `&mut self` plus a fully built `LedgerEntry`; `Ledger::project` (`:331`) is `async`. Tests in this module are `#[tokio::test] async fn`. Add `Subject`, `SubjectKind`, and `Uri` to the module's `use crate::{…}` list at `:915-919`.
+
+**Note the pre-Task-7 shape:** `ChannelOpened.name` is still `String` at this point in the plan — pass `"subjects".into()`, not `Some(…)`. Task 7 updates these constructions when it makes the field optional.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
@@ -636,7 +687,7 @@ pub fn remember_mount(junto_home: &Path, uri: &Uri, path: &Path) -> Result<()> {
 }
 ```
 
-If `Uri` has no `as_str()`, add one to `crates/junto-kernel/src/provenance.rs` returning `&str` — do not reach into a private field from the host crate.
+`Uri::as_str()` already exists at `crates/junto-kernel/src/provenance.rs:43` — verified, no kernel change needed. `Uri` is also `#[serde(into = "String", try_from = "String")]` (`:23`), so a `Subject`'s uri serializes as a plain JSON string in the canonical bytes.
 
 Then delete `launch.rs:405-504` in full, add `mod mounts;` to `crates/junto/src/main.rs`, and fix the call sites listed in **Files** to resolve a path through the channel's projected subjects instead of `workspace_for`.
 
@@ -803,11 +854,11 @@ git commit -m "feat(host): compute subject capabilities from kind and mount"
 Append to `mod tests` in `crates/junto/src/launch.rs`:
 
 ```rust
-    #[test]
-    fn a_channel_with_no_executable_subject_runs_in_a_scratch_directory() {
+    #[tokio::test]
+    async fn a_channel_with_no_executable_subject_runs_in_a_scratch_directory() {
         let home = HomeGuard::new();
         let session = EntryId::new();
-        let view = channel_view_with_subjects(&[]);
+        let view = channel_view_with_subjects(&[]).await;
 
         let dir = session_workdir(home.path(), &view, session).expect("a workdir");
         assert!(dir.exists(), "the scratch directory must be created");
@@ -822,15 +873,15 @@ Append to `mod tests` in `crates/junto/src/launch.rs`:
         );
     }
 
-    #[test]
-    fn a_mounted_repo_subject_wins_over_the_scratch_directory() {
+    #[tokio::test]
+    async fn a_mounted_repo_subject_wins_over_the_scratch_directory() {
         let home = HomeGuard::new();
         let repo = git_repo();
         let uri = junto_kernel::Uri::new("git+https://example.com/a.git").expect("valid uri");
         crate::mounts::remember_mount(home.path(), &uri, repo.path()).unwrap();
 
         let subject = junto_kernel::Subject::new(junto_kernel::SubjectKind::Repo, uri);
-        let view = channel_view_with_subjects(&[subject]);
+        let view = channel_view_with_subjects(&[subject]).await;
 
         let dir = session_workdir(home.path(), &view, EntryId::new()).expect("a workdir");
         assert_eq!(dir, dunce::canonicalize(repo.path()).unwrap());
@@ -841,23 +892,54 @@ Add the fixture beside them:
 
 ```rust
     /// A `ChannelView` carrying just the subjects a workdir test needs.
-    fn channel_view_with_subjects(subjects: &[junto_kernel::Subject]) -> ChannelView {
-        let (ledger, channel, author) = opened_channel();
+    ///
+    /// Built through the kernel's in-memory substrate rather than a git-refs
+    /// one: `session_workdir` reads only `view.subjects`, so an in-memory
+    /// ledger is the honest minimum here.
+    async fn channel_view_with_subjects(subjects: &[junto_kernel::Subject]) -> ChannelView {
+        use junto_kernel::{
+            ChannelId, EntryId, EntryPayload, InMemorySubstrate, Ledger, LedgerEntry, Member,
+            Timestamp,
+        };
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let dan = Member::human("Dan", "dan@example.com");
+        let mut millis = 1;
+        let mut append = |ledger: &mut Ledger<InMemorySubstrate>, payload: EntryPayload| {
+            let built = LedgerEntry {
+                signature: None,
+                id: EntryId::new(),
+                channel,
+                author: dan.clone(),
+                timestamp: Timestamp::from_millis(millis),
+                payload,
+            };
+            millis += 1;
+            ledger.append(built)
+        };
+        append(
+            &mut ledger,
+            EntryPayload::ChannelOpened {
+                name: "workdir".into(),
+            },
+        )
+        .await
+        .expect("append genesis");
         for subject in subjects {
             append(
-                &ledger,
-                &channel,
-                &author,
-                junto_kernel::EntryPayload::SubjectAttached {
+                &mut ledger,
+                EntryPayload::SubjectAttached {
                     subject: subject.clone(),
                 },
-            );
+            )
+            .await
+            .expect("attach subject");
         }
-        ledger.project(&channel).expect("project")
+        ledger.project(&channel).await.expect("project")
     }
 ```
 
-Reuse `opened_channel`/`append` if this crate's test module already has equivalents; otherwise build the view with the crate's existing host test fixtures rather than inventing new ones.
+**These two tests are `#[tokio::test] async fn`**, because `channel_view_with_subjects` awaits the kernel's async `append`/`project`. `crates/junto` already has `tokio` available and uses `#[tokio::test]` elsewhere. If the closure borrow above fights the borrow checker, inline the entry construction in the loop rather than reaching for `Rc`/`RefCell` — this is test scaffolding, keep it dumb.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -1009,65 +1091,104 @@ git commit -m "feat(kernel): a channel may open without a name"
 In `crates/junto-kernel/src/ledger.rs`, inside `mod tests`:
 
 ```rust
-    #[test]
-    fn a_channel_with_nothing_ratified_is_scratch_and_stays_out_of_recall() {
-        let (ledger, channel, author) = opened_channel();
-        append(
-            &ledger,
-            &channel,
-            &author,
-            EntryPayload::Assertion {
-                statement: "a half-formed thought".into(),
-                rationale: String::new(),
-                provenance: Vec::new(),
-                frame: None,
-            },
-        );
-        let view = ledger.project(&channel).expect("project");
-        assert_eq!(view.channel_standing, ChannelStanding::Scratch);
+    /// Build a channel whose genesis is authored by `dan`, then run `body`'s
+    /// extra entries through it. Kept local to these three tests rather than
+    /// added to the module's shared fixtures — `entry` and `assertion` are the
+    /// only helpers this module has, and it stays that way.
+    async fn standing_of(extra: Vec<EntryPayload>) -> ChannelStanding {
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let dan = Member::human("Dan", "dan@example.com");
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                dan.clone(),
+                1,
+                EntryPayload::ChannelOpened {
+                    name: "standing".into(),
+                },
+            ))
+            .await
+            .expect("append genesis");
+        for (offset, payload) in extra.into_iter().enumerate() {
+            let millis = 2 + i64::try_from(offset).expect("small offset");
+            ledger
+                .append(entry(EntryId::new(), channel, dan.clone(), millis, payload))
+                .await
+                .expect("append entry");
+        }
+        ledger
+            .project(&channel)
+            .await
+            .expect("project")
+            .channel_standing
     }
 
-    #[test]
-    fn one_ratified_entry_promotes_a_channel_to_standing() {
-        let (ledger, channel, author) = opened_channel();
-        let claim = append(
-            &ledger,
-            &channel,
-            &author,
-            EntryPayload::Assertion {
-                statement: "a real finding".into(),
-                rationale: String::new(),
-                provenance: Vec::new(),
-                frame: None,
-            },
-        );
-        append(
-            &ledger,
-            &channel,
-            &author,
-            EntryPayload::Ratification { target: claim },
-        );
-        let view = ledger.project(&channel).expect("project");
+    #[tokio::test]
+    async fn a_channel_with_nothing_ratified_is_scratch_and_stays_out_of_recall() {
+        let standing = standing_of(vec![assertion("a half-formed thought")]).await;
+        assert_eq!(standing, ChannelStanding::Scratch);
+    }
+
+    #[tokio::test]
+    async fn one_ratified_entry_promotes_a_channel_to_standing() {
+        // The ratification must target the assertion's real id, so this test
+        // builds its entries directly rather than through `standing_of`.
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let dan = Member::human("Dan", "dan@example.com");
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                dan.clone(),
+                1,
+                EntryPayload::ChannelOpened {
+                    name: "standing".into(),
+                },
+            ))
+            .await
+            .expect("append genesis");
+        let claim = EntryId::new();
+        ledger
+            .append(entry(
+                claim,
+                channel,
+                dan.clone(),
+                2,
+                assertion("a real finding"),
+            ))
+            .await
+            .expect("append assertion");
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                dan.clone(),
+                3,
+                EntryPayload::Ratification {
+                    target: claim,
+                    rationale: "checked".into(),
+                },
+            ))
+            .await
+            .expect("append ratification");
+        let view = ledger.project(&channel).await.expect("project");
         assert_eq!(view.channel_standing, ChannelStanding::Standing);
     }
 
-    #[test]
-    fn closing_a_channel_settles_it_even_with_nothing_ratified() {
-        let (ledger, channel, author) = opened_channel();
-        append(
-            &ledger,
-            &channel,
-            &author,
-            EntryPayload::ChannelClosed {
-                rationale: "abandoned".into(),
-            },
-        );
-        let view = ledger.project(&channel).expect("project");
-        assert_eq!(view.channel_standing, ChannelStanding::Settled);
+    #[tokio::test]
+    async fn closing_a_channel_settles_it_even_with_nothing_ratified() {
+        let standing = standing_of(vec![EntryPayload::ChannelClosed {
+            rationale: "abandoned".into(),
+        }])
+        .await;
+        assert_eq!(standing, ChannelStanding::Settled);
     }
 ```
 
-Match each `EntryPayload` construction to the real field list in `entry.rs` — `Assertion` and `Ratification` may carry fields not shown here; read the enum and pass what it actually declares.
+**Verified field lists — use exactly these:** `Assertion { statement, rationale, provenance, frame }` (`entry.rs:170`, and the `assertion(…)` helper at `ledger.rs:939` builds one for you); `Ratification { target, rationale }` (`entry.rs:184`); `ChannelClosed { rationale }` (`entry.rs:119`). `ChannelOpened.name` is still `String` here — Task 7 makes it optional afterwards.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
