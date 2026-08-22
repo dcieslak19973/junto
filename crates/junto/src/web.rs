@@ -91,6 +91,14 @@ pub fn router(host: Arc<Host>) -> Router {
         .route("/settings.json", get(settings_json))
         .route("/channels/{channel}/entries/{entry}/{act}", post(verify))
         .route(
+            "/channels/{channel}/keys/{grant}/retire",
+            post(retire_device),
+        )
+        .route(
+            "/channels/{channel}/members/{email}/revoke",
+            post(revoke_member),
+        )
+        .route(
             "/channels/{channel}/sessions/{session}/live",
             get(crate::live_ws::live_session),
         )
@@ -1564,6 +1572,263 @@ async fn verify(
         .map(str::to_string)
         .unwrap_or_else(|| format!("/channels/{id}"));
     Redirect::to(&destination).into_response()
+}
+
+/// The form body of a founder-only revoke/retire act: just the
+/// rationale — mirrors [`ActForm`] minus `back` (these are non-HTML acts,
+/// no page to return to); no member code, the host derives the author
+/// and checks founder authority itself.
+#[derive(Debug, Deserialize)]
+struct RationaleForm {
+    rationale: String,
+}
+
+/// [`retire_device`]'s and [`revoke_member`]'s shared success response:
+/// how many key grants were parked.
+#[derive(Serialize)]
+struct ParkedDto {
+    parked: usize,
+}
+
+/// Refuse an empty rationale, in the same voice [`verify`] already uses.
+// Response-as-error, cold Err path — same reasoning as `project` above.
+#[allow(clippy::result_large_err)]
+fn require_rationale(rationale: &str) -> Result<String, Response> {
+    let rationale = rationale.trim().to_string();
+    if rationale.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "a rationale is required — it's a rationale, not a checkbox",
+        )
+            .into_response());
+    }
+    Ok(rationale)
+}
+
+/// Resolve `channel` to its home substrate, ledger and canonical id, or
+/// surface the failure exactly as [`verify`] does — shared by
+/// [`retire_device`] and [`revoke_member`], which both need the raw
+/// [`crate::host::SharedLedger`] (to hold its guard across a
+/// `project_fresh` + `append`), unlike [`project`]/[`project_fresh`],
+/// which lock and release in one call.
+// Response-as-error, cold Err path — same reasoning as `project` above.
+#[allow(clippy::result_large_err)]
+async fn resolve_for_act(
+    host: &Host,
+    channel: &str,
+) -> Result<(std::path::PathBuf, crate::host::SharedLedger, ChannelId), Response> {
+    let resolution = host
+        .resolve(channel)
+        .await
+        .map_err(|err| internal(format!("resolving '{channel}': {err}")))?;
+    match resolution {
+        Resolution::Resolved {
+            substrate,
+            ledger,
+            id,
+        } => Ok((substrate, ledger, id)),
+        Resolution::NotFound => {
+            Err((StatusCode::NOT_FOUND, format!("no channel '{channel}'")).into_response())
+        }
+        Resolution::Ambiguous(_) => Err((
+            StatusCode::CONFLICT,
+            format!("channel name '{channel}' is ambiguous; use the id"),
+        )
+            .into_response()),
+    }
+}
+
+/// `POST /channels/{channel}/keys/{grant}/retire` — retire exactly one key
+/// grant, named by the entry that granted it (device-key-enrollment plan,
+/// Task 10): the HTTP counterpart of `junto retire-device`
+/// (`main.rs::retire_device`). Mirrors that CLI path exactly — two
+/// implementations of revocation is the drift this design fights.
+///
+/// Founder-only (via [`crate::identity::require_founder`]), but
+/// deliberately still works on a **founder's own** grant (rotation) —
+/// unlike [`revoke_member`], which refuses the founder outright. Projects
+/// with `guard.project_fresh` (not the cached [`project`]): a grant the
+/// CLI retired seconds ago in a separate process must not be parked
+/// twice off a stale fold. The ledger guard is dropped before the
+/// best-effort background sync — never held across the push.
+async fn retire_device(
+    State(host): State<Arc<Host>>,
+    Path((channel, grant)): Path<(String, String)>,
+    Form(form): Form<RationaleForm>,
+) -> Response {
+    let rationale = match require_rationale(&form.rationale) {
+        Ok(rationale) => rationale,
+        Err(response) => return response,
+    };
+    let Ok(target) = grant.parse::<EntryId>() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("'{grant}' is not an entry id"),
+        )
+            .into_response();
+    };
+    let (substrate, ledger, id) = match resolve_for_act(&host, &channel).await {
+        Ok(resolved) => resolved,
+        Err(response) => return response,
+    };
+
+    let mut guard = ledger.lock().await;
+    let view = match guard.project_fresh(&id).await {
+        Ok(view) => view,
+        Err(err) => return internal(format!("projection failed: {err}")),
+    };
+
+    let author = match crate::host::git_user(&substrate) {
+        Ok(author) => author,
+        Err(err) => {
+            return internal(format!(
+                "no author identity: {err} (set git config user.name / user.email)"
+            ));
+        }
+    };
+    if let Err(err) = crate::identity::require_founder(&view, &author, &channel) {
+        return (StatusCode::FORBIDDEN, format!("{err:#}")).into_response();
+    }
+
+    match view
+        .keyring
+        .values()
+        .flatten()
+        .find(|grant| grant.granted_by == target)
+    {
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                format!(
+                    "'{grant}' does not name a key-granting entry in channel '{channel}' — \
+                     check the keys view for the granted_by id to pass here"
+                ),
+            )
+                .into_response();
+        }
+        Some(found) if found.retired_at.is_some() => {
+            return (
+                StatusCode::CONFLICT,
+                format!(
+                    "grant '{grant}' is already retired — parking it again would not change \
+                     anything"
+                ),
+            )
+                .into_response();
+        }
+        Some(_) => {}
+    }
+
+    let mut entry = LedgerEntry {
+        signature: None,
+        id: EntryId::new(),
+        channel: id,
+        author,
+        timestamp: Timestamp::now(),
+        payload: EntryPayload::Park { target, rationale },
+    };
+    host.sign_entry(&mut entry);
+    if let Err(err) = guard.append(entry).await {
+        return internal(format!("append failed: {err}"));
+    }
+    drop(guard);
+
+    spawn_channel_sync(substrate, id);
+    axum::Json(ParkedDto { parked: 1 }).into_response()
+}
+
+/// `POST /channels/{channel}/members/{email}/revoke` — park every ACTIVE
+/// key grant `email` holds, in one act (device-key-enrollment plan, Task
+/// 10): the HTTP counterpart of `junto revoke-member`
+/// (`main.rs::revoke_member`). Refuses to revoke the channel's own
+/// founder — `require_founder` only gates who may revoke, nothing gates
+/// who may *be* revoked, and parking the founder's own grants would hand
+/// them a cutoff and unrecognize everything they author afterward. Never
+/// removes `email` from the party — recognition is party-set membership
+/// (`docs/adr/0035`). Projects with `guard.project_fresh`, same reasoning
+/// as [`retire_device`], and drops the guard before the background sync.
+async fn revoke_member(
+    State(host): State<Arc<Host>>,
+    Path((channel, email)): Path<(String, String)>,
+    Form(form): Form<RationaleForm>,
+) -> Response {
+    let rationale = match require_rationale(&form.rationale) {
+        Ok(rationale) => rationale,
+        Err(response) => return response,
+    };
+    let (substrate, ledger, id) = match resolve_for_act(&host, &channel).await {
+        Ok(resolved) => resolved,
+        Err(response) => return response,
+    };
+
+    let mut guard = ledger.lock().await;
+    let view = match guard.project_fresh(&id).await {
+        Ok(view) => view,
+        Err(err) => return internal(format!("projection failed: {err}")),
+    };
+
+    let author = match crate::host::git_user(&substrate) {
+        Ok(author) => author,
+        Err(err) => {
+            return internal(format!(
+                "no author identity: {err} (set git config user.name / user.email)"
+            ));
+        }
+    };
+    if let Err(err) = crate::identity::require_founder(&view, &author, &channel) {
+        return (StatusCode::FORBIDDEN, format!("{err:#}")).into_response();
+    }
+
+    if crate::identity::is_founder(&view, &email) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "'{email}' is the founder of '{channel}' — revoke-member would park every one \
+                 of the founder's own key grants and unrecognize everything they author from \
+                 that moment on. To rotate one of the founder's own machines, retire just that \
+                 device instead; or, when moving to a new device, enroll it FIRST and only \
+                 retire the old device's grant once the new one is in place"
+            ),
+        )
+            .into_response();
+    }
+
+    let targets = crate::identity::grants_to_park(&view, &email);
+    if targets.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "{email} has no active key grants in channel '{channel}' — nothing to revoke \
+                 (already fully retired, or never held a key)"
+            ),
+        )
+            .into_response();
+    }
+
+    for target in &targets {
+        let mut entry = LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel: id,
+            author: author.clone(),
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::Park {
+                target: *target,
+                rationale: rationale.clone(),
+            },
+        };
+        host.sign_entry(&mut entry);
+        if let Err(err) = guard.append(entry).await {
+            return internal(format!("append failed: {err}"));
+        }
+    }
+    drop(guard);
+
+    spawn_channel_sync(substrate, id);
+    axum::Json(ParkedDto {
+        parked: targets.len(),
+    })
+    .into_response()
 }
 
 async fn channel_brief(State(host): State<Arc<Host>>, Path(channel): Path<String>) -> Response {
@@ -4918,5 +5183,276 @@ mod tests {
         let body = body_text(response).await;
         assert!(body.contains("never"), "{body}");
         assert!(body.contains("already"), "{body}");
+    }
+
+    /// A test host with one repo whose git user "Web User" founds one
+    /// channel and grants "Carol" two device grants (two distinct keys) —
+    /// the roster [`retire_device`]/[`revoke_member`] act on.
+    struct RevokeFixture {
+        _home: crate::host::test_home::HomeGuard,
+        _dirs: Vec<TempDir>,
+        host: Arc<Host>,
+        channel: ChannelId,
+        founder: Member,
+        member: Member,
+    }
+
+    async fn revoke_fixture() -> RevokeFixture {
+        let home = crate::host::test_home::HomeGuard::new();
+        let repo = tempfile::tempdir().expect("repo dir");
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(repo.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        for (key, value) in [("user.name", "Web User"), ("user.email", "web@example.com")] {
+            assert!(
+                StdCommand::new("git")
+                    .args(["config", key, value])
+                    .current_dir(repo.path())
+                    .status()
+                    .expect("git config")
+                    .success()
+            );
+        }
+        let host = Host::fixed_with_member_home(
+            vec![repo.path().to_path_buf()],
+            Some(home.path().to_path_buf()),
+        );
+        let founder = Member::human("Web User", "web@example.com");
+        let channel = host
+            .open_channel(None, "acme", founder.clone(), None)
+            .await
+            .expect("open channel")
+            .id;
+        let member = Member::human("Carol", "carol@example.com");
+        let key_a = junto_kernel::SigningKey::from_secret_bytes([7; 32]);
+        let key_b = junto_kernel::SigningKey::from_secret_bytes([9; 32]);
+        host.add_member(
+            "acme",
+            &founder,
+            member.clone(),
+            Some(key_a.public_key()),
+            None,
+        )
+        .await
+        .expect("add carol device a");
+        host.add_member(
+            "acme",
+            &founder,
+            member.clone(),
+            Some(key_b.public_key()),
+            None,
+        )
+        .await
+        .expect("add carol device b");
+        RevokeFixture {
+            _home: home,
+            _dirs: vec![repo],
+            host,
+            channel,
+            founder,
+            member,
+        }
+    }
+
+    #[tokio::test]
+    async fn post_revoke_parks_every_active_grant_and_leaves_the_member_in_the_party() {
+        let fx = revoke_fixture().await;
+        let response = revoke_member(
+            State(fx.host.clone()),
+            Path((fx.channel.to_string(), fx.member.email.clone())),
+            Form(RationaleForm {
+                rationale: "leaving the team".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json: serde_json::Value =
+            serde_json::from_str(&body_text(response).await).expect("valid json");
+        assert_eq!(json["parked"], 2);
+
+        let (_, view, _) = project(&fx.host, &fx.channel.to_string())
+            .await
+            .expect("projects");
+        let grants = view
+            .keyring
+            .get(&fx.member.email)
+            .expect("carol has grants");
+        assert_eq!(grants.len(), 2);
+        assert!(grants.iter().all(|g| g.retired_at.is_some()), "{grants:?}");
+        assert!(
+            view.party.iter().any(|m| m.email == fx.member.email),
+            "carol stays in the party (ADR 0035)"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_revoke_refuses_the_founder_and_an_empty_rationale() {
+        let fx = revoke_fixture().await;
+        let (_, view_before, _) = project(&fx.host, &fx.channel.to_string())
+            .await
+            .expect("projects");
+        let entries_before = view_before.entries.len();
+
+        let founder_response = revoke_member(
+            State(fx.host.clone()),
+            Path((fx.channel.to_string(), fx.founder.email.clone())),
+            Form(RationaleForm {
+                rationale: "rotating".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(founder_response.status(), StatusCode::BAD_REQUEST);
+
+        let empty_rationale_response = revoke_member(
+            State(fx.host.clone()),
+            Path((fx.channel.to_string(), fx.member.email.clone())),
+            Form(RationaleForm {
+                rationale: "   ".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(empty_rationale_response.status(), StatusCode::BAD_REQUEST);
+
+        let (_, view_after, _) = project(&fx.host, &fx.channel.to_string())
+            .await
+            .expect("projects");
+        assert_eq!(
+            view_after.entries.len(),
+            entries_before,
+            "nothing appended in either case"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_retire_parks_one_grant_and_refuses_an_already_retired_one() {
+        let fx = revoke_fixture().await;
+        let (_, view, _) = project(&fx.host, &fx.channel.to_string())
+            .await
+            .expect("projects");
+        let grants = view
+            .keyring
+            .get(&fx.member.email)
+            .expect("carol has grants");
+        assert_eq!(grants.len(), 2);
+        let first = grants[0].granted_by;
+        let second = grants[1].granted_by;
+
+        let response = retire_device(
+            State(fx.host.clone()),
+            Path((fx.channel.to_string(), first.to_string())),
+            Form(RationaleForm {
+                rationale: "rotating device".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json: serde_json::Value =
+            serde_json::from_str(&body_text(response).await).expect("valid json");
+        assert_eq!(json["parked"], 1);
+
+        let (_, view, _) = project(&fx.host, &fx.channel.to_string())
+            .await
+            .expect("projects");
+        let grants = view.keyring.get(&fx.member.email).expect("has grants");
+        let retired = grants
+            .iter()
+            .find(|g| g.granted_by == first)
+            .expect("first grant present");
+        assert!(retired.retired_at.is_some());
+        let still_active = grants
+            .iter()
+            .find(|g| g.granted_by == second)
+            .expect("second grant present");
+        assert!(still_active.retired_at.is_none());
+        let entries_before = view.entries.len();
+
+        let second_response = retire_device(
+            State(fx.host.clone()),
+            Path((fx.channel.to_string(), first.to_string())),
+            Form(RationaleForm {
+                rationale: "again".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(second_response.status(), StatusCode::CONFLICT);
+        let (_, view_after, _) = project(&fx.host, &fx.channel.to_string())
+            .await
+            .expect("projects");
+        assert_eq!(
+            view_after.entries.len(),
+            entries_before,
+            "no second Park appended"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_retire_refuses_a_caller_who_is_not_the_founder() {
+        // A different repo whose git user is Carol — a member of the
+        // channel, but not its founder.
+        let home = crate::host::test_home::HomeGuard::new();
+        let repo = tempfile::tempdir().expect("repo dir");
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(repo.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        for (key, value) in [("user.name", "Carol"), ("user.email", "carol@example.com")] {
+            assert!(
+                StdCommand::new("git")
+                    .args(["config", key, value])
+                    .current_dir(repo.path())
+                    .status()
+                    .expect("git config")
+                    .success()
+            );
+        }
+        let host = Host::fixed_with_member_home(
+            vec![repo.path().to_path_buf()],
+            Some(home.path().to_path_buf()),
+        );
+        let founder = Member::human("Web User", "web@example.com");
+        let channel = host
+            .open_channel(None, "acme", founder.clone(), None)
+            .await
+            .expect("open channel")
+            .id;
+        let member = Member::human("Carol", "carol@example.com");
+        let key = junto_kernel::SigningKey::from_secret_bytes([11; 32]);
+        host.add_member(
+            "acme",
+            &founder,
+            member.clone(),
+            Some(key.public_key()),
+            None,
+        )
+        .await
+        .expect("add carol");
+        let (_, view, _) = project(&host, &channel.to_string())
+            .await
+            .expect("projects");
+        let grant = view
+            .keyring
+            .get(&member.email)
+            .and_then(|grants| grants.first())
+            .expect("carol has a grant")
+            .granted_by;
+
+        let response = retire_device(
+            State(host),
+            Path((channel.to_string(), grant.to_string())),
+            Form(RationaleForm {
+                rationale: "trying to retire someone else's grant".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 }
