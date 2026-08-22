@@ -35,7 +35,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use junto_kernel::{
-    ChannelId, ChannelView, EntryId, EntryPayload, LedgerEntry, Member, PublicKey, Timestamp,
+    ChannelId, ChannelStanding, ChannelView, EntryId, EntryPayload, LedgerEntry, Member, PublicKey,
+    Timestamp,
 };
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
@@ -320,7 +321,7 @@ async fn main() -> Result<()> {
             };
             init::run(&repo, channel, open, agent).await
         }
-        Command::Brief { dir } => brief(dir).await,
+        Command::Brief { dir } => brief(dir, &mut std::io::stdout()).await,
         Command::AddMember {
             email,
             name,
@@ -1047,8 +1048,10 @@ async fn retire_device(channel: String, grant: String, rationale: String) -> Res
 
 /// Print the briefs of every channel this checkout is bound to. Best-effort by
 /// design — a SessionStart hook must never break session start, so failures
-/// are notes on stderr and the exit is always success.
-async fn brief(dir: PathBuf) -> Result<()> {
+/// are notes on stderr and the exit is always success. `out` receives each
+/// channel's rendered brief — production passes `stdout`; tests substitute a
+/// buffer so they can assert on what would (or would not) have been printed.
+async fn brief(dir: PathBuf, out: &mut impl std::io::Write) -> Result<()> {
     let channels = match binding::bound_channels(&dir) {
         Ok(channels) => channels,
         Err(err) => {
@@ -1066,12 +1069,6 @@ async fn brief(dir: PathBuf) -> Result<()> {
             return Ok(());
         }
     };
-    // Fetched once, up front: a channel with nothing ratified stays out of
-    // the brief until something in it earns standing (spec §2's collapse —
-    // "a scratch thread is epistemically free: invisible to the brief
-    // until something in it is ratified"). Fails open (`None`) on a
-    // transient error rather than hiding every bound channel.
-    let recallable = host.channels_for_recall().await.ok();
     for channel in channels {
         match host.resolve(&channel).await {
             Ok(host::Resolution::Resolved { ledger, id, .. }) => {
@@ -1085,12 +1082,22 @@ async fn brief(dir: PathBuf) -> Result<()> {
                 match projected {
                     Ok(view) => {
                         let lineage = host.lineage_context(&view).await.unwrap_or_default();
-                        let recall_eligible = recallable
-                            .as_ref()
-                            .is_none_or(|list| list.iter().any(|summary| summary.id == id));
-                        if recall_eligible {
+                        // Nothing ratified yet — epistemically free, stays
+                        // out of the brief until something in it earns
+                        // standing (spec §2's collapse: "a scratch thread
+                        // is epistemically free: invisible to the brief
+                        // until something in it is ratified"). The view is
+                        // already in hand, so this reads its own derived
+                        // `channel_standing` directly rather than paying a
+                        // second, machine-wide projection sweep for a
+                        // single-channel check.
+                        if view.channel_standing != ChannelStanding::Scratch {
                             let name = view.name.clone().unwrap_or_else(|| channel.clone());
-                            println!("{}", render::brief_markdown(&name, &id, &view, &lineage));
+                            writeln!(
+                                out,
+                                "{}",
+                                render::brief_markdown(&name, &id, &view, &lineage)
+                            )?;
                         }
                     }
                     Err(err) => eprintln!("junto brief: projecting '{channel}': {err}"),
@@ -1321,9 +1328,10 @@ mod tests {
         )
         .unwrap();
 
+        let mut out = Vec::new();
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            brief(checkout.path().to_path_buf()),
+            brief(checkout.path().to_path_buf(), &mut out),
         )
         .await;
         assert!(
@@ -1335,9 +1343,9 @@ mod tests {
         outcome.unwrap().unwrap();
     }
 
-    /// A bound channel with nothing ratified must not break session start —
-    /// it is simply skipped (spec §2's collapse: "invisible to the brief
-    /// until something in it is ratified").
+    /// A bound channel with nothing ratified must not break session start,
+    /// and must print nothing for it (spec §2's collapse: "invisible to the
+    /// brief until something in it is ratified") — not just "didn't error".
     #[tokio::test]
     async fn brief_skips_a_scratch_bound_channel_without_erroring() {
         let _home = crate::host::test_home::HomeGuard::new();
@@ -1348,7 +1356,77 @@ mod tests {
             "channels = [\"scratch-only\"]\n",
         )
         .unwrap();
-        brief(checkout.path().to_path_buf()).await.unwrap();
+        let mut out = Vec::new();
+        brief(checkout.path().to_path_buf(), &mut out)
+            .await
+            .unwrap();
+        assert!(
+            out.is_empty(),
+            "a scratch channel must print nothing to the brief: {}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    /// The counterpart to the scratch skip above: once a bound channel
+    /// earns standing (a ratified entry), the brief actually prints it —
+    /// guards against a filter bug that suppresses everything.
+    #[tokio::test]
+    async fn brief_prints_a_bound_channel_that_has_earned_standing() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (repo, id) = setup_channel("ratified-only").await;
+        let host = host::Host::fixed(vec![repo.path().to_path_buf()]);
+        let ledger = host.ledger_for(repo.path()).await.unwrap();
+        let decision = EntryId::new();
+        ledger
+            .lock()
+            .await
+            .append(LedgerEntry {
+                signature: None,
+                id: decision,
+                channel: id,
+                author: Member::human("Dan", "dan@example.com"),
+                timestamp: Timestamp::now(),
+                payload: EntryPayload::Assertion {
+                    statement: "use NDJSON for the pending queue".into(),
+                    rationale: "matches the substrate".into(),
+                    provenance: vec![],
+                    frame: None,
+                },
+            })
+            .await
+            .unwrap();
+        ledger
+            .lock()
+            .await
+            .append(LedgerEntry {
+                signature: None,
+                id: EntryId::new(),
+                channel: id,
+                author: Member::human("Dan", "dan@example.com"),
+                timestamp: Timestamp::now(),
+                payload: EntryPayload::Ratification {
+                    target: decision,
+                    rationale: "agreed".into(),
+                },
+            })
+            .await
+            .unwrap();
+
+        let checkout = tempfile::tempdir().unwrap();
+        std::fs::write(
+            checkout.path().join(binding::PROJECT_BINDING),
+            "channels = [\"ratified-only\"]\n",
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        brief(checkout.path().to_path_buf(), &mut out)
+            .await
+            .unwrap();
+        let printed = String::from_utf8(out).unwrap();
+        assert!(
+            printed.contains("ratified-only"),
+            "a channel with a ratified entry must print in the brief: {printed}"
+        );
     }
 
     fn build_enroll_url(

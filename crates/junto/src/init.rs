@@ -83,12 +83,27 @@ pub async fn run(
 
     let host = host::Host::fixed(vec![repo.clone()]);
     if open {
-        let opened_by = host::git_user(&repo)?;
-        let opened = host
-            .open_channel(Some(&repo), &channel, opened_by, None)
-            .await?;
-        println!("opened channel '{channel}' (id {})", opened.id);
-        print_founder_code(&opened);
+        // Idempotent, like every other step here (module doc): names are no
+        // longer unique (`docs/adr/0014`'s amendment), so re-running init
+        // without this check would mint a second, empty `Scratch` genesis
+        // for the same name every time — and since resolution prefers the
+        // most recently opened match, every name-addressed reference to the
+        // ambient channel (the committed binding, this repo's URLs) would
+        // immediately start pointing at that new, empty duplicate instead
+        // of the real one.
+        match host.resolve(&channel).await? {
+            host::Resolution::NotFound => {
+                let opened_by = host::git_user(&repo)?;
+                let opened = host
+                    .open_channel(Some(&repo), &channel, opened_by, None)
+                    .await?;
+                println!("opened channel '{channel}' (id {})", opened.id);
+                print_founder_code(&opened);
+            }
+            host::Resolution::Resolved { id, .. } => {
+                println!("channel '{channel}' is already open (id {id}) — not re-opening");
+            }
+        }
     } else {
         println!("(channel '{channel}' not opened — run `junto open \"{channel}\"` when ready)");
     }
@@ -471,6 +486,38 @@ mod tests {
         let inventory = host.inventory().await.unwrap();
         assert_eq!(inventory.len(), 1);
         assert_eq!(inventory[0].name.as_deref(), Some("my-channel"));
+    }
+
+    /// Names are no longer unique (`docs/adr/0014`'s amendment) but init's
+    /// open step must still be idempotent like every other step here — a
+    /// re-run must never mint a second, empty genesis for the ambient
+    /// channel (that would immediately steal every name-addressed reference
+    /// to it, since resolution prefers the most recently opened match).
+    #[tokio::test]
+    async fn a_second_init_with_open_does_not_duplicate_the_ambient_channel() {
+        let _home = HomeGuard::new();
+        let repo = git_repo();
+
+        run(repo.path(), Some("ambient".into()), true, None)
+            .await
+            .unwrap();
+        run(repo.path(), Some("ambient".into()), true, None)
+            .await
+            .unwrap();
+
+        let host = host::Host::fixed(vec![repo.path().to_path_buf()]);
+        let matches: Vec<_> = host
+            .inventory()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|summary| summary.name.as_deref() == Some("ambient"))
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "a second init must not mint a second genesis for the same ambient channel: {matches:?}"
+        );
     }
 
     #[tokio::test]

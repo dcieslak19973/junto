@@ -246,7 +246,8 @@ impl AttentionGroup {
 
 /// The result of resolving a user-supplied channel reference.
 pub enum Resolution {
-    /// Exactly one channel matched, in its home substrate's ledger.
+    /// The channel resolution settled on — by raw id, or by name (the most
+    /// recently opened match, when more than one channel shares the name).
     Resolved {
         /// The home substrate repo (e.g. for deriving a default author from
         /// its git config).
@@ -449,10 +450,17 @@ impl Host {
     /// `Settled` (closed or converged), never `Scratch` (nothing ratified
     /// yet). A scratch channel is epistemically free (spec §2's collapse: "a
     /// scratch thread is epistemically free: invisible to the brief until
-    /// something in it is ratified") — the brief/recall surfaces enumerate
-    /// this instead of [`Host::inventory`] so a junk thread never reaches an
-    /// agent's injected context. Same projection sweep as `inventory`, just
-    /// filtered.
+    /// something in it is ratified"). Same projection sweep as `inventory`,
+    /// just filtered.
+    ///
+    /// A per-channel caller that already has a projected [`ChannelView`] in
+    /// hand (e.g. `junto brief`'s SessionStart hook) should filter on
+    /// `view.channel_standing` directly instead — this sweeps *every*
+    /// registered substrate, which is wasteful for a single-channel check
+    /// and not what a caller with one view in hand wants. This method is
+    /// for a caller that genuinely needs the whole filtered list at once
+    /// (no such surface exists yet — `#[allow(dead_code)]` until one does).
+    #[allow(dead_code)]
     pub async fn channels_for_recall(&self) -> Result<Vec<ChannelSummary>> {
         Ok(self
             .inventory()

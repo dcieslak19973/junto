@@ -607,8 +607,8 @@ async fn setup_repo(State(host): State<Arc<Host>>, Form(form): Form<SetupRepoFor
         Ok(Resolution::Resolved { id, .. }) => {
             Redirect::to(&format!("/channels/{id}")).into_response()
         }
-        // Ambiguous (the name exists elsewhere too) or anything unexpected:
-        // the index shows the new substrate either way.
+        // Not found or anything unexpected: the index shows the new
+        // substrate either way.
         _ => Redirect::to("/").into_response(),
     }
 }
