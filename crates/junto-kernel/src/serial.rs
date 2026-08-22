@@ -227,6 +227,29 @@ mod tests {
             description: "the fix as a unified diff".into(),
             provenance: vec![provenance_with_digest()],
         }));
+        assert_round_trips(&entry(EntryPayload::SubjectAttached {
+            subject: crate::Subject::new(
+                crate::SubjectKind::Repo,
+                Uri::new("git+https://github.com/dcieslak19973/junto.git").expect("valid uri"),
+            ),
+        }));
+        assert_round_trips(&entry(EntryPayload::SubjectDetached { target }));
+    }
+
+    #[test]
+    fn an_absent_subject_digest_is_omitted_from_the_canonical_bytes() {
+        let without = entry(EntryPayload::SubjectAttached {
+            subject: crate::Subject::new(
+                crate::SubjectKind::Document,
+                Uri::new("file:///notes/spec.md").expect("valid uri"),
+            ),
+        });
+        let bytes = without.to_canonical_bytes().expect("serialize");
+        let text = String::from_utf8(bytes).expect("utf8");
+        assert!(
+            !text.contains("digest"),
+            "an absent digest must not appear in the canonical bytes: {text}"
+        );
     }
 
     #[test]

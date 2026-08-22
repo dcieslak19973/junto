@@ -1287,6 +1287,13 @@ fn preview(entry: &LedgerEntry) -> String {
         EntryPayload::SessionStarted { intent } => ("session started", intent.clone()),
         EntryPayload::SessionUpdated { note, .. } => ("session updated", note.clone()),
         EntryPayload::ArtifactAttached { description, .. } => ("artifact", description.clone()),
+        // Provisional copy — the surface plan owns subject rendering.
+        EntryPayload::SubjectAttached { subject } => (
+            "subject attached",
+            format!("{:?} {}", subject.kind, subject.uri.as_str()),
+        ),
+        // Provisional copy — the surface plan owns subject rendering.
+        EntryPayload::SubjectDetached { target } => ("subject detached", target.to_string()),
     };
     const LIMIT: usize = 160;
     let snippet: String = text.chars().take(LIMIT).collect();

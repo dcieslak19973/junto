@@ -513,6 +513,18 @@ fn recent_line(entry: &LedgerEntry) -> String {
         EntryPayload::ArtifactAttached { description, .. } => {
             format!("attached artifact: {}", clamp(description, TAIL_CLAMP))
         }
+        // Provisional copy — the surface plan owns subject rendering.
+        EntryPayload::SubjectAttached { subject } => {
+            format!(
+                "subject attached: {:?} {}",
+                subject.kind,
+                clamp(subject.uri.as_str(), TAIL_CLAMP)
+            )
+        }
+        // Provisional copy — the surface plan owns subject rendering.
+        EntryPayload::SubjectDetached { target } => {
+            format!("subject detached `{}`", short(target))
+        }
         EntryPayload::ChannelClosed { rationale } => {
             format!("closed the channel: {}", clamp(rationale, TAIL_CLAMP))
         }
@@ -796,6 +808,18 @@ fn describe_markdown(entry: &LedgerEntry, view: &ChannelView) -> String {
             ..
         } => {
             format!("**artifact** ({kind}) on session `{target}` — {description}")
+        }
+        // Provisional copy — the surface plan owns subject rendering.
+        EntryPayload::SubjectAttached { subject } => {
+            format!(
+                "**subject attached** — {:?} {}",
+                subject.kind,
+                subject.uri.as_str()
+            )
+        }
+        // Provisional copy — the surface plan owns subject rendering.
+        EntryPayload::SubjectDetached { target } => {
+            format!("**subject detached** of `{target}`")
         }
         EntryPayload::ChannelClosed { rationale } => {
             format!("**channel closed** — {rationale}")
@@ -2574,9 +2598,12 @@ fn backticks_to_code(text: &str) -> String {
 fn entry_family(payload: &EntryPayload) -> &'static str {
     match payload {
         EntryPayload::Assertion { .. } | EntryPayload::Proposal { .. } => "fam-decision",
+        // Provisional copy — the surface plan owns subject rendering.
         EntryPayload::SessionStarted { .. }
         | EntryPayload::SessionUpdated { .. }
-        | EntryPayload::ArtifactAttached { .. } => "fam-work",
+        | EntryPayload::ArtifactAttached { .. }
+        | EntryPayload::SubjectAttached { .. }
+        | EntryPayload::SubjectDetached { .. } => "fam-work",
         EntryPayload::ChannelOpened { .. }
         | EntryPayload::MemberAdded { .. }
         | EntryPayload::ChannelClosed { .. }
@@ -2750,6 +2777,19 @@ fn entry_card(entry: &LedgerEntry, view: &ChannelView, channel: &ChannelId) -> S
             Some(provenance.as_slice()),
             Some(*target),
         ),
+        // Provisional copy — the surface plan owns subject rendering.
+        EntryPayload::SubjectAttached { subject } => (
+            "subject attached",
+            None,
+            Some(format!("{:?} {}", subject.kind, subject.uri.as_str())),
+            None,
+            None,
+            None,
+        ),
+        // Provisional copy — the surface plan owns subject rendering.
+        EntryPayload::SubjectDetached { target } => {
+            ("subject detached", None, None, None, None, Some(*target))
+        }
         EntryPayload::DivergedFrom { parent, .. } => (
             "diverged from",
             None,

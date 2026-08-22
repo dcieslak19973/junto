@@ -16,6 +16,7 @@ use std::cmp::Ordering;
 
 use serde::{Deserialize, Serialize};
 
+use crate::subject::Subject;
 use crate::{
     EntryId, Member, ProvenanceRef, Timestamp, gate::ApprovalRequirement, ids::ChannelId,
     session::SessionState, sign::Signature,
@@ -311,6 +312,23 @@ pub enum EntryPayload {
         /// detectable and the artifact is re-fetchable.
         provenance: Vec<ProvenanceRef>,
     },
+    /// Binds a **Subject** — a thing this channel is about — to the channel
+    /// (spec §1). A channel may carry zero, many, or none; a repo is one kind
+    /// beside a document. The subject is a portable URI: how a given machine
+    /// resolves it to a path is a **Mount**, machine-local config that never
+    /// enters the ledger (`domain-model.md:32`). This entry's id identifies
+    /// the attachment, so `SubjectDetached` can target it.
+    SubjectAttached {
+        /// What the channel is now about.
+        subject: Subject,
+    },
+    /// Withdraws a previously attached Subject. Append-only: the attachment
+    /// entry stays in the log and the detachment is a new entry that targets
+    /// it, exactly as verification acts target assertions (`docs/adr/0002`).
+    SubjectDetached {
+        /// The `SubjectAttached` entry being withdrawn.
+        target: EntryId,
+    },
 }
 
 impl LedgerEntry {
@@ -336,11 +354,12 @@ impl EntryPayload {
     ///
     /// Returns `None` for the kinds that target nothing — the *subject* kinds
     /// [`Assertion`](EntryPayload::Assertion), [`Proposal`](EntryPayload::Proposal),
-    /// and [`SessionStarted`](EntryPayload::SessionStarted), and the lifecycle
+    /// [`SessionStarted`](EntryPayload::SessionStarted), and
+    /// [`SubjectAttached`](EntryPayload::SubjectAttached), and the lifecycle
     /// acts [`ChannelOpened`](EntryPayload::ChannelOpened) /
     /// [`MemberAdded`](EntryPayload::MemberAdded) — and `Some(target)` for the
     /// acts that reference a prior entry (ratify / park / correct / approve /
-    /// reject / session-update / artifact-attach).
+    /// reject / session-update / artifact-attach / subject-detach).
     #[must_use]
     pub fn target(&self) -> Option<EntryId> {
         match self {
@@ -356,7 +375,8 @@ impl EntryPayload {
             | EntryPayload::ConvergenceReceived { .. }
             | EntryPayload::Assertion { .. }
             | EntryPayload::Proposal { .. }
-            | EntryPayload::SessionStarted { .. } => None,
+            | EntryPayload::SessionStarted { .. }
+            | EntryPayload::SubjectAttached { .. } => None,
             EntryPayload::Ratification { target, .. }
             | EntryPayload::Park { target, .. }
             | EntryPayload::Correction { target, .. }
@@ -364,7 +384,8 @@ impl EntryPayload {
             | EntryPayload::Rejection { target, .. }
             | EntryPayload::GateExecuted { target, .. }
             | EntryPayload::SessionUpdated { target, .. }
-            | EntryPayload::ArtifactAttached { target, .. } => Some(*target),
+            | EntryPayload::ArtifactAttached { target, .. }
+            | EntryPayload::SubjectDetached { target } => Some(*target),
         }
     }
 }

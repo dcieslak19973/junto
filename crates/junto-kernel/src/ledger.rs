@@ -790,7 +790,9 @@ impl<S: SubstrateProvider> Ledger<S> {
                 | EntryPayload::GateExecuted { .. }
                 | EntryPayload::SessionStarted { .. }
                 | EntryPayload::SessionUpdated { .. }
-                | EntryPayload::ArtifactAttached { .. } => continue,
+                | EntryPayload::ArtifactAttached { .. }
+                | EntryPayload::SubjectAttached { .. }
+                | EntryPayload::SubjectDetached { .. } => continue,
             };
             if let Some(target) = entry.payload.target()
                 && let Some(slot) = standings.get_mut(&target)
