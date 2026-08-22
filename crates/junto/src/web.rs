@@ -804,10 +804,10 @@ async fn launch_session(
         // `mounts_for` skips subjects this machine hasn't mounted (a
         // teammate's checkout, `mounts.rs`'s "a teammate may hold a
         // checkout you do not"), so a fresh clone of an already-attached
-        // repo lands here too — as does a retry after `remember_mount`
-        // below failed on a prior attempt that did attach. Attach only when
-        // the derived uri isn't already carried by the channel; either way,
-        // remember this machine's mount for it.
+        // repo lands here too. `Host::attach_subject` is idempotent against
+        // a uri the channel already carries — it returns the existing
+        // attachment rather than duplicating it — so this always calls it
+        // and always remembers the mount, with no redundant check here.
         (false, None) => {
             let repo_path = std::path::Path::new(typed);
             let uri = match repo_subject_uri(repo_path) {
@@ -820,22 +820,20 @@ async fn launch_session(
                         .into_response();
                 }
             };
-            if !view.subjects.iter().any(|(_, subject)| subject.uri == uri) {
-                let subject = Subject::new(SubjectKind::Repo, uri.clone());
-                let author = match crate::host::git_user(&substrate) {
-                    Ok(author) => author,
-                    Err(err) => {
-                        return internal(format!(
-                            "no author identity: {err} (set git config user.name / user.email)"
-                        ));
-                    }
-                };
-                if let Err(err) = host
-                    .attach_subject(&channel, subject, author, WriteAuth::Human)
-                    .await
-                {
-                    return lineage_error(err);
+            let subject = Subject::new(SubjectKind::Repo, uri.clone());
+            let author = match crate::host::git_user(&substrate) {
+                Ok(author) => author,
+                Err(err) => {
+                    return internal(format!(
+                        "no author identity: {err} (set git config user.name / user.email)"
+                    ));
                 }
+            };
+            if let Err(err) = host
+                .attach_subject(&channel, subject, author, WriteAuth::Human)
+                .await
+            {
+                return lineage_error(err);
             }
             if let Err(err) = crate::mounts::remember_mount(&junto_home, &uri, repo_path) {
                 return internal(format!("remembering mount: {err}"));

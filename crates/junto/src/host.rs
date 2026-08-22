@@ -855,6 +855,18 @@ impl Host {
     /// recording one `SubjectAttached` entry. Returns the attachment's entry
     /// id, which is what a later `SubjectDetached` targets.
     ///
+    /// **Idempotent**: if the channel already carries a subject with this
+    /// uri, nothing is appended — the existing attachment's `EntryId` is
+    /// returned instead. This is enforced here, under the ledger lock,
+    /// against a *fresh* (uncached) projection, not left to callers: a
+    /// handler-side check against a cached view cannot see an attach that
+    /// landed via `junto sync` in another process within the projection
+    /// cache's TTL, or a concurrent call racing this one, so the guard has
+    /// to live at the write boundary to actually close those windows. The
+    /// record is append-only with no `SubjectDetached` write surface yet, so
+    /// a duplicate here would be permanent — worth the extra fold every
+    /// caller inherits.
+    ///
     /// The subject's URI is portable by construction; where *this* machine
     /// keeps it is a Mount, machine-local and never recorded.
     ///
@@ -875,8 +887,11 @@ impl Host {
     ) -> Result<EntryId> {
         let (_substrate, ledger, channel_id) = self.resolve_for_write(channel).await?;
         let mut guard = ledger.lock().await;
-        let view = guard.project(&channel_id).await?;
+        let view = guard.project_fresh(&channel_id).await?;
         self.check_write_auth(&view, &author, &auth)?;
+        if let Some((existing, _)) = view.subjects.iter().find(|(_, s)| s.uri == subject.uri) {
+            return Ok(*existing);
+        }
         let mut entry = LedgerEntry {
             signature: None,
             id: EntryId::new(),
@@ -2040,6 +2055,38 @@ mod lineage_tests {
             .await
             .expect_err("a non-member must not attach a subject");
         assert!(format!("{err}").to_lowercase().contains("member"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn attaching_the_same_subject_twice_is_idempotent() {
+        let (_dirs, host) = lineage_host(1);
+        host.open_channel(None, "subjects", dan(), None)
+            .await
+            .unwrap();
+
+        let subject = Subject::new(
+            SubjectKind::Repo,
+            Uri::new("git+https://example.com/a.git").expect("valid uri"),
+        );
+        let first = host
+            .attach_subject("subjects", subject.clone(), dan(), WriteAuth::Human)
+            .await
+            .expect("first attach");
+        let second = host
+            .attach_subject("subjects", subject.clone(), dan(), WriteAuth::Human)
+            .await
+            .expect("second attach is a no-op, not an error");
+        assert_eq!(
+            first, second,
+            "a repeat attach of the same uri returns the existing attachment's id"
+        );
+
+        let (_, view) = project(&host, "subjects").await;
+        assert_eq!(
+            view.subjects,
+            vec![(first, subject)],
+            "the channel carries exactly one subject, not a duplicate"
+        );
     }
 
     #[tokio::test]
