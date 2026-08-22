@@ -5354,9 +5354,13 @@ mod tests {
             StatusCode::SEE_OTHER,
             "a session that already ran in scratch keeps running there"
         );
-        let _ = home;
-
+        // Clear the harness override BEFORE dropping `home`: dropping it
+        // releases the process-wide `HOME_LOCK`, and another test can grab
+        // the lock and set its own `JUNTO_HARNESS_CMD` in the window — which
+        // this `remove_var` would then delete out from under it, leaving its
+        // launch turn with no harness and never reaching `Done`.
         unsafe { std::env::remove_var("JUNTO_HARNESS_CMD") };
+        drop(home);
     }
 
     #[tokio::test]
@@ -5474,9 +5478,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&bytes), NO_MOUNTABLE_SUBJECT);
-        let _ = (home, workspace);
-
+        // Clear the harness override BEFORE dropping `home` — see the note
+        // in `steering_a_scratch_session_survives_a_teammates_unmounted_repo_subject`.
         unsafe { std::env::remove_var("JUNTO_HARNESS_CMD") };
+        drop((home, workspace));
     }
 
     #[tokio::test]
