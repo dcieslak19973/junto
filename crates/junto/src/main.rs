@@ -1806,6 +1806,39 @@ mod tests {
         );
     }
 
+    /// Guards `Host::add_member`'s human-key refusal message (`host.rs`):
+    /// every command it tells the operator to run must actually parse —
+    /// the exact bug that message itself carried until this fix (it named
+    /// a `--channel` flag on the `--enroll` path, which conflicts with
+    /// `--enroll` and always fails to parse). A later edit that breaks
+    /// any of these three commands' flags fails here before it can rot
+    /// the message back into unusable advice (finding 4, review round 1).
+    #[test]
+    fn add_member_refusal_message_commands_all_parse() {
+        Cli::try_parse_from([
+            "junto",
+            "invite",
+            "--member",
+            "alice@example.com",
+            "--channel",
+            "acme",
+        ])
+        .expect("`junto invite --member <email> --channel <channel>` must parse");
+
+        Cli::try_parse_from(["junto", "enroll", "--invite", "junto://invite?code=x"])
+            .expect("`junto enroll --invite <url>` must parse");
+
+        Cli::try_parse_from([
+            "junto",
+            "add-member",
+            "--enroll",
+            "junto://enroll?code=x",
+            "--kind",
+            "human",
+        ])
+        .expect("`junto add-member --enroll <url> --kind human` must parse");
+    }
+
     #[test]
     fn redeem_line_reads_differently_for_every_outcome() {
         let cases = [

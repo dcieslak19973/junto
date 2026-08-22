@@ -6242,6 +6242,30 @@ mod tests {
             "chan-a's grant is retired"
         );
 
+        // The retired channel's grant actually stops something: a fresh
+        // entry signed by the same device key, timestamped well after the
+        // retirement, is unrecognized there — proving `retired_at` is a
+        // real cutoff the fold consults, not just a recorded flag left
+        // unconsulted by `KeyGrant::active_at` (finding 2, review round 1).
+        let retire_cutoff = view_a
+            .keyring
+            .get("eve@example.com")
+            .expect("eve's grant on chan-a")
+            .iter()
+            .filter_map(|g| g.retired_at)
+            .max()
+            .expect("the retire above set retired_at");
+        let after_retire_ts = Timestamp::from_millis(retire_cutoff.as_millis() + 60_000);
+        let unrecognized_a =
+            sign_and_append(&ledger, chan_a, &eve, &device_signing_key, after_retire_ts).await;
+        let (_, view_a, _) = project_fresh(&host, "chan-a")
+            .await
+            .expect("chan-a projects");
+        assert!(
+            view_a.unrecognized.contains(&unrecognized_a),
+            "an entry stamped after chan-a's own retirement is unrecognized there"
+        );
+
         // The other channel's grant still verifies a freshly signed entry.
         let still_verified_b =
             sign_and_append(&ledger, chan_b, &eve, &device_signing_key, Timestamp::now()).await;
@@ -6263,8 +6287,15 @@ mod tests {
         // --- `POST /channels/chan-b/members/eve@example.com/revoke` — a
         // later entry from the same device unrecognizes; an earlier one
         // keeps the standing it already had.
-        let earlier =
-            sign_and_append(&ledger, chan_b, &eve, &device_signing_key, Timestamp::now()).await;
+        // Stamped explicitly a minute *before* "now", not `Timestamp::now()`
+        // itself (finding 3, review round 1): the assertion below needs
+        // `earlier` to precede the revoke's own cutoff, and a backward
+        // wall-clock step (an NTP correction, a resumed VM) between this
+        // line and the revoke call just below could otherwise put
+        // `earlier` after that cutoff, failing the test for a reason
+        // unrelated to the code under test.
+        let earlier_ts = Timestamp::from_millis(Timestamp::now().as_millis() - 60_000);
+        let earlier = sign_and_append(&ledger, chan_b, &eve, &device_signing_key, earlier_ts).await;
         let revoke_response = revoke_member(
             State(host.clone()),
             Path(("chan-b".to_string(), "eve@example.com".to_string())),
