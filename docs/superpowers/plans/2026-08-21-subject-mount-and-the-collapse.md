@@ -37,11 +37,14 @@
 | `crates/junto-kernel/src/serial.rs` | round-trip coverage for the new variants | modify (`:81-230`) |
 | `crates/junto/src/mounts.rs` | the Mount store — `Mount`, `mounts_for`, `remember_mount`, `capabilities` | **create** |
 | `crates/junto/src/launch.rs` | delete the Workspace store; call Mounts instead; scratch-dir sessions | modify (`:405-504`, `:2733`) |
-| `crates/junto/src/host.rs` | `open_channel` accepts an absent name; name resolution stops requiring uniqueness | modify |
-| `crates/junto/src/web.rs` | call-site cutover | modify (`:581, 681, 695, 698, 789, 1921`) |
+| `crates/junto/src/host.rs` | `open_channel` accepts an absent name; name resolution stops requiring uniqueness; **`preview()`'s entry-kind match** (`:1261`) | modify |
+| `crates/junto/src/render.rs` | **entry-kind display/badge matches** (`:481`, `:734`, `:2575`, `:2601`) — provisional copy for the two new kinds | modify |
+| `crates/junto/src/web.rs` | call-site cutover (`:581, 681, 695, 698, 789, 1921`); **`EntryDto::from_entry`'s entry-kind match** (`:2047`) | modify |
 | `crates/junto/src/main.rs` | module declaration | modify |
 
 Subjects live in the kernel because they are recorded; Mounts live in `crates/junto` because they are machine config, the same seam `workspaces.toml` already sits on (ADR 0020).
+
+**Correction, found during execution (ledger ruling, Task 2):** the bolded rows above were missing from this table's first draft. `EntryPayload` matches are exhaustive, so adding a variant breaks compilation at **six** sites in crate `junto` that render entries for humans — and unlike the projection folds, those arms need actual copy, not an inert `continue`. They are a compile obligation of Task 2 and land in its diff with deliberately plain provisional copy, each marked `// Provisional copy — the surface plan owns subject rendering.` The surface plan owns their design. Anyone widening `EntryPayload` again should expect this blast radius: four kernel sites plus six rendering sites.
 
 ---
 
@@ -704,6 +707,158 @@ git commit -m "feat(host): the Mount store replaces the Workspace store"
 ```
 
 ---
+
+### Task 4b: `Host::attach_subject` and the write path
+
+**Added during execution.** The plan as written had a read side with no write side: nothing in Tasks 1-10 ever appended a `SubjectAttached` entry, so `view.subjects` was empty for every real channel and Task 4's whole cutover had nothing to resolve. The plan's own self-review flagged this and failed to fix it. Task 4 therefore left the write-side sites refusing loudly; this task closes the gap. Ledger ruling recorded under `Task 4: Ruling: THE PLAN HAD NO WRITE PATH`.
+
+**Files:**
+- Modify: `crates/junto/src/host.rs` — add `Host::attach_subject`
+- Modify: `crates/junto/src/web.rs` — the launch form attaches before mounting
+- Modify: `crates/junto/src/mounts.rs` — drop the `#[allow(dead_code)]` on `remember_mount`/`mount_path` once they have production callers
+
+**Interfaces:**
+- Consumes: `EntryPayload::SubjectAttached { subject }` (Task 2); `Subject::{new, with_digest}`, `SubjectKind::{Repo, Document}` (Task 1); `ChannelView::subjects` (Task 3); `remember_mount`, `mount_path` (Task 4); the existing `WriteAuth` enum at `host.rs:37` and `Host::check_write_auth` at `:1006`.
+- Produces: `Host::attach_subject(&self, channel: &str, subject: Subject, author: Member, auth: WriteAuth<'_>) -> Result<EntryId>` — appends one `SubjectAttached` and returns its entry id. Task 10's dogfood calls this.
+
+**Two decisions already ruled, do not re-litigate:**
+1. **The write surface is the existing launch form**, not new UI. The UX is unchanged — the user types a repo path and launches — it just attaches a Subject first when the channel has none.
+2. **A git repo's Subject URI is its `origin` remote URL when it has one, else `file://<canonical path>`.** Portable in the common case, degraded honestly when no portable identity exists.
+
+- [ ] **Step 1: Write the failing test**
+
+In `crates/junto/src/host.rs`'s `mod tests`:
+
+```rust
+    #[tokio::test]
+    async fn attaching_a_subject_records_it_and_projects_it() {
+        let home = HomeGuard::new();
+        let repo = git_repo();
+        let host = test_host(&home, &repo);
+        let dan = Member::human("Dan", "dan@example.com");
+        let opened = host
+            .open_channel(None, "subjects", dan.clone(), None)
+            .await
+            .expect("open");
+
+        let subject = Subject::new(
+            SubjectKind::Repo,
+            Uri::new("git+https://example.com/a.git").expect("valid uri"),
+        );
+        let id = host
+            .attach_subject(&opened.id.to_string(), subject.clone(), dan.clone(), WriteAuth::Human)
+            .await
+            .expect("attach");
+
+        let view = host.project(&opened.id.to_string()).await.expect("project");
+        assert_eq!(view.subjects, vec![(id, subject)]);
+    }
+
+    #[tokio::test]
+    async fn attaching_a_subject_refuses_a_non_member() {
+        let home = HomeGuard::new();
+        let repo = git_repo();
+        let host = test_host(&home, &repo);
+        let dan = Member::human("Dan", "dan@example.com");
+        let opened = host
+            .open_channel(None, "subjects", dan, None)
+            .await
+            .expect("open");
+
+        let stranger = Member::human("Stranger", "stranger@example.com");
+        let subject = Subject::new(
+            SubjectKind::Repo,
+            Uri::new("git+https://example.com/a.git").expect("valid uri"),
+        );
+        let err = host
+            .attach_subject(&opened.id.to_string(), subject, stranger, WriteAuth::Human)
+            .await
+            .expect_err("a non-member must not attach a subject");
+        assert!(format!("{err}").to_lowercase().contains("member"), "{err}");
+    }
+```
+
+Use the crate's real host-construction fixture rather than `test_host` if it is named differently — read `mod tests` in `host.rs` first, and reuse `open_channel`'s actual signature rather than the shape sketched here.
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `rtk cargo test -p junto attaching_a_subject`
+Expected: FAIL — `no method named attach_subject found`.
+
+- [ ] **Step 3: Write `Host::attach_subject`**
+
+Mirror `Host::diverge` (`host.rs:700-747`), which is the established pattern for a member-authored write: resolve the channel for write, project it, `check_write_auth`, then append. Authorization is **not** re-implemented — dispatch through `check_write_auth` so both surfaces are served, exactly as the lineage ops do.
+
+```rust
+    /// Attach a **Subject** — something this channel is about (spec §1) — by
+    /// recording one `SubjectAttached` entry. Returns the attachment's entry
+    /// id, which is what a later `SubjectDetached` targets.
+    ///
+    /// The subject's URI is portable by construction; where *this* machine
+    /// keeps it is a Mount, machine-local and never recorded.
+    ///
+    /// # Errors
+    /// Refuses an author who is not in the channel's Party, or whose member
+    /// code is missing or wrong on the agent surface (`docs/adr/0017`/`0021`).
+    pub async fn attach_subject(
+        &self,
+        channel: &str,
+        subject: Subject,
+        author: Member,
+        auth: WriteAuth<'_>,
+    ) -> Result<EntryId> {
+        let (_substrate, ledger, channel_id) = self.resolve_for_write(channel).await?;
+        let mut guard = ledger.lock().await;
+        let view = guard.project(&channel_id).await?;
+        self.check_write_auth(&view, &author, &auth)?;
+        let entry = LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel: channel_id,
+            author,
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::SubjectAttached { subject },
+        };
+        let id = entry.id;
+        guard.append(entry).await?;
+        Ok(id)
+    }
+```
+
+Sign the entry if `diverge` signs its own — match whatever the sibling does about signatures rather than leaving this one unsigned when its neighbours are signed.
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `rtk cargo test -p junto attaching_a_subject`
+Expected: PASS, 2 tests.
+
+- [ ] **Step 5: Re-point the launch form**
+
+In `web.rs`'s `launch_session`, the branch Task 4 left refusing a typed path now has work to do: when the channel has **no** mountable subject and the user typed a path, derive a repo Subject from that path, attach it, remember the mount, and proceed to launch. Derivation, per the ruling:
+
+```rust
+/// A git repo's portable identity: its `origin` remote when it has one, else
+/// a `file://` URI of the canonical path. The fallback is machine-shaped on
+/// purpose — a repo with no remote has no portable identity to offer.
+fn repo_subject_uri(path: &std::path::Path) -> Result<Uri> { /* … */ }
+```
+
+Use `git -C <path> remote get-url origin`, trimmed; on any non-zero exit or empty output, fall back. Reuse whatever helper the crate already has for running git rather than adding a second way to shell out.
+
+Add a test that a channel with no subject, given a typed path to a real git repo, ends up with one attached `SubjectAttached` whose uri is the repo's `origin`, a remembered mount, and a launched session. Then drop the now-unnecessary `#[allow(dead_code)]` from `remember_mount` and `mount_path`.
+
+- [ ] **Step 6: Full green, then commit**
+
+```bash
+rtk cargo fmt --check
+rtk cargo clippy --workspace --all-targets -- -D warnings
+rtk cargo test --workspace
+git add crates/junto/src/host.rs crates/junto/src/web.rs crates/junto/src/mounts.rs
+git commit -m "feat(host): attach_subject, and the launch form attaches before mounting"
+```
+
+---
+
 
 ### Task 5: Capabilities are computed, never recorded
 
