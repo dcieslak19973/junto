@@ -75,7 +75,7 @@ pub const MAX_INVITE_CHANNELS: usize = 32;
 /// `decode_enroll` reject any other value in a payload's `v` field, so a
 /// future format change can be introduced without a mis-parsed old payload
 /// silently passing as valid.
-const PAYLOAD_VERSION: u8 = 2;
+pub(crate) const PAYLOAD_VERSION: u8 = 2;
 
 /// The payload behind a `junto://invite?code=…` URI — see the module docs
 /// for what it grants and why [`invite_token`](Self::invite_token) is a
@@ -446,6 +446,17 @@ mod tests {
         let url = encode_invite(&p).unwrap();
         let err = decode_invite(&url).unwrap_err().to_string();
         assert!(err.contains(&MAX_INVITE_CHANNELS.to_string()), "{err}");
+    }
+
+    #[test]
+    fn a_channel_set_at_exactly_the_cap_is_not_rejected_for_count() {
+        // Same shape as the over-the-cap case, one element fewer: MUST NOT
+        // be rejected by the count check — pins `>` rather than `>=` in
+        // the cap comparison.
+        let mut p = sample_invite();
+        p.channels = (0..MAX_INVITE_CHANNELS).map(|i| format!("c{i}")).collect();
+        let url = encode_invite(&p).unwrap();
+        assert!(decode_invite(&url).is_ok());
     }
 
     #[test]
