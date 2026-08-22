@@ -36,12 +36,13 @@
 //! here alone would be scope this task doesn't need.
 //!
 //! `junto invite` (Task 6) calls `issue`, `junto add-member --enroll`
-//! (Task 8) calls `consume`, and `junto invite` itself calls `prune` at
-//! its own top (final fix wave, finding 1 — `prune` fell between Task 9's
+//! (Task 4's `redeem_enrollment`) calls `consume` once per channel a
+//! token still covers, and `junto invite` itself calls `prune` at its
+//! own top (final fix wave, finding 1 — `prune` fell between Task 9's
 //! brief, which shipped `keys list`/`revoke-member`/`retire-device`
-//! instead, and Task 6's, written before `prune` existed). `channels_for`
-//! (Task 2) carries `#[allow(dead_code)]` because it is called from Task 4
-//! (the UI layer).
+//! instead, and Task 6's, written before `prune` existed).
+//! `redeem_enrollment` is also `channels_for`'s first production caller
+//! (Task 4) — it no longer carries `#[allow(dead_code)]`.
 
 use std::path::{Path, PathBuf};
 
@@ -180,8 +181,20 @@ pub fn consume(
         return Ok(Consumed::WrongMember);
     }
 
-    // Find the record for the specific channel.
-    let Some(record) = matching_hash.iter_mut().find(|r| r.channel == channel) else {
+    // Find the record for the specific channel AND member — narrowed to
+    // both, not channel alone (Task 4 finding, ruled non-blocking when
+    // raised by the store task, closed here): `issue` writes one member
+    // per every channel of a token today, so this was unreachable, but
+    // Task 4's multi-channel redemption caller makes multi-record tokens
+    // (different members per channel) routine — without this, a token
+    // whose records carry different members per channel could let one
+    // member's request select another member's record for that channel.
+    // `WrongMember`-before-`WrongChannel` precedence above is untouched:
+    // this only narrows which record counts as "the channel's record".
+    let Some(record) = matching_hash
+        .iter_mut()
+        .find(|r| r.channel == channel && r.member_email == member_email)
+    else {
         return Ok(Consumed::WrongChannel);
     };
 
@@ -224,8 +237,6 @@ pub fn prune(junto_home: &Path) -> Result<usize> {
 ///
 /// # Errors
 /// Returns an error if `<junto-home>/invites.toml` cannot be read or parsed.
-/// Called from Task 4 (the UI layer); alive but not yet used internally.
-#[allow(dead_code)]
 pub fn channels_for(junto_home: &Path, token: &str) -> Result<Vec<String>> {
     let file = load(junto_home)?;
     let hash = token_sha256(token);
@@ -335,6 +346,30 @@ mod tests {
             )
             .unwrap(),
             Consumed::WrongMember
+        ));
+    }
+
+    #[test]
+    fn consume_never_selects_another_members_record_for_the_same_channel() {
+        // One token, two channels, DIFFERENT members per channel — the
+        // shape Task 4's multi-channel redemption makes routine. Dan
+        // presenting the right token for `chan-b` must never be able to
+        // consume Eve's record for that channel just because his own
+        // hash-matching record (for `chan-a`) proves the token is his.
+        let home = tempfile::tempdir().unwrap();
+        let token = "t".repeat(43);
+        issue(home.path(), &token, "dan@x.com", "chan-a", future()).unwrap();
+        issue(home.path(), &token, "eve@x.com", "chan-b", future()).unwrap();
+
+        assert!(matches!(
+            consume(home.path(), &token, "dan@x.com", "chan-b").unwrap(),
+            Consumed::WrongChannel
+        ));
+
+        // Eve's own record is untouched — still redeemable by her.
+        assert!(matches!(
+            consume(home.path(), &token, "eve@x.com", "chan-b").unwrap(),
+            Consumed::Ok
         ));
     }
 

@@ -2064,7 +2064,7 @@ mod tests {
         // OBSERVABLE side effect is the ledger append, not its println,
         // so no worker process is needed for this leg.
         crate::add_member(
-            channel.to_string(),
+            None,
             None,
             None,
             Some("human".to_string()),
