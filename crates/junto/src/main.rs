@@ -1083,7 +1083,14 @@ async fn brief(dir: PathBuf) -> Result<()> {
     for channel in channels {
         match host.resolve(&channel).await {
             Ok(host::Resolution::Resolved { ledger, id, .. }) => {
-                match ledger.lock().await.project(&id).await {
+                // Bind the projection instead of matching the lock guard's
+                // temporary directly: a `MutexGuard` created in a `match`
+                // scrutinee lives until the end of the *whole* match, not
+                // just its arm, so it would still be held below while
+                // `lineage_context` re-locks this same per-substrate ledger
+                // for a sibling channel — a guaranteed self-deadlock.
+                let projected = ledger.lock().await.project(&id).await;
+                match projected {
                     Ok(view) => {
                         let name = view.name.clone().unwrap_or_else(|| channel.clone());
                         let lineage = host.lineage_context(&view).await.unwrap_or_default();
@@ -1286,6 +1293,55 @@ mod tests {
             .await
             .unwrap();
         (repo, opened.id)
+    }
+
+    /// `docs/adr/0027`'s hazard, reproduced exactly as `brief` hits it: the
+    /// bound channel has an **incoming lineage edge to a sibling channel in
+    /// the same substrate**, so `Host::lineage_context` resolves the same
+    /// per-substrate `Ledger` that `brief`'s own projection already locked.
+    /// A regression here must never be able to hang the suite, so the whole
+    /// call is bounded by `tokio::time::timeout` — a fixture this tiny has
+    /// no business taking anywhere near that long, so elapsing it is
+    /// unambiguously the deadlock, not slowness.
+    #[tokio::test]
+    async fn brief_does_not_deadlock_on_a_same_substrate_lineage_edge() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (repo, _parent_id) = setup_channel("parent").await;
+        let setup_host = host::Host::fixed(vec![repo.path().to_path_buf()]);
+        setup_host
+            .diverge(
+                "parent",
+                "child",
+                None,
+                Member::human("Dan", "dan@example.com"),
+                host::WriteAuth::Human,
+            )
+            .await
+            .unwrap();
+
+        // Bind a fresh checkout to the child — the end this whole diagnosis
+        // hinges on: `brief` walks bound channels one at a time, and the
+        // child's `view.lineage` carries the Incoming edge back to the
+        // parent, both served by the one ledger `Arc` this substrate shares.
+        let checkout = tempfile::tempdir().unwrap();
+        std::fs::write(
+            checkout.path().join(binding::PROJECT_BINDING),
+            "channels = [\"child\"]\n",
+        )
+        .unwrap();
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            brief(checkout.path().to_path_buf()),
+        )
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "brief() did not return within 5s — a lock taken while projecting the bound \
+             channel is still held across lineage_context, which re-locks the same \
+             per-substrate ledger for the sibling channel and deadlocks"
+        );
+        outcome.unwrap().unwrap();
     }
 
     fn build_enroll_url(
