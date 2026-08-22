@@ -3640,7 +3640,7 @@ pub(crate) fn iso_utc(millis: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use junto_kernel::{EntryId, Member, Timestamp};
+    use junto_kernel::{ChannelStanding, EntryId, Member, Timestamp};
     use std::collections::HashMap;
 
     fn summary(name: &str, repo: &std::path::Path, secs: i64, gates: usize) -> ChannelSummary {
@@ -3857,6 +3857,7 @@ mod tests {
             closed: false,
             lineage: Vec::new(),
             subjects: Vec::new(),
+            channel_standing: ChannelStanding::Scratch,
         }
     }
 
@@ -4352,6 +4353,7 @@ mod tests {
             closed: false,
             lineage: Vec::new(),
             subjects: Vec::new(),
+            channel_standing: ChannelStanding::Standing,
         };
         let brief = brief_markdown("t", &ChannelId::new(), &view, &Default::default());
 
@@ -4392,6 +4394,7 @@ mod tests {
             closed: false,
             lineage: Vec::new(),
             subjects: Vec::new(),
+            channel_standing: ChannelStanding::Standing,
         };
         let brief = brief_markdown("t", &ChannelId::new(), &view, &Default::default());
 

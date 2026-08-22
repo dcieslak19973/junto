@@ -42,8 +42,8 @@ pub use error::{Error, Result};
 pub use gate::{ApprovalRequirement, GateStatus};
 pub use ids::{ChannelId, EntryId};
 pub use ledger::{
-    ChannelView, KeyGrant, Keyring, Ledger, LineageDirection, LineageEdge, LineageRelation,
-    Standing,
+    ChannelStanding, ChannelView, KeyGrant, Keyring, Ledger, LineageDirection, LineageEdge,
+    LineageRelation, Standing,
 };
 pub use member::{Member, MemberKind};
 pub use provenance::{ContentDigest, ProvenanceRef, Uri};

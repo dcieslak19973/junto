@@ -2412,7 +2412,7 @@ fn lineage_label(edge: &junto_kernel::LineageEdge) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use junto_kernel::{ApprovalRequirement, GateStatus, Member, Standing};
+    use junto_kernel::{ApprovalRequirement, ChannelStanding, GateStatus, Member, Standing};
     use std::process::Command as StdCommand;
     use tempfile::TempDir;
 
@@ -5164,6 +5164,7 @@ mod tests {
             closed: false,
             lineage: Vec::new(),
             subjects: Vec::new(),
+            channel_standing: ChannelStanding::Scratch,
         };
         let html = crate::render::channel_html(
             &[],

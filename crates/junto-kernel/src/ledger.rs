@@ -48,6 +48,23 @@ pub enum Standing {
     Superseded,
 }
 
+/// A whole channel's derived standing (spec §2) — the filter that lets
+/// channels be cheap without drowning recall.
+///
+/// Derived by projection from entries the ledger already holds: no new entry
+/// kind, no user action, nothing to declare. A channel that has produced
+/// nothing verified is invisible to the brief, so opening one costs nothing
+/// epistemically. **Existence and standing are different things.**
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelStanding {
+    /// Nothing ratified and not closed — visible to its author only.
+    Scratch,
+    /// At least one ratified entry: it has produced something. Feeds recall.
+    Standing,
+    /// Closed or converged. Feeds recall as history.
+    Settled,
+}
+
 /// Whether a [`LineageEdge`] is a divergence or a convergence (`docs/adr/0027`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineageRelation {
@@ -218,6 +235,9 @@ pub struct ChannelView {
     /// [`entries`](ChannelView::entries), because the record is append-only.
     /// Members only, like every other fold (`docs/adr/0017`).
     pub subjects: Vec<(EntryId, Subject)>,
+    /// This channel's derived standing (spec §2). Recall and the focus board
+    /// filter on it so that cheap channels cost nothing.
+    pub channel_standing: ChannelStanding,
 }
 
 impl ChannelView {
@@ -454,6 +474,7 @@ impl<S: SubstrateProvider> Ledger<S> {
                 _ => None,
             })
             .unwrap_or(false);
+        let channel_standing = Self::project_channel_standing(&standings, closed);
 
         let view = ChannelView {
             name,
@@ -469,6 +490,7 @@ impl<S: SubstrateProvider> Ledger<S> {
             closed,
             lineage,
             subjects,
+            channel_standing,
         };
         if let Ok(mut cache) = self.cache.lock() {
             cache.insert(*channel, (std::time::Instant::now(), view.clone()));
@@ -815,6 +837,23 @@ impl<S: SubstrateProvider> Ledger<S> {
         standings
     }
 
+    /// Derive the channel's standing from what its ledger already contains.
+    fn project_channel_standing(
+        standings: &HashMap<EntryId, Standing>,
+        closed: bool,
+    ) -> ChannelStanding {
+        if closed {
+            return ChannelStanding::Settled;
+        }
+        if standings
+            .values()
+            .any(|standing| *standing == Standing::Ratified)
+        {
+            return ChannelStanding::Standing;
+        }
+        ChannelStanding::Scratch
+    }
+
     /// Fold the proposal gate statuses out of an ordered list of *recognized*
     /// entries — so only members' approvals and rejections count
     /// (`docs/adr/0017`).
@@ -954,9 +993,9 @@ impl<S: SubstrateProvider> Ledger<S> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        ApprovalRequirement, EntryId, EntryPayload, GateStatus, InMemorySubstrate, KeyGrant,
-        Ledger, LedgerEntry, LineageDirection, LineageEdge, LineageRelation, Member, SessionState,
-        Standing, Subject, SubjectKind, Timestamp, Uri, ids::ChannelId,
+        ApprovalRequirement, ChannelStanding, EntryId, EntryPayload, GateStatus, InMemorySubstrate,
+        KeyGrant, Ledger, LedgerEntry, LineageDirection, LineageEdge, LineageRelation, Member,
+        SessionState, Standing, Subject, SubjectKind, Timestamp, Uri, ids::ChannelId,
     };
 
     /// Build an entry with explicit id/timestamp/author for deterministic tests.
@@ -4234,5 +4273,101 @@ mod tests {
             view.party.iter().any(|m| m.email == "worker@agents.junto"),
             "revocation retires keys; it must never remove the member from the party"
         );
+    }
+
+    /// Build a channel whose genesis is authored by `dan`, then run `body`'s
+    /// extra entries through it. Kept local to these three tests rather than
+    /// added to the module's shared fixtures — `entry` and `assertion` are the
+    /// only helpers this module has, and it stays that way.
+    async fn standing_of(extra: Vec<EntryPayload>) -> ChannelStanding {
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let dan = Member::human("Dan", "dan@example.com");
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                dan.clone(),
+                1,
+                EntryPayload::ChannelOpened {
+                    name: Some("standing".into()),
+                },
+            ))
+            .await
+            .expect("append genesis");
+        for (offset, payload) in extra.into_iter().enumerate() {
+            let millis = 2 + i64::try_from(offset).expect("small offset");
+            ledger
+                .append(entry(EntryId::new(), channel, dan.clone(), millis, payload))
+                .await
+                .expect("append entry");
+        }
+        ledger
+            .project(&channel)
+            .await
+            .expect("project")
+            .channel_standing
+    }
+
+    #[tokio::test]
+    async fn a_channel_with_nothing_ratified_is_scratch_and_stays_out_of_recall() {
+        let standing = standing_of(vec![assertion("a half-formed thought")]).await;
+        assert_eq!(standing, ChannelStanding::Scratch);
+    }
+
+    #[tokio::test]
+    async fn one_ratified_entry_promotes_a_channel_to_standing() {
+        // The ratification must target the assertion's real id, so this test
+        // builds its entries directly rather than through `standing_of`.
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let dan = Member::human("Dan", "dan@example.com");
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                dan.clone(),
+                1,
+                EntryPayload::ChannelOpened {
+                    name: Some("standing".into()),
+                },
+            ))
+            .await
+            .expect("append genesis");
+        let claim = EntryId::new();
+        ledger
+            .append(entry(
+                claim,
+                channel,
+                dan.clone(),
+                2,
+                assertion("a real finding"),
+            ))
+            .await
+            .expect("append assertion");
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                dan.clone(),
+                3,
+                EntryPayload::Ratification {
+                    target: claim,
+                    rationale: "checked".into(),
+                },
+            ))
+            .await
+            .expect("append ratification");
+        let view = ledger.project(&channel).await.expect("project");
+        assert_eq!(view.channel_standing, ChannelStanding::Standing);
+    }
+
+    #[tokio::test]
+    async fn closing_a_channel_settles_it_even_with_nothing_ratified() {
+        let standing = standing_of(vec![EntryPayload::ChannelClosed {
+            rationale: "abandoned".into(),
+        }])
+        .await;
+        assert_eq!(standing, ChannelStanding::Settled);
     }
 }
