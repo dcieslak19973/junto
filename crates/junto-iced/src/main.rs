@@ -429,6 +429,11 @@ struct EntryDto {
     summary: String,
     status: Option<String>,
     unrecognized: bool,
+    /// Recognized but the signature is missing or does not verify against
+    /// the author's recorded key (`docs/adr/0033`). Absent from a host that
+    /// predates the field.
+    #[serde(default)]
+    unverified: bool,
     /// The entry this one acts on (e.g. a session memo/artifact → its session).
     #[serde(default)]
     target: Option<String>,
@@ -3123,6 +3128,17 @@ fn dot(color: Color) -> Element<'static, Message> {
         .into()
 }
 
+/// Which authorship badges an entry card shows: `(show_unrecognized,
+/// show_unverified)`. Pure — extracted from `entry_card` so the suppression
+/// rule is testable without a renderer. `unverified` is suppressed whenever
+/// `unrecognized` is set: that badge already signals distrust louder
+/// (mirrors the web's reasoning, `crates/junto/src/render.rs`).
+fn entry_badges(entry: &EntryDto) -> (bool, bool) {
+    let show_unrecognized = entry.unrecognized;
+    let show_unverified = entry.unverified && !entry.unrecognized;
+    (show_unrecognized, show_unverified)
+}
+
 /// One timeline entry as a card: a colour-coded kind badge + author + status,
 /// over the summary text.
 #[allow(clippy::too_many_arguments)]
@@ -3145,8 +3161,12 @@ fn entry_card<'a>(
     if let Some(status) = &entry.status {
         head = head.push(badge(status, status_color(status)));
     }
-    if entry.unrecognized {
-        head = head.push(badge("unrecognized", MUTED));
+    let (show_unrecognized, show_unverified) = entry_badges(entry);
+    if show_unrecognized {
+        head = head.push(badge("unrecognized", RED));
+    }
+    if show_unverified {
+        head = head.push(badge("unverified", YELLOW));
     }
     head = head.push(Space::with_width(Fill));
     head = head.push(copy_button(entry.summary.clone()));
@@ -4750,5 +4770,43 @@ mod tests {
         assert_eq!(parse_span(""), None, "empty input is rejected");
         assert_eq!(parse_span("12-"), None, "a dangling range is rejected");
         assert_eq!(parse_span("-12"), None, "a missing start is rejected");
+    }
+
+    /// All fields defaulted or empty — a minimal `EntryDto` for tests that
+    /// only care about the authorship-badge fields.
+    fn sample_entry() -> EntryDto {
+        EntryDto {
+            id: String::new(),
+            author: String::new(),
+            kind: String::new(),
+            summary: String::new(),
+            status: None,
+            unrecognized: false,
+            unverified: false,
+            target: None,
+            frame: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn entry_badges_suppress_unverified_on_an_unrecognized_card() {
+        let both = EntryDto {
+            unrecognized: true,
+            unverified: true,
+            ..sample_entry()
+        };
+        assert_eq!(entry_badges(&both), (true, false));
+        let only_unverified = EntryDto {
+            unrecognized: false,
+            unverified: true,
+            ..sample_entry()
+        };
+        assert_eq!(entry_badges(&only_unverified), (false, true));
+        let clean = EntryDto {
+            unrecognized: false,
+            unverified: false,
+            ..sample_entry()
+        };
+        assert_eq!(entry_badges(&clean), (false, false));
     }
 }

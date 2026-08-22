@@ -2238,6 +2238,10 @@ struct EntryDto {
     summary: String,
     status: Option<String>,
     unrecognized: bool,
+    /// Recognized but the signature is missing or does not verify against
+    /// the author's recorded key that was active at the entry's own
+    /// timestamp (`docs/adr/0033`, `ChannelView::unverified`).
+    unverified: bool,
     /// The entry this one acts on, if any — e.g. a SessionUpdated/ArtifactAttached
     /// points at its SessionStarted, letting a surface group a session's record.
     target: Option<String>,
@@ -2396,6 +2400,7 @@ impl EntryDto {
             summary,
             status,
             unrecognized: view.unrecognized.contains(&entry.id),
+            unverified: view.unverified.contains(&entry.id),
             target: entry.payload.target().map(|t| t.to_string()),
             frame,
         }
@@ -4205,6 +4210,116 @@ mod tests {
         assert!(
             html.contains("recording\\u2026"),
             "act feedback script present"
+        );
+    }
+
+    #[tokio::test]
+    async fn view_json_flags_an_unverified_entry() {
+        // An entry signed by a key that does not match its author's grant
+        // projects as unverified; assert the JSON carries unverified: true
+        // for it and false for a properly signed neighbour.
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(dir.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        for (key, value) in [("user.name", "Web User"), ("user.email", "web@example.com")] {
+            assert!(
+                StdCommand::new("git")
+                    .args(["config", key, value])
+                    .current_dir(dir.path())
+                    .status()
+                    .expect("git config")
+                    .success()
+            );
+        }
+        let member_home = tempfile::tempdir().expect("member home");
+        let host = Host::fixed_with_member_home(
+            vec![dir.path().to_path_buf()],
+            Some(member_home.path().to_path_buf()),
+        );
+        let founder = Member::human("Web User", "web@example.com");
+        let opened = host
+            .open_channel(None, "web-test", founder.clone(), None)
+            .await
+            .expect("open channel");
+        let channel = opened.id;
+        let bot = Member::agent("Bot", "bot@example.com");
+        let granted_key = junto_kernel::SigningKey::from_secret_bytes([21; 32]);
+        let stray_key = junto_kernel::SigningKey::from_secret_bytes([22; 32]);
+        host.add_member(
+            "web-test",
+            &founder,
+            bot.clone(),
+            Some(granted_key.public_key()),
+            None,
+        )
+        .await
+        .expect("add bot with a granted key");
+
+        let ledger = host.ledger_for(dir.path()).await.expect("ledger");
+        let mut verified_entry = LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel,
+            author: bot.clone(),
+            timestamp: Timestamp::now(),
+            payload: assertion(),
+        };
+        verified_entry
+            .sign(&granted_key)
+            .expect("sign with the granted key");
+        let verified_id = verified_entry.id;
+        ledger
+            .lock()
+            .await
+            .append(verified_entry)
+            .await
+            .expect("append the properly signed entry");
+
+        let mut unverified_entry = LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel,
+            author: bot.clone(),
+            timestamp: Timestamp::now(),
+            payload: assertion(),
+        };
+        unverified_entry
+            .sign(&stray_key)
+            .expect("sign with a key that was never granted");
+        let unverified_id = unverified_entry.id;
+        ledger
+            .lock()
+            .await
+            .append(unverified_entry)
+            .await
+            .expect("append the wrongly signed entry");
+
+        let response = channel_view_json(State(host.clone()), Path("web-test".into())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_text(response).await;
+        let json: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        let entries = json["entries"].as_array().expect("entries array");
+        let find = |id: EntryId| {
+            entries
+                .iter()
+                .find(|e| e["id"] == id.to_string())
+                .unwrap_or_else(|| panic!("entry {id} present in the JSON: {entries:?}"))
+        };
+        assert_eq!(
+            find(unverified_id)["unverified"],
+            true,
+            "signed by an ungranted key"
+        );
+        assert_eq!(
+            find(verified_id)["unverified"],
+            false,
+            "signed by the author's granted key"
         );
     }
 
