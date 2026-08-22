@@ -192,17 +192,21 @@ fn internal(message: String) -> Response {
 
 /// Response layer: turn any error-status plain-text response (the handlers'
 /// `(StatusCode, message)` returns) into a styled error page, so the human
-/// surface never shows a bare body on a blank page. Already-HTML and success
-/// responses pass through untouched.
+/// surface never shows a bare body on a blank page. Already-HTML and
+/// already-JSON responses pass through untouched — a JSON endpoint's error
+/// body (e.g. `POST /members`'s 409 `{"outcomes":[…]}`) is structured data a
+/// non-HTML caller parses, not a page to prettify; rewriting it here would
+/// silently discard the per-channel truth the brief requires that body to
+/// carry.
 async fn prettify_errors(response: Response) -> Response {
     let status = response.status();
     if !status.is_client_error() && !status.is_server_error() {
         return response;
     }
     if let Some(content_type) = response.headers().get(header::CONTENT_TYPE)
-        && content_type
-            .to_str()
-            .is_ok_and(|value| value.starts_with("text/html"))
+        && content_type.to_str().is_ok_and(|value| {
+            value.starts_with("text/html") || value.starts_with("application/json")
+        })
     {
         return response;
     }
@@ -2928,7 +2932,21 @@ async fn redeem_enrollment_endpoint(
 
     let outcomes = match crate::redeem_enrollment(&host, &payload, kind, None).await {
         Ok(outcomes) => outcomes,
-        Err(err) => return (StatusCode::CONFLICT, err.to_string()).into_response(),
+        Err(err) => {
+            let message = err.to_string();
+            // The engine's only `bail!` is the exhausted-invite refusal
+            // (`channels_for` returned nothing to redeem) — every other
+            // `Err` is a genuine failure (e.g. an unreadable invite store),
+            // which `preview_enrollment` already reports as `internal`, not
+            // 409. Compared by exact text against the shared constant
+            // (`crate::invite_exhausted_message`) rather than by variant,
+            // since `redeem_enrollment`'s `Result` carries no error enum —
+            // see its own doc comment.
+            if message == crate::invite_exhausted_message() {
+                return (StatusCode::CONFLICT, message).into_response();
+            }
+            return internal(message);
+        }
     };
 
     let mut granted_any = false;
@@ -5012,17 +5030,16 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn post_members_returns_409_with_outcomes_when_nothing_could_be_granted() {
-        // A stale, already-consumed record sharing a (channel, member) pair
-        // with a fresh, still-covered duplicate is the one way
-        // `RedeemOutcome::InviteAlreadyUsed` is reachable now that
-        // `AlreadyAMember` is decided first (see
-        // `main.rs`'s `a_stale_consumed_duplicate_record_reports_invite_already_used`,
-        // which this mirrors for both of this fixture's channels): the
-        // fresh duplicate keeps `channels_for` naming the channel, but
-        // `consume` lands on the stale, already-used record first.
-        let fx = redeem_fixture().await;
+    /// Set up a token whose invite record for every channel in `fx` is a
+    /// stale, already-consumed duplicate — the one way
+    /// `RedeemOutcome::InviteAlreadyUsed` is reachable now that
+    /// `AlreadyAMember` is decided first (see `main.rs`'s
+    /// `a_stale_consumed_duplicate_record_reports_invite_already_used`,
+    /// mirrored here for both of this fixture's channels): a fresh
+    /// duplicate keeps `channels_for` naming the channel, but `consume`
+    /// lands on the stale, already-used record first. Returns the encoded
+    /// enroll code for "eve@example.com".
+    fn stale_duplicate_invite_enroll_url(fx: &RedeemFixture) -> String {
         let key = junto_kernel::SigningKey::from_secret_bytes([7; 32]);
         let transport_key = junto_kernel::SigningKey::from_secret_bytes([8; 32]);
         let junto_home = crate::host::junto_home().unwrap();
@@ -5048,7 +5065,13 @@ mod tests {
             transport_public_key: transport_key.public_key(),
             expires_at,
         };
-        let url = crate::enroll::encode_enroll(&payload).expect("encodes");
+        crate::enroll::encode_enroll(&payload).expect("encodes")
+    }
+
+    #[tokio::test]
+    async fn post_members_returns_409_with_outcomes_when_nothing_could_be_granted() {
+        let fx = redeem_fixture().await;
+        let url = stale_duplicate_invite_enroll_url(&fx);
 
         let response = redeem_enrollment_endpoint(
             State(fx.host.clone()),
@@ -5066,6 +5089,95 @@ mod tests {
         for outcome in outcomes {
             assert_eq!(outcome["result"], "invite_already_used", "{outcome:?}");
         }
+    }
+
+    /// Finding 1 (review round 1): `prettify_errors` used to rewrite the
+    /// body of EVERY error-status response whose `Content-Type` was not
+    /// `text/html` into a styled HTML page — silently discarding a JSON
+    /// endpoint's structured error body (here, `/members`'s 409
+    /// `{"outcomes":[…]}`, exactly what the brief requires that body to
+    /// carry). `prettify_errors` is the ONLY transformation `router()`
+    /// applies on top of a handler's own `Response` (routing/extraction do
+    /// not touch an already-built body), so piping the handler's raw 409
+    /// through it — precisely what `.layer(axum::middleware::
+    /// map_response(prettify_errors))` does for every live request —
+    /// reproduces the real over-the-wire response without a full HTTP
+    /// client.
+    #[tokio::test]
+    async fn post_members_409_json_body_survives_the_error_prettifying_layer() {
+        let fx = redeem_fixture().await;
+        let url = stale_duplicate_invite_enroll_url(&fx);
+
+        let response = redeem_enrollment_endpoint(
+            State(fx.host.clone()),
+            Form(RedeemForm {
+                enroll: url,
+                kind: "human".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let response = prettify_errors(response).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        assert_eq!(
+            content_type.as_deref(),
+            Some("application/json"),
+            "the layer must not have rewritten a JSON error body"
+        );
+        let body = body_text(response).await;
+        let json: serde_json::Value =
+            serde_json::from_str(&body).expect("still valid JSON after prettify_errors");
+        let outcomes = json["outcomes"].as_array().expect("outcomes array");
+        assert_eq!(outcomes.len(), 2, "{outcomes:?}");
+        for outcome in outcomes {
+            assert_eq!(outcome["result"], "invite_already_used", "{outcome:?}");
+        }
+    }
+
+    /// Finding 2 (review round 1): `redeem_enrollment` `?`s on
+    /// `host::junto_home()` and `invites::channels_for` before it can
+    /// even reach its own empty-set `bail!` — so a genuinely unreadable
+    /// or corrupt invite store must NOT be reported as 409 (that status
+    /// means "the whole set was already used or not ours", a normal
+    /// operator-facing condition, not an I/O failure). Compared against
+    /// [`preview_enrollment`], which already classifies the identical
+    /// failure as `internal`.
+    #[tokio::test]
+    async fn post_members_500s_on_a_genuine_invite_store_failure_not_409() {
+        let home = crate::host::test_home::HomeGuard::new();
+        // Corrupt invites.toml so `channels_for`'s `load` fails to parse,
+        // rather than legitimately reporting an empty (exhausted) set.
+        std::fs::write(home.path().join("invites.toml"), "not valid toml {{{").unwrap();
+        let host = Host::fixed_with_member_home(vec![], Some(home.path().to_path_buf()));
+
+        let key = junto_kernel::SigningKey::from_secret_bytes([7; 32]);
+        let transport_key = junto_kernel::SigningKey::from_secret_bytes([8; 32]);
+        let payload = crate::enroll::EnrollPayload {
+            v: crate::enroll::PAYLOAD_VERSION,
+            invite_token: crate::enroll::mint_invite_token(),
+            email: "eve@example.com".to_string(),
+            display_name: "Eve".to_string(),
+            public_key: key.public_key(),
+            transport_public_key: transport_key.public_key(),
+            expires_at: Timestamp::now().as_millis() + 60_000,
+        };
+        let url = crate::enroll::encode_enroll(&payload).expect("encodes");
+
+        let response = redeem_enrollment_endpoint(
+            State(host),
+            Form(RedeemForm {
+                enroll: url,
+                kind: "human".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]
@@ -5328,6 +5440,108 @@ mod tests {
         );
     }
 
+    /// Finding 4a (review round 1): `revoke_fixture`'s target had two
+    /// ACTIVE grants and none retired, so a naive "every grant for this
+    /// email" (ignoring `retired_at`) reported the identical `{"parked":2}`
+    /// as the real `grants_to_park` — the "every ACTIVE grant" contract was
+    /// unobservable. Retiring one grant first, then revoking, makes the
+    /// two implementations diverge: only 1 more grant to park, exactly 1
+    /// new `Park` entry.
+    #[tokio::test]
+    async fn post_revoke_parks_only_active_grants_leaving_already_retired_ones_alone() {
+        let fx = revoke_fixture().await;
+        let (_, view, _) = project(&fx.host, &fx.channel.to_string())
+            .await
+            .expect("projects");
+        let grants = view
+            .keyring
+            .get(&fx.member.email)
+            .expect("carol has grants");
+        assert_eq!(grants.len(), 2);
+        let already_retired = grants[0].granted_by;
+
+        let retire_response = retire_device(
+            State(fx.host.clone()),
+            Path((fx.channel.to_string(), already_retired.to_string())),
+            Form(RationaleForm {
+                rationale: "retiring device a ahead of the revoke".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(retire_response.status(), StatusCode::OK);
+
+        let (_, view_before, _) = project(&fx.host, &fx.channel.to_string())
+            .await
+            .expect("projects");
+        let entries_before = view_before.entries.len();
+
+        let response = revoke_member(
+            State(fx.host.clone()),
+            Path((fx.channel.to_string(), fx.member.email.clone())),
+            Form(RationaleForm {
+                rationale: "leaving the team".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json: serde_json::Value =
+            serde_json::from_str(&body_text(response).await).expect("valid json");
+        assert_eq!(
+            json["parked"], 1,
+            "only the still-active grant is parked, not the already-retired one"
+        );
+
+        let (_, view_after, _) = project(&fx.host, &fx.channel.to_string())
+            .await
+            .expect("projects");
+        assert_eq!(
+            view_after.entries.len(),
+            entries_before + 1,
+            "exactly one new Park entry — none for the already-retired grant"
+        );
+    }
+
+    /// Finding 4b (review round 1): `revoke_member`'s `targets.is_empty()`
+    /// 400 branch had no test — revoking the same member twice leaves
+    /// nothing to park the second time.
+    #[tokio::test]
+    async fn post_revoke_refuses_a_member_with_no_active_grants() {
+        let fx = revoke_fixture().await;
+        let first_response = revoke_member(
+            State(fx.host.clone()),
+            Path((fx.channel.to_string(), fx.member.email.clone())),
+            Form(RationaleForm {
+                rationale: "leaving the team".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(first_response.status(), StatusCode::OK);
+
+        let (_, view_before, _) = project(&fx.host, &fx.channel.to_string())
+            .await
+            .expect("projects");
+        let entries_before = view_before.entries.len();
+
+        let second_response = revoke_member(
+            State(fx.host.clone()),
+            Path((fx.channel.to_string(), fx.member.email.clone())),
+            Form(RationaleForm {
+                rationale: "again".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(second_response.status(), StatusCode::BAD_REQUEST);
+
+        let (_, view_after, _) = project(&fx.host, &fx.channel.to_string())
+            .await
+            .expect("projects");
+        assert_eq!(
+            view_after.entries.len(),
+            entries_before,
+            "nothing appended for a member with no active grants"
+        );
+    }
+
     #[tokio::test]
     async fn post_retire_parks_one_grant_and_refuses_an_already_retired_one() {
         let fx = revoke_fixture().await;
@@ -5390,10 +5604,78 @@ mod tests {
         );
     }
 
+    /// Finding 5 (review round 1): `retire_device`'s unknown-grant 404 and
+    /// its empty-rationale refusal had no tests.
     #[tokio::test]
-    async fn post_retire_refuses_a_caller_who_is_not_the_founder() {
-        // A different repo whose git user is Carol — a member of the
-        // channel, but not its founder.
+    async fn post_retire_refuses_an_unknown_grant_and_an_empty_rationale() {
+        let fx = revoke_fixture().await;
+        let (_, view_before, _) = project(&fx.host, &fx.channel.to_string())
+            .await
+            .expect("projects");
+        let entries_before = view_before.entries.len();
+
+        // A fresh, never-issued entry id names no grant in this channel.
+        let unknown = EntryId::new();
+        let unknown_response = retire_device(
+            State(fx.host.clone()),
+            Path((fx.channel.to_string(), unknown.to_string())),
+            Form(RationaleForm {
+                rationale: "rotating".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(unknown_response.status(), StatusCode::NOT_FOUND);
+
+        let grant = view_before
+            .keyring
+            .get(&fx.member.email)
+            .and_then(|grants| grants.first())
+            .expect("carol has a grant")
+            .granted_by;
+        let empty_rationale_response = retire_device(
+            State(fx.host.clone()),
+            Path((fx.channel.to_string(), grant.to_string())),
+            Form(RationaleForm {
+                rationale: "   ".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(empty_rationale_response.status(), StatusCode::BAD_REQUEST);
+
+        let (_, view_after, _) = project(&fx.host, &fx.channel.to_string())
+            .await
+            .expect("projects");
+        assert_eq!(
+            view_after.entries.len(),
+            entries_before,
+            "nothing appended in either case"
+        );
+    }
+
+    /// A host whose git identity is `caller_name`/`caller_email` — never
+    /// this channel's founder — with `target_name`/`target_email` added as
+    /// a party member holding one grant. Shared by [`retire_device`]'s and
+    /// [`revoke_member`]'s "caller is not the founder" tests: the founder-
+    /// authority check they both call through `crate::identity::
+    /// require_founder` must refuse no matter which act it gates. Passing
+    /// the same name/email for both parameters (as the retire test does)
+    /// makes the caller its own target, exactly the original single-Carol
+    /// setup.
+    struct NonFounderCallerFixture {
+        _home: crate::host::test_home::HomeGuard,
+        _dirs: Vec<TempDir>,
+        host: Arc<Host>,
+        channel: ChannelId,
+        target: Member,
+        grant: EntryId,
+    }
+
+    async fn non_founder_caller_fixture(
+        caller_name: &str,
+        caller_email: &str,
+        target_name: &str,
+        target_email: &str,
+    ) -> NonFounderCallerFixture {
         let home = crate::host::test_home::HomeGuard::new();
         let repo = tempfile::tempdir().expect("repo dir");
         assert!(
@@ -5404,7 +5686,7 @@ mod tests {
                 .expect("git init")
                 .success()
         );
-        for (key, value) in [("user.name", "Carol"), ("user.email", "carol@example.com")] {
+        for (key, value) in [("user.name", caller_name), ("user.email", caller_email)] {
             assert!(
                 StdCommand::new("git")
                     .args(["config", key, value])
@@ -5424,35 +5706,86 @@ mod tests {
             .await
             .expect("open channel")
             .id;
-        let member = Member::human("Carol", "carol@example.com");
+        let target = Member::human(target_name, target_email);
         let key = junto_kernel::SigningKey::from_secret_bytes([11; 32]);
         host.add_member(
             "acme",
             &founder,
-            member.clone(),
+            target.clone(),
             Some(key.public_key()),
             None,
         )
         .await
-        .expect("add carol");
+        .expect("add target");
         let (_, view, _) = project(&host, &channel.to_string())
             .await
             .expect("projects");
         let grant = view
             .keyring
-            .get(&member.email)
+            .get(&target.email)
             .and_then(|grants| grants.first())
-            .expect("carol has a grant")
+            .expect("target has a grant")
             .granted_by;
+        NonFounderCallerFixture {
+            _home: home,
+            _dirs: vec![repo],
+            host,
+            channel,
+            target,
+            grant,
+        }
+    }
 
+    #[tokio::test]
+    async fn post_retire_refuses_a_caller_who_is_not_the_founder() {
+        // Carol is both the caller and the retired grant's own owner.
+        let fx =
+            non_founder_caller_fixture("Carol", "carol@example.com", "Carol", "carol@example.com")
+                .await;
         let response = retire_device(
-            State(host),
-            Path((channel.to_string(), grant.to_string())),
+            State(fx.host),
+            Path((fx.channel.to_string(), fx.grant.to_string())),
             Form(RationaleForm {
                 rationale: "trying to retire someone else's grant".to_string(),
             }),
         )
         .await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// Finding 3 (review round 1): `revoke_member`'s founder gate had no
+    /// test of its own — `revoke_fixture` always calls as the founder, so
+    /// deleting `require_founder`'s check there left every Task 10 test
+    /// green. Dave is a resolvable git identity that is neither the
+    /// founder nor even a party member; Carol is a third member with an
+    /// active grant.
+    #[tokio::test]
+    async fn post_revoke_refuses_a_caller_who_is_not_the_founder() {
+        let fx =
+            non_founder_caller_fixture("Dave", "dave@example.com", "Carol", "carol@example.com")
+                .await;
+        let (_, view_before, _) = project(&fx.host, &fx.channel.to_string())
+            .await
+            .expect("projects");
+        let entries_before = view_before.entries.len();
+
+        let response = revoke_member(
+            State(fx.host.clone()),
+            Path((fx.channel.to_string(), fx.target.email.clone())),
+            Form(RationaleForm {
+                rationale: "trying to revoke someone else's grant".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let (_, view_after, _) = project(&fx.host, &fx.channel.to_string())
+            .await
+            .expect("projects");
+        assert_eq!(
+            view_after.entries.len(),
+            entries_before,
+            "nothing appended for a refused caller"
+        );
     }
 }
