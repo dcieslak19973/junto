@@ -146,13 +146,14 @@ pub fn transport_key(junto_home: &Path, email: &str) -> Result<SigningKey> {
 }
 
 /// Whether `email` already has a transport key on file — **never mints**
-/// one, mirroring [`has_signing_key`] for the same reason. Not yet called
-/// from this task's own wiring (`Host::add_member`'s local-mint path mints
-/// unconditionally, mirroring `keyed`'s own signing-key mint, which never
-/// consults `has_signing_key` either) — a later transport-slice task (the
-/// `keys.json`/`/devices/enroll` endpoints) is this function's first real
-/// caller, matching `enroll.rs`'s own precedent for kernel API landed ahead
-/// of its wiring.
+/// one, mirroring [`has_signing_key`] for the same reason. Exercised by
+/// `host::lineage_tests::add_member_keyless_still_mints_for_a_local_agent`,
+/// but has no caller from non-test code yet — `Host::add_member`'s
+/// local-mint path mints unconditionally, mirroring `keyed`'s own
+/// signing-key mint, which never consults `has_signing_key` either. A
+/// later transport-slice task (the `keys.json`/`/devices/enroll`
+/// endpoints) is this function's first real *production* caller, matching
+/// `enroll.rs`'s own precedent for kernel API landed ahead of its wiring.
 #[allow(dead_code)]
 pub fn has_transport_key(junto_home: &Path, email: &str) -> Result<bool> {
     Ok(load(junto_home)?

@@ -1523,6 +1523,46 @@ mod lineage_tests {
         );
     }
 
+    /// The central integration point this task exists for: an enroll
+    /// payload supplying BOTH halves flows through `Host::add_member` into
+    /// the projected grant unchanged — the recorded transport key is the
+    /// one supplied, not a locally minted one, and it rides the SAME grant
+    /// as the signing key (not a separate one).
+    #[tokio::test]
+    async fn add_member_with_a_supplied_transport_key_records_the_pair() {
+        let (_dirs, host) = lineage_host(1);
+        host.open_channel(None, "acme", dan(), None).await.unwrap();
+        let alice_key = junto_kernel::SigningKey::from_secret_bytes([7; 32]);
+        let alice_transport_key = junto_kernel::SigningKey::from_secret_bytes([8; 32]);
+        let alice = Member::human("Alice", "alice@example.com");
+        host.add_member(
+            "acme",
+            &dan(),
+            alice,
+            Some(alice_key.public_key()),
+            Some(alice_transport_key.public_key()),
+        )
+        .await
+        .unwrap();
+
+        let (_, view) = project(&host, "acme").await;
+        let grant = view
+            .keyring
+            .get("alice@example.com")
+            .and_then(|grants| grants.first())
+            .expect("alice has a keyring grant");
+        assert_eq!(
+            grant.key,
+            alice_key.public_key(),
+            "the recorded signing key is the one supplied"
+        );
+        assert_eq!(
+            grant.transport_key,
+            Some(alice_transport_key.public_key()),
+            "the recorded transport key is the one supplied, not a locally minted one"
+        );
+    }
+
     /// The core fix's other half: a keyless grant for a human this host has
     /// no local key for (and was handed no key) must be refused, not
     /// silently mint one on the founder's machine.
@@ -1547,7 +1587,9 @@ mod lineage_tests {
 
     /// The keyless/interactive path must keep working for the local-agent
     /// case: an agent runs on this machine by construction, so first-use
-    /// minting is legitimate.
+    /// minting is legitimate — and that must mint BOTH halves, not just
+    /// the signing key, giving `keys::has_transport_key` its first real
+    /// caller.
     #[tokio::test]
     async fn add_member_keyless_still_mints_for_a_local_agent() {
         let (dirs, host) = lineage_host(1);
@@ -1559,6 +1601,10 @@ mod lineage_tests {
         assert!(
             crate::keys::has_signing_key(member_home(&dirs), "worker@agents.junto").unwrap(),
             "an agent's key is minted like its member code (docs/adr/0033)"
+        );
+        assert!(
+            crate::keys::has_transport_key(member_home(&dirs), "worker@agents.junto").unwrap(),
+            "the transport half is minted alongside the signing key on the same local path"
         );
     }
 

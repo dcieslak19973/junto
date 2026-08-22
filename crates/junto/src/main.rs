@@ -1273,6 +1273,7 @@ mod tests {
         assert_eq!(payload.public_key, key);
         assert_eq!(payload.transport_public_key, transport_key);
         assert_eq!(payload.display_name, "Dan's Laptop");
+        assert_eq!(payload.expires_at, invite.expires_at);
     }
 
     fn git_repo() -> tempfile::TempDir {
