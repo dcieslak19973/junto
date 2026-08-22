@@ -32,6 +32,7 @@ pub mod provenance;
 pub mod serial;
 pub mod session;
 pub mod sign;
+pub mod subject;
 pub mod substrate;
 pub mod time;
 
@@ -48,6 +49,7 @@ pub use member::{Member, MemberKind};
 pub use provenance::{ContentDigest, ProvenanceRef, Uri};
 pub use session::{SessionState, SessionView};
 pub use sign::{PublicKey, Signature, SigningKey};
+pub use subject::{Subject, SubjectKind};
 pub use substrate::{InMemorySubstrate, SubstrateProvider};
 pub use time::Timestamp;
 
