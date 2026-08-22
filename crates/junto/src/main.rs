@@ -598,24 +598,35 @@ fn member_code_for(email: &str) -> Result<Option<String>> {
         .map(|record| record.code))
 }
 
-/// `junto invite` — mint a founder-issued enrollment invite
-/// (device-key-enrollment plan, Task 6). One invite may cover several
-/// channels (Task 3): every one is resolved to its canonical id and
-/// checked with `require_founder` BEFORE a token is minted or anything is
-/// written — an invite the caller cannot complete for even one channel is
-/// refused whole, nothing issued, nothing printed. Two names (or a name
-/// and its id) that address the same channel collapse to a single record,
-/// in first-seen order, so redemption never reports the same channel
-/// twice. Refuses more than `enroll::MAX_INVITE_CHANNELS` channels here
-/// too, rather than minting a code `decode_invite` would only reject
-/// later.
+/// Everything `junto invite` produces before it prints anything: the
+/// payload to encode into the shareable URI, and the display labels —
+/// the spellings the founder actually typed, first-seen order, deduped
+/// by canonical id — for the line `invite_line` prints. Split out of
+/// `invite` so tests can inspect the minted token and payload directly,
+/// without capturing `invite`'s `println!` (this crate has, and may add,
+/// no stdout-capture dependency).
+struct MintedInvite {
+    payload: enroll::InvitePayload,
+    display_channels: Vec<String>,
+}
+
+/// One invite may cover several channels (Task 3): every one is resolved
+/// to its canonical id and checked with `require_founder` BEFORE a token
+/// is minted or anything is written — an invite the caller cannot
+/// complete for even one channel is refused whole, nothing issued,
+/// nothing minted. Two spellings that address the same channel (a name
+/// and its id, or two aliases) collapse to a single record, kept under
+/// the FIRST spelling the founder typed — `invite_line` must show what a
+/// human actually typed, never the raw canonical id underneath. Refuses
+/// more than `enroll::MAX_INVITE_CHANNELS` channels here too, rather than
+/// minting a code `decode_invite` would only reject later.
 ///
 /// Prunes `invites.toml` first (final fix wave, finding 1): every call
 /// appends new records, so without this the file would grow without
 /// bound (`invites::prune`'s own doc comment) — `invite` is the one
 /// command guaranteed to run whenever a human is actively using this
 /// mechanism, so it is the natural place to reclaim long-expired ones.
-async fn invite(channels: Vec<String>, member: String) -> Result<()> {
+async fn mint_invite(channels: Vec<String>, member: String) -> Result<MintedInvite> {
     invites::prune(&host::junto_home()?)?;
     if channels.len() > enroll::MAX_INVITE_CHANNELS {
         bail!(
@@ -630,6 +641,7 @@ async fn invite(channels: Vec<String>, member: String) -> Result<()> {
     // above) — an invite the caller cannot complete for even one channel
     // must leave nothing behind.
     let mut canonical_channels: Vec<String> = Vec::new();
+    let mut display_channels: Vec<String> = Vec::new();
     for channel in &channels {
         let (substrate, ledger, id) = resolve_channel(&host, channel).await?;
         let view = ledger.lock().await.project(&id).await?;
@@ -642,10 +654,13 @@ async fn invite(channels: Vec<String>, member: String) -> Result<()> {
         // the same channel — otherwise the two legs of one exchange land
         // on different strings and redemption fails with a misleading
         // `WrongChannel`. Dedupe here, on the canonical id, so two
-        // spellings of one channel never produce two records.
+        // spellings of one channel never produce two records — keeping
+        // the FIRST spelling as the display label, never the id a human
+        // never typed.
         let canonical = id.to_string();
         if !canonical_channels.contains(&canonical) {
             canonical_channels.push(canonical);
+            display_channels.push(channel.clone());
         }
     }
 
@@ -661,14 +676,30 @@ async fn invite(channels: Vec<String>, member: String) -> Result<()> {
     for canonical in &canonical_channels {
         invites::issue(&host::junto_home()?, &token, &member, canonical, expires_at)?;
     }
-    let url = enroll::encode_invite(&enroll::InvitePayload {
-        v: enroll::PAYLOAD_VERSION,
-        invite_token: token,
-        member_email: member,
-        channels: canonical_channels.clone(),
-        expires_at,
-    })?;
-    println!("{}", invite_line(&url, expires_at, &canonical_channels));
+    Ok(MintedInvite {
+        payload: enroll::InvitePayload {
+            v: enroll::PAYLOAD_VERSION,
+            invite_token: token,
+            member_email: member,
+            channels: canonical_channels,
+            expires_at,
+        },
+        display_channels,
+    })
+}
+
+/// `junto invite` — mint a founder-issued enrollment invite
+/// (device-key-enrollment plan, Task 6); see [`mint_invite`] for the
+/// rules. This wrapper only encodes the minted payload into a shareable
+/// URI and prints it.
+async fn invite(channels: Vec<String>, member: String) -> Result<()> {
+    let minted = mint_invite(channels, member).await?;
+    let expires_at = minted.payload.expires_at;
+    let url = enroll::encode_invite(&minted.payload)?;
+    println!(
+        "{}",
+        invite_line(&url, expires_at, &minted.display_channels)
+    );
     Ok(())
 }
 
@@ -2439,8 +2470,10 @@ mod tests {
     }
 
     /// One token, one record per channel — the shape `channels_for` reads
-    /// back. `alpha` is named twice (once more than needed) to pin the
-    /// dedupe rule: it must still produce exactly one record.
+    /// back. `alpha` is named twice under two different spellings — once
+    /// by name, once by its canonical id — to pin the dedupe rule on the
+    /// RESOLVED id: a dedupe that instead compared raw strings would let
+    /// this pair through as two distinct channels.
     #[tokio::test]
     async fn invite_issues_one_record_per_channel_for_a_single_token() {
         let _home = crate::host::test_home::HomeGuard::new();
@@ -2448,7 +2481,7 @@ mod tests {
         let (_repo_b, id_b) = setup_channel("beta").await;
 
         invite(
-            vec!["alpha".to_string(), "beta".to_string(), "alpha".to_string()],
+            vec!["alpha".to_string(), "beta".to_string(), id_a.to_string()],
             "someone@example.com".to_string(),
         )
         .await
@@ -2465,7 +2498,8 @@ mod tests {
         assert_eq!(
             records.len(),
             2,
-            "dedupe must collapse the repeated 'alpha' flag into one record: {records:?}"
+            "'alpha' and its own id name the same channel and must collapse to one record: \
+             {records:?}"
         );
         let tokens: std::collections::HashSet<&str> = records
             .iter()
@@ -2484,6 +2518,68 @@ mod tests {
             channels,
             [id_a.to_string(), id_b.to_string()].into_iter().collect(),
             "the store must name exactly the two canonical ids"
+        );
+    }
+
+    /// The line a founder reads before pasting it must show what they
+    /// actually typed, never the raw canonical id `resolve_channel`
+    /// resolves underneath — and when the same channel is named twice
+    /// under two spellings (its name, then its own id), only the FIRST
+    /// spelling survives as the display label.
+    #[tokio::test]
+    async fn mint_invite_displays_the_first_spelling_not_the_canonical_id() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (_repo, id) = setup_channel("acme").await;
+
+        let minted = mint_invite(
+            vec!["acme".to_string(), id.to_string()],
+            "someone@example.com".to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            minted.payload.channels,
+            vec![id.to_string()],
+            "one canonical id, deduped"
+        );
+        assert_eq!(
+            minted.display_channels,
+            vec!["acme".to_string()],
+            "the first spelling wins; the raw id must never be shown"
+        );
+    }
+
+    /// Task 4 walks `InvitePayload.channels` to produce one outcome per
+    /// channel; if that order ever diverged from what `channels_for`
+    /// reads back for the same token, the founder would be shown one
+    /// order in the minted code and granted in another once it is
+    /// redeemed.
+    #[tokio::test]
+    async fn invite_payload_channel_order_matches_channels_for() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (_repo_a, id_a) = setup_channel("alpha").await;
+        let (_repo_b, id_b) = setup_channel("beta").await;
+        let (_repo_c, id_c) = setup_channel("gamma").await;
+
+        let minted = mint_invite(
+            vec!["gamma".to_string(), "alpha".to_string(), "beta".to_string()],
+            "someone@example.com".to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            minted.payload.channels,
+            vec![id_c.to_string(), id_a.to_string(), id_b.to_string()],
+            "first-seen order, not sorted"
+        );
+
+        let junto_home = host::junto_home().unwrap();
+        let stored = invites::channels_for(&junto_home, &minted.payload.invite_token).unwrap();
+        assert_eq!(
+            stored, minted.payload.channels,
+            "the store must read back channels in the same order the minted payload names them"
         );
     }
 
