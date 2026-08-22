@@ -21,6 +21,9 @@
 //! — identity is the more fundamental error) — because Task 8 surfaces this
 //! diagnosis to a human, not just a pass/fail.
 //!
+//! One token may cover several channels, and `channels_for` is the read that
+//! recovers them: all channels the token still covers (unconsumed and unexpired).
+//!
 //! `consume`'s single-use guarantee is a plain read-modify-write over
 //! `invites.toml` (`load` → check → mutate → `save`, the same shape as
 //! `members.rs::mint`) — it holds against **sequential** redemption
@@ -205,6 +208,30 @@ pub fn prune(junto_home: &Path) -> Result<usize> {
     Ok(removed)
 }
 
+/// Recover the channels this token still covers — all records whose hash
+/// matches, `consumed_at` is `None`, and `expires_at >= now_ms()`, in file
+/// order (which is issue order). An unknown token yields an empty vec, not an
+/// error. This is a read: it does not consume, write, or prune anything.
+///
+/// # Errors
+#[allow(dead_code)]
+pub fn channels_for(junto_home: &Path, token: &str) -> Result<Vec<String>> {
+    let file = load(junto_home)?;
+    let hash = token_sha256(token);
+    let current_time = now_ms();
+    let channels = file
+        .invites
+        .iter()
+        .filter(|record| {
+            record.token_sha256 == hash
+                && record.consumed_at.is_none()
+                && record.expires_at >= current_time
+        })
+        .map(|record| record.channel.clone())
+        .collect();
+    Ok(channels)
+}
+
 fn now_ms() -> i64 {
     junto_kernel::Timestamp::now().as_millis()
 }
@@ -344,6 +371,72 @@ mod tests {
         ));
         assert!(matches!(
             consume(home.path(), &fresh, "dan@x.com", "junto-dev").unwrap(),
+            Consumed::Ok
+        ));
+    }
+
+    #[test]
+    fn channels_for_returns_every_channel_the_token_still_covers() {
+        let home = tempfile::tempdir().unwrap();
+        let token = "t".repeat(43);
+        issue(home.path(), &token, "dan@x.com", "chan-a", future()).unwrap();
+        issue(home.path(), &token, "dan@x.com", "chan-b", future()).unwrap();
+        assert_eq!(
+            channels_for(home.path(), &token).unwrap(),
+            vec!["chan-a".to_string(), "chan-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn channels_for_omits_a_consumed_channel_and_keeps_the_rest() {
+        // The property redemption retries depend on: a partial success leaves the
+        // remainder recoverable from the same code.
+        let home = tempfile::tempdir().unwrap();
+        let token = "t".repeat(43);
+        issue(home.path(), &token, "dan@x.com", "chan-a", future()).unwrap();
+        issue(home.path(), &token, "dan@x.com", "chan-b", future()).unwrap();
+        assert!(matches!(
+            consume(home.path(), &token, "dan@x.com", "chan-a").unwrap(),
+            Consumed::Ok
+        ));
+        assert_eq!(
+            channels_for(home.path(), &token).unwrap(),
+            vec!["chan-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn channels_for_omits_an_expired_channel() {
+        let home = tempfile::tempdir().unwrap();
+        let token = "t".repeat(43);
+        issue(home.path(), &token, "dan@x.com", "stale", past()).unwrap();
+        issue(home.path(), &token, "dan@x.com", "live", future()).unwrap();
+        assert_eq!(
+            channels_for(home.path(), &token).unwrap(),
+            vec!["live".to_string()]
+        );
+    }
+
+    #[test]
+    fn channels_for_an_unknown_token_is_empty_not_an_error() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(
+            channels_for(home.path(), &"z".repeat(43))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn channels_for_does_not_consume() {
+        // A read that burned the token would make the redeem screen's preview
+        // destructive — the exact bug this assertion exists to prevent.
+        let home = tempfile::tempdir().unwrap();
+        let token = "t".repeat(43);
+        issue(home.path(), &token, "dan@x.com", "chan-a", future()).unwrap();
+        channels_for(home.path(), &token).unwrap();
+        assert!(matches!(
+            consume(home.path(), &token, "dan@x.com", "chan-a").unwrap(),
             Consumed::Ok
         ));
     }
