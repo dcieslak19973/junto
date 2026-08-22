@@ -3,12 +3,17 @@
 Design for the five-item plan handed off in junto entry `69e27b99`
 (channel *Document attach surface 20260822*, `6cd0cbb8`), diverged from
 *Multiplayer-first rethink 20260821* (`3c38ead9`). Baseline: `fd4fe89`,
-596 tests green.
+596 tests green (verified independently: `fmt` clean, `clippy` clean,
+596 passed in 7 suites).
 
-Decisions settled with Dan are recorded in the channel as `c9238d39`
-(D1–D6, E1–E2); the permanence finding that shaped them is `2c0cd09f`.
-This document is the design those entries decided, written down once so
-the plan has something to be a plan *of*.
+Decisions D1–D6 are recorded in the channel as `c9238d39`; the
+permanence finding that shaped them is `2c0cd09f`. **E1 and E2 as
+recorded there were both withdrawn** after Dan could not evaluate
+them as posed — a fair verdict on how they were framed, not on the
+question: E1 widened the tool to attach Repos by URL and is dropped
+outright, and E2 was a fourth URI rule whose only real casualty was a
+legitimate git remote spelling. Both are superseded in the channel; the
+text below is authoritative.
 
 ## Why this plan
 
@@ -66,42 +71,48 @@ different Subject for the same document.
 
 ## Design
 
-### D2 — the URI guard
+### D2 — the machine-path guard
 
-The subtle point, and the reason this is a design decision rather than
-a line of validation: **`D:/git/junto/docs/spec.md` parses as a URI
-with scheme `d`.** "Require a scheme" admits precisely the Windows
-machine path it was written to exclude, on one of two equal target
-platforms.
+The guard rejects what is *provably machine-local* and nothing else. It
+deliberately does **not** validate URI schemes: the goal is keeping an
+identity that means nothing on another machine out of a permanent
+record, not enforcing taste about address formats.
+
+The subtle point, and the reason this needs stating rather than
+assuming: **`D:/git/junto/docs/spec.md` parses as a URI with scheme
+`d`.** "Require a scheme" admits precisely the Windows machine path it
+was written to exclude, on one of two equal target platforms.
 
 `fn subject_uri(raw: &str) -> Result<Uri, McpError>`, in `mcp.rs`
 beside `parse_provenance`. Rules, in order:
 
 1. Reject a leading path separator — `/` or `\` — catching POSIX
    absolute paths and UNC shares (`\\server\share\spec.md`).
-2. Reject when there is no `:`.
-3. Reject when the text before the first `:` is shorter than two
-   characters — the Windows drive letter.
-4. Reject when that text is not an RFC 3986 §3.1 scheme:
-   `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`.
+2. Reject when there is no `:` — a bare or relative path (`spec.md`,
+   `docs/spec.md`).
+3. Reject when the text before the first `:` is a single character —
+   the Windows drive letter.
 
-Stated positively: the surface accepts exactly what carries a real
-scheme of two or more characters. Both separators are inspected
-explicitly; CLAUDE.md's "never hardcode `/` or `\`" governs *building*
-paths, and a guard that ignored one separator would be a guard that
-works on one platform.
+That is the whole rule. Anything else passes, including an SCP-style
+git remote (`git@github.com:owner/repo.git`), a `urn:`, and any scheme
+nobody has thought of yet. Both separators are inspected explicitly;
+CLAUDE.md's "never hardcode `/` or `\`" governs *building* paths, and a
+guard that ignored one separator would be a guard that works on one
+platform.
+
+**An earlier draft added a fourth rule** — reject anything whose
+pre-colon text is not an RFC 3986 §3.1 scheme — and it was wrong. Its
+first casualty was `git@host:path`, a legitimate and extremely common
+git remote spelling, refused for failing a test that had nothing to do
+with whether the string was machine-local. That is taste encoded as
+validation, and it would have made the new surface stricter than
+`repo_subject_uri` (which keeps recording `origin` verbatim) for no
+gain in permanence safety. The three rules above refuse every machine
+path the fourth did and nothing more.
 
 Refusals are `McpError::invalid_params` naming the rule and the fix, so
 an agent self-corrects without a round trip.
 
-**E2, a new known limit:** the guard refuses an SCP-style git remote
-(`git@host:path`) — the text before the first colon is `git@host`,
-which is not a scheme. Such a remote must be given as `ssh://`. The
-new surface is therefore strictly stricter than `repo_subject_uri`,
-which keeps recording `origin` verbatim. The asymmetry is deliberate:
-0037's second known limit is that ssh and https spellings of one repo
-are two Subjects, and refusing the ambiguous spelling at the only
-surface that can still refuse is the narrow version of fixing it.
 
 ### D3 — digests
 
@@ -134,23 +145,26 @@ appends nothing, which is the safest available behaviour in an
 append-only record. Zero live impact: one production caller, always
 `Repo`.
 
-### E1 — the tool exposes `kind`
+### E1 — the tool attaches Documents only
 
-`SubjectKindParam { Repo, Document }`, `#[serde(rename_all =
-"lowercase")]`, mirroring `AuthorKind` (`mcp.rs:42-49`) with a
-`From<SubjectKindParam> for SubjectKind`.
+The tool hard-codes `SubjectKind::Document`. No `kind` parameter.
 
-Mirrors the kernel instead of narrowing it: a Document-only tool is a
-surface that must be widened later, and D4's refusal is only
-expressible at the surface if the surface can name both kinds. It also
-serves the multiplayer case — attaching a teammate's repo by origin URL
-on a machine with no clone.
+An earlier draft exposed `kind` with both values, to mirror
+`Host::attach_subject`, which accepts any kind. Dropped, for three
+reasons that all point the same way. The plan's scope is a *document*
+attach surface — 0037's recorded limit is that no surface can attach a
+Document, and nothing says a surface cannot attach a Repo by URL.
+Nobody has asked to attach a repo without a clone. And doing so would
+let a caller put a channel into exactly the state that makes junto
+refuse to run sessions in it: a Repo Subject with no local mount. Item
+3 makes that state survivable on steer, but manufacturing it locally
+with one hand while fixing it with the other is how a plan loses track
+of which change fixed what.
 
-One consequence, kept explicit: attaching a Repo Subject with no local
-mount **manufactures** the unmounted-Repo state item 3 exists to
-survive. That is correct — `launch` still refuses, because there
-genuinely is no checkout — and item 3 shipping alongside is what makes
-it survivable on steer.
+D4's refusal stays fully testable without the parameter: it lives on
+`Host::attach_subject`, whose tests pass `Subject` values directly and
+can name either kind. Widening the tool later costs one enum variant
+and one `From` impl.
 
 ### Item 2 — `Host::detach_subject`
 
@@ -190,9 +204,9 @@ Two tools on `JuntoMcp`, following `diverge_channel`
 errors through `invalid`.
 
 ```rust
-struct AttachSubjectRequest {
+struct AttachDocumentRequest {
     channel: String, author: AuthorParam, code: Option<String>,
-    kind: SubjectKindParam, uri: String, digest: Option<String>,
+    uri: String, digest: Option<String>,
 }
 struct DetachSubjectRequest {
     channel: String, author: AuthorParam, code: Option<String>,
@@ -227,9 +241,11 @@ place enumerating the tool set; both tools are named there.
 ### D6 — ADR treatment
 
 No new ADR. ADR 0037's Known-limits section is amended in place: two
-limits are closed (no detach surface, no Document surface), one is
-narrowed (the guard now refuses ambiguous spellings at the new
-surface), and one is added (E2's SCP-style refusal). A known limit that
+limits are closed — no detach surface, and no Document attach surface.
+The remaining three stand untouched, including exact-string URI
+identity: the machine-path guard refuses machine paths, it does not
+normalize or canonicalize anything, so two spellings of one document
+are still two Subjects. No new limit is introduced. A known limit that
 has stopped being true is not history, it is a false statement about
 current code. Closing a limit 0037 itself anticipated is not a new
 architectural decision, and repo precedent reserves a new ADR for
@@ -257,7 +273,10 @@ Behavioural only; no test asserts on source text.
 - `D:/git/junto/spec.md` is refused (the drive-letter case);
 - `/home/dan/spec.md` and `\\server\share\spec.md` are refused;
 - `spec.md` is refused;
-- `https://…`, `file:///…`, `git+ssh://…`, `urn:isbn:…` are accepted;
+- `https://…`, `file:///…`, `git+ssh://…`, `urn:isbn:…` are accepted,
+  and so is `git@github.com:owner/repo.git` — the case the dropped
+  fourth rule would have wrongly refused, so it is pinned as a test
+  rather than left to memory;
 - detach by 6+ char prefix succeeds; an ambiguous prefix errors;
 - a caller-supplied digest round-trips; a malformed one is refused.
 
@@ -282,6 +301,10 @@ Merged through junto's own code-PR push-gate, not `gh pr create`.
 
 - A human web control for attaching a Document — depends on decisions
   the surface plan owns.
+- Attaching a Repo Subject by URL from any surface (E1). The tool is
+  Document-only; `launch_session` remains the sole Repo attach path.
+- Validating URI schemes. The guard refuses machine paths and nothing
+  else (D2).
 - Computing or verifying digests anywhere (D3).
 - URI normalization or canonicalization; 0037's exact-string identity
   stands.
