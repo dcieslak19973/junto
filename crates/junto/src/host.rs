@@ -944,16 +944,23 @@ impl Host {
     /// recording one `SubjectAttached` entry. Returns the attachment's entry
     /// id, which is what a later `SubjectDetached` targets.
     ///
-    /// **Idempotent**: if the channel already carries a subject with this
-    /// uri, nothing is appended — the existing attachment's `EntryId` is
-    /// returned instead. This is enforced here, under the ledger lock,
-    /// against a *fresh* (uncached) projection, not left to callers: a
-    /// handler-side check against a cached view cannot see an attach that
-    /// landed via `junto sync` in another process within the projection
-    /// cache's TTL, or a concurrent call racing this one, so the guard has
-    /// to live at the write boundary to actually close those windows. The
-    /// record is append-only with no `SubjectDetached` write surface yet, so
-    /// a duplicate here would be permanent — worth the extra fold every
+    /// **Idempotent on `(uri, kind)`**: if the channel already carries this
+    /// uri under the *same* kind, nothing is appended — the existing
+    /// attachment's `EntryId` is returned instead. This is enforced here,
+    /// under the ledger lock, against a *fresh* (uncached) projection, not
+    /// left to callers: a handler-side check against a cached view cannot
+    /// see an attach that landed via `junto sync` in another process within
+    /// the projection cache's TTL, or a concurrent call racing this one, so
+    /// the guard has to live at the write boundary to actually close those
+    /// windows.
+    ///
+    /// The same uri under a *different* kind is **refused** rather than
+    /// silently resolving to the existing attachment: a Subject's uri is
+    /// its identity (`docs/adr/0037`), and [`crate::mounts`] keys the mount
+    /// store on uri alone, so admitting both kinds would make this
+    /// machine's mount for it ambiguous. Refusing appends nothing. The
+    /// record is append-only, so a duplicate here would need an explicit
+    /// [`Host::detach_subject`] to withdraw — worth the extra fold every
     /// caller inherits.
     ///
     /// The subject's URI is portable by construction; where *this* machine
@@ -978,7 +985,18 @@ impl Host {
         let mut guard = ledger.lock().await;
         let view = guard.project_fresh(&channel_id).await?;
         self.check_write_auth(&view, &author, &auth)?;
-        if let Some((existing, _)) = view.subjects.iter().find(|(_, s)| s.uri == subject.uri) {
+        if let Some((existing, attached)) = view.subjects.iter().find(|(_, s)| s.uri == subject.uri)
+        {
+            if attached.kind != subject.kind {
+                bail!(
+                    "'{}' is already attached to this channel as {:?}, not {:?} — a Subject's \
+                     uri is its identity (docs/adr/0037), so one uri cannot be two kinds. \
+                     Detach {existing} first if the kind is wrong.",
+                    subject.uri.as_str(),
+                    attached.kind,
+                    subject.kind
+                );
+            }
             return Ok(*existing);
         }
         let mut entry = LedgerEntry {
@@ -988,6 +1006,77 @@ impl Host {
             author,
             timestamp: Timestamp::now(),
             payload: EntryPayload::SubjectAttached { subject },
+        };
+        self.sign_entry(&mut entry);
+        let id = entry.id;
+        guard.append(entry).await?;
+        Ok(id)
+    }
+
+    /// Withdraw an attached **Subject** by recording one `SubjectDetached`
+    /// entry targeting its `SubjectAttached` (`docs/adr/0037`). Returns the
+    /// detachment's own entry id.
+    ///
+    /// The attachment stays in the log — the record is append-only, exactly
+    /// as a Park leaves its target standing (`docs/adr/0002`) — but
+    /// [`junto_kernel::Ledger`]'s `project_subjects` stops projecting it,
+    /// order-insensitively, so every replica agrees on the live set
+    /// regardless of clock skew.
+    ///
+    /// **Refuses rather than no-ops**, and distinguishes the two failure
+    /// modes: `project_subjects` drops detached attachments, so a bare "not
+    /// found" would tell a caller retrying after a dropped connection that
+    /// their attachment never existed. Nothing is appended on either
+    /// refusal.
+    ///
+    /// This machine's Mount for the subject is deliberately left alone:
+    /// [`crate::launch::mount_with_capability`] walks a channel's
+    /// *subjects*, so a mount whose Subject is gone is already inert, and a
+    /// durable ledger write should not delete machine-local config.
+    ///
+    /// Dispatches through [`Host::check_write_auth`], like
+    /// [`Host::attach_subject`], so both write surfaces are served
+    /// (`docs/adr/0021`).
+    ///
+    /// # Errors
+    /// Refuses an author who is not in the channel's Party, or whose member
+    /// code is missing or wrong on the agent surface
+    /// (`docs/adr/0017`/`0021`); refuses a `target` that is not a live
+    /// subject attachment in this channel; also errors if `channel` does
+    /// not resolve.
+    pub async fn detach_subject(
+        &self,
+        channel: &str,
+        target: EntryId,
+        author: Member,
+        auth: WriteAuth<'_>,
+    ) -> Result<EntryId> {
+        let (_substrate, ledger, channel_id) = self.resolve_for_write(channel).await?;
+        let mut guard = ledger.lock().await;
+        let view = guard.project_fresh(&channel_id).await?;
+        self.check_write_auth(&view, &author, &auth)?;
+        if !view.subjects.iter().any(|(id, _)| *id == target) {
+            let ever_attached = view.entries.iter().any(|entry| {
+                entry.id == target && matches!(entry.payload, EntryPayload::SubjectAttached { .. })
+            });
+            if ever_attached {
+                bail!(
+                    "subject attachment {target} is already detached — nothing to withdraw \
+                     (docs/adr/0037)"
+                );
+            }
+            bail!(
+                "{target} is not a subject attachment in this channel — check view_channel for \
+                 the attachment id"
+            );
+        }
+        let mut entry = LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel: channel_id,
+            author,
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::SubjectDetached { target },
         };
         self.sign_entry(&mut entry);
         let id = entry.id;
@@ -2394,6 +2483,159 @@ mod lineage_tests {
             vec![(first, subject)],
             "the channel carries exactly one subject, not a duplicate"
         );
+    }
+
+    #[tokio::test]
+    async fn attaching_the_same_uri_under_a_different_kind_refuses() {
+        // ADR 0037 makes a Subject's uri its identity, compared as an exact
+        // string, and the mount store keys on uri alone — so one uri under
+        // two kinds is incoherent rather than merely redundant. Refusing
+        // appends nothing, the only safe answer in an append-only record;
+        // the old behaviour silently handed back the Repo attachment to a
+        // caller who asked for a Document.
+        let (_dirs, host) = lineage_host(1);
+        host.open_channel(None, "subjects", dan(), None)
+            .await
+            .unwrap();
+
+        let uri = Uri::new("https://example.com/thing").expect("valid uri");
+        let as_repo = Subject::new(SubjectKind::Repo, uri.clone());
+        let first = host
+            .attach_subject("subjects", as_repo.clone(), dan(), WriteAuth::Human)
+            .await
+            .expect("attach as repo");
+
+        let as_document = Subject::new(SubjectKind::Document, uri);
+        let err = host
+            .attach_subject("subjects", as_document, dan(), WriteAuth::Human)
+            .await
+            .expect_err("the same uri under a different kind must refuse");
+        assert!(
+            format!("{err}").contains("already attached"),
+            "the error must name the conflict, not the authorization: {err}"
+        );
+
+        let (_, view) = project(&host, "subjects").await;
+        assert_eq!(
+            view.subjects,
+            vec![(first, as_repo)],
+            "a refused attach must append nothing and leave the original kind intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn detaching_a_subject_withdraws_it_from_the_projection() {
+        let (_dirs, host) = lineage_host(1);
+        host.open_channel(None, "subjects", dan(), None)
+            .await
+            .unwrap();
+
+        let subject = Subject::new(
+            SubjectKind::Document,
+            Uri::new("https://example.com/spec.md").expect("valid uri"),
+        );
+        let attachment = host
+            .attach_subject("subjects", subject, dan(), WriteAuth::Human)
+            .await
+            .expect("attach");
+
+        let detachment = host
+            .detach_subject("subjects", attachment, dan(), WriteAuth::Human)
+            .await
+            .expect("detach");
+        assert_ne!(
+            detachment, attachment,
+            "a detachment is its own entry, not the attachment's id echoed back"
+        );
+
+        let (_, view) = project(&host, "subjects").await;
+        assert!(
+            view.subjects.is_empty(),
+            "project_subjects must drop a detached attachment"
+        );
+    }
+
+    #[tokio::test]
+    async fn detaching_twice_refuses_and_appends_nothing() {
+        let (_dirs, host) = lineage_host(1);
+        host.open_channel(None, "subjects", dan(), None)
+            .await
+            .unwrap();
+
+        let subject = Subject::new(
+            SubjectKind::Document,
+            Uri::new("https://example.com/spec.md").expect("valid uri"),
+        );
+        let attachment = host
+            .attach_subject("subjects", subject, dan(), WriteAuth::Human)
+            .await
+            .expect("attach");
+        host.detach_subject("subjects", attachment, dan(), WriteAuth::Human)
+            .await
+            .expect("first detach");
+
+        let (_, before) = project(&host, "subjects").await;
+        let count_before = before.entries.len();
+
+        let err = host
+            .detach_subject("subjects", attachment, dan(), WriteAuth::Human)
+            .await
+            .expect_err("a second detach of the same attachment must refuse");
+        assert!(
+            format!("{err}").contains("already detached"),
+            "the error must say the attachment is already gone, not that it never existed: {err}"
+        );
+
+        let (_, after) = project(&host, "subjects").await;
+        assert_eq!(
+            after.entries.len(),
+            count_before,
+            "a refused detach must append nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn detaching_something_that_is_not_an_attachment_refuses() {
+        let (_dirs, host) = lineage_host(1);
+        host.open_channel(None, "subjects", dan(), None)
+            .await
+            .unwrap();
+
+        let (_, view) = project(&host, "subjects").await;
+        let genesis = view.entries.first().expect("genesis entry").id;
+
+        let err = host
+            .detach_subject("subjects", genesis, dan(), WriteAuth::Human)
+            .await
+            .expect_err("the genesis entry is not a subject attachment");
+        assert!(
+            format!("{err}").contains("not a subject attachment"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn detaching_a_subject_refuses_a_non_member() {
+        let (_dirs, host) = lineage_host(1);
+        host.open_channel(None, "subjects", dan(), None)
+            .await
+            .unwrap();
+
+        let subject = Subject::new(
+            SubjectKind::Document,
+            Uri::new("https://example.com/spec.md").expect("valid uri"),
+        );
+        let attachment = host
+            .attach_subject("subjects", subject, dan(), WriteAuth::Human)
+            .await
+            .expect("attach");
+
+        let stranger = Member::human("Stranger", "stranger@example.com");
+        let err = host
+            .detach_subject("subjects", attachment, stranger, WriteAuth::Human)
+            .await
+            .expect_err("a non-member must not detach a subject");
+        assert!(format!("{err}").to_lowercase().contains("member"), "{err}");
     }
 
     #[tokio::test]
