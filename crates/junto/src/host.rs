@@ -685,11 +685,23 @@ impl Host {
         // supplied the new member's own key (the keyless/interactive path;
         // `junto add-member --enroll` always supplies one), this host must
         // decide whether it may legitimately mint one itself.
-        // `keys::has_signing_key` — never `signing_key`, which mints as a
-        // side effect of the lookup — answers "does a key already exist"
-        // without creating one: if this machine already holds a key for
-        // this email, reuse is legitimate no matter the member kind (e.g.
-        // the founder joining a second channel). Otherwise an agent may
+        // `keys::has_authored_signing_key` — never `has_signing_key`, and
+        // never `signing_key`, which mints as a side effect of the lookup
+        // — answers "does an AUTHORED key already exist" without creating
+        // one: if this machine minted that key for an identity it already
+        // had authority over (an agent it created, or a human already
+        // speaking through it — `sign_entry`'s own mint-on-first-use),
+        // reuse is legitimate no matter the member kind (e.g. the founder
+        // joining a second channel). `has_signing_key` alone is NOT
+        // enough (finding 9a, final fix wave): `/devices/enroll` and
+        // `junto enroll` deliberately have no founder check, and mint a
+        // key on THIS host for whatever email a composed invite names —
+        // an unauthorized caller could plant one there for a target
+        // email before this keyless grant ever runs, pre-satisfying mere
+        // existence. Those two callers mint through
+        // `keys::enrolled_signing_key` instead, which records the fresh
+        // key `authored: false`, so it can never stand in for "this
+        // machine already spoke as this identity". Otherwise an agent may
         // mint fresh — it runs on this machine by construction — but a
         // human may not: minting a key for a human whose machine is not
         // this one is exactly the bug this plan exists to close (a keypair
@@ -697,7 +709,7 @@ impl Host {
         // own).
         if key.is_none() {
             let home = self.member_home()?;
-            let already_local = crate::keys::has_signing_key(&home, &member.email)?;
+            let already_local = crate::keys::has_authored_signing_key(&home, &member.email)?;
             if !already_local && member.kind == MemberKind::Human {
                 bail!(
                     "{} has no signing key on this machine, and none was supplied — a human \
@@ -1583,6 +1595,31 @@ mod lineage_tests {
         assert!(
             !crate::keys::has_signing_key(member_home(&dirs), "bob@example.com").unwrap(),
             "no key was minted for the refused human"
+        );
+    }
+
+    /// Finding 9a (final fix wave): a key planted by `/devices/enroll`'s
+    /// own mint (`keys::enrolled_signing_key`, simulated directly here —
+    /// `enroll_device`'s own web-layer test covers the endpoint) must NOT
+    /// pre-satisfy the keyless-human reuse check just by existing —
+    /// `/devices/enroll` has no founder check, so an unauthorized caller
+    /// could otherwise plant a key for a target email and have this
+    /// ordinary keyless grant silently mint the human's membership onto
+    /// it instead of refusing, exactly the state `has_authored_signing_key`
+    /// (not `has_signing_key`) exists to prevent.
+    #[tokio::test]
+    async fn add_member_refuses_a_human_whose_only_local_key_is_enroll_sourced() {
+        let (dirs, host) = lineage_host(1);
+        host.open_channel(None, "acme", dan(), None).await.unwrap();
+        crate::keys::enrolled_signing_key(member_home(&dirs), "victim@example.com").unwrap();
+        let victim = Member::human("Victim", "victim@example.com");
+        let err = host
+            .add_member("acme", &dan(), victim, None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("enroll"),
+            "the refusal should point at the enrollment path even though a key exists: {err}"
         );
     }
 

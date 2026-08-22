@@ -190,6 +190,41 @@ fn internal(message: String) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, message).into_response()
 }
 
+/// Build a JSON refusal for one of the six identity endpoints (finding
+/// 1, final fix wave): `prettify_errors` below already passes
+/// `application/json` through untouched, and the native GUI's
+/// `describe_failed_response` (`crates/junto-iced/src/main.rs`) already
+/// extracts a `message` field from a JSON body — so every refusal these
+/// endpoints build with this (instead of the shared `(StatusCode,
+/// String)` idiom every HTML-rendering route here still uses) renders
+/// verbatim in the GUI instead of collapsing to a fixed "see the host
+/// log" sentence the desktop app has no host log to back.
+fn identity_error(status: StatusCode, message: impl Into<String>) -> Response {
+    (
+        status,
+        axum::Json(serde_json::json!({ "message": message.into() })),
+    )
+        .into_response()
+}
+
+/// Rewrite an already-built plain-text error [`Response`] — the shared
+/// `project`/`resolve_for_projection` idiom, which the HTML-rendering
+/// channel routes also use and which `prettify_errors` turns into a
+/// styled page for them — into [`identity_error`]'s same `{"message":
+/// …}` envelope. For the identity endpoints that resolve a channel
+/// through those shared helpers (`mint_invite` via [`project_fresh`],
+/// [`keys_json`]): the rewrite happens at THEIR call sites, never inside
+/// the shared helpers themselves, so the HTML routes sharing those
+/// helpers keep their styled-page behavior untouched.
+async fn as_identity_error(response: Response) -> Response {
+    let status = response.status();
+    let message = match axum::body::to_bytes(response.into_body(), 64 * 1024).await {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(_) => "internal error".to_string(),
+    };
+    identity_error(status, message)
+}
+
 /// Response layer: turn any error-status plain-text response (the handlers'
 /// `(StatusCode, message)` returns) into a styled error page, so the human
 /// surface never shows a bare body on a blank page. Already-HTML and
@@ -1600,11 +1635,10 @@ struct ParkedDto {
 fn require_rationale(rationale: &str) -> Result<String, Response> {
     let rationale = rationale.trim().to_string();
     if rationale.is_empty() {
-        return Err((
+        return Err(identity_error(
             StatusCode::BAD_REQUEST,
             "a rationale is required — it's a rationale, not a checkbox",
-        )
-            .into_response());
+        ));
     }
     Ok(rationale)
 }
@@ -1621,24 +1655,26 @@ async fn resolve_for_act(
     host: &Host,
     channel: &str,
 ) -> Result<(std::path::PathBuf, crate::host::SharedLedger, ChannelId), Response> {
-    let resolution = host
-        .resolve(channel)
-        .await
-        .map_err(|err| internal(format!("resolving '{channel}': {err}")))?;
+    let resolution = host.resolve(channel).await.map_err(|err| {
+        identity_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("resolving '{channel}': {err}"),
+        )
+    })?;
     match resolution {
         Resolution::Resolved {
             substrate,
             ledger,
             id,
         } => Ok((substrate, ledger, id)),
-        Resolution::NotFound => {
-            Err((StatusCode::NOT_FOUND, format!("no channel '{channel}'")).into_response())
-        }
-        Resolution::Ambiguous(_) => Err((
+        Resolution::NotFound => Err(identity_error(
+            StatusCode::NOT_FOUND,
+            format!("no channel '{channel}'"),
+        )),
+        Resolution::Ambiguous(_) => Err(identity_error(
             StatusCode::CONFLICT,
             format!("channel name '{channel}' is ambiguous; use the id"),
-        )
-            .into_response()),
+        )),
     }
 }
 
@@ -1650,8 +1686,12 @@ async fn resolve_for_act(
 ///
 /// Founder-only (via [`crate::identity::require_founder`]), but
 /// deliberately still works on a **founder's own** grant (rotation) —
-/// unlike [`revoke_member`], which refuses the founder outright. Projects
-/// with `guard.project_fresh` (not the cached [`project`]): a grant the
+/// unlike [`revoke_member`], which refuses the founder outright.
+/// Refuses a retire that would leave the founder with zero active grants
+/// (finding 8, final fix wave) — the same lockout `revoke_member` already
+/// refuses to produce for the founder, and `keys.json` publishes exactly
+/// the grant ids needed to aim one at it. Projects with
+/// `guard.project_fresh` (not the cached [`project`]): a grant the
 /// CLI retired seconds ago in a separate process must not be parked
 /// twice off a stale fold. The ledger guard is dropped before the
 /// best-effort background sync — never held across the push.
@@ -1665,11 +1705,10 @@ async fn retire_device(
         Err(response) => return response,
     };
     let Ok(target) = grant.parse::<EntryId>() else {
-        return (
+        return identity_error(
             StatusCode::BAD_REQUEST,
             format!("'{grant}' is not an entry id"),
-        )
-            .into_response();
+        );
     };
     let (substrate, ledger, id) = match resolve_for_act(&host, &channel).await {
         Ok(resolved) => resolved,
@@ -1679,19 +1718,25 @@ async fn retire_device(
     let mut guard = ledger.lock().await;
     let view = match guard.project_fresh(&id).await {
         Ok(view) => view,
-        Err(err) => return internal(format!("projection failed: {err}")),
+        Err(err) => {
+            return identity_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("projection failed: {err}"),
+            );
+        }
     };
 
     let author = match crate::host::git_user(&substrate) {
         Ok(author) => author,
         Err(err) => {
-            return internal(format!(
-                "no author identity: {err} (set git config user.name / user.email)"
-            ));
+            return identity_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("no author identity: {err} (set git config user.name / user.email)"),
+            );
         }
     };
     if let Err(err) = crate::identity::require_founder(&view, &author, &channel) {
-        return (StatusCode::FORBIDDEN, format!("{err:#}")).into_response();
+        return identity_error(StatusCode::FORBIDDEN, format!("{err:#}"));
     }
 
     match view
@@ -1701,26 +1746,33 @@ async fn retire_device(
         .find(|grant| grant.granted_by == target)
     {
         None => {
-            return (
+            return identity_error(
                 StatusCode::NOT_FOUND,
                 format!(
                     "'{grant}' does not name a key-granting entry in channel '{channel}' — \
                      check the keys view for the granted_by id to pass here"
                 ),
-            )
-                .into_response();
+            );
         }
         Some(found) if found.retired_at.is_some() => {
-            return (
+            return identity_error(
                 StatusCode::CONFLICT,
                 format!(
                     "grant '{grant}' is already retired — parking it again would not change \
                      anything"
                 ),
-            )
-                .into_response();
+            );
         }
         Some(_) => {}
+    }
+
+    if crate::identity::retiring_would_strand_founder(&view, target) {
+        return identity_error(
+            StatusCode::BAD_REQUEST,
+            "retiring this grant would leave the founder with zero active key grants — \
+             enroll the replacement device first (POST /devices/enroll then /members), then \
+             retire this grant once the new one is in place",
+        );
     }
 
     let mut entry = LedgerEntry {
@@ -1733,7 +1785,10 @@ async fn retire_device(
     };
     host.sign_entry(&mut entry);
     if let Err(err) = guard.append(entry).await {
-        return internal(format!("append failed: {err}"));
+        return identity_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("append failed: {err}"),
+        );
     }
     drop(guard);
 
@@ -1768,23 +1823,29 @@ async fn revoke_member(
     let mut guard = ledger.lock().await;
     let view = match guard.project_fresh(&id).await {
         Ok(view) => view,
-        Err(err) => return internal(format!("projection failed: {err}")),
+        Err(err) => {
+            return identity_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("projection failed: {err}"),
+            );
+        }
     };
 
     let author = match crate::host::git_user(&substrate) {
         Ok(author) => author,
         Err(err) => {
-            return internal(format!(
-                "no author identity: {err} (set git config user.name / user.email)"
-            ));
+            return identity_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("no author identity: {err} (set git config user.name / user.email)"),
+            );
         }
     };
     if let Err(err) = crate::identity::require_founder(&view, &author, &channel) {
-        return (StatusCode::FORBIDDEN, format!("{err:#}")).into_response();
+        return identity_error(StatusCode::FORBIDDEN, format!("{err:#}"));
     }
 
     if crate::identity::is_founder(&view, &email) {
-        return (
+        return identity_error(
             StatusCode::BAD_REQUEST,
             format!(
                 "'{email}' is the founder of '{channel}' — revoke-member would park every one \
@@ -1793,20 +1854,18 @@ async fn revoke_member(
                  device instead; or, when moving to a new device, enroll it FIRST and only \
                  retire the old device's grant once the new one is in place"
             ),
-        )
-            .into_response();
+        );
     }
 
     let targets = crate::identity::grants_to_park(&view, &email);
     if targets.is_empty() {
-        return (
+        return identity_error(
             StatusCode::BAD_REQUEST,
             format!(
                 "{email} has no active key grants in channel '{channel}' — nothing to revoke \
                  (already fully retired, or never held a key)"
             ),
-        )
-            .into_response();
+        );
     }
 
     for target in &targets {
@@ -1823,7 +1882,10 @@ async fn revoke_member(
         };
         host.sign_entry(&mut entry);
         if let Err(err) = guard.append(entry).await {
-            return internal(format!("append failed: {err}"));
+            return identity_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("append failed: {err}"),
+            );
         }
     }
     drop(guard);
@@ -2451,7 +2513,7 @@ async fn keys_json(State(host): State<Arc<Host>>, Path(channel): Path<String>) -
             };
             axum::Json(dto).into_response()
         }
-        Err(response) => response,
+        Err(response) => as_identity_error(response).await,
     }
 }
 
@@ -2594,46 +2656,39 @@ async fn mint_invite(
 
     let junto_home = match crate::host::junto_home() {
         Ok(home) => home,
-        Err(err) => return internal(err.to_string()),
+        Err(err) => return identity_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     };
     if let Err(err) = crate::invites::prune(&junto_home) {
-        return internal(err.to_string());
+        return identity_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
     }
 
     if member.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            "an invite must name a member".to_string(),
-        )
-            .into_response();
+        return identity_error(StatusCode::BAD_REQUEST, "an invite must name a member");
     }
     if member.chars().count() > crate::enroll::MAX_FIELD_CHARS {
-        return (
+        return identity_error(
             StatusCode::BAD_REQUEST,
             format!(
                 "member exceeds the {}-char limit",
                 crate::enroll::MAX_FIELD_CHARS
             ),
-        )
-            .into_response();
+        );
     }
 
     if form.channel.is_empty() {
-        return (
+        return identity_error(
             StatusCode::BAD_REQUEST,
-            "an invite must name at least one channel".to_string(),
-        )
-            .into_response();
+            "an invite must name at least one channel",
+        );
     }
     if form.channel.len() > crate::enroll::MAX_INVITE_CHANNELS {
-        return (
+        return identity_error(
             StatusCode::BAD_REQUEST,
             format!(
                 "an invite may name at most {} channels",
                 crate::enroll::MAX_INVITE_CHANNELS
             ),
-        )
-            .into_response();
+        );
     }
 
     // Resolve every channel and prove founder authority on every one
@@ -2643,14 +2698,14 @@ async fn mint_invite(
     for channel in &form.channel {
         let (id, view, substrate) = match project_fresh(&host, channel).await {
             Ok(projected) => projected,
-            Err(response) => return response,
+            Err(response) => return as_identity_error(response).await,
         };
         let caller = match crate::host::git_user(&substrate) {
             Ok(caller) => caller,
-            Err(err) => return internal(err.to_string()),
+            Err(err) => return identity_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
         };
         if let Err(err) = crate::identity::require_founder(&view, &caller, channel) {
-            return (StatusCode::FORBIDDEN, err.to_string()).into_response();
+            return identity_error(StatusCode::FORBIDDEN, err.to_string());
         }
         let canonical = id.to_string();
         if !canonical_channels.contains(&canonical) {
@@ -2663,7 +2718,7 @@ async fn mint_invite(
     for canonical in &canonical_channels {
         if let Err(err) = crate::invites::issue(&junto_home, &token, &member, canonical, expires_at)
         {
-            return internal(err.to_string());
+            return identity_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
         }
     }
 
@@ -2676,7 +2731,7 @@ async fn mint_invite(
     };
     let url = match crate::enroll::encode_invite(&payload) {
         Ok(url) => url,
-        Err(err) => return internal(err.to_string()),
+        Err(err) => return identity_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     };
 
     axum::Json(InviteMintedDto {
@@ -2740,13 +2795,13 @@ async fn enroll_device(Form(form): Form<EnrollForm>) -> Response {
             } else {
                 format!("invalid invite: {err}")
             };
-            return (StatusCode::BAD_REQUEST, message).into_response();
+            return identity_error(StatusCode::BAD_REQUEST, message);
         }
     };
 
     let junto_home = match crate::host::junto_home() {
         Ok(home) => home,
-        Err(err) => return internal(err.to_string()),
+        Err(err) => return identity_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     };
 
     let display_name = form
@@ -2765,16 +2820,34 @@ async fn enroll_device(Form(form): Form<EnrollForm>) -> Response {
                 .unwrap_or(&invite.member_email)
                 .to_string()
         });
+    // Finding 9c (final fix wave): bounded before it reaches the
+    // payload — an unbounded name would mint a code
+    // `enroll::decode_enroll`'s own `check_field_bounds` could only ever
+    // reject later, on the founder's machine (the same bound
+    // `mint_invite`'s `member` already enforces).
+    if display_name.chars().count() > crate::enroll::MAX_FIELD_CHARS {
+        return identity_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "name exceeds the {}-char limit",
+                crate::enroll::MAX_FIELD_CHARS
+            ),
+        );
+    }
 
     // No secret, no seed, and no full public key may reach the response,
     // a log line, or an error message from here down — only fingerprints.
-    let key = match crate::keys::signing_key(&junto_home, &invite.member_email) {
+    // `enrolled_signing_key`, never `signing_key` (finding 9a, final fix
+    // wave): this mints for whatever email the decoded invite names, not
+    // a locally resolved identity, so it must record `authored: false` —
+    // see that function's doc comment.
+    let key = match crate::keys::enrolled_signing_key(&junto_home, &invite.member_email) {
         Ok(key) => key,
-        Err(err) => return internal(err.to_string()),
+        Err(err) => return identity_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     };
     let transport_key = match crate::keys::transport_key(&junto_home, &invite.member_email) {
         Ok(key) => key,
-        Err(err) => return internal(err.to_string()),
+        Err(err) => return identity_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     };
 
     let payload = crate::enroll::EnrollPayload {
@@ -2788,7 +2861,7 @@ async fn enroll_device(Form(form): Form<EnrollForm>) -> Response {
     };
     let url = match crate::enroll::encode_enroll(&payload) {
         Ok(url) => url,
-        Err(err) => return internal(err.to_string()),
+        Err(err) => return identity_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     };
 
     axum::Json(EnrolledDto {
@@ -2816,7 +2889,9 @@ struct EnrolledDto {
 
 /// Decode `code` as a `junto://enroll?code=…` URI, or a 400 response
 /// distinguishing an expired code from every other malformed shape — the
-/// same distinction [`enroll_device`] draws.
+/// same distinction [`enroll_device`] draws. JSON (finding 1, final fix
+/// wave): shared only by [`preview_enrollment`] and
+/// [`redeem_enrollment_endpoint`], both identity endpoints.
 // Response-as-error, cold Err path — same reasoning as `project` above.
 #[allow(clippy::result_large_err)]
 fn decode_enroll_or_400(code: &str) -> Result<crate::enroll::EnrollPayload, Response> {
@@ -2826,7 +2901,7 @@ fn decode_enroll_or_400(code: &str) -> Result<crate::enroll::EnrollPayload, Resp
         } else {
             format!("invalid enroll code: {err}")
         };
-        (StatusCode::BAD_REQUEST, message).into_response()
+        identity_error(StatusCode::BAD_REQUEST, message)
     })
 }
 
@@ -2858,12 +2933,17 @@ struct RedeemedDto {
 /// `invite_already_used`, `not_founder`, `failed`); `detail` carries
 /// `Failed`'s message (`None` for every other variant). `channel` is
 /// always the canonical id; `channel_name` is resolved for display.
+/// `warning` carries `Granted`'s revocation-cutoff warning (finding 5,
+/// final fix wave) — `None` on every non-`Granted` outcome and on an
+/// ordinary grant; this is the HTTP path's ONLY way to see it, since it
+/// has no host log to read a CLI `println!` from.
 #[derive(Serialize)]
 struct RedeemOutcomeDto {
     channel: String,
     channel_name: Option<String>,
     result: String,
     detail: Option<String>,
+    warning: Option<String>,
 }
 
 impl RedeemOutcomeDto {
@@ -2872,18 +2952,19 @@ impl RedeemOutcomeDto {
         channel_name: Option<String>,
         outcome: &RedeemOutcome,
     ) -> Self {
-        let (result, detail): (&str, Option<String>) = match outcome {
-            RedeemOutcome::Granted => ("granted", None),
-            RedeemOutcome::AlreadyAMember => ("already_a_member", None),
-            RedeemOutcome::InviteAlreadyUsed => ("invite_already_used", None),
-            RedeemOutcome::NotFounder => ("not_founder", None),
-            RedeemOutcome::Failed(reason) => ("failed", Some(reason.clone())),
+        let (result, detail, warning): (&str, Option<String>, Option<String>) = match outcome {
+            RedeemOutcome::Granted { warning } => ("granted", None, warning.clone()),
+            RedeemOutcome::AlreadyAMember => ("already_a_member", None, None),
+            RedeemOutcome::InviteAlreadyUsed => ("invite_already_used", None, None),
+            RedeemOutcome::NotFounder => ("not_founder", None, None),
+            RedeemOutcome::Failed(reason) => ("failed", Some(reason.clone()), None),
         };
         RedeemOutcomeDto {
             channel,
             channel_name,
             result: result.to_string(),
             detail,
+            warning,
         }
     }
 }
@@ -2918,20 +2999,17 @@ async fn redeem_enrollment_endpoint(
         "human" => junto_kernel::MemberKind::Human,
         "agent" => junto_kernel::MemberKind::Agent,
         "" => {
-            return (
+            return identity_error(
                 StatusCode::BAD_REQUEST,
                 "kind is required and must be 'human' or 'agent' — it is never defaulted \
-                 (docs/adr/0035)"
-                    .to_string(),
-            )
-                .into_response();
+                 (docs/adr/0035)",
+            );
         }
         other => {
-            return (
+            return identity_error(
                 StatusCode::BAD_REQUEST,
                 format!("kind must be 'human' or 'agent', not '{other}'"),
-            )
-                .into_response();
+            );
         }
     };
 
@@ -2949,16 +3027,16 @@ async fn redeem_enrollment_endpoint(
             // deeper in the engine, would silently reclassify a string
             // match but cannot fool a downcast.
             if err.downcast_ref::<crate::InviteExhausted>().is_some() {
-                return (StatusCode::CONFLICT, err.to_string()).into_response();
+                return identity_error(StatusCode::CONFLICT, err.to_string());
             }
-            return internal(err.to_string());
+            return identity_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
         }
     };
 
     let mut granted_any = false;
     let mut dtos = Vec::with_capacity(outcomes.len());
     for (channel, outcome) in &outcomes {
-        if *outcome == RedeemOutcome::Granted {
+        if matches!(outcome, RedeemOutcome::Granted { .. }) {
             granted_any = true;
         }
         let channel_name = project(&host, channel)
@@ -2989,11 +3067,17 @@ struct PreviewForm {
 
 /// `POST /devices/preview`'s response: what an enroll code would grant if
 /// redeemed right now (device-key-enrollment plan, Task 9).
+/// `transport_fingerprint` (finding 2, final fix wave) is the founder's
+/// ONLY integrity check on the transport half: the enroll code is
+/// unsigned and travels by paste, so without this an altered code that
+/// keeps the signing key but substitutes the transport key would pass
+/// the founder's out-of-band fingerprint comparison unchanged.
 #[derive(Serialize)]
 struct EnrollPreviewDto {
     email: String,
     display_name: String,
     fingerprint: String,
+    transport_fingerprint: String,
     channels: Vec<PreviewChannelDto>,
 }
 
@@ -3012,6 +3096,12 @@ struct PreviewChannelDto {
 /// are about to grant *before* anything is appended, and the channel set
 /// deliberately never travels inside the code itself.
 ///
+/// Reads `channels_for` with the payload's OWN email (finding 9b, final
+/// fix wave) — the same identity comparison [`crate::invites::consume`]
+/// already makes, so a token whose records were issued for a different
+/// member can never enumerate that member's channels through this
+/// read-only path.
+///
 /// An empty channel set is a 409 carrying [`crate::InviteExhausted`]'s
 /// shared wording — the same refusal [`redeem_enrollment_endpoint`] gives
 /// for the identical condition, since one `channels_for` read cannot tell
@@ -3026,14 +3116,15 @@ async fn preview_enrollment(
     };
     let junto_home = match crate::host::junto_home() {
         Ok(home) => home,
-        Err(err) => return internal(err.to_string()),
+        Err(err) => return identity_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     };
-    let channels = match crate::invites::channels_for(&junto_home, &payload.invite_token) {
-        Ok(channels) => channels,
-        Err(err) => return internal(err.to_string()),
-    };
+    let channels =
+        match crate::invites::channels_for(&junto_home, &payload.invite_token, &payload.email) {
+            Ok(channels) => channels,
+            Err(err) => return identity_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        };
     if channels.is_empty() {
-        return (StatusCode::CONFLICT, crate::InviteExhausted.to_string()).into_response();
+        return identity_error(StatusCode::CONFLICT, crate::InviteExhausted.to_string());
     }
 
     let mut dtos = Vec::with_capacity(channels.len());
@@ -3049,6 +3140,7 @@ async fn preview_enrollment(
         email: payload.email.clone(),
         display_name: payload.display_name.clone(),
         fingerprint: crate::identity::fingerprint(&payload.public_key),
+        transport_fingerprint: crate::identity::fingerprint(&payload.transport_public_key),
         channels: dtos,
     })
     .into_response()
@@ -4786,7 +4878,9 @@ mod tests {
         assert_eq!(json_channels, expected);
 
         let junto_home = crate::host::junto_home().unwrap();
-        let mut covers = crate::invites::channels_for(&junto_home, &decoded.invite_token).unwrap();
+        let mut covers =
+            crate::invites::channels_for(&junto_home, &decoded.invite_token, "eve@example.com")
+                .unwrap();
         covers.sort();
         assert_eq!(covers, expected, "channels_for recovers both channels");
     }
@@ -4900,7 +4994,9 @@ mod tests {
         assert_eq!(decoded.channels.len(), 1);
 
         let junto_home = crate::host::junto_home().unwrap();
-        let covers = crate::invites::channels_for(&junto_home, &decoded.invite_token).unwrap();
+        let covers =
+            crate::invites::channels_for(&junto_home, &decoded.invite_token, "eve@example.com")
+                .unwrap();
         assert_eq!(covers.len(), 1, "one issued record, not two: {covers:?}");
     }
 
@@ -5441,6 +5537,13 @@ mod tests {
         assert_eq!(
             json["fingerprint"],
             crate::identity::fingerprint(&key.public_key())
+        );
+        // Finding 2 (final fix wave): the founder's only integrity check
+        // on the transport half — pins that it is present and correct,
+        // not merely that the endpoint still answers 200.
+        assert_eq!(
+            json["transport_fingerprint"],
+            crate::identity::fingerprint(&transport_key.public_key())
         );
         let mut channels: Vec<String> = json["channels"]
             .as_array()

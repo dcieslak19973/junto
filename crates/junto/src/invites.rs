@@ -230,14 +230,18 @@ pub fn prune(junto_home: &Path) -> Result<usize> {
     Ok(removed)
 }
 
-/// Recover the channels this token still covers — all records whose hash
-/// matches, `consumed_at` is `None`, and `expires_at >= now_ms()`, in file
-/// order (which is issue order). An unknown token yields an empty vec, not an
+/// Recover the channels this token still covers FOR `member_email` — all
+/// records whose hash matches, whose `member_email` matches (finding 9b,
+/// final fix wave: the comparison [`consume`] already makes, so a token
+/// answering FOR one identity can never enumerate a channel set issued
+/// for another), `consumed_at` is `None`, and `expires_at >= now_ms()`,
+/// in file order (which is issue order). An unknown token, or a token
+/// whose records name a different member, yields an empty vec, not an
 /// error. This is a read: it does not consume, write, or prune anything.
 ///
 /// # Errors
 /// Returns an error if `<junto-home>/invites.toml` cannot be read or parsed.
-pub fn channels_for(junto_home: &Path, token: &str) -> Result<Vec<String>> {
+pub fn channels_for(junto_home: &Path, token: &str, member_email: &str) -> Result<Vec<String>> {
     let file = load(junto_home)?;
     let hash = token_sha256(token);
     let current_time = now_ms();
@@ -246,6 +250,7 @@ pub fn channels_for(junto_home: &Path, token: &str) -> Result<Vec<String>> {
         .iter()
         .filter(|record| {
             record.token_sha256 == hash
+                && record.member_email == member_email
                 && record.consumed_at.is_none()
                 && record.expires_at >= current_time
         })
@@ -428,8 +433,30 @@ mod tests {
         issue(home.path(), &token, "dan@x.com", "chan-a", future()).unwrap();
         issue(home.path(), &token, "dan@x.com", "chan-b", future()).unwrap();
         assert_eq!(
-            channels_for(home.path(), &token).unwrap(),
+            channels_for(home.path(), &token, "dan@x.com").unwrap(),
             vec!["chan-a".to_string(), "chan-b".to_string()]
+        );
+    }
+
+    /// Finding 9b (final fix wave): a token whose records are issued for a
+    /// DIFFERENT member must never enumerate that member's channels — the
+    /// same identity check `consume` already makes, applied to the
+    /// read-only preview path so a leaked or tampered enroll payload's
+    /// claimed email cannot see a channel set it is not entitled to.
+    #[test]
+    fn channels_for_omits_a_channel_issued_for_a_different_member() {
+        let home = tempfile::tempdir().unwrap();
+        let token = "t".repeat(43);
+        issue(home.path(), &token, "dan@x.com", "chan-a", future()).unwrap();
+        assert_eq!(
+            channels_for(home.path(), &token, "someone-else@x.com").unwrap(),
+            Vec::<String>::new(),
+            "a different claimed email must see nothing this token covers"
+        );
+        assert_eq!(
+            channels_for(home.path(), &token, "dan@x.com").unwrap(),
+            vec!["chan-a".to_string()],
+            "the rightful member still sees it"
         );
     }
 
@@ -446,7 +473,7 @@ mod tests {
             Consumed::Ok
         ));
         assert_eq!(
-            channels_for(home.path(), &token).unwrap(),
+            channels_for(home.path(), &token, "dan@x.com").unwrap(),
             vec!["chan-b".to_string()]
         );
     }
@@ -458,7 +485,7 @@ mod tests {
         issue(home.path(), &token, "dan@x.com", "stale", past()).unwrap();
         issue(home.path(), &token, "dan@x.com", "live", future()).unwrap();
         assert_eq!(
-            channels_for(home.path(), &token).unwrap(),
+            channels_for(home.path(), &token, "dan@x.com").unwrap(),
             vec!["live".to_string()]
         );
     }
@@ -467,7 +494,7 @@ mod tests {
     fn channels_for_an_unknown_token_is_empty_not_an_error() {
         let home = tempfile::tempdir().unwrap();
         assert!(
-            channels_for(home.path(), &"z".repeat(43))
+            channels_for(home.path(), &"z".repeat(43), "dan@x.com")
                 .unwrap()
                 .is_empty()
         );
@@ -480,7 +507,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let token = "t".repeat(43);
         issue(home.path(), &token, "dan@x.com", "chan-a", future()).unwrap();
-        channels_for(home.path(), &token).unwrap();
+        channels_for(home.path(), &token, "dan@x.com").unwrap();
         assert!(matches!(
             consume(home.path(), &token, "dan@x.com", "chan-a").unwrap(),
             Consumed::Ok

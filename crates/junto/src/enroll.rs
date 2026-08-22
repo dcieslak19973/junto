@@ -12,11 +12,15 @@
 //!   intended member.
 //! - **enroll**, minted by the new device (`junto enroll --invite …`): the
 //!   device's freshly generated public key, echoed back alongside the
-//!   invite token that proves which grant it is answering. Unlike the
-//!   invite, this carries **no secret** — a public key grants nothing by
-//!   itself; authority comes entirely from the founder's own act of
-//!   recording it on the ledger (`junto add-member`). So the enroll code is
-//!   safe to paste into a chat, read aloud, or leave in shell history.
+//!   SAME [`InvitePayload::invite_token`] that proves which grant it is
+//!   answering ([`EnrollPayload::invite_token`]). That echo means the
+//!   enroll code carries the identical bearer secret the invite code
+//!   does — anyone who sees a decoded enroll code can redeem the invite
+//!   it names for a device of their own, exactly as if they held the
+//!   invite code itself. It is NOT safe to paste into a chat, read
+//!   aloud, or leave in shell history — treat it with the same care as
+//!   the invite: deliver it only to the founder completing this
+//!   redemption.
 //!
 //! Both shapes are modelled on Orca's shipped `orca environment add
 //! --pairing-code` envelope, read out of the app rather than guessed: a
@@ -157,11 +161,15 @@ pub fn decode_invite(url: &str) -> Result<InvitePayload> {
 }
 
 /// Decode and validate a `junto://enroll?code=…` URI. See the module docs
-/// for the validation order.
+/// for the validation order. Also refuses a payload whose transport key
+/// equals its signing key (finding 3, final fix wave): the two keys must
+/// stay distinct (`docs/adr/0033` two-key separation) — a transport key is
+/// never a verification key, and an altered or malformed code that
+/// collapses them to one must never decode successfully.
 ///
 /// # Errors
 /// Returns an error for an oversized, malformed, wrong-version, out-of-
-/// bounds, or expired code.
+/// bounds, expired, or key-collapsed code.
 pub fn decode_enroll(url: &str) -> Result<EnrollPayload> {
     let json = decode_code(url, "enroll")?;
     let payload: EnrollPayload =
@@ -173,6 +181,13 @@ pub fn decode_enroll(url: &str) -> Result<EnrollPayload> {
         ("display_name", payload.display_name.as_str()),
     ])?;
     check_expiry(payload.expires_at)?;
+    if payload.public_key == payload.transport_public_key {
+        bail!(
+            "enroll payload names the same key for both signing and transport — the two \
+             keys must be distinct (docs/adr/0033); this code is malformed or was tampered \
+             with"
+        );
+    }
     Ok(payload)
 }
 
@@ -311,15 +326,32 @@ mod tests {
     }
 
     #[test]
-    fn enroll_round_trips_and_carries_no_secret() {
+    fn enroll_round_trips_and_carries_no_private_key_field() {
         let p = sample_enroll();
         let url = encode_enroll(&p).unwrap();
         assert!(url.starts_with("junto://enroll?code="));
         assert_eq!(decode_enroll(&url).unwrap(), p);
-        // `EnrollPayload` has no secret-key field to begin with — only a
-        // `PublicKey` — so there is nothing here for a leak to expose; the
-        // type makes "safe to paste or read aloud" true by construction,
-        // not by convention.
+        // `EnrollPayload` has no secret-KEY field — only a `PublicKey` —
+        // so a leak can never expose a private key this way. It STILL
+        // carries `invite_token`, the invite's own bearer secret, echoed
+        // back verbatim (finding 7, final fix wave): the enroll code is
+        // exactly as sensitive as the invite code, never "safe to paste
+        // or read aloud" — see the corrected module doc.
+        assert_eq!(decode_enroll(&url).unwrap().invite_token, p.invite_token);
+    }
+
+    /// Finding 3 (final fix wave): `decode_enroll` must refuse a payload
+    /// whose transport key collapses to its signing key — the one
+    /// boundary where the two-key separation invariant (`docs/adr/0033`)
+    /// is actually guarded, since the enroll code is unsigned and travels
+    /// by paste.
+    #[test]
+    fn decode_enroll_refuses_when_transport_key_equals_signing_key() {
+        let mut p = sample_enroll();
+        p.transport_public_key = p.public_key.clone();
+        let url = encode_enroll(&p).unwrap();
+        let err = decode_enroll(&url).unwrap_err();
+        assert!(err.to_string().contains("distinct"), "{err}");
     }
 
     #[test]

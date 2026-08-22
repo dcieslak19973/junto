@@ -68,6 +68,22 @@ pub(crate) fn grants_to_park(view: &ChannelView, email: &str) -> Vec<EntryId> {
         .collect()
 }
 
+/// Whether retiring `target` would leave `view`'s founder with zero
+/// active key grants (finding 8, final fix wave) — byte-for-byte the
+/// state [`require_founder`]'s caller (`revoke_member`) already refuses
+/// to produce for the founder: a cutoff that unrecognizes every later
+/// founder-authored entry, including any future revocation the founder
+/// tries to author themselves. `false` when there is no founder, when
+/// `target` is not one of the founder's own grants, or when the founder
+/// holds another active grant besides it — ordinary founder-grant
+/// rotation (retiring one of several devices) stays untouched.
+pub(crate) fn retiring_would_strand_founder(view: &ChannelView, target: EntryId) -> bool {
+    let Some(founder) = view.party.first() else {
+        return false;
+    };
+    grants_to_park(view, &founder.email) == [target]
+}
+
 /// The warning `add-member --enroll` prints when `email` currently holds a
 /// revocation cutoff (finding 2, final fix wave): at least one grant and
 /// every one of them retired — the exact condition
@@ -263,6 +279,81 @@ mod tests {
     fn grants_to_park_returns_empty_for_an_email_with_no_grants_at_all() {
         let view = channel_view_with_keyring(junto_kernel::Keyring::new());
         assert!(grants_to_park(&view, "nobody@example.com").is_empty());
+    }
+
+    /// Finding 8 (final fix wave): retiring the founder's ONLY active
+    /// grant must be flagged — the exact state `revoke_member` already
+    /// refuses to produce for the founder.
+    #[test]
+    fn retiring_would_strand_founder_true_when_target_is_the_founders_only_active_grant() {
+        let key = PublicKey::new(format!("ed25519:{}", "a".repeat(64))).unwrap();
+        let target = EntryId::new();
+        let mut keyring = junto_kernel::Keyring::new();
+        keyring.insert(
+            "founder@x.com".to_string(),
+            vec![junto_kernel::KeyGrant {
+                key,
+                transport_key: None,
+                granted_by: target,
+                retired_at: None,
+            }],
+        );
+        let mut view = view_with_party(&["founder@x.com"]);
+        view.keyring = keyring;
+        assert!(retiring_would_strand_founder(&view, target));
+    }
+
+    /// Ordinary founder-grant rotation (retiring one of several devices)
+    /// must stay unflagged — a mutation that drops the "only" condition
+    /// (flags ANY founder grant) fails this.
+    #[test]
+    fn retiring_would_strand_founder_false_when_the_founder_has_another_active_grant() {
+        let key = PublicKey::new(format!("ed25519:{}", "a".repeat(64))).unwrap();
+        let target = EntryId::new();
+        let other = EntryId::new();
+        let mut keyring = junto_kernel::Keyring::new();
+        keyring.insert(
+            "founder@x.com".to_string(),
+            vec![
+                junto_kernel::KeyGrant {
+                    key: key.clone(),
+                    transport_key: None,
+                    granted_by: target,
+                    retired_at: None,
+                },
+                junto_kernel::KeyGrant {
+                    key,
+                    transport_key: None,
+                    granted_by: other,
+                    retired_at: None,
+                },
+            ],
+        );
+        let mut view = view_with_party(&["founder@x.com"]);
+        view.keyring = keyring;
+        assert!(!retiring_would_strand_founder(&view, target));
+    }
+
+    /// A non-founder's own grant must never be flagged, no matter how few
+    /// active grants they hold — a mutation that drops the founder-only
+    /// scoping (checks ANY email's grant count) fails this.
+    #[test]
+    fn retiring_would_strand_founder_false_for_a_non_founder_grant() {
+        let key = PublicKey::new(format!("ed25519:{}", "a".repeat(64))).unwrap();
+        let target = EntryId::new();
+        let mut keyring = junto_kernel::Keyring::new();
+        keyring.insert(
+            "member@x.com".to_string(),
+            vec![junto_kernel::KeyGrant {
+                key,
+                transport_key: None,
+                granted_by: target,
+                retired_at: None,
+            }],
+        );
+        let mut view = view_with_party(&["founder@x.com", "member@x.com"]);
+        view.keyring = keyring;
+        assert!(!retiring_would_strand_founder(&view, target));
     }
 
     /// Pinned to a literal expected string, not to calling `fingerprint`

@@ -452,7 +452,7 @@ async fn add_member(
         let mut granted_any = false;
         for (channel, outcome) in &outcomes {
             println!("{}", redeem_line(channel, outcome));
-            if *outcome == RedeemOutcome::Granted {
+            if matches!(outcome, RedeemOutcome::Granted { .. }) {
                 granted_any = true;
             }
         }
@@ -534,8 +534,14 @@ fn member_code_line(code: &str, newly_minted: bool) -> String {
 /// its own response body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RedeemOutcome {
-    /// The channel's `MemberAdded` was appended.
-    Granted,
+    /// The channel's `MemberAdded` was appended. `warning` carries
+    /// [`identity::revocation_cutoff_warning`]'s text when re-admitting
+    /// this email drops an existing revocation cutoff (finding 5, final
+    /// fix wave) — `None` on every ordinary grant. Data, not a
+    /// `println!`, so both the CLI (`redeem_line`) and the HTTP endpoint
+    /// (`RedeemOutcomeDto`, `web.rs`) can surface it; the HTTP path has
+    /// no host log a founder could read a bare `println!` from.
+    Granted { warning: Option<String> },
     /// The email was already on the channel's roster with an ACTIVE grant
     /// for the payload's own key — exactly `Host::add_member`'s own
     /// no-op condition (`host.rs`, `add_member`, the party/keyring check),
@@ -557,10 +563,15 @@ pub(crate) enum RedeemOutcome {
 
 /// One printed line per channel [`redeem_enrollment`] attempted — every
 /// variant reads distinctly, so a mixed run's output never leaves the
-/// human guessing which lines are the good news.
+/// human guessing which lines are the good news. `Granted`'s cutoff
+/// warning, when present, prints as its own indented follow-up line
+/// (finding 5, final fix wave) — never silently dropped on the CLI path.
 fn redeem_line(channel: &str, outcome: &RedeemOutcome) -> String {
     match outcome {
-        RedeemOutcome::Granted => format!("{channel}: granted"),
+        RedeemOutcome::Granted { warning: None } => format!("{channel}: granted"),
+        RedeemOutcome::Granted {
+            warning: Some(warning),
+        } => format!("{channel}: granted\n  {warning}"),
         RedeemOutcome::AlreadyAMember => {
             format!("{channel}: already a member with this key — nothing to grant")
         }
@@ -628,7 +639,7 @@ pub(crate) async fn redeem_enrollment(
     granted_by: Option<Member>,
 ) -> Result<Vec<(String, RedeemOutcome)>> {
     let junto_home = host::junto_home()?;
-    let channels = invites::channels_for(&junto_home, &payload.invite_token)?;
+    let channels = invites::channels_for(&junto_home, &payload.invite_token, &payload.email)?;
     if channels.is_empty() {
         bail!(InviteExhausted);
     }
@@ -667,6 +678,13 @@ pub(crate) async fn redeem_enrollment(
 /// channel's record (fails closed, matching the single-channel path's
 /// original ordering, `spent_token_context`'s doc comment) — only that
 /// channel's token is spent; every other channel's stays untouched.
+///
+/// Projects with `project_fresh`, not the cached `project` (finding 6,
+/// final fix wave): this decides founder authority and `AlreadyAMember`
+/// off the SAME fold every other authorization-critical reader in this
+/// codebase re-folds fresh for exactly this reason — a `revoke-member`/
+/// `retire-device` run in a separate process must be visible to the very
+/// next redemption, not hidden behind this process's cached projection.
 async fn redeem_one_channel(
     host: &host::Host,
     junto_home: &Path,
@@ -679,7 +697,7 @@ async fn redeem_one_channel(
         Ok(resolved) => resolved,
         Err(err) => return RedeemOutcome::Failed(format!("{err:#}")),
     };
-    let view = match ledger.lock().await.project(&id).await {
+    let view = match ledger.lock().await.project_fresh(&id).await {
         Ok(view) => view,
         Err(err) => return RedeemOutcome::Failed(format!("{err:#}")),
     };
@@ -690,13 +708,20 @@ async fn redeem_one_channel(
             Err(err) => return RedeemOutcome::Failed(format!("{err:#}")),
         },
     };
-    let Some(founder) = view.party.first() else {
+    if view.party.is_empty() {
         return RedeemOutcome::Failed(format!(
             "channel '{channel}' has no genesis, so it has no founding member to grant \
              membership"
         ));
-    };
-    if founder.email != granted_by.email {
+    }
+    // The shared predicate (finding 4, final fix wave), never a
+    // hand-rewritten `founder.email != granted_by.email` comparison —
+    // `identity::require_founder`'s own `Result` is not used here: its
+    // `?`/bail idiom would stop the WHOLE redemption on the first
+    // non-founder channel, but every channel in the covered set must get
+    // its own outcome (this function's own doc comment, "never bails
+    // mid-set").
+    if !identity::is_founder(&view, &granted_by.email) {
         return RedeemOutcome::NotFounder;
     }
 
@@ -735,12 +760,11 @@ async fn redeem_one_channel(
 
     // Finding 2, part 3 (final fix wave): re-enrolling a member who
     // currently has a revocation cutoff silently restores it — say so.
-    // Printed only right before the append it warns about, never for a
-    // channel that turned out not to need one (`AlreadyAMember`,
-    // `NotFounder` above).
-    if let Some(warning) = identity::revocation_cutoff_warning(&view, &member.email, channel) {
-        println!("{warning}");
-    }
+    // Carried as DATA on the `Granted` outcome now, not a `println!`
+    // (finding 5, final fix wave): a `println!` never reaches the HTTP
+    // path, which has no host log for a founder to read, so both
+    // surfaces now render whatever this holds from the SAME value.
+    let warning = identity::revocation_cutoff_warning(&view, &member.email, channel);
 
     // `{err:#}` (anyhow's alternate Debug), not `{err}`/`.to_string()`
     // (review round 3, finding 1): `Display` renders only the outermost
@@ -763,7 +787,7 @@ async fn redeem_one_channel(
         true,
     );
     match appended {
-        Ok(_) => RedeemOutcome::Granted,
+        Ok(_) => RedeemOutcome::Granted { warning },
         Err(err) => RedeemOutcome::Failed(format!("{err:#}")),
     }
 }
@@ -841,6 +865,7 @@ fn member_code_for(email: &str) -> Result<Option<String>> {
 /// `invite` so tests can inspect the minted token and payload directly,
 /// without capturing `invite`'s `println!` (this crate has, and may add,
 /// no stdout-capture dependency).
+#[derive(Debug)]
 struct MintedInvite {
     payload: enroll::InvitePayload,
     display_channels: Vec<String>,
@@ -864,6 +889,24 @@ struct MintedInvite {
 /// mechanism, so it is the natural place to reclaim long-expired ones.
 async fn mint_invite(channels: Vec<String>, member: String) -> Result<MintedInvite> {
     invites::prune(&host::junto_home()?)?;
+    // Finding 9c (final fix wave): validated up front, before any channel
+    // is resolved or founder-checked — matches `web.rs::mint_invite`'s
+    // order, and a blank/oversized member is refused before any of that
+    // work runs, not after. `invites::consume` compares the payload's
+    // email to the record's, and `""` matches `""`, so a blank member
+    // would otherwise mint a real, redeemable record for the empty
+    // string (the same reasoning `web.rs::mint_invite`'s own doc comment
+    // already gives for its HTTP twin).
+    let member = member.trim().to_string();
+    if member.is_empty() {
+        bail!("--member is required and must not be blank");
+    }
+    if member.chars().count() > enroll::MAX_FIELD_CHARS {
+        bail!(
+            "--member exceeds the {}-char limit",
+            enroll::MAX_FIELD_CHARS
+        );
+    }
     if channels.len() > enroll::MAX_INVITE_CHANNELS {
         bail!(
             "an invite may name at most {} channels",
@@ -898,13 +941,6 @@ async fn mint_invite(channels: Vec<String>, member: String) -> Result<MintedInvi
             canonical_channels.push(canonical);
             display_channels.push(channel.clone());
         }
-    }
-
-    if member.chars().count() > enroll::MAX_FIELD_CHARS {
-        bail!(
-            "--member exceeds the {}-char limit",
-            enroll::MAX_FIELD_CHARS
-        );
     }
 
     let token = enroll::mint_invite_token();
@@ -998,7 +1034,20 @@ async fn enroll(invite_url: String, name: Option<String>) -> Result<()> {
                 .display_name
         }
     };
-    let key = keys::signing_key(&host::junto_home()?, &invite.member_email)?;
+    // Finding 9c (final fix wave): bounded before it ever reaches the
+    // payload — an unbounded `--name` would mint a code
+    // `enroll::decode_enroll`'s own `check_field_bounds` could only ever
+    // reject later, on the founder's machine, burning the wasted encode
+    // for nothing (the same bound `mint_invite`'s `--member` already
+    // enforces).
+    if display_name.chars().count() > enroll::MAX_FIELD_CHARS {
+        bail!("--name exceeds the {}-char limit", enroll::MAX_FIELD_CHARS);
+    }
+    // Finding 9a (final fix wave): `enrolled_signing_key`, never
+    // `signing_key` — this mints for whatever email the decoded invite
+    // names, not a locally resolved identity, so it must record
+    // `authored: false` (see that function's doc comment).
+    let key = keys::enrolled_signing_key(&host::junto_home()?, &invite.member_email)?;
     let transport_key = keys::transport_key(&host::junto_home()?, &invite.member_email)?;
     let payload = enroll_payload_from_invite(
         &invite,
@@ -1216,6 +1265,18 @@ async fn retire_device(channel: String, grant: String, rationale: String) -> Res
             bail!("grant '{grant}' is already retired — parking it again would not change anything")
         }
         Some(_) => {}
+    }
+
+    // Finding 8 (final fix wave): refuse a retire that would leave the
+    // founder with zero active grants — byte-for-byte the cutoff
+    // `revoke-member` already refuses to hand the founder. Ordinary
+    // rotation (retiring one of several devices) is untouched.
+    if identity::retiring_would_strand_founder(&view, target) {
+        bail!(
+            "retiring '{grant}' would leave the founder of '{channel}' with zero active key \
+             grants — enroll the replacement device first (`junto add-member --enroll`), \
+             then retire this grant once the new one is in place"
+        );
     }
 
     let mut entry = LedgerEntry {
@@ -1465,6 +1526,30 @@ mod tests {
         assert_eq!(payload.transport_public_key, transport_key);
         assert_eq!(payload.display_name, "Dan's Laptop");
         assert_eq!(payload.expires_at, invite.expires_at);
+    }
+
+    /// Finding 9c (final fix wave): `junto enroll --name` must be
+    /// bounded, exactly like `web.rs::enroll_device`'s own `name` field —
+    /// an unbounded value would mint a code `enroll::decode_enroll`'s own
+    /// `check_field_bounds` could only ever reject later, on the
+    /// founder's machine, after the round trip and a wasted key mint.
+    #[tokio::test]
+    async fn enroll_refuses_an_oversized_name() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (_repo, id) = setup_channel("acme").await;
+        let minted = mint_invite(vec![id.to_string()], "alice@example.com".to_string())
+            .await
+            .unwrap();
+        let url = enroll::encode_invite(&minted.payload).unwrap();
+        let err = enroll(url, Some("x".repeat(enroll::MAX_FIELD_CHARS + 1)))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("--name"), "{err}");
+        assert!(
+            !crate::keys::has_signing_key(&host::junto_home().unwrap(), "alice@example.com")
+                .unwrap(),
+            "no key should be minted for a refused oversized name"
+        );
     }
 
     fn git_repo() -> tempfile::TempDir {
@@ -1842,7 +1927,7 @@ mod tests {
     #[test]
     fn redeem_line_reads_differently_for_every_outcome() {
         let cases = [
-            RedeemOutcome::Granted,
+            RedeemOutcome::Granted { warning: None },
             RedeemOutcome::AlreadyAMember,
             RedeemOutcome::InviteAlreadyUsed,
             RedeemOutcome::NotFounder,
@@ -1855,9 +1940,26 @@ mod tests {
         let unique: std::collections::HashSet<&String> = lines.iter().collect();
         assert_eq!(
             unique.len(),
-            cases.len(),
-            "each outcome must read differently: {lines:?}"
+            lines.len(),
+            "every outcome must read distinctly: {lines:?}"
         );
+    }
+
+    /// Finding 5 (final fix wave): a `Granted` outcome's revocation-cutoff
+    /// warning must actually render on the CLI, not be silently dropped —
+    /// pins `redeem_line`'s follow-up line, killing a mutation that
+    /// matches only the `warning: None` arm (or ignores the field
+    /// entirely) and always prints the bare "granted" line.
+    #[test]
+    fn redeem_line_renders_the_granted_outcomes_warning() {
+        let line = redeem_line(
+            "chan",
+            &RedeemOutcome::Granted {
+                warning: Some("re-admission warning".to_string()),
+            },
+        );
+        assert!(line.contains("granted"), "{line}");
+        assert!(line.contains("re-admission warning"), "{line}");
     }
 
     /// The core guarantee: a mixed run grants what it can, reports the
@@ -1948,11 +2050,11 @@ mod tests {
             .collect();
         assert_eq!(
             outcome_map.get(id_a.to_string().as_str()),
-            Some(&&RedeemOutcome::Granted)
+            Some(&&RedeemOutcome::Granted { warning: None })
         );
         assert_eq!(
             outcome_map.get(id_b.to_string().as_str()),
-            Some(&&RedeemOutcome::Granted)
+            Some(&&RedeemOutcome::Granted { warning: None })
         );
         assert_eq!(
             outcome_map.get(id_c.to_string().as_str()),
@@ -1963,7 +2065,8 @@ mod tests {
             Some(&&RedeemOutcome::AlreadyAMember)
         );
 
-        let mut remaining = invites::channels_for(&junto_home, &payload.invite_token).unwrap();
+        let mut remaining =
+            invites::channels_for(&junto_home, &payload.invite_token, &payload.email).unwrap();
         remaining.sort();
         let mut expected = vec![id_c.to_string(), id_already.to_string()];
         expected.sort();
@@ -2057,7 +2160,8 @@ mod tests {
             "the run must keep going past the failing channel: {outcomes:?}"
         );
 
-        let remaining = invites::channels_for(&junto_home, &payload.invite_token).unwrap();
+        let remaining =
+            invites::channels_for(&junto_home, &payload.invite_token, &payload.email).unwrap();
         assert_eq!(
             remaining,
             vec![id_theirs.to_string()],
@@ -2118,7 +2222,7 @@ mod tests {
         assert_eq!(
             outcomes,
             vec![
-                (id.to_string(), RedeemOutcome::Granted),
+                (id.to_string(), RedeemOutcome::Granted { warning: None }),
                 (id.to_string(), RedeemOutcome::AlreadyAMember),
             ]
         );
@@ -2142,7 +2246,7 @@ mod tests {
         // The second, un-attempted record was never consumed — a
         // duplicate that resolves to `AlreadyAMember` burns nothing.
         assert_eq!(
-            invites::channels_for(&junto_home, &token).unwrap(),
+            invites::channels_for(&junto_home, &token, "alice@example.com").unwrap(),
             vec![id.to_string()],
             "the un-consumed duplicate record stays retryable"
         );
@@ -2190,7 +2294,7 @@ mod tests {
             invites::Consumed::Ok
         ));
         assert_eq!(
-            invites::channels_for(&junto_home, &token).unwrap(),
+            invites::channels_for(&junto_home, &token, "alice@example.com").unwrap(),
             vec![id.to_string()],
             "the second record keeps the channel covered"
         );
@@ -3063,6 +3167,27 @@ mod tests {
         );
     }
 
+    /// Finding 9c (final fix wave): the CLI must refuse a blank member,
+    /// exactly like `web.rs::post_invites_refuses_a_blank_member` — a
+    /// mutation that drops the emptiness check (or checks only the
+    /// untrimmed string) would mint a real, redeemable record for the
+    /// empty string (`invites::consume` compares `""` to `""`).
+    #[tokio::test]
+    async fn mint_invite_refuses_a_blank_member() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (_repo, _id) = setup_channel("acme").await;
+        let err = mint_invite(vec!["acme".to_string()], "   ".to_string())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("blank"), "{err}");
+
+        let junto_home = host::junto_home().unwrap();
+        assert!(
+            !junto_home.join("invites.toml").exists(),
+            "nothing issued for a blank member"
+        );
+    }
+
     /// Task 4 walks `InvitePayload.channels` to produce one outcome per
     /// channel; if that order ever diverged from what `channels_for`
     /// reads back for the same token, the founder would be shown one
@@ -3089,7 +3214,12 @@ mod tests {
         );
 
         let junto_home = host::junto_home().unwrap();
-        let stored = invites::channels_for(&junto_home, &minted.payload.invite_token).unwrap();
+        let stored = invites::channels_for(
+            &junto_home,
+            &minted.payload.invite_token,
+            "someone@example.com",
+        )
+        .unwrap();
         assert_eq!(
             stored, minted.payload.channels,
             "the store must read back channels in the same order the minted payload names them"
@@ -3176,6 +3306,74 @@ mod tests {
         );
     }
 
+    /// Finding 5 (final fix wave): the revocation-cutoff warning must be
+    /// DATA on `RedeemOutcome::Granted`, not merely a `println!` the HTTP
+    /// path could never see — pins that `redeem_enrollment`'s return
+    /// value itself carries it, killing a mutation that keeps the
+    /// message on stdout only (or drops it) instead of threading it onto
+    /// the outcome the caller actually receives.
+    #[tokio::test]
+    async fn redeem_enrollment_returns_the_cutoff_warning_as_data_on_granted() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (repo, channel_id) = setup_channel("acme").await;
+        let junto_home = host::junto_home().unwrap();
+        let setup_host = host::Host::fixed(vec![repo.path().to_path_buf()]);
+        let host::Resolution::Resolved { ledger, id, .. } =
+            setup_host.resolve(&channel_id.to_string()).await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+
+        let old_key = PublicKey::new(format!("ed25519:{}", "a".repeat(64))).unwrap();
+        let grant_id = grant_key(&ledger, id, "alice@example.com", &old_key).await;
+        let park = LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel: id,
+            author: Member::human("Dan", "dan@example.com"),
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::Park {
+                target: grant_id,
+                rationale: "lost device".into(),
+            },
+        };
+        ledger.lock().await.append(park).await.unwrap();
+
+        let expires_at = Timestamp::now().as_millis() + enroll::MAX_INVITE_TTL_MS;
+        let token = enroll::mint_invite_token();
+        invites::issue(
+            &junto_home,
+            &token,
+            "alice@example.com",
+            &channel_id.to_string(),
+            expires_at,
+        )
+        .unwrap();
+        let new_key = PublicKey::new(format!("ed25519:{}", "b".repeat(64))).unwrap();
+        let transport_key = PublicKey::new(format!("ed25519:{}", "c".repeat(64))).unwrap();
+        let payload = enroll::EnrollPayload {
+            v: enroll::PAYLOAD_VERSION,
+            invite_token: token,
+            email: "alice@example.com".to_string(),
+            display_name: "Alice".to_string(),
+            public_key: new_key,
+            transport_public_key: transport_key,
+            expires_at,
+        };
+
+        let host = host::Host::from_registry(junto_home);
+        let outcomes = redeem_enrollment(&host, &payload, MemberKind::Human, None)
+            .await
+            .unwrap();
+        assert_eq!(outcomes.len(), 1);
+        match &outcomes[0].1 {
+            RedeemOutcome::Granted { warning: Some(w) } => {
+                assert!(w.contains("cutoff"), "{w}");
+            }
+            other => panic!("expected Granted with a warning, got {other:?}"),
+        }
+    }
+
     /// Task 4 finding 2 (review round 3): `already_a_member`'s
     /// `&& grant.retired_at.is_none()` clause was undiscriminated — the
     /// test above enrolls with a DIFFERENT key than the one it retires,
@@ -3238,10 +3436,16 @@ mod tests {
         let outcomes = redeem_enrollment(&host, &payload, MemberKind::Human, None)
             .await
             .unwrap();
-        assert_eq!(
-            outcomes,
-            vec![(channel_id.to_string(), RedeemOutcome::Granted)],
-            "a RETIRED grant for the same key must not read as AlreadyAMember"
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].0, channel_id.to_string());
+        // Re-enrolling with the retired grant's own key also drops
+        // alice's revocation cutoff (finding 5, final fix wave) — this
+        // test's own re-enroll-after-retire setup is exactly that
+        // scenario, so `warning` is `Some`, not the ordinary-grant `None`.
+        assert!(
+            matches!(&outcomes[0].1, RedeemOutcome::Granted { warning: Some(_) }),
+            "a RETIRED grant for the same key must not read as AlreadyAMember: {:?}",
+            outcomes[0].1
         );
 
         let view = ledger.lock().await.project(&id).await.unwrap();
@@ -3300,14 +3504,16 @@ mod tests {
         );
     }
 
-    /// Finding 3 (final fix wave): the founder guard belongs on
+    /// Finding 3 (an earlier fix wave): the founder guard belongs on
     /// `revoke-member` only — `retire-device` parks one grant at a time,
     /// and the founder may legitimately need it to rotate a single
-    /// machine. Pins that `retire_device` is untouched by finding 3's fix
-    /// — an over-broad guard copied onto this function too would make
-    /// the `.unwrap()` below panic on an `Err`.
+    /// machine, so an over-broad "never touch the founder" guard must
+    /// not land here. Finding 8 (final fix wave, THIS one) narrows that:
+    /// retiring the founder's ONLY active grant is refused — the same
+    /// cutoff state `revoke-member` already refuses to hand the founder
+    /// — while retiring one of SEVERAL still works (the next test).
     #[tokio::test]
-    async fn retire_device_still_works_on_a_founder_grant() {
+    async fn retire_device_refuses_the_founders_only_grant() {
         let _home = crate::host::test_home::HomeGuard::new();
         let (repo, channel_id) = setup_channel("acme").await;
         let fixed = host::Host::fixed(vec![repo.path().to_path_buf()]);
@@ -3316,16 +3522,23 @@ mod tests {
         else {
             panic!("channel resolves");
         };
-        let key = PublicKey::new(format!("ed25519:{}", "4".repeat(64))).unwrap();
-        let grant_id = grant_key(&ledger, id, "dan@example.com", &key).await;
+        // `Host::open_channel` already grants the founder one key at
+        // genesis (`host.rs::open_channel`'s `self.keyed(opened_by,
+        // None)` — "the genesis carries the founder's public key, the
+        // first link in the channel keyring") — that IS the founder's
+        // only active grant here; no `grant_key` call needed.
+        let view = ledger.lock().await.project(&id).await.unwrap();
+        let grant_id = view.keyring["dan@example.com"][0].granted_by;
 
-        retire_device(
+        let err = retire_device(
             channel_id.to_string(),
             grant_id.to_string(),
             "rotating this one device".to_string(),
         )
         .await
-        .unwrap();
+        .unwrap_err();
+        assert!(err.to_string().contains("zero active"), "{err}");
+        assert!(err.to_string().contains("enroll"), "{err}");
 
         let view = ledger.lock().await.project(&id).await.unwrap();
         let grant = view.keyring["dan@example.com"]
@@ -3333,8 +3546,46 @@ mod tests {
             .find(|g| g.granted_by == grant_id)
             .unwrap();
         assert!(
-            grant.retired_at.is_some(),
-            "retire-device must still be able to park a founder's own single grant"
+            grant.retired_at.is_none(),
+            "a refused retire-device must not park anything"
+        );
+    }
+
+    /// Finding 8's other half: ordinary founder-grant rotation — retiring
+    /// one of SEVERAL active devices — must keep working, since the
+    /// founder is never left with zero active grants by it.
+    #[tokio::test]
+    async fn retire_device_still_rotates_a_founder_grant_when_another_remains() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (repo, channel_id) = setup_channel("acme").await;
+        let fixed = host::Host::fixed(vec![repo.path().to_path_buf()]);
+        let host::Resolution::Resolved { ledger, id, .. } =
+            fixed.resolve(&channel_id.to_string()).await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+        // The genesis grant is the founder's FIRST device; `grant_key`
+        // adds a second — retiring the first (an old laptop) must still
+        // work, since the second keeps the founder active.
+        let view = ledger.lock().await.project(&id).await.unwrap();
+        let old_grant = view.keyring["dan@example.com"][0].granted_by;
+        let new_key = PublicKey::new(format!("ed25519:{}", "6".repeat(64))).unwrap();
+        grant_key(&ledger, id, "dan@example.com", &new_key).await;
+
+        retire_device(
+            channel_id.to_string(),
+            old_grant.to_string(),
+            "old laptop retired".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let view = ledger.lock().await.project(&id).await.unwrap();
+        let grants = &view.keyring["dan@example.com"];
+        assert_eq!(
+            grants.iter().filter(|g| g.retired_at.is_none()).count(),
+            1,
+            "the new device's grant stays active: {grants:?}"
         );
     }
 }
