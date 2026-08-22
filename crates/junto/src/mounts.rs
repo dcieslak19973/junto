@@ -7,10 +7,11 @@
 //! requirement**: a document subject mounts to a directory or file and simply
 //! reports fewer capabilities.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use junto_kernel::{Subject, Uri};
+use junto_kernel::{Subject, SubjectKind, Uri};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -139,6 +140,55 @@ pub fn all_mounts(junto_home: &Path) -> Result<Vec<Mount>> {
         .collect()
 }
 
+/// What a Subject affords, on this machine, right now.
+///
+/// **Never recorded.** Capabilities vary by machine — one host has the
+/// checkout and the credentials, another has neither — so putting them in the
+/// ledger would smuggle machine facts into the record (spec §1). They are
+/// recomputed at use time from the kind and the mount, and resolve against the
+/// **executing host**, not the viewing human (spec §4).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Capability {
+    /// Fetch its current state.
+    Read,
+    /// Receive change events.
+    Watch,
+    /// Attach a span that survives the content moving.
+    Anchor,
+    /// Produce a mechanical before/after.
+    Diff,
+    /// Run an agent session inside it.
+    Execute,
+    /// Write back to it — always through a gate.
+    Mutate,
+}
+
+/// The capability set for a subject on this machine.
+#[allow(dead_code)]
+#[must_use]
+pub fn capabilities(subject: &Subject, mount: Option<&Mount>) -> BTreeSet<Capability> {
+    let mut caps = BTreeSet::new();
+    // Reading is the floor: a URI is enough to fetch or open something.
+    caps.insert(Capability::Read);
+    if mount.is_none() {
+        return caps;
+    }
+    caps.insert(Capability::Watch);
+    caps.insert(Capability::Anchor);
+    caps.insert(Capability::Mutate);
+    match subject.kind {
+        SubjectKind::Repo => {
+            caps.insert(Capability::Diff);
+            caps.insert(Capability::Execute);
+        }
+        // A document has no working tree to run in and no mechanical diff;
+        // its provenance is a content digest instead (spec §1).
+        SubjectKind::Document => {}
+    }
+    caps
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,5 +273,49 @@ mod tests {
             ],
             "every remembered mount must be listed, with no subject required"
         );
+    }
+
+    #[test]
+    fn a_mounted_repo_can_do_everything_and_an_unmounted_one_can_only_be_read() {
+        let repo = Subject::new(SubjectKind::Repo, uri("git+https://example.com/a.git"));
+        let dir = tempfile::tempdir().unwrap();
+        let mount = Mount {
+            uri: repo.uri.clone(),
+            path: dir.path().to_path_buf(),
+        };
+
+        let mounted = capabilities(&repo, Some(&mount));
+        for expected in [
+            Capability::Read,
+            Capability::Watch,
+            Capability::Anchor,
+            Capability::Diff,
+            Capability::Execute,
+            Capability::Mutate,
+        ] {
+            assert!(mounted.contains(&expected), "missing {expected:?}");
+        }
+
+        let unmounted = capabilities(&repo, None);
+        assert_eq!(
+            unmounted,
+            [Capability::Read].into_iter().collect(),
+            "without a mount there is nothing to run in, diff, or write back to"
+        );
+    }
+
+    #[test]
+    fn a_document_is_never_executable_even_when_mounted() {
+        let doc = Subject::new(SubjectKind::Document, uri("file:///notes/spec.md"));
+        let dir = tempfile::tempdir().unwrap();
+        let mount = Mount {
+            uri: doc.uri.clone(),
+            path: dir.path().to_path_buf(),
+        };
+        let caps = capabilities(&doc, Some(&mount));
+        assert!(!caps.contains(&Capability::Execute));
+        assert!(!caps.contains(&Capability::Diff));
+        assert!(caps.contains(&Capability::Anchor));
+        assert!(caps.contains(&Capability::Mutate));
     }
 }
