@@ -20,8 +20,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use junto_kernel::{
-    ChannelId, ChannelStanding, ChannelView, EntryId, EntryPayload, GateStatus, Ledger,
-    LedgerEntry, Member, MemberKind, PublicKey, Standing, Subject, SubstrateProvider, Timestamp,
+    ChannelId, ChannelView, EntryId, EntryPayload, GateStatus, Ledger, LedgerEntry, Member,
+    MemberKind, PublicKey, Standing, Subject, SubstrateProvider, Timestamp,
 };
 use junto_substrate_git::GitRefsSubstrate;
 use serde::{Deserialize, Serialize};
@@ -169,11 +169,6 @@ pub struct ChannelSummary {
     /// The channel this one converged into (`docs/adr/0027`), if any — the
     /// strip draws the merge-back into that target's track.
     pub converged_into: Option<ChannelId>,
-    /// Recall's derived-standing filter (spec §2's collapse): `Scratch`
-    /// (nothing ratified yet) stays invisible to `Host::channels_for_recall`;
-    /// carried on every summary (not just the recall path) so any caller that
-    /// wants to badge or filter on it can, without a second projection sweep.
-    pub standing: ChannelStanding,
 }
 
 /// One notable event on a channel's track — a settled decision, an attached
@@ -443,31 +438,6 @@ impl Host {
     /// Every channel across every served substrate, projected into summaries.
     pub async fn inventory(&self) -> Result<Vec<ChannelSummary>> {
         Ok(self.overview().await?.0)
-    }
-
-    /// Every channel across every served substrate whose derived standing
-    /// has earned recall — `Standing` (at least one ratified entry) or
-    /// `Settled` (closed or converged), never `Scratch` (nothing ratified
-    /// yet). A scratch channel is epistemically free (spec §2's collapse: "a
-    /// scratch thread is epistemically free: invisible to the brief until
-    /// something in it is ratified"). Same projection sweep as `inventory`,
-    /// just filtered.
-    ///
-    /// A per-channel caller that already has a projected [`ChannelView`] in
-    /// hand (e.g. `junto brief`'s SessionStart hook) should filter on
-    /// `view.channel_standing` directly instead — this sweeps *every*
-    /// registered substrate, which is wasteful for a single-channel check
-    /// and not what a caller with one view in hand wants. This method is
-    /// for a caller that genuinely needs the whole filtered list at once
-    /// (no such surface exists yet — `#[allow(dead_code)]` until one does).
-    #[allow(dead_code)]
-    pub async fn channels_for_recall(&self) -> Result<Vec<ChannelSummary>> {
-        Ok(self
-            .inventory()
-            .await?
-            .into_iter()
-            .filter(|summary| summary.standing != ChannelStanding::Scratch)
-            .collect())
     }
 
     /// Resolve a channel reference — a name bound by a genesis entry, or a raw
@@ -1357,7 +1327,6 @@ fn summarize(id: &ChannelId, view: &ChannelView, substrate: &Path) -> ChannelSum
                 && edge.direction == junto_kernel::LineageDirection::Outgoing)
                 .then_some(edge.other)
         }),
-        standing: view.channel_standing,
     }
 }
 
@@ -1625,77 +1594,6 @@ mod lineage_tests {
             panic!("'auth stuff' resolves");
         };
         assert_eq!(id, expected, "the greater canonical_cmp genesis wins");
-    }
-
-    /// A channel with nothing ratified (`ChannelStanding::Scratch`) must not
-    /// reach the brief/recall surfaces (spec §2's collapse).
-    #[tokio::test]
-    async fn channels_for_recall_omits_a_scratch_channel() {
-        let (_dirs, host) = lineage_host(1);
-        let scratch = host
-            .open_channel(None, "scratch thread", dan(), None)
-            .await
-            .expect("open");
-        let listed = host.channels_for_recall().await.expect("recall list");
-        assert!(
-            !listed.iter().any(|c| c.id == scratch.id),
-            "a channel with nothing ratified must not reach the brief"
-        );
-    }
-
-    /// Once a channel earns standing (at least one ratified entry), recall
-    /// carries it.
-    #[tokio::test]
-    async fn channels_for_recall_includes_a_channel_with_a_ratified_entry() {
-        let (dirs, host) = lineage_host(1);
-        let opened = host
-            .open_channel(None, "ratified thread", dan(), None)
-            .await
-            .expect("open");
-        let substrate = host.substrate_paths().unwrap()[0].clone();
-        let ledger = host.ledger_for(&substrate).await.unwrap();
-        let decision = EntryId::new();
-        ledger
-            .lock()
-            .await
-            .append(LedgerEntry {
-                signature: None,
-                id: decision,
-                channel: opened.id,
-                author: dan(),
-                timestamp: Timestamp::now(),
-                payload: EntryPayload::Assertion {
-                    statement: "use NDJSON for the pending queue".into(),
-                    rationale: "matches the substrate".into(),
-                    provenance: vec![],
-                    frame: None,
-                },
-            })
-            .await
-            .unwrap();
-        ledger
-            .lock()
-            .await
-            .append(LedgerEntry {
-                signature: None,
-                id: EntryId::new(),
-                channel: opened.id,
-                author: dan(),
-                timestamp: Timestamp::now(),
-                payload: EntryPayload::Ratification {
-                    target: decision,
-                    rationale: "agreed".into(),
-                },
-            })
-            .await
-            .unwrap();
-        let _ = &dirs;
-
-        let listed = host.channels_for_recall().await.expect("recall list");
-        assert!(
-            listed.iter().any(|c| c.id == opened.id),
-            "a channel with a ratified entry earns recall"
-        );
     }
 
     /// `docs/adr/0033` end to end through the host: opening a channel keys

@@ -3658,7 +3658,6 @@ mod tests {
             milestones: Vec::new(),
             parent: None,
             converged_into: None,
-            standing: ChannelStanding::Standing,
         }
     }
 
