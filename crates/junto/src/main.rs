@@ -654,17 +654,17 @@ async fn redeem_one_channel(
 ) -> RedeemOutcome {
     let (substrate, ledger, id) = match resolve_channel(host, channel).await {
         Ok(resolved) => resolved,
-        Err(err) => return RedeemOutcome::Failed(err.to_string()),
+        Err(err) => return RedeemOutcome::Failed(format!("{err:#}")),
     };
     let view = match ledger.lock().await.project(&id).await {
         Ok(view) => view,
-        Err(err) => return RedeemOutcome::Failed(err.to_string()),
+        Err(err) => return RedeemOutcome::Failed(format!("{err:#}")),
     };
     let granted_by = match granted_by_override {
         Some(member) => member.clone(),
         None => match host::git_user(&substrate) {
             Ok(member) => member,
-            Err(err) => return RedeemOutcome::Failed(err.to_string()),
+            Err(err) => return RedeemOutcome::Failed(format!("{err:#}")),
         },
     };
     let Some(founder) = view.party.first() else {
@@ -698,7 +698,7 @@ async fn redeem_one_channel(
     let consumed =
         match invites::consume(junto_home, &payload.invite_token, &payload.email, channel) {
             Ok(consumed) => consumed,
-            Err(err) => return RedeemOutcome::Failed(err.to_string()),
+            Err(err) => return RedeemOutcome::Failed(format!("{err:#}")),
         };
     match consumed {
         invites::Consumed::Ok => {}
@@ -706,7 +706,7 @@ async fn redeem_one_channel(
         other => {
             let err = consumed_error(other, &payload.email, channel)
                 .expect("every non-Ok Consumed besides AlreadyUsed maps to an error");
-            return RedeemOutcome::Failed(err.to_string());
+            return RedeemOutcome::Failed(format!("{err:#}"));
         }
     }
 
@@ -719,6 +719,15 @@ async fn redeem_one_channel(
         println!("{warning}");
     }
 
+    // `{err:#}` (anyhow's alternate Debug), not `{err}`/`.to_string()`
+    // (review round 3, finding 1): `Display` renders only the outermost
+    // context — here `spent_token_context`'s "already burned" wrapper —
+    // and discards the actual cause (a substrate write failure, a
+    // signing failure, an unexpected refusal). The single-channel path
+    // this replaced returned the `Error` to `main`, which prints the
+    // full `Caused by` chain via `{:?}`; folding it into one `String`
+    // must not lose what that chain carried, especially for the HTTP
+    // endpoint, where this string is the client's only diagnostic.
     let appended = spent_token_context(
         host.add_member(
             channel,
@@ -732,7 +741,7 @@ async fn redeem_one_channel(
     );
     match appended {
         Ok(_) => RedeemOutcome::Granted,
-        Err(err) => RedeemOutcome::Failed(err.to_string()),
+        Err(err) => RedeemOutcome::Failed(format!("{err:#}")),
     }
 }
 
@@ -1868,21 +1877,30 @@ mod tests {
     }
 
     /// The keyless path still requires `--channel`: nothing about this
-    /// task changes it.
+    /// task changes it. `email` is POSITIONAL (no `--email` flag exists
+    /// on `Command::AddMember`) — review round 3, finding 3: the
+    /// original body used `--email`, which clap rejects as an unknown
+    /// flag before ever reaching the missing-`--channel` check, so the
+    /// assertion passed for a reason unrelated to `--channel` at all and
+    /// stayed green even if `required_unless_present = "enroll"` were
+    /// removed from the `channel` field entirely.
     #[test]
     fn add_member_keyless_still_requires_channel() {
+        let Err(err) = Cli::try_parse_from([
+            "junto",
+            "add-member",
+            "a@b.c",
+            "--name",
+            "A",
+            "--kind",
+            "agent",
+        ]) else {
+            panic!("expected a clap parse error");
+        };
         assert!(
-            Cli::try_parse_from([
-                "junto",
-                "add-member",
-                "--email",
-                "a@b.c",
-                "--name",
-                "A",
-                "--kind",
-                "agent",
-            ])
-            .is_err()
+            err.kind() == clap::error::ErrorKind::MissingRequiredArgument
+                || err.to_string().contains("--channel"),
+            "{err}"
         );
     }
 
@@ -2018,6 +2036,98 @@ mod tests {
             remaining, expected,
             "only channels that did not append (NotFounder, AlreadyAMember) should remain \
              retryable — the two that granted must be burned"
+        );
+    }
+
+    /// Task 4 finding 4 (review round 3): `RedeemOutcome::Failed` had no
+    /// coverage through the real engine — `redeem_one_channel` must
+    /// report `Failed` and KEEP GOING on a genuine post-consume
+    /// `Host::add_member` failure, and burn ONLY the channel that was
+    /// actually attempted. `members.toml` pre-created as a DIRECTORY (not
+    /// a file) makes `members::mint`'s final write fail — deterministic,
+    /// cross-platform, and genuinely downstream of a successful ledger
+    /// append (`Host::add_member`'s own tail call, after `guard.append`
+    /// already succeeded) — not a contrived error. Kills: a mutation
+    /// returning `Granted` on an append failure (assertion on
+    /// `mine-fails`'s outcome), one that `?`-propagates out of the loop
+    /// instead of continuing (assertion that `theirs`, issued and
+    /// processed AFTER the failing channel, still gets its own outcome),
+    /// and one that skips burning on a downstream failure or burns a
+    /// channel that was never attempted (the `channels_for` assertion).
+    #[tokio::test]
+    async fn a_failing_channel_reports_failed_and_the_run_keeps_going() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (repo_fails, id_fails) = setup_channel("mine-fails").await;
+        let (repo_theirs, id_theirs) =
+            setup_channel_with_founder("theirs", Member::human("Carol", "carol@example.com")).await;
+        let junto_home = host::junto_home().unwrap();
+
+        let minted = mint_invite(
+            vec!["mine-fails".to_string()],
+            "alice@example.com".to_string(),
+        )
+        .await
+        .unwrap();
+        invites::issue(
+            &junto_home,
+            &minted.payload.invite_token,
+            "alice@example.com",
+            &id_theirs.to_string(),
+            minted.payload.expires_at,
+        )
+        .unwrap();
+
+        let key = PublicKey::new(format!("ed25519:{}", "5".repeat(64))).unwrap();
+        let transport_key = PublicKey::new(format!("ed25519:{}", "6".repeat(64))).unwrap();
+        let payload = enroll::EnrollPayload {
+            v: enroll::PAYLOAD_VERSION,
+            invite_token: minted.payload.invite_token.clone(),
+            email: "alice@example.com".to_string(),
+            display_name: "Alice".to_string(),
+            public_key: key,
+            transport_public_key: transport_key,
+            expires_at: minted.payload.expires_at,
+        };
+
+        // An unwritable member-code store: `members.toml` is a DIRECTORY,
+        // so `members::mint`'s final write — called only AFTER a
+        // successful ledger append — fails.
+        let broken_home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(broken_home.path().join("members.toml")).unwrap();
+        let host = host::Host::fixed_with_member_home(
+            vec![
+                repo_fails.path().to_path_buf(),
+                repo_theirs.path().to_path_buf(),
+            ],
+            Some(broken_home.path().to_path_buf()),
+        );
+
+        let outcomes = redeem_enrollment(&host, &payload, MemberKind::Human, None)
+            .await
+            .unwrap();
+        let outcome_map: std::collections::HashMap<&str, &RedeemOutcome> = outcomes
+            .iter()
+            .map(|(channel, outcome)| (channel.as_str(), outcome))
+            .collect();
+        assert!(
+            matches!(
+                outcome_map.get(id_fails.to_string().as_str()),
+                Some(&&RedeemOutcome::Failed(_))
+            ),
+            "{outcomes:?}"
+        );
+        assert_eq!(
+            outcome_map.get(id_theirs.to_string().as_str()),
+            Some(&&RedeemOutcome::NotFounder),
+            "the run must keep going past the failing channel: {outcomes:?}"
+        );
+
+        let remaining = invites::channels_for(&junto_home, &payload.invite_token).unwrap();
+        assert_eq!(
+            remaining,
+            vec![id_theirs.to_string()],
+            "the failing channel's record must still be burned (fails closed, matching a \
+             Granted channel's own ordering); the un-attempted NotFounder channel must not be"
         );
     }
 
@@ -3367,6 +3477,89 @@ mod tests {
                 .iter()
                 .any(|g| g.key == new_key && g.retired_at.is_none()),
             "re-enrollment's new key must be ACTIVE: {grants:?}"
+        );
+    }
+
+    /// Task 4 finding 2 (review round 3): `already_a_member`'s
+    /// `&& grant.retired_at.is_none()` clause was undiscriminated — the
+    /// test above enrolls with a DIFFERENT key than the one it retires,
+    /// so no keyring grant matches the payload's key at all regardless
+    /// of that clause, and deleting it would still leave that test
+    /// green. This pins the realistic production case directly:
+    /// `keys::signing_key` mints a device's key only once, so a member
+    /// re-enrolling from the SAME device after `revoke-member` presents
+    /// the SAME public key against a RETIRED grant — that must still be
+    /// `Granted`, never read back as `AlreadyAMember`.
+    #[tokio::test]
+    async fn redeeming_with_a_retired_grant_for_the_same_key_still_grants() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (repo, channel_id) = setup_channel("acme").await;
+        let junto_home = host::junto_home().unwrap();
+        let setup_host = host::Host::fixed(vec![repo.path().to_path_buf()]);
+        let host::Resolution::Resolved { ledger, id, .. } =
+            setup_host.resolve(&channel_id.to_string()).await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+
+        let key = PublicKey::new(format!("ed25519:{}", "b".repeat(64))).unwrap();
+        let grant_id = grant_key(&ledger, id, "alice@example.com", &key).await;
+        let park = LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel: id,
+            author: Member::human("Dan", "dan@example.com"),
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::Park {
+                target: grant_id,
+                rationale: "lost device".into(),
+            },
+        };
+        ledger.lock().await.append(park).await.unwrap();
+
+        let token = enroll::mint_invite_token();
+        let expires_at = Timestamp::now().as_millis() + enroll::MAX_INVITE_TTL_MS;
+        invites::issue(
+            &junto_home,
+            &token,
+            "alice@example.com",
+            &channel_id.to_string(),
+            expires_at,
+        )
+        .unwrap();
+        let transport_key = PublicKey::new(format!("ed25519:{}", "c".repeat(64))).unwrap();
+        let payload = enroll::EnrollPayload {
+            v: enroll::PAYLOAD_VERSION,
+            invite_token: token,
+            email: "alice@example.com".to_string(),
+            display_name: "Alice".to_string(),
+            public_key: key.clone(),
+            transport_public_key: transport_key,
+            expires_at,
+        };
+
+        let host = host::Host::from_registry(junto_home);
+        let outcomes = redeem_enrollment(&host, &payload, MemberKind::Human, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcomes,
+            vec![(channel_id.to_string(), RedeemOutcome::Granted)],
+            "a RETIRED grant for the same key must not read as AlreadyAMember"
+        );
+
+        let view = ledger.lock().await.project(&id).await.unwrap();
+        let grants = view.keyring.get("alice@example.com").unwrap();
+        assert_eq!(
+            grants.len(),
+            2,
+            "re-enrollment with the same key appends a second grant: {grants:?}"
+        );
+        assert!(
+            grants
+                .iter()
+                .any(|g| g.key == key && g.retired_at.is_none()),
+            "the same key must now have an ACTIVE grant: {grants:?}"
         );
     }
 
