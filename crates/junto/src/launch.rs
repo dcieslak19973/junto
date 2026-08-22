@@ -3773,7 +3773,7 @@ mod tests {
         let dan = Member::human("Dan", "dan@example.com");
         let mut millis: i64 = 1;
         let mut payloads = vec![EntryPayload::ChannelOpened {
-            name: "workdir".into(),
+            name: Some("workdir".into()),
         }];
         for subject in subjects {
             payloads.push(EntryPayload::SubjectAttached {

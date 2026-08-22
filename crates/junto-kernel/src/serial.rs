@@ -1,4 +1,4 @@
-﻿//! The canonical byte form of a [`LedgerEntry`] — junto's durable record format.
+//! The canonical byte form of a [`LedgerEntry`] — junto's durable record format.
 //!
 //! Entries are stored under git refs (`refs/junto/*`, hard constraint #3) and
 //! will eventually be content-addressed, so their byte form must be
@@ -83,7 +83,7 @@ mod tests {
         let target = EntryId::new();
 
         assert_round_trips(&entry(EntryPayload::ChannelOpened {
-            name: "junto-dev".into(),
+            name: Some("junto-dev".into()),
         }));
         assert_round_trips(&entry(EntryPayload::MemberAdded {
             member: Member::agent("Claude Code", "claude-code@anthropic.com"),
@@ -242,6 +242,32 @@ mod tests {
             ),
         }));
         assert_round_trips(&entry(EntryPayload::SubjectDetached { target }));
+    }
+
+    #[test]
+    fn an_unnamed_channel_omits_the_name_from_its_canonical_bytes() {
+        let unnamed = entry(EntryPayload::ChannelOpened { name: None });
+        assert_round_trips(&unnamed);
+        let text =
+            String::from_utf8(unnamed.to_canonical_bytes().expect("serialize")).expect("utf8");
+        assert!(
+            !text.contains("\"name\":"),
+            "an absent name must not appear in the canonical bytes \
+             (checked as the JSON key, since the author's `display_name` \
+             field also contains the substring \"name\"): {text}"
+        );
+    }
+
+    #[test]
+    fn a_named_channels_canonical_bytes_are_unchanged_by_the_name_becoming_optional() {
+        let named = entry(EntryPayload::ChannelOpened {
+            name: Some("junto-dev".into()),
+        });
+        let text = String::from_utf8(named.to_canonical_bytes().expect("serialize")).expect("utf8");
+        assert!(
+            text.contains(r#""name":"junto-dev""#),
+            "a present name must serialize exactly as before: {text}"
+        );
     }
 
     #[test]

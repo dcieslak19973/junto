@@ -479,7 +479,10 @@ pub fn brief_markdown(
 fn recent_line(entry: &LedgerEntry) -> String {
     const TAIL_CLAMP: usize = 80;
     match &entry.payload {
-        EntryPayload::ChannelOpened { name } => format!("opened channel '{name}'"),
+        EntryPayload::ChannelOpened { name } => match name {
+            Some(name) => format!("opened channel '{name}'"),
+            None => "opened channel".to_string(),
+        },
         EntryPayload::MemberAdded { member } => {
             format!("added member {}", member.display_name)
         }
@@ -744,9 +747,10 @@ pub fn transcript_markdown(name: &str, id: &ChannelId, view: &ChannelView) -> St
 /// One entry on one markdown line, with its derived state attached.
 fn describe_markdown(entry: &LedgerEntry, view: &ChannelView) -> String {
     match &entry.payload {
-        EntryPayload::ChannelOpened { name } => {
-            format!("**genesis** — channel '{name}' opened")
-        }
+        EntryPayload::ChannelOpened { name } => match name {
+            Some(name) => format!("**genesis** — channel '{name}' opened"),
+            None => "**genesis** — channel opened".to_string(),
+        },
         EntryPayload::MemberAdded { member } => {
             format!("**member added** — {}", member_label(member))
         }
@@ -2629,7 +2633,10 @@ fn entry_card(entry: &LedgerEntry, view: &ChannelView, channel: &ChannelId) -> S
         EntryPayload::ChannelOpened { name } => (
             "genesis",
             None,
-            Some(format!("channel '{name}' opened")),
+            Some(match name {
+                Some(name) => format!("channel '{name}' opened"),
+                None => "channel opened".to_string(),
+            }),
             None,
             None,
             None,
@@ -3874,6 +3881,37 @@ mod tests {
         assert!(
             !html.contains("badge unverified"),
             "verified entry renders no badge"
+        );
+    }
+
+    /// An unnamed genesis (`EntryPayload::ChannelOpened { name: None }`)
+    /// must describe the act honestly — no quoted empty name, and no
+    /// fabricated placeholder like "Untitled" borrowed from the channel's
+    /// display-name fallback, which is a different mechanism entirely.
+    #[test]
+    fn an_unnamed_genesis_renders_without_quotes_or_a_placeholder_word() {
+        let channel = ChannelId::new();
+        let entry = LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel,
+            author: Member::human("Ada", "ada@example.com"),
+            timestamp: Timestamp::from_millis(1_781_046_734_154),
+            payload: EntryPayload::ChannelOpened { name: None },
+        };
+        let view = view_with(vec![entry.clone()]);
+        let card = entry_card(&entry, &view, &channel);
+        assert!(
+            card.contains("channel opened"),
+            "an unnamed genesis still describes the act: {card}"
+        );
+        assert!(
+            !card.contains("channel ''") && !card.contains("channel \"\""),
+            "no empty quotes for the missing name: {card}"
+        );
+        assert!(
+            !card.contains("Untitled"),
+            "the act text must not fabricate a name: {card}"
         );
     }
 

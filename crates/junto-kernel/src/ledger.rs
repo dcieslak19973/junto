@@ -141,7 +141,9 @@ pub type Keyring = std::collections::HashMap<String, Vec<KeyGrant>>;
 pub struct ChannelView {
     /// The channel's human-facing name, from its `ChannelOpened` genesis entry
     /// (`docs/adr/0014`/`0016`). `None` if no genesis is present (an unopened
-    /// dogfood-era channel, or a record synced before its genesis arrived).
+    /// dogfood-era channel, or a record synced before its genesis arrived), or
+    /// if the genesis itself carries no name — an unnamed channel, opened by
+    /// a human's first message and not yet named (the collapse, spec §2).
     /// If concurrent opens left multiple geneses, the canonically first wins —
     /// deterministic on every replica, like all projection.
     pub name: Option<String>,
@@ -430,14 +432,14 @@ impl<S: SubstrateProvider> Ledger<S> {
             EntryPayload::ChannelOpened { name } => Some((entry.id, name.clone())),
             _ => None,
         });
-        let name = genesis.map(|(genesis_id, mut name)| {
+        let name = genesis.and_then(|(genesis_id, mut name)| {
             for entry in &recognized {
                 if let EntryPayload::Correction {
                     target, statement, ..
                 } = &entry.payload
                     && *target == genesis_id
                 {
-                    name = statement.clone();
+                    name = Some(statement.clone());
                 }
             }
             name
@@ -999,7 +1001,7 @@ mod tests {
                 dan.clone(),
                 1,
                 EntryPayload::ChannelOpened {
-                    name: "subjects".into(),
+                    name: Some("subjects".into()),
                 },
             ))
             .await
@@ -1074,7 +1076,7 @@ mod tests {
                 dan,
                 1,
                 EntryPayload::ChannelOpened {
-                    name: "empty".into(),
+                    name: Some("empty".into()),
                 },
             ))
             .await
@@ -1096,7 +1098,7 @@ mod tests {
                 dan.clone(),
                 1,
                 EntryPayload::ChannelOpened {
-                    name: "subjects".into(),
+                    name: Some("subjects".into()),
                 },
             ))
             .await
@@ -1164,7 +1166,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         genesis.sign(&key).unwrap();
 
@@ -1224,7 +1228,9 @@ mod tests {
                 channel,
                 dan.clone(),
                 0,
-                EntryPayload::ChannelOpened { name: "ch".into() },
+                EntryPayload::ChannelOpened {
+                    name: Some("ch".into()),
+                },
             ))
             .await
             .unwrap();
@@ -1250,7 +1256,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         genesis.sign(&founder_key).unwrap();
         let mut grant = entry(
@@ -1299,7 +1307,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         // The founder's own second device, enrolled via a self-authored
         // MemberAdded carrying k2 (see spec "Enrollment flow").
@@ -1351,7 +1361,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         // First, the founder legitimately adds the outsider to the roster...
         let add_outsider = entry(
@@ -1398,7 +1410,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         let add_keyless = entry(
             EntryId::new(),
@@ -1438,7 +1452,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         // Same email, two different devices, both authored by the founder.
         let member = Member::human("Mia", "mia@example.com");
@@ -1507,7 +1523,7 @@ mod tests {
                 bob.clone(),
                 2,
                 EntryPayload::ChannelOpened {
-                    name: "later".into(),
+                    name: Some("later".into()),
                 },
             ))
             .await
@@ -1519,7 +1535,7 @@ mod tests {
                 alice.clone(),
                 1,
                 EntryPayload::ChannelOpened {
-                    name: "first".into(),
+                    name: Some("first".into()),
                 },
             ))
             .await
@@ -1570,7 +1586,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         genesis.sign(&founder_key).unwrap();
 
@@ -1674,7 +1692,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         genesis.sign(&founder_key).unwrap();
 
@@ -1752,7 +1772,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         genesis.sign(&founder_key).unwrap();
 
@@ -1851,7 +1873,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         genesis.sign(&k1).unwrap();
 
@@ -2301,7 +2325,7 @@ mod tests {
                 alice,
                 1,
                 EntryPayload::ChannelOpened {
-                    name: "slice-8".into(),
+                    name: Some("slice-8".into()),
                 },
             ))
             .await
@@ -2556,7 +2580,7 @@ mod tests {
                 dan.clone(),
                 0,
                 EntryPayload::ChannelOpened {
-                    name: "first-name".into(),
+                    name: Some("first-name".into()),
                 },
             ))
             .await
@@ -2612,7 +2636,7 @@ mod tests {
                 bob,
                 2,
                 EntryPayload::ChannelOpened {
-                    name: "later-name".into(),
+                    name: Some("later-name".into()),
                 },
             ))
             .await
@@ -2624,7 +2648,7 @@ mod tests {
                 alice,
                 1,
                 EntryPayload::ChannelOpened {
-                    name: "first-name".into(),
+                    name: Some("first-name".into()),
                 },
             ))
             .await
@@ -2963,7 +2987,9 @@ mod tests {
     // ---- the Party & membership filter (docs/adr/0017) ----
 
     fn genesis(name: &str) -> EntryPayload {
-        EntryPayload::ChannelOpened { name: name.into() }
+        EntryPayload::ChannelOpened {
+            name: Some(name.into()),
+        }
     }
 
     fn member_added(member: &Member) -> EntryPayload {
@@ -3395,7 +3421,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         let grant_id = EntryId::new();
         let grant = entry(
@@ -3487,7 +3515,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         let grant_id = EntryId::new();
         let grant = entry(
@@ -3568,7 +3598,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         let grant_id = EntryId::new();
         let grant = entry(
@@ -3661,7 +3693,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         let member = Member::human("Mia", "mia@example.com");
         let device1_id = EntryId::new();
@@ -3742,7 +3776,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         let member = Member::human("Alice", "alice@example.com");
         let device_a_id = EntryId::new();
@@ -3838,7 +3874,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         let member = Member::human("Alice", "alice@example.com");
         let device_a_id = EntryId::new();
@@ -3931,7 +3969,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         let member = Member::human("Alice", "alice@example.com");
         let device_a_id = EntryId::new();
@@ -4022,7 +4062,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         let member = Member::human("Alice", "alice@example.com");
         let device_a_id = EntryId::new();
@@ -4101,7 +4143,9 @@ mod tests {
             channel,
             dan.clone(),
             2,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         let grant = entry(
             EntryId::new(),
@@ -4156,7 +4200,9 @@ mod tests {
             channel,
             dan.clone(),
             1,
-            EntryPayload::ChannelOpened { name: "ch".into() },
+            EntryPayload::ChannelOpened {
+                name: Some("ch".into()),
+            },
         );
         let grant_id = EntryId::new();
         let grant = entry(

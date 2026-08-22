@@ -553,7 +553,7 @@ impl Host {
             author: opened_by.clone(),
             timestamp: Timestamp::now(),
             payload: EntryPayload::ChannelOpened {
-                name: name.to_string(),
+                name: Some(name.to_string()),
             },
         };
         self.sign_entry(&mut genesis);
@@ -1314,7 +1314,13 @@ fn summarize(id: &ChannelId, view: &ChannelView, substrate: &Path) -> ChannelSum
 /// most telling text.
 fn preview(entry: &LedgerEntry) -> String {
     let (kind, text) = match &entry.payload {
-        EntryPayload::ChannelOpened { name } => ("genesis", format!("channel '{name}' opened")),
+        EntryPayload::ChannelOpened { name } => (
+            "genesis",
+            match name {
+                Some(name) => format!("channel '{name}' opened"),
+                None => "channel opened".to_string(),
+            },
+        ),
         EntryPayload::MemberAdded { member } => ("member added", member.display_name.clone()),
         EntryPayload::ChannelClosed { rationale } => ("closed", rationale.clone()),
         EntryPayload::ChannelReopened { rationale } => ("reopened", rationale.clone()),

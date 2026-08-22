@@ -100,9 +100,14 @@ pub enum EntryPayload {
     /// every other entry. First of the anticipated lifecycle family
     /// (fork / close follow the same pattern when designed).
     ChannelOpened {
-        /// The human-facing label — unique within the home substrate, *not*
-        /// identity (`docs/adr/0014`).
-        name: String,
+        /// The human-facing label — *not* identity (`docs/adr/0014`), and
+        /// since the collapse (spec §2) no longer unique within the home
+        /// substrate and no longer required. `None` is an unnamed channel:
+        /// opened by a human's first message, named later or never. Omitted
+        /// from the canonical bytes when absent, so every entry written before
+        /// the name became optional serializes byte-identically.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        name: Option<String>,
     },
     /// The founding member grants channel membership to `member`
     /// (`docs/adr/0017`) — the second entry kind in the lifecycle family
