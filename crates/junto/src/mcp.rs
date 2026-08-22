@@ -145,8 +145,10 @@ fn parse_frame(
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct OpenChannelRequest {
-    /// The channel's human-facing name — a label, unique within its home
-    /// substrate (docs/adr/0014).
+    /// The channel's human-facing name — a label, not identity and **not
+    /// unique** (`docs/adr/0014`'s amendment): two channels may share one,
+    /// even in the same home substrate, and a bare-name lookup then
+    /// resolves to whichever was opened most recently.
     pub name: String,
     pub author: AuthorParam,
     /// The home substrate repo path. May be omitted when the host serves

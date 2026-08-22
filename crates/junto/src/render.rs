@@ -2314,7 +2314,7 @@ pub fn channel_html(
              <input name=\"intent\" placeholder=\"what should the agent do? e.g. fix the flaky \
              sync test\" required>\
              <input name=\"workspace\" value=\"{workspace}\" placeholder=\"workspace repo path \
-             (mount it on this machine first)\"{ws_required}>\
+             (optional — a channel with no repo runs in a scratch directory)\">\
              {harness_picker}\
              <label class=\"mode\" title=\"verify each change against the rubric and re-run until it passes (docs/adr/0025)\">\
              <input type=\"checkbox\" name=\"mode\" value=\"outcome\"> code-PR push-gate (verify loop)</label>\
@@ -2330,7 +2330,6 @@ pub fn channel_html(
                     .map(|p| p.display().to_string())
                     .unwrap_or_default()
             ),
-            ws_required = if workspace.is_some() { "" } else { " required" },
         )
     };
     let sessions = sessions_section(view, id);
@@ -4224,6 +4223,34 @@ mod tests {
         assert!(
             !html.contains("<div class=\"side-sub\""),
             "no sidebar groups"
+        );
+    }
+
+    #[test]
+    fn start_work_workspace_field_is_optional_when_nothing_is_mounted() {
+        // Finding 2: `ws_required` used to emit ` required` whenever
+        // `channel_mount` resolved nothing, which made a repo-free
+        // channel's headline capability (Task 6: a session runs in a
+        // scratch directory) unreachable from the browser — HTML5
+        // validation blocked the empty-field submit before the server-side
+        // `NO_MOUNTABLE_SUBJECT` / scratch fallback logic ever ran.
+        let view = view_with(vec![]);
+        let html = channel_html(
+            &[],
+            "t",
+            &ChannelId::new(),
+            &view,
+            std::path::Path::new("/repo"),
+            None,
+        );
+        let workspace_input = html
+            .split("name=\"workspace\"")
+            .nth(1)
+            .and_then(|rest| rest.split('>').next())
+            .expect("workspace input tag is rendered");
+        assert!(
+            !workspace_input.contains("required"),
+            "the workspace input must be optional when nothing is mounted: {workspace_input}"
         );
     }
 

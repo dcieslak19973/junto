@@ -3727,7 +3727,7 @@ mod tests {
     async fn a_mounted_repo_subject_wins_over_the_scratch_directory() {
         let home = HomeGuard::new();
         let repo = git_repo();
-        let uri = junto_kernel::Uri::new("git+https://example.com/a.git").expect("valid uri");
+        let uri = junto_kernel::Uri::new("https://example.com/a.git").expect("valid uri");
         crate::mounts::remember_mount(home.path(), &uri, repo.path()).unwrap();
 
         let subject = junto_kernel::Subject::new(junto_kernel::SubjectKind::Repo, uri);
@@ -3785,7 +3785,7 @@ mod tests {
     async fn diff_capable_is_true_for_a_mounted_repo_subject() {
         let home = HomeGuard::new();
         let repo = git_repo();
-        let uri = junto_kernel::Uri::new("git+https://example.com/a.git").expect("valid uri");
+        let uri = junto_kernel::Uri::new("https://example.com/a.git").expect("valid uri");
         crate::mounts::remember_mount(home.path(), &uri, repo.path()).unwrap();
         let subject = junto_kernel::Subject::new(junto_kernel::SubjectKind::Repo, uri);
         let view = channel_view_with_subjects(&[subject]).await;

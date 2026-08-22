@@ -789,7 +789,7 @@ async fn launch_session(
     // resolve the same id's workdir (`session_workdir`) before the session
     // exists in the ledger.
     let session = EntryId::new();
-    let mut attached_subject = false;
+    let mut attached_view: Option<ChannelView> = None;
     let workspace = match (typed.is_empty(), mounted) {
         // Either arm below that does *not* introduce a new typed path
         // resolves through `session_workdir` — the sole authority on
@@ -842,7 +842,6 @@ async fn launch_session(
         // attachment rather than duplicating it — so this always calls it
         // and always remembers the mount, with no redundant check here.
         (false, None) => {
-            attached_subject = true;
             let repo_path = std::path::Path::new(typed);
             let uri = match repo_subject_uri(repo_path) {
                 Ok(uri) => uri,
@@ -854,7 +853,6 @@ async fn launch_session(
                         .into_response();
                 }
             };
-            let subject = Subject::new(SubjectKind::Repo, uri.clone());
             let author = match crate::host::git_user(&substrate) {
                 Ok(author) => author,
                 Err(err) => {
@@ -863,20 +861,43 @@ async fn launch_session(
                     ));
                 }
             };
+            // The append below is the one irreversible step in this arm —
+            // nothing can withdraw a `SubjectAttached` yet (`SubjectDetached`
+            // has no writer, ADR 0036's Known limits). So it runs last among
+            // what can still fail: `remember_mount` needs only `uri` and
+            // `repo_path`, already in hand, not anything `attach_subject`
+            // returns, so it moves ahead of the append (fix round, finding
+            // 9). What can't move ahead of it is `session_workdir` below —
+            // it walks a *fresh* view's subjects, and the newly attached
+            // one isn't there until the append lands — nor, for the same
+            // reason, the `mode=outcome` gate a few lines down. That
+            // dependency is the residual this reordering cannot remove.
+            if let Err(err) = crate::mounts::remember_mount(&junto_home, &uri, repo_path) {
+                return internal(format!("remembering mount: {err}"));
+            }
+            let subject = Subject::new(SubjectKind::Repo, uri.clone());
             if let Err(err) = host
                 .attach_subject(&channel, subject, author, WriteAuth::Human)
                 .await
             {
                 return lineage_error(err);
             }
-            if let Err(err) = crate::mounts::remember_mount(&junto_home, &uri, repo_path) {
-                return internal(format!("remembering mount: {err}"));
-            }
-            match crate::mounts::mount_path(&junto_home, &uri) {
-                Ok(Some(path)) => path,
-                Ok(None) => return internal("the mount just written was not found".to_string()),
-                Err(err) => return internal(format!("reading mounts: {err}")),
-            }
+            // `session_workdir` re-derives from a fresh view the same way
+            // every other arm does (finding 8) — `mount_path` alone is
+            // capability-unfiltered and can't tell an `Execute`-capable
+            // mount from any other, which is exactly the four-step
+            // coincidence-of-reasoning `session_workdir`'s "sole authority"
+            // contract exists to replace with construction.
+            let fresh = match project(&host, &channel).await {
+                Ok((_, fresh, _)) => fresh,
+                Err(response) => return response,
+            };
+            let workspace = match crate::launch::session_workdir(&junto_home, &fresh, session) {
+                Ok(path) => path,
+                Err(err) => return internal(format!("preparing a workdir: {err}")),
+            };
+            attached_view = Some(fresh);
+            workspace
         }
         // A subject is already mounted; a typed path that differs from it
         // can't be remembered directly without knowing whether it means to
@@ -905,19 +926,12 @@ async fn launch_session(
     let outcome_mode = form.mode.trim() == "outcome";
     if outcome_mode {
         // The `(false, None)` arm above may have just attached a Repo
-        // subject and remembered its mount — `view` was projected before
-        // that write and does not contain it, so evaluating the gate
-        // against `view` unchanged would refuse the exact subject the
-        // human just supplied. Re-project only when that happened; the
-        // `view` already in hand is current for every other arm.
-        let gate_view = if attached_subject {
-            match project(&host, &channel).await {
-                Ok((_, fresh, _)) => fresh,
-                Err(response) => return response,
-            }
-        } else {
-            view
-        };
+        // subject and remembered its mount, and already re-projected to
+        // resolve `session_workdir` against it (finding 8) — reuse that
+        // same fresh view here rather than projecting a third time; `view`
+        // (projected before that write, if it happened) is current for
+        // every other arm.
+        let gate_view = attached_view.unwrap_or(view);
         match crate::launch::diff_capable(&junto_home, &gate_view) {
             Ok(true) => {}
             Ok(false) => {
@@ -1077,10 +1091,27 @@ async fn steer_session(
             // session started (`session_workdir`): a mounted subject's
             // path, or the scratch directory Task 6 gives a repo-free
             // channel — deterministic from `(junto_home, view, session)`,
-            // so recomputing it here is exact, not a guess.
-            let workspace = match crate::launch::session_workdir(&junto_home, &view, session) {
-                Ok(workspace) => workspace,
-                Err(err) => return internal(format!("preparing a workdir: {err}")),
+            // and therefore stable only while the mount store is: this
+            // re-resolves the *current* first Execute-capable mount, not
+            // necessarily the one this session launched in (ADR 0037's
+            // recorded limit). A session that already ran in scratch keeps
+            // running there: `<junto_home>/scratch/<session>` is created
+            // by `session_workdir` and never removed, so its existence is
+            // already a durable, machine-local record that this session
+            // ran in scratch — re-resolving instead would silently move a
+            // resumed turn into a repo mounted after launch, running the
+            // agent in a checkout this session was never launched against,
+            // and recording that repo's uncommitted changes as this
+            // session's diff artifact (the likely instance of ADR 0037's
+            // limit).
+            let scratch = junto_home.join("scratch").join(session.to_string());
+            let workspace = if scratch.is_dir() {
+                scratch
+            } else {
+                match crate::launch::session_workdir(&junto_home, &view, session) {
+                    Ok(workspace) => workspace,
+                    Err(err) => return internal(format!("preparing a workdir: {err}")),
+                }
             };
             match crate::launch::steer(
                 host.clone(),
@@ -2534,7 +2565,7 @@ mod tests {
         junto_home: &std::path::Path,
         path: &std::path::Path,
     ) {
-        let uri = junto_kernel::Uri::new(format!("git+https://example.com/{}.git", fx.channel))
+        let uri = junto_kernel::Uri::new(format!("https://example.com/{}.git", fx.channel))
             .expect("valid uri");
         let subject = junto_kernel::Subject::new(junto_kernel::SubjectKind::Repo, uri.clone());
         let ledger = fx
@@ -3525,6 +3556,164 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         assert!(turns_done >= 2, "the resumed turn must also complete");
+
+        let _ = home;
+        unsafe { std::env::remove_var("JUNTO_HARNESS_CMD") };
+    }
+
+    #[tokio::test]
+    async fn steering_a_scratch_session_stays_in_scratch_even_after_a_repo_is_mounted() {
+        // Finding 1 (final review): `steer_session` used to re-resolve the
+        // workdir from the channel's *current* subjects and mount store on
+        // every steer. A session that launched in scratch (no subject at
+        // launch time) would silently move into a repo mounted *after*
+        // launch — resuming the harness there, with write access to a
+        // checkout it was never launched against, and (via
+        // `record_turn`/`workspace_diff`) recording that repo's
+        // pre-existing uncommitted changes as this session's diff
+        // artifact. The fix: a session whose scratch directory still
+        // exists on disk keeps running there, unconditionally, regardless
+        // of what gets mounted later.
+        let home = crate::host::test_home::HomeGuard::new();
+        let stub_dir = tempfile::tempdir().expect("stub dir");
+        let stub = if cfg!(windows) {
+            let path = stub_dir.path().join("stub.cmd");
+            std::fs::write(
+                &path,
+                "@echo.>marker.txt\r\n@echo {\"type\":\"result\",\"subtype\":\"success\",\
+                 \"result\":\"ok\",\"session_id\":\"h-scratch-steer-1\",\
+                 \"is_error\":false}\r\n",
+            )
+            .expect("write stub");
+            path
+        } else {
+            let path = stub_dir.path().join("stub.sh");
+            std::fs::write(
+                &path,
+                "#!/bin/sh\ntouch marker.txt\necho '{\"type\":\"result\",\"subtype\":\
+                 \"success\",\"result\":\"ok\",\"session_id\":\"h-scratch-steer-1\",\
+                 \"is_error\":false}'\n",
+            )
+            .expect("write stub");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod stub");
+            }
+            path
+        };
+        unsafe { std::env::set_var("JUNTO_HARNESS_CMD", &stub) };
+
+        // host_with_entry founds "web-test" with no Subject attached at all.
+        let fx = host_with_entry(assertion()).await;
+        let launched = launch_session(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LaunchForm {
+                intent: "research something with no repo".into(),
+                workspace: String::new(),
+                agent: String::new(),
+                mode: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(launched.status(), StatusCode::SEE_OTHER);
+
+        let Resolution::Resolved { ledger, id, .. } = fx.host.resolve("web-test").await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+        let mut session_id = None;
+        for _ in 0..100 {
+            let view = ledger.lock().await.project(&id).await.unwrap();
+            if let Some((sid, _)) = view
+                .sessions
+                .iter()
+                .find(|(_, s)| s.state == junto_kernel::SessionState::Done)
+            {
+                session_id = Some(*sid);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let session_id = session_id.expect("first turn reached done");
+
+        // The scratch dir this session actually ran in.
+        let scratch_root = home.path().join("scratch");
+        let scratch_dirs: Vec<_> = std::fs::read_dir(&scratch_root)
+            .expect("scratch root exists")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .collect();
+        assert_eq!(
+            scratch_dirs.len(),
+            1,
+            "exactly one scratch dir for this session"
+        );
+        let scratch_dir = scratch_dirs[0].clone();
+        assert!(scratch_dir.join("marker.txt").exists());
+
+        // Now a repo gets mounted — the sequence the finding names as
+        // likely: scratch first, a Repo subject attached and mounted for a
+        // *later* session, which also makes it `executable_mount` for this
+        // channel from here on.
+        let repo_dir = tempfile::tempdir().expect("repo dir");
+        attach_and_mount_repo(&fx, home.path(), repo_dir.path()).await;
+
+        let steered = steer_session(
+            State(fx.host.clone()),
+            Path(("web-test".into(), session_id.to_string())),
+            Form(SteerForm {
+                message: "keep going".into(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            steered.status(),
+            StatusCode::SEE_OTHER,
+            "a scratch session must still be steerable once a repo is mounted"
+        );
+
+        let mut turns_done = 0;
+        for _ in 0..100 {
+            let view = ledger.lock().await.project(&id).await.unwrap();
+            turns_done = view
+                .entries
+                .iter()
+                .filter(|entry| {
+                    matches!(
+                        &entry.payload,
+                        EntryPayload::SessionUpdated { target, state, .. }
+                            if *target == session_id && *state == junto_kernel::SessionState::Done
+                    )
+                })
+                .count();
+            if turns_done >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            turns_done >= 2,
+            "the resumed (steered) turn must also complete"
+        );
+
+        // The load-bearing assertion: the resumed turn ran in the *same*
+        // scratch directory, never in the newly mounted repo. Before the
+        // fix, `steer_session` re-resolved through the now-mounted
+        // subject, so the harness would have run with `repo_dir` as its
+        // cwd instead, dropping `marker.txt` there — and, worse,
+        // `record_turn` would have appended a diff artifact describing
+        // that repo's pre-existing state as this session's own work.
+        assert!(
+            !repo_dir.path().join("marker.txt").exists(),
+            "the steered turn must not have run inside the newly mounted repo"
+        );
+        assert!(
+            scratch_dir.join("marker.txt").exists(),
+            "the scratch directory must still show the harness ran there"
+        );
 
         let _ = home;
         unsafe { std::env::remove_var("JUNTO_HARNESS_CMD") };

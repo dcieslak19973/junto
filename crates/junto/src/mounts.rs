@@ -51,10 +51,13 @@ fn read_mounts(junto_home: &Path) -> Result<MountsFile> {
     toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
 }
 
-/// Where this machine keeps the given subject, if anywhere. The single-
-/// subject lookup `crate::web`'s `launch_session` uses to read back the
-/// canonical path just handed to [`remember_mount`], once
-/// `Host::attach_subject` has recorded the Subject a typed path implies.
+/// Where this machine keeps the given subject, if anywhere — the direct
+/// read counterpart to [`remember_mount`]. No production caller resolves a
+/// session's workdir this way any more (`session_workdir` — the sole
+/// authority, capability-aware — replaced the last one, finding 8 of the
+/// final review); kept `#[cfg(test)]` as the read/write round-trip these
+/// modules' own tests exercise directly.
+#[cfg(test)]
 pub fn mount_path(junto_home: &Path, uri: &Uri) -> Result<Option<PathBuf>> {
     Ok(read_mounts(junto_home)?
         .mounts
@@ -115,8 +118,8 @@ pub fn remember_mount(junto_home: &Path, uri: &Uri, path: &Path) -> Result<()> {
 ///
 /// The one caller is a surface that lists "everything available here" for
 /// picking (the launch form's suggestions) — ordinary code resolving a
-/// specific subject should use `mounts_for`/`mount_path` instead, which stay
-/// scoped to a channel's actual subjects rather than every mount ever made.
+/// specific subject should use `mounts_for` instead, which stays scoped to
+/// a channel's actual subjects rather than every mount ever made.
 pub fn all_mounts(junto_home: &Path) -> Result<Vec<Mount>> {
     read_mounts(junto_home)?
         .mounts
@@ -192,7 +195,7 @@ mod tests {
     #[test]
     fn a_mount_is_remembered_by_uri_and_updated_in_place() {
         let home = HomeGuard::new();
-        let repo = uri("git+https://example.com/a.git");
+        let repo = uri("https://example.com/a.git");
         assert!(mount_path(home.path(), &repo).unwrap().is_none());
 
         let first = tempfile::tempdir().unwrap();
@@ -224,13 +227,13 @@ mod tests {
     #[test]
     fn unmounted_subjects_are_skipped_rather_than_erroring() {
         let home = HomeGuard::new();
-        let mounted = uri("git+https://example.com/a.git");
+        let mounted = uri("https://example.com/a.git");
         let dir = tempfile::tempdir().unwrap();
         remember_mount(home.path(), &mounted, dir.path()).unwrap();
 
         let subjects = vec![
             Subject::new(SubjectKind::Repo, mounted.clone()),
-            Subject::new(SubjectKind::Repo, uri("git+https://example.com/never.git")),
+            Subject::new(SubjectKind::Repo, uri("https://example.com/never.git")),
         ];
         let mounts = mounts_for(home.path(), &subjects).unwrap();
         assert_eq!(mounts.len(), 1, "the unmounted subject is simply absent");
@@ -240,7 +243,7 @@ mod tests {
     #[test]
     fn all_mounts_lists_every_remembered_mount_regardless_of_subject() {
         let home = HomeGuard::new();
-        let a = uri("git+https://example.com/a.git");
+        let a = uri("https://example.com/a.git");
         let b = uri("file:///notes/spec.md");
         let dir_a = tempfile::tempdir().unwrap();
         let dir_b = tempfile::tempdir().unwrap();
@@ -267,7 +270,7 @@ mod tests {
 
     #[test]
     fn a_mounted_repo_can_do_everything_and_an_unmounted_one_can_only_be_read() {
-        let repo = Subject::new(SubjectKind::Repo, uri("git+https://example.com/a.git"));
+        let repo = Subject::new(SubjectKind::Repo, uri("https://example.com/a.git"));
         let dir = tempfile::tempdir().unwrap();
         let mount = Mount {
             uri: repo.uri.clone(),
