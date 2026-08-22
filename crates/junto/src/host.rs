@@ -19,7 +19,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use junto_kernel::{
     ChannelId, ChannelView, EntryId, EntryPayload, GateStatus, Ledger, LedgerEntry, Member,
-    MemberKind, PublicKey, Standing, SubstrateProvider, Timestamp,
+    MemberKind, PublicKey, Standing, Subject, SubstrateProvider, Timestamp,
 };
 use junto_substrate_git::GitRefsSubstrate;
 use serde::{Deserialize, Serialize};
@@ -851,6 +851,46 @@ impl Host {
         Ok(())
     }
 
+    /// Attach a **Subject** — something this channel is about (spec §1) — by
+    /// recording one `SubjectAttached` entry. Returns the attachment's entry
+    /// id, which is what a later `SubjectDetached` targets.
+    ///
+    /// The subject's URI is portable by construction; where *this* machine
+    /// keeps it is a Mount, machine-local and never recorded.
+    ///
+    /// Dispatches through [`Host::check_write_auth`], the same guardrail
+    /// [`Host::diverge`]/[`Host::converge`] use, so both write surfaces
+    /// (`docs/adr/0021`) are served without re-implementing authorization.
+    ///
+    /// # Errors
+    /// Refuses an author who is not in the channel's Party, or whose member
+    /// code is missing or wrong on the agent surface (`docs/adr/0017`/`0021`);
+    /// also errors if `channel` does not resolve.
+    pub async fn attach_subject(
+        &self,
+        channel: &str,
+        subject: Subject,
+        author: Member,
+        auth: WriteAuth<'_>,
+    ) -> Result<EntryId> {
+        let (_substrate, ledger, channel_id) = self.resolve_for_write(channel).await?;
+        let mut guard = ledger.lock().await;
+        let view = guard.project(&channel_id).await?;
+        self.check_write_auth(&view, &author, &auth)?;
+        let mut entry = LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel: channel_id,
+            author,
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::SubjectAttached { subject },
+        };
+        self.sign_entry(&mut entry);
+        let id = entry.id;
+        guard.append(entry).await?;
+        Ok(id)
+    }
+
     /// Resolve a **target** channel reference for [`Host::converge`]: its id,
     /// plus its local ledger if this host hosts it. A raw id that isn't hosted
     /// here resolves to the id alone — the far side reconciles later
@@ -1345,7 +1385,7 @@ pub(crate) mod test_home {
 #[cfg(test)]
 mod lineage_tests {
     use super::*;
-    use junto_kernel::{ApprovalRequirement, LineageDirection, LineageRelation};
+    use junto_kernel::{ApprovalRequirement, LineageDirection, LineageRelation, SubjectKind, Uri};
     use std::process::Command as StdCommand;
     use tempfile::TempDir;
 
@@ -1961,6 +2001,45 @@ mod lineage_tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not a member"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn attaching_a_subject_records_it_and_projects_it() {
+        let (_dirs, host) = lineage_host(1);
+        host.open_channel(None, "subjects", dan(), None)
+            .await
+            .unwrap();
+
+        let subject = Subject::new(
+            SubjectKind::Repo,
+            Uri::new("git+https://example.com/a.git").expect("valid uri"),
+        );
+        let id = host
+            .attach_subject("subjects", subject.clone(), dan(), WriteAuth::Human)
+            .await
+            .expect("attach");
+
+        let (_, view) = project(&host, "subjects").await;
+        assert_eq!(view.subjects, vec![(id, subject)]);
+    }
+
+    #[tokio::test]
+    async fn attaching_a_subject_refuses_a_non_member() {
+        let (_dirs, host) = lineage_host(1);
+        host.open_channel(None, "subjects", dan(), None)
+            .await
+            .unwrap();
+
+        let stranger = Member::human("Stranger", "stranger@example.com");
+        let subject = Subject::new(
+            SubjectKind::Repo,
+            Uri::new("git+https://example.com/a.git").expect("valid uri"),
+        );
+        let err = host
+            .attach_subject("subjects", subject, stranger, WriteAuth::Human)
+            .await
+            .expect_err("a non-member must not attach a subject");
+        assert!(format!("{err}").to_lowercase().contains("member"), "{err}");
     }
 
     #[tokio::test]

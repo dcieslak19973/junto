@@ -31,10 +31,13 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
-use junto_kernel::{ChannelId, ChannelView, EntryId, EntryPayload, LedgerEntry, Timestamp};
+use junto_kernel::{
+    ChannelId, ChannelView, EntryId, EntryPayload, LedgerEntry, Subject, SubjectKind, Timestamp,
+    Uri,
+};
 use serde::{Deserialize, Serialize};
 
-use crate::host::{Host, Resolution};
+use crate::host::{Host, Resolution, WriteAuth};
 use crate::render;
 
 /// The web routes, to be merged into the host's router.
@@ -661,11 +664,47 @@ struct LaunchForm {
     mode: String,
 }
 
+/// A git repo's portable identity: its `origin` remote when it has one, else
+/// a `file://` URI of the canonical path. Portable in the common case; the
+/// fallback is machine-shaped on purpose — a repo with no remote has no
+/// portable identity to offer.
+///
+/// # Errors
+/// Errors if `path` cannot be canonicalized (only reached by the fallback,
+/// when `origin` is absent) or if the resulting string is not a valid
+/// [`Uri`].
+fn repo_subject_uri(path: &std::path::Path) -> anyhow::Result<Uri> {
+    let mut command = std::process::Command::new("git");
+    command
+        .arg("-C")
+        .arg(path)
+        .args(["remote", "get-url", "origin"]);
+    // Terminal-less: no flashed console window (runs on every launch).
+    crate::launch::no_console_window(&mut command);
+    let origin = command
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+    let raw = match origin {
+        Some(url) => url,
+        None => {
+            let canonical = dunce::canonicalize(path)
+                .map_err(|err| anyhow::anyhow!("canonicalizing {}: {err}", path.display()))?;
+            format!("file://{}", canonical.display())
+        }
+    };
+    Ok(Uri::new(raw)?)
+}
+
 /// Launch an Agent Session from the channel page: resolve the workspace
-/// through this machine's Mount store (the form may resubmit the prefilled
-/// mount unchanged, but cannot remember a new one — see `required_mount`),
-/// check the agent's member is in the Party, and spawn the first turn in
-/// the background.
+/// through this machine's Mount store — an already-mounted subject's path,
+/// or, when nothing is mounted yet, a freshly typed path (which attaches a
+/// Subject derived from it and remembers the mount, [`repo_subject_uri`] /
+/// [`Host::attach_subject`]) — check the agent's member is in the Party,
+/// and spawn the first turn in the background.
 async fn launch_session(
     State(host): State<Arc<Host>>,
     Path(channel): Path<String>,
@@ -741,17 +780,54 @@ async fn launch_session(
         // that value back unchanged is not a new path, so accept it exactly
         // as the empty-field case above would.
         (false, Some(path)) if path == std::path::Path::new(typed) => path,
-        (false, _) => {
-            // A genuinely different typed path can't be remembered
-            // directly: doing so would require synthesizing a Subject URI
-            // for a path that has none, which re-creates the channel→path
-            // coupling the Mount store exists to remove, under a new name.
-            // `Host::attach_subject` (a follow-up) is what actually closes
-            // this — attach a Subject, then mount it.
+        // Nothing is mountable yet: a typed path is this channel's first
+        // Subject. Derive its portable identity, attach it (the write path
+        // `Host::attach_subject` closes), and remember where this machine
+        // keeps it.
+        (false, None) => {
+            let repo_path = std::path::Path::new(typed);
+            let uri = match repo_subject_uri(repo_path) {
+                Ok(uri) => uri,
+                Err(err) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        format!("could not derive a subject for '{typed}': {err:#}"),
+                    )
+                        .into_response();
+                }
+            };
+            let subject = Subject::new(SubjectKind::Repo, uri.clone());
+            let author = match crate::host::git_user(&substrate) {
+                Ok(author) => author,
+                Err(err) => {
+                    return internal(format!(
+                        "no author identity: {err} (set git config user.name / user.email)"
+                    ));
+                }
+            };
+            if let Err(err) = host
+                .attach_subject(&channel, subject, author, WriteAuth::Human)
+                .await
+            {
+                return lineage_error(err);
+            }
+            if let Err(err) = crate::mounts::remember_mount(&junto_home, &uri, repo_path) {
+                return internal(format!("remembering mount: {err}"));
+            }
+            match crate::mounts::mount_path(&junto_home, &uri) {
+                Ok(Some(path)) => path,
+                Ok(None) => return internal("the mount just written was not found".to_string()),
+                Err(err) => return internal(format!("reading mounts: {err}")),
+            }
+        }
+        // A subject is already mounted; a typed path that differs from it
+        // can't be remembered directly without knowing whether it means to
+        // re-point that same subject or introduce a second one.
+        (false, Some(_)) => {
             return (
                 StatusCode::BAD_REQUEST,
-                "typing a new workspace path is not supported yet — attach a subject to this \
-                 channel first",
+                "typing a new workspace path is not supported yet — this channel's subject is \
+                 already mounted elsewhere",
             )
                 .into_response();
         }
@@ -3053,6 +3129,123 @@ mod tests {
             _ => None,
         });
         assert_eq!(granted_by.as_deref(), Some("web@example.com"));
+
+        unsafe { std::env::remove_var("JUNTO_HARNESS_CMD") };
+    }
+
+    #[tokio::test]
+    async fn launching_with_a_typed_path_and_no_subject_attaches_one_and_mounts_it() {
+        // The write path this channel needed: typing a path when nothing is
+        // mounted derives a Subject from the repo's `origin`, attaches it,
+        // remembers the mount, and launches — instead of refusing.
+        let home = crate::host::test_home::HomeGuard::new();
+        let stub_dir = tempfile::tempdir().expect("stub dir");
+        let stub = if cfg!(windows) {
+            let path = stub_dir.path().join("stub.cmd");
+            std::fs::write(
+                &path,
+                "@echo {\"type\":\"result\",\"subtype\":\"success\",\"result\":\"attach work \
+                 done\",\"session_id\":\"h-attach-1\",\"is_error\":false}\r\n",
+            )
+            .expect("write stub");
+            path
+        } else {
+            let path = stub_dir.path().join("stub.sh");
+            std::fs::write(
+                &path,
+                "#!/bin/sh\necho '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"attach \
+                 work done\",\"session_id\":\"h-attach-1\",\"is_error\":false}'\n",
+            )
+            .expect("write stub");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod stub");
+            }
+            path
+        };
+        unsafe { std::env::set_var("JUNTO_HARNESS_CMD", &stub) };
+
+        let fx = host_with_entry(assertion()).await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        let origin = "https://example.com/acme/widgets.git";
+        assert!(
+            StdCommand::new("git")
+                .args(["remote", "add", "origin", origin])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git remote add")
+                .success()
+        );
+
+        // No fixture attached a subject: the channel starts bare.
+        let (_, before, _) = project(&fx.host, "web-test").await.expect("project");
+        assert!(
+            before.subjects.is_empty(),
+            "the channel starts with no subject"
+        );
+
+        let response = launch_session(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LaunchForm {
+                intent: "do the stub thing".into(),
+                workspace: workspace.path().display().to_string(),
+                agent: String::new(),
+                mode: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::SEE_OTHER,
+            "a typed path with no mountable subject now attaches and launches, not refuses"
+        );
+
+        let (_, view, _) = project(&fx.host, "web-test").await.expect("project");
+        assert_eq!(view.subjects.len(), 1, "exactly one subject was attached");
+        let (_, subject) = &view.subjects[0];
+        assert_eq!(subject.kind, SubjectKind::Repo);
+        assert_eq!(
+            subject.uri.as_str(),
+            origin,
+            "the derived subject's uri is the repo's origin remote"
+        );
+
+        let mounted = crate::mounts::mount_path(home.path(), &subject.uri)
+            .expect("reading mounts")
+            .expect("the subject's mount was remembered");
+        assert_eq!(mounted, dunce::canonicalize(workspace.path()).unwrap());
+
+        // Poll the projection until the background turn lands, confirming a
+        // session actually launched (not just a redirect).
+        let Resolution::Resolved { ledger, id, .. } = fx.host.resolve("web-test").await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+        let mut done = false;
+        for _ in 0..100 {
+            let view = ledger.lock().await.project(&id).await.unwrap();
+            if view
+                .sessions
+                .iter()
+                .any(|(_, s)| s.state == junto_kernel::SessionState::Done)
+            {
+                done = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(done, "the launched session reached done");
 
         unsafe { std::env::remove_var("JUNTO_HARNESS_CMD") };
     }

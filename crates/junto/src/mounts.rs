@@ -51,13 +51,10 @@ fn read_mounts(junto_home: &Path) -> Result<MountsFile> {
     toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
 }
 
-/// Where this machine keeps the given subject, if anywhere.
-// No production caller yet: the single-subject lookup this exists for
-// (checking a specific Subject's mount before, say, re-mounting it) has no
-// call site until Task 4b's Subject-attachment/re-mount surface exists.
-// Exercised by this module's own tests; kept public per the interface this
-// module was specified against.
-#[allow(dead_code)]
+/// Where this machine keeps the given subject, if anywhere. The single-
+/// subject lookup `crate::web`'s `launch_session` uses to read back the
+/// canonical path just handed to [`remember_mount`], once
+/// `Host::attach_subject` has recorded the Subject a typed path implies.
 pub fn mount_path(junto_home: &Path, uri: &Uri) -> Result<Option<PathBuf>> {
     Ok(read_mounts(junto_home)?
         .mounts
@@ -85,14 +82,9 @@ pub fn mounts_for(junto_home: &Path, subjects: &[Subject]) -> Result<Vec<Mount>>
         .collect())
 }
 
-/// Remember (or update) where this machine keeps a subject.
-// No production caller yet, deliberately: writing a mount requires a
-// Subject to key it on, and nothing in this task attaches one — see
-// `crate::web`'s `required_mount`, which refuses rather than invent one.
-// `Host::attach_subject` (Task 4b) is the actual write path; until then this
-// is exercised only by this module's own tests, kept public per the
-// interface this module was specified against.
-#[allow(dead_code)]
+/// Remember (or update) where this machine keeps a subject. The write half
+/// of the Mount store: `crate::web`'s `launch_session` calls this once
+/// `Host::attach_subject` has recorded the Subject a typed path implies.
 pub fn remember_mount(junto_home: &Path, uri: &Uri, path: &Path) -> Result<()> {
     let path = dunce::canonicalize(path)
         .with_context(|| format!("mount path {} not found", path.display()))?;
