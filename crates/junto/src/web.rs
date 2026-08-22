@@ -797,6 +797,7 @@ async fn launch_session(
     // resolve the same id's workdir (`session_workdir`) before the session
     // exists in the ledger.
     let session = EntryId::new();
+    let mut attached_subject = false;
     let workspace = match (typed.is_empty(), mounted) {
         // Either arm below that does *not* introduce a new typed path
         // resolves through `session_workdir` — the sole authority on
@@ -849,6 +850,7 @@ async fn launch_session(
         // attachment rather than duplicating it — so this always calls it
         // and always remembers the mount, with no redundant check here.
         (false, None) => {
+            attached_subject = true;
             let repo_path = std::path::Path::new(typed);
             let uri = match repo_subject_uri(repo_path) {
                 Ok(uri) => uri,
@@ -910,7 +912,21 @@ async fn launch_session(
     // fully supported in a scratch directory.
     let outcome_mode = form.mode.trim() == "outcome";
     if outcome_mode {
-        match crate::launch::diff_capable(&junto_home, &view) {
+        // The `(false, None)` arm above may have just attached a Repo
+        // subject and remembered its mount — `view` was projected before
+        // that write and does not contain it, so evaluating the gate
+        // against `view` unchanged would refuse the exact subject the
+        // human just supplied. Re-project only when that happened; the
+        // `view` already in hand is current for every other arm.
+        let gate_view = if attached_subject {
+            match project(&host, &channel).await {
+                Ok((_, fresh, _)) => fresh,
+                Err(response) => return response,
+            }
+        } else {
+            view
+        };
+        match crate::launch::diff_capable(&junto_home, &gate_view) {
             Ok(true) => {}
             Ok(false) => {
                 return (
@@ -1024,30 +1040,11 @@ async fn steer_session(
         Ok(home) => home,
         Err(err) => return internal(format!("no junto home: {err}")),
     };
-    // A Repo subject this machine no longer has mounted here — `mounts.toml`
-    // edited, or the entry removed after launch — is the one shape
-    // `launch_session`'s empty-field path also refuses
-    // (`channel_has_unmounted_repo_subject`): silently resuming into a
-    // fresh, empty `session_workdir` scratch directory would be strictly
-    // worse than a loud refusal, discarding whatever work already exists
-    // in the mount the human just lost, not offering a repo-free channel.
-    match channel_has_unmounted_repo_subject(&junto_home, &view) {
-        Ok(true) => return (StatusCode::BAD_REQUEST, NO_MOUNTABLE_SUBJECT).into_response(),
-        Ok(false) => {}
-        Err(response) => return response,
-    }
-    // The same id's workdir `launch_session` resolved when this session
-    // started (`session_workdir`): a mounted subject's path, or the
-    // scratch directory Task 6 gives a repo-free channel — deterministic
-    // from `(junto_home, view, session)`, so recomputing it here is exact,
-    // not a guess.
-    let workspace = match crate::launch::session_workdir(&junto_home, &view, session) {
-        Ok(workspace) => workspace,
-        Err(err) => return internal(format!("preparing a workdir: {err}")),
-    };
-    // One steer box, routed on liveness: a running turn is steered in place over
-    // the control channel; a turn that has already landed is resumed (docs/adr/
-    // 0032).
+    // One steer box, routed on liveness: a running turn is steered in place
+    // over the control channel; a turn that has already landed is resumed
+    // (docs/adr/0032). A live steer touches no workspace at all, so the
+    // mount checks below run only inside the between-turns resume path,
+    // after this routing decision — never ahead of it.
     match crate::launch::steer_live(
         host.clone(),
         id,
@@ -1059,20 +1056,55 @@ async fn steer_session(
     .await
     {
         Ok(()) => Redirect::to(&format!("/channels/{id}")).into_response(),
-        Err(crate::launch::NotLive) => match crate::launch::steer(
-            host.clone(),
-            id,
-            channel.clone(),
-            workspace,
-            session,
-            author,
-            message,
-        )
-        .await
-        {
-            Ok(()) => Redirect::to(&format!("/channels/{id}")).into_response(),
-            Err(err) => (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
-        },
+        Err(crate::launch::NotLive) => {
+            // A channel with a mounted, `Execute`-capable subject resolves
+            // through it regardless of anything else the channel carries
+            // (the same rule `launch_session` follows —
+            // `a_mounted_repo_subject_still_launches_alongside_a_second_unmounted_one`).
+            // Refuse only when *nothing* is `Execute`-capable *and* a Repo
+            // subject this machine has no mount for exists (`mounts.toml`
+            // edited, or the entry removed after launch): that is a
+            // fixable gap, not a repo-free channel, and silently resuming
+            // into a fresh, empty `session_workdir` scratch directory
+            // would discard whatever work already exists in the mount the
+            // human just lost.
+            let executable = match crate::launch::executable_mount(&junto_home, &view) {
+                Ok(mount) => mount,
+                Err(err) => return internal(format!("reading mounts: {err}")),
+            };
+            if executable.is_none() {
+                match channel_has_unmounted_repo_subject(&junto_home, &view) {
+                    Ok(true) => {
+                        return (StatusCode::BAD_REQUEST, NO_MOUNTABLE_SUBJECT).into_response();
+                    }
+                    Ok(false) => {}
+                    Err(response) => return response,
+                }
+            }
+            // The same id's workdir `launch_session` resolved when this
+            // session started (`session_workdir`): a mounted subject's
+            // path, or the scratch directory Task 6 gives a repo-free
+            // channel — deterministic from `(junto_home, view, session)`,
+            // so recomputing it here is exact, not a guess.
+            let workspace = match crate::launch::session_workdir(&junto_home, &view, session) {
+                Ok(workspace) => workspace,
+                Err(err) => return internal(format!("preparing a workdir: {err}")),
+            };
+            match crate::launch::steer(
+                host.clone(),
+                id,
+                channel.clone(),
+                workspace,
+                session,
+                author,
+                message,
+            )
+            .await
+            {
+                Ok(()) => Redirect::to(&format!("/channels/{id}")).into_response(),
+                Err(err) => (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
+            }
+        }
     }
 }
 
@@ -4131,6 +4163,314 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&bytes), NO_MOUNTABLE_SUBJECT);
+        let _ = home;
+
+        unsafe { std::env::remove_var("JUNTO_HARNESS_CMD") };
+    }
+
+    #[tokio::test]
+    async fn steering_succeeds_when_a_mounted_repo_subject_is_present_alongside_an_unmounted_one() {
+        // Fix round 3, finding 1 (first half): the refusal must fire only
+        // when *nothing* is `Execute`-capable, matching `launch_session`'s
+        // own rule
+        // (`a_mounted_repo_subject_still_launches_alongside_a_second_unmounted_one`).
+        // A channel with a working, mounted Repo subject resolves through
+        // it for steering too, even with a second Repo subject this
+        // machine has never mounted (a teammate's checkout) also present.
+        let home = crate::host::test_home::HomeGuard::new();
+        let stub_dir = tempfile::tempdir().expect("stub dir");
+        let stub = if cfg!(windows) {
+            let path = stub_dir.path().join("stub.cmd");
+            std::fs::write(
+                &path,
+                "@echo {\"type\":\"result\",\"subtype\":\"success\",\"result\":\"ok\",\
+                 \"session_id\":\"h-steer-second-repo-1\",\"is_error\":false}\r\n",
+            )
+            .expect("write stub");
+            path
+        } else {
+            let path = stub_dir.path().join("stub.sh");
+            std::fs::write(
+                &path,
+                "#!/bin/sh\necho '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\
+                 \"ok\",\"session_id\":\"h-steer-second-repo-1\",\"is_error\":false}'\n",
+            )
+            .expect("write stub");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod stub");
+            }
+            path
+        };
+        unsafe { std::env::set_var("JUNTO_HARNESS_CMD", &stub) };
+
+        let fx = host_with_entry(assertion()).await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        attach_and_mount_repo(&fx, home.path(), workspace.path()).await;
+
+        let launched = launch_session(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LaunchForm {
+                intent: "do the stub thing".into(),
+                workspace: String::new(),
+                agent: String::new(),
+                mode: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(launched.status(), StatusCode::SEE_OTHER);
+
+        let Resolution::Resolved { ledger, id, .. } = fx.host.resolve("web-test").await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+        let mut session_id = None;
+        for _ in 0..100 {
+            let view = ledger.lock().await.project(&id).await.unwrap();
+            if let Some((sid, _)) = view
+                .sessions
+                .iter()
+                .find(|(_, s)| s.state == junto_kernel::SessionState::Done)
+            {
+                session_id = Some(*sid);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let session_id = session_id.expect("launch turn reached done");
+
+        // A second Repo subject, deliberately never mounted here.
+        let second_uri =
+            junto_kernel::Uri::new(format!("git+https://example.com/second-{}.git", fx.channel))
+                .expect("valid uri");
+        let second_subject =
+            junto_kernel::Subject::new(junto_kernel::SubjectKind::Repo, second_uri);
+        let ledger_handle = fx
+            .host
+            .ledger_for(fx._dirs[0].path())
+            .await
+            .expect("ledger");
+        ledger_handle
+            .lock()
+            .await
+            .append(LedgerEntry {
+                signature: None,
+                id: EntryId::new(),
+                channel: fx.channel,
+                author: Member::human("Web User", "web@example.com"),
+                timestamp: Timestamp::now(),
+                payload: EntryPayload::SubjectAttached {
+                    subject: second_subject,
+                },
+            })
+            .await
+            .expect("attach a second, deliberately unmounted repo subject");
+
+        let steered = steer_session(
+            State(fx.host.clone()),
+            Path(("web-test".into(), session_id.to_string())),
+            Form(SteerForm {
+                message: "keep going".into(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            steered.status(),
+            StatusCode::SEE_OTHER,
+            "the mounted Repo subject must win even with a second, unmounted one present"
+        );
+
+        // Wait for the resumed turn to also land before tearing env down.
+        let mut turns_done = 0;
+        for _ in 0..100 {
+            let view = ledger.lock().await.project(&id).await.unwrap();
+            turns_done = view
+                .entries
+                .iter()
+                .filter(|entry| {
+                    matches!(
+                        &entry.payload,
+                        EntryPayload::SessionUpdated { target, state, .. }
+                            if *target == session_id && *state == junto_kernel::SessionState::Done
+                    )
+                })
+                .count();
+            if turns_done >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(turns_done >= 2, "the resumed turn must also complete");
+
+        unsafe { std::env::remove_var("JUNTO_HARNESS_CMD") };
+    }
+
+    #[tokio::test]
+    async fn a_live_steer_succeeds_even_with_an_unmounted_repo_subject_present() {
+        // Fix round 3, finding 1 (second half): the mount checks must run
+        // only in the between-turns resume path, never ahead of the
+        // live/landed routing — a running turn is steered purely over the
+        // control channel and touches no workspace at all. Attach a Repo
+        // subject this machine has no mount for — the exact shape that
+        // *would* refuse if the check ran here (see
+        // `steering_refuses_when_the_channel_now_carries_an_unmounted_repo_subject`)
+        // — then register a live feed and steer: it must succeed, proving
+        // the check never runs on this path at all.
+        let fx = host_with_entry(session_started()).await;
+        let uri = junto_kernel::Uri::new(format!("git+https://example.com/{}.git", fx.channel))
+            .expect("valid uri");
+        let subject = junto_kernel::Subject::new(junto_kernel::SubjectKind::Repo, uri);
+        let ledger = fx
+            .host
+            .ledger_for(fx._dirs[0].path())
+            .await
+            .expect("ledger");
+        ledger
+            .lock()
+            .await
+            .append(LedgerEntry {
+                signature: None,
+                id: EntryId::new(),
+                channel: fx.channel,
+                author: Member::human("Web User", "web@example.com"),
+                timestamp: Timestamp::now(),
+                payload: EntryPayload::SubjectAttached { subject },
+            })
+            .await
+            .expect("attach a repo subject, deliberately never mounted");
+
+        let _rx = fx
+            .host
+            .live()
+            .begin(fx.host.clone(), "web-test".into(), fx.target, true);
+
+        let steered = steer_session(
+            State(fx.host.clone()),
+            Path(("web-test".into(), fx.target.to_string())),
+            Form(SteerForm {
+                message: "keep going".into(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            steered.status(),
+            StatusCode::SEE_OTHER,
+            "a live steer must succeed without ever consulting mount state, even where the \
+             between-turns refusal would otherwise fire"
+        );
+    }
+
+    #[tokio::test]
+    async fn launching_with_a_typed_path_and_mode_outcome_launches_not_refuses() {
+        // Fix round 3, finding 2: the `(false, None)` arm attaches a Repo
+        // subject and remembers its mount, but `view` was projected before
+        // that write. Evaluating the Diff-capability gate against the
+        // stale `view` reported no subject at all and refused
+        // `mode=outcome` with "mount a Repo subject" — exactly what the
+        // human just did. A bare channel, a typed path to a real git
+        // repo, `mode=outcome` must launch.
+        let home = crate::host::test_home::HomeGuard::new();
+        let stub_dir = tempfile::tempdir().expect("stub dir");
+        let stub = if cfg!(windows) {
+            let path = stub_dir.path().join("stub.cmd");
+            std::fs::write(
+                &path,
+                "@echo {\"type\":\"result\",\"subtype\":\"success\",\"result\":\"ok\",\
+                 \"session_id\":\"h-typed-outcome-1\",\"is_error\":false}\r\n",
+            )
+            .expect("write stub");
+            path
+        } else {
+            let path = stub_dir.path().join("stub.sh");
+            std::fs::write(
+                &path,
+                "#!/bin/sh\necho '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\
+                 \"ok\",\"session_id\":\"h-typed-outcome-1\",\"is_error\":false}'\n",
+            )
+            .expect("write stub");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod stub");
+            }
+            path
+        };
+        unsafe { std::env::set_var("JUNTO_HARNESS_CMD", &stub) };
+
+        let fx = host_with_entry(assertion()).await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        let origin = "https://example.com/acme/widgets.git";
+        assert!(
+            StdCommand::new("git")
+                .args(["remote", "add", "origin", origin])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git remote add")
+                .success()
+        );
+
+        // No fixture attached a subject: the channel starts bare.
+        let (_, before, _) = project(&fx.host, "web-test").await.expect("project");
+        assert!(
+            before.subjects.is_empty(),
+            "the channel starts with no subject"
+        );
+
+        let response = launch_session(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LaunchForm {
+                intent: "grade a real change".into(),
+                workspace: workspace.path().display().to_string(),
+                agent: String::new(),
+                mode: "outcome".into(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::SEE_OTHER,
+            "a typed path just attached must launch the Outcome loop, not refuse itself"
+        );
+
+        let Resolution::Resolved { ledger, id, .. } = fx.host.resolve("web-test").await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+        let mut terminal = false;
+        for _ in 0..200 {
+            let view = ledger.lock().await.project(&id).await.unwrap();
+            if view
+                .sessions
+                .iter()
+                .any(|(_, s)| s.state != junto_kernel::SessionState::Working)
+            {
+                terminal = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(terminal, "the outcome loop must reach a terminal state");
         let _ = home;
 
         unsafe { std::env::remove_var("JUNTO_HARNESS_CMD") };

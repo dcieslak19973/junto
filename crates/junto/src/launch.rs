@@ -3758,6 +3758,44 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn diff_capable_is_false_for_a_mounted_document_subject() {
+        // Fix round 3, finding 3: a direct, discriminating unit test of
+        // `diff_capable` itself — the round-2 web-layer test
+        // (`outcome_mode_refuses_with_a_mounted_document_subject`) passes
+        // against the old scratch-path gate too, now that `session_workdir`
+        // is the sole authority (round 2, finding 1), so it no longer
+        // proves this function specifically matters. This does: a mounted
+        // Document subject is a real, non-scratch directory, but
+        // `mounts::capabilities` never grants it `Capability::Diff`.
+        let home = HomeGuard::new();
+        let doc_dir = tempfile::tempdir().unwrap();
+        let uri = junto_kernel::Uri::new("file:///notes/spec.md").expect("valid uri");
+        crate::mounts::remember_mount(home.path(), &uri, doc_dir.path()).unwrap();
+        let subject = junto_kernel::Subject::new(junto_kernel::SubjectKind::Document, uri);
+        let view = channel_view_with_subjects(&[subject]).await;
+
+        assert!(
+            !diff_capable(home.path(), &view).expect("reading mounts"),
+            "a mounted Document subject must never report Diff capability"
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_capable_is_true_for_a_mounted_repo_subject() {
+        let home = HomeGuard::new();
+        let repo = git_repo();
+        let uri = junto_kernel::Uri::new("git+https://example.com/a.git").expect("valid uri");
+        crate::mounts::remember_mount(home.path(), &uri, repo.path()).unwrap();
+        let subject = junto_kernel::Subject::new(junto_kernel::SubjectKind::Repo, uri);
+        let view = channel_view_with_subjects(&[subject]).await;
+
+        assert!(
+            diff_capable(home.path(), &view).expect("reading mounts"),
+            "a mounted Repo subject must report Diff capability"
+        );
+    }
+
     /// A `ChannelView` carrying just the subjects a workdir test needs.
     ///
     /// Built through the kernel's in-memory substrate rather than a git-refs
