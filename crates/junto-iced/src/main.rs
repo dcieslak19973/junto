@@ -18,8 +18,8 @@ use iced::widget::{
     text, text_input,
 };
 use iced::{
-    Background, Border, Center, Color, Element, Fill, Length, Point, Rectangle, Renderer, Size,
-    Task, Theme, mouse,
+    Background, Border, Center, Color, Element, Fill, Length, Padding, Point, Rectangle, Renderer,
+    Size, Task, Theme, mouse,
 };
 use junto_kernel::{
     Anchor, Annotation, AnnotationId, CodeAnchor, CommitOid, ContentDigest, EntryId, Member,
@@ -27,6 +27,7 @@ use junto_kernel::{
 };
 use junto_live::{Frame as WireFrame, LiveDoc, Presence};
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 
 const HOST: &str = "http://127.0.0.1:1727";
 
@@ -105,6 +106,18 @@ struct App {
     agent_mcp: Vec<(String, String)>,
     agent_skills: Vec<String>,
     agent_plugins: Vec<String>,
+    /// The join box (Settings → this device): a pasted invite that mints
+    /// this machine's key pair via `POST /devices/enroll`. The GUI never
+    /// mints a key itself — `join_result` only ever holds what the host
+    /// handed back.
+    join_invite: String,
+    join_pending: bool,
+    join_error: Option<String>,
+    join_result: Option<EnrolledDto>,
+    /// This device's signing-key fingerprint for the current git identity,
+    /// if one is on file — computed once, on `SettingsLoaded`/`JoinDone`
+    /// (never from the view: `load_signing_key` is a blocking file read).
+    device_key_fingerprint: Option<String>,
 }
 
 /// The admin views behind the top-bar buttons.
@@ -237,6 +250,48 @@ struct Pane {
     brief_md: Option<Vec<markdown::Item>>,
     /// The humanized brief text, kept so it can be copied to the clipboard.
     brief_text: Option<String>,
+    /// The channel's key roster (`keys.json`) — the members-and-devices
+    /// disclosure's data (device-key-enrollment plan, Task 13). `None`
+    /// until the first fetch lands.
+    keys: Option<KeysDto>,
+    /// The last `keys.json` fetch's error, if it failed — rendered by the
+    /// disclosure instead of silently reading as "no members" (a fetch
+    /// failure and a genuinely empty roster must never look the same).
+    keys_error: Option<String>,
+    /// Whether the members disclosure is expanded.
+    members_open: bool,
+    /// The founder identity act currently open in this pane, if any — the
+    /// `IdentityForm` analogue of `lifecycle`.
+    identity_form: Option<IdentityForm>,
+    /// An identity act is in flight.
+    identity_pending: bool,
+    /// The last identity act's error, if it failed.
+    identity_error: Option<String>,
+    /// A freshly minted invite, shown with its countdown until dismissed
+    /// or replaced by a fresh mint.
+    invite_minted: Option<InviteMintedDto>,
+    /// A redeem form's pre-append preview (`POST /devices/preview`),
+    /// shown before the kind picker and the confirm that actually appends.
+    redeem_preview: Option<EnrollPreviewDto>,
+    /// A redeem form's per-channel outcomes, persisting until the form is
+    /// cancelled.
+    redeem_outcomes: Vec<RedeemOutcomeDto>,
+    /// The invite form's member-email input.
+    identity_member: String,
+    /// The invite form's channel checkboxes: (channel name, ticked).
+    identity_channels: Vec<(String, bool)>,
+    /// The redeem form's pasted enroll code.
+    identity_paste: String,
+    /// The redeem form's picked member kind — `""` until the founder
+    /// picks one; never defaulted (`docs/adr/0035`).
+    identity_kind: String,
+    /// The retire/revoke forms' rationale input.
+    identity_rationale: String,
+    /// A retire/revoke act's success confirmation ("parked N grant(s)"),
+    /// shown until dismissed — the form itself has already closed by
+    /// then, so this is the only feedback the founder gets that it
+    /// actually happened.
+    identity_notice: Option<String>,
 }
 
 enum Content {
@@ -338,6 +393,21 @@ struct IdentityDto {
     email: String,
 }
 
+/// `POST /devices/enroll`'s response — mirrors
+/// `crates/junto/src/web.rs::EnrolledDto` exactly. A device enrolling under
+/// the current payload version always mints both keypairs in the same
+/// step, so neither fingerprint is ever optional here (contrast
+/// `keys.json`'s per-grant transport fingerprint, which IS optional for a
+/// grant made before transport keys existed — that DTO belongs to the
+/// members-disclosure task).
+#[derive(Debug, Clone, Deserialize)]
+struct EnrolledDto {
+    url: String,
+    email: String,
+    fingerprint: String,
+    transport_fingerprint: String,
+}
+
 impl std::fmt::Display for AgentDto {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // "name · harness" (with model when overridden) — what the dropdown shows.
@@ -392,6 +462,9 @@ struct ChannelDto {
     name: Option<String>,
     #[allow(dead_code)]
     closed: bool,
+    /// Superseded by `keys.json`'s roster (Task 13's members disclosure);
+    /// kept for DTO fidelity with the host, unread by the surface.
+    #[allow(dead_code)]
     party: Vec<String>,
     /// The channel's remembered workspace repo, if any (a returning channel).
     #[serde(default)]
@@ -429,6 +502,11 @@ struct EntryDto {
     summary: String,
     status: Option<String>,
     unrecognized: bool,
+    /// Recognized but the signature is missing or does not verify against
+    /// the author's recorded key (`docs/adr/0033`). Absent from a host that
+    /// predates the field.
+    #[serde(default)]
+    unverified: bool,
     /// The entry this one acts on (e.g. a session memo/artifact → its session).
     #[serde(default)]
     target: Option<String>,
@@ -495,6 +573,148 @@ enum ArtifactContent {
 struct ArtifactDto {
     format: String,
     content: String,
+}
+
+/// `keys.json`'s response — mirrors `crates/junto/src/web.rs::KeysDto`
+/// field-for-field (device-key-enrollment plan, Task 13).
+#[derive(Debug, Clone, Deserialize)]
+struct KeysDto {
+    founder_email: String,
+    /// The git identity this host writes as. `None` when `git_user` fails
+    /// (no git config) — the endpoint still answers 200 (reading a roster
+    /// needs no identity of its own). Kept for DTO fidelity with the host
+    /// even though the surface only ever reads `viewer_is_founder`.
+    #[allow(dead_code)]
+    viewer_email: Option<String>,
+    viewer_is_founder: bool,
+    /// `view.party` order — founder first; never sorted here, the host's
+    /// replicas already agree on it.
+    members: Vec<KeyMemberDto>,
+}
+
+/// One party member, mirrors `KeyMemberDto`.
+#[derive(Debug, Clone, Deserialize)]
+struct KeyMemberDto {
+    display_name: String,
+    email: String,
+    /// "human" | "agent".
+    kind: String,
+    /// Canonical grant order — never sorted here either.
+    devices: Vec<KeyGrantDto>,
+    /// Every grant retired (`docs/adr/0035`'s all-retired rule). Never
+    /// implies the member left the party — they stay listed.
+    revoked: bool,
+}
+
+/// One key grant, mirrors `KeyGrantDto`.
+#[derive(Debug, Clone, Deserialize, Default)]
+struct KeyGrantDto {
+    /// 16 hex chars of the signing key.
+    fingerprint: String,
+    /// 16 hex chars of the transport key — `None` for a grant made before
+    /// transport keys existed. Kept for DTO fidelity; the disclosure's
+    /// device line shows the signing fingerprint only.
+    #[allow(dead_code)]
+    transport_fingerprint: Option<String>,
+    /// The entry id that authorized this key.
+    granted_by: String,
+    /// Epoch millis, when retired.
+    retired_at: Option<i64>,
+}
+
+/// `POST /invites`'s response, mirrors `InviteMintedDto`.
+#[derive(Debug, Clone, Deserialize)]
+struct InviteMintedDto {
+    url: String,
+    expires_at: i64,
+    channels: Vec<String>,
+}
+
+/// `POST /devices/preview`'s response, mirrors `EnrollPreviewDto` — what
+/// an enroll code would grant if redeemed right now. Appends nothing.
+#[derive(Debug, Clone, Deserialize)]
+struct EnrollPreviewDto {
+    email: String,
+    display_name: String,
+    fingerprint: String,
+    transport_fingerprint: String,
+    channels: Vec<PreviewChannelDto>,
+}
+
+/// One channel an enroll code covers, mirrors `PreviewChannelDto`.
+#[derive(Debug, Clone, Deserialize)]
+struct PreviewChannelDto {
+    id: String,
+    name: Option<String>,
+}
+
+/// `POST /members`'s response, mirrors `RedeemedDto`.
+#[derive(Debug, Clone, Deserialize)]
+struct RedeemedDto {
+    outcomes: Vec<RedeemOutcomeDto>,
+}
+
+/// One channel's redeem outcome, mirrors `RedeemOutcomeDto`. `result` is
+/// snake_case: `granted` / `already_a_member` / `invite_already_used` /
+/// `not_founder` / `failed`. `warning` carries the ADR 0035 re-admission
+/// warning on a `granted` outcome (`None` otherwise) — the HTTP path's
+/// only way to see it, since there is no host log to read a CLI
+/// `println!` from.
+#[derive(Debug, Clone, Deserialize)]
+struct RedeemOutcomeDto {
+    channel: String,
+    channel_name: Option<String>,
+    result: String,
+    detail: Option<String>,
+    warning: Option<String>,
+}
+
+/// A founder identity act the members disclosure can perform
+/// (device-key-enrollment plan, Task 13) — the `IdentityForm` analogue of
+/// `LifecycleKind`. `Retire`/`Revoke` carry their target directly (the
+/// grant's authorizing entry id, the member's email) instead of a
+/// separate pane field, since each is opened right from that row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IdentityForm {
+    Invite,
+    Redeem,
+    Retire { grant: String },
+    Revoke { email: String },
+}
+
+impl IdentityForm {
+    fn label(&self) -> &'static str {
+        match self {
+            IdentityForm::Invite => "invite a device",
+            IdentityForm::Redeem => "redeem an enrollment",
+            IdentityForm::Retire { .. } => "retire",
+            IdentityForm::Revoke { .. } => "revoke",
+        }
+    }
+}
+
+/// Which identity-form text input `Message::IdentityInput` edits — one
+/// multiplexed editor for every open `IdentityForm`'s free-text fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentityField {
+    Member,
+    Paste,
+    Kind,
+    Rationale,
+}
+
+/// What a finished identity act asks the pane to do next — the
+/// `IdentityResult` analogue of `LifecycleResult`.
+#[derive(Debug, Clone)]
+enum IdentityResult {
+    /// A preview of what an enroll code would grant (`/devices/preview`)
+    /// — appends nothing; the redeem form shows this before the kind
+    /// picker.
+    Previewed(EnrollPreviewDto),
+    Minted(InviteMintedDto),
+    Redeemed(RedeemedDto),
+    /// Retire/revoke: the number of grants parked.
+    Parked(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -615,6 +835,15 @@ enum Message {
     /// Open an admin view, or `None` to return to the channels workspace.
     OpenAdmin(Option<AdminView>),
     SettingsLoaded(Option<SettingsDto>),
+    /// The join box's pasted-invite text input changed (Settings → this device).
+    JoinInviteChanged(String),
+    /// Submit the join box: mint this device's key pair on the host from
+    /// the pasted invite (`POST /devices/enroll`).
+    JoinSubmit,
+    /// The result of a join POST — Ok carries the enrolled identity
+    /// (enroll code + both fingerprints) to show; the GUI never mints
+    /// anything itself.
+    JoinDone(Result<EnrolledDto, String>),
     RepoPathChanged(String),
     BrowseRepo,
     RepoPicked(Option<String>),
@@ -644,6 +873,28 @@ enum Message {
     PluginRemove(usize),
     PluginBrowse(usize),
     PluginPicked(usize, Option<String>),
+    // --- members & devices disclosure: invite / redeem / retire / revoke ---
+    /// `keys.json` arrived for a pane (device-key-enrollment plan, Task 13).
+    KeysFetched(pane_grid::Pane, Result<KeysDto, String>),
+    /// Expand/collapse the members disclosure.
+    MembersToggle(pane_grid::Pane),
+    /// Open (or toggle off) an identity act form.
+    IdentitySelect(pane_grid::Pane, IdentityForm),
+    /// Cancel the open identity form.
+    IdentityCancel(pane_grid::Pane),
+    IdentityInput(pane_grid::Pane, IdentityField, String),
+    /// Toggle one channel checkbox in the invite form (index into
+    /// `Pane::identity_channels`).
+    IdentityChannelToggle(pane_grid::Pane, usize),
+    /// Submit the open identity act — for the redeem form, the first
+    /// submit previews (`/devices/preview`); the second, once a kind is
+    /// picked, actually redeems.
+    IdentitySubmit(pane_grid::Pane),
+    /// An identity act finished.
+    IdentityDone(pane_grid::Pane, Result<IdentityResult, String>),
+    /// A 1-second tick, live only while a minted invite is on screen and
+    /// unexpired (`App::subscription`) — drives the countdown.
+    Tick,
 }
 
 impl App {
@@ -676,6 +927,11 @@ impl App {
             agent_mcp: Vec::new(),
             agent_skills: Vec::new(),
             agent_plugins: Vec::new(),
+            join_invite: String::new(),
+            join_pending: false,
+            join_error: None,
+            join_result: None,
+            device_key_fingerprint: None,
         };
         (
             app,
@@ -851,13 +1107,18 @@ impl App {
                         state.content = Content::Loaded(dto);
                         let base = state.base().to_string();
                         let channel = state.channel.clone();
-                        // Jump to the newest entry (bottom) and refresh the brief.
+                        // Jump to the newest entry (bottom), refresh the
+                        // brief, and refresh the key roster the members
+                        // disclosure reads (device-key-enrollment plan,
+                        // Task 13) — every view.json load keeps keys.json
+                        // in step.
                         Task::batch([
                             scrollable::snap_to(
                                 state.scroll_id.clone(),
                                 scrollable::RelativeOffset::END,
                             ),
-                            fetch_brief(pane, base, channel),
+                            fetch_brief(pane, base.clone(), channel.clone()),
+                            fetch_keys(pane, base, &channel),
                         ])
                     }
                     Err(err) => {
@@ -1477,6 +1738,205 @@ impl App {
                     }
                 }
             }
+            // --- members & devices disclosure: invite / redeem / retire / revoke ---
+            Message::KeysFetched(pane, result) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    match result {
+                        Ok(dto) => {
+                            state.keys = Some(dto);
+                            state.keys_error = None;
+                        }
+                        Err(err) => state.keys_error = Some(err),
+                    }
+                }
+                Task::none()
+            }
+            Message::MembersToggle(pane) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    state.members_open = !state.members_open;
+                }
+                Task::none()
+            }
+            Message::IdentitySelect(pane, form) => {
+                let all_channels: Vec<String> = self.channels.options().to_vec();
+                let Some(state) = self.panes.get_mut(pane) else {
+                    return Task::none();
+                };
+                // Toggle off if the same form is already open — same
+                // pattern as `LifecycleSelect`. Closing runs the same
+                // cleanup as `IdentityCancel`: a minted code must never
+                // outlive the form that shows it, or the countdown-tick
+                // subscription (gated on the form being open) and the
+                // retained code disagree.
+                if state.identity_form.as_ref() == Some(&form) {
+                    state.identity_form = None;
+                    state.identity_error = None;
+                    state.invite_minted = None;
+                    state.redeem_preview = None;
+                    state.redeem_outcomes.clear();
+                    state.identity_notice = None;
+                } else {
+                    let is_invite = form == IdentityForm::Invite;
+                    let current_channel = state.channel.clone();
+                    state.identity_form = Some(form);
+                    state.identity_member.clear();
+                    state.identity_paste.clear();
+                    state.identity_kind.clear();
+                    state.identity_rationale.clear();
+                    state.identity_error = None;
+                    state.invite_minted = None;
+                    state.redeem_preview = None;
+                    state.redeem_outcomes.clear();
+                    state.identity_notice = None;
+                    if is_invite {
+                        state.identity_channels = all_channels
+                            .into_iter()
+                            .map(|c| {
+                                let ticked = c == current_channel;
+                                (c, ticked)
+                            })
+                            .collect();
+                    }
+                }
+                Task::none()
+            }
+            Message::IdentityCancel(pane) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    state.identity_form = None;
+                    state.identity_error = None;
+                    state.invite_minted = None;
+                    state.redeem_preview = None;
+                    state.redeem_outcomes.clear();
+                    state.identity_notice = None;
+                }
+                Task::none()
+            }
+            Message::IdentityInput(pane, field, value) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    match field {
+                        IdentityField::Member => state.identity_member = value,
+                        IdentityField::Paste => state.identity_paste = value,
+                        IdentityField::Kind => state.identity_kind = value,
+                        IdentityField::Rationale => state.identity_rationale = value,
+                    }
+                }
+                Task::none()
+            }
+            Message::IdentityChannelToggle(pane, idx) => {
+                if let Some(state) = self.panes.get_mut(pane)
+                    && let Some(entry) = state.identity_channels.get_mut(idx)
+                {
+                    entry.1 = !entry.1;
+                }
+                Task::none()
+            }
+            Message::IdentitySubmit(pane) => {
+                let Some(state) = self.panes.get_mut(pane) else {
+                    return Task::none();
+                };
+                // A second submit while one is already in flight must never
+                // reach the network — retire/revoke/invite all append to the
+                // ledger, and a double-fire would double-park or double-mint.
+                if state.identity_pending {
+                    return Task::none();
+                }
+                let Some(form) = state.identity_form.clone() else {
+                    return Task::none();
+                };
+                let base = state.base().to_string();
+                let channel = state.channel.clone();
+                match form {
+                    IdentityForm::Invite => {
+                        let member = state.identity_member.trim().to_string();
+                        let channels: Vec<String> = state
+                            .identity_channels
+                            .iter()
+                            .filter(|(_, on)| *on)
+                            .map(|(name, _)| name.clone())
+                            .collect();
+                        if member.is_empty() || channels.is_empty() {
+                            return Task::none();
+                        }
+                        state.identity_pending = true;
+                        state.identity_error = None;
+                        post_invite(pane, base, member, channels)
+                    }
+                    IdentityForm::Redeem => {
+                        let enroll = state.identity_paste.trim().to_string();
+                        if enroll.is_empty() {
+                            return Task::none();
+                        }
+                        if state.redeem_preview.is_some() {
+                            let kind = state.identity_kind.clone();
+                            if kind.is_empty() {
+                                return Task::none();
+                            }
+                            state.identity_pending = true;
+                            state.identity_error = None;
+                            post_redeem(pane, base, enroll, kind)
+                        } else {
+                            state.identity_pending = true;
+                            state.identity_error = None;
+                            post_preview_enroll(pane, base, enroll)
+                        }
+                    }
+                    IdentityForm::Retire { .. } | IdentityForm::Revoke { .. } => {
+                        let rationale = state.identity_rationale.trim().to_string();
+                        if rationale.is_empty() {
+                            return Task::none();
+                        }
+                        state.identity_pending = true;
+                        state.identity_error = None;
+                        post_park(pane, base, channel, form, rationale)
+                    }
+                }
+            }
+            Message::IdentityDone(pane, result) => {
+                let Some(state) = self.panes.get_mut(pane) else {
+                    return Task::none();
+                };
+                state.identity_pending = false;
+                match result {
+                    Ok(IdentityResult::Previewed(dto)) => {
+                        state.redeem_preview = Some(dto);
+                        state.identity_error = None;
+                        Task::none()
+                    }
+                    // Minted/Redeemed/Parked all changed host state — refetch
+                    // `keys.json` (via `fetch`'s own chained fetch_keys) and
+                    // the pane's `view.json` so the panel and the timeline
+                    // agree.
+                    Ok(IdentityResult::Minted(dto)) => {
+                        state.invite_minted = Some(dto);
+                        state.identity_error = None;
+                        let base = state.base().to_string();
+                        let channel = state.channel.clone();
+                        fetch(pane, base, &channel)
+                    }
+                    Ok(IdentityResult::Redeemed(dto)) => {
+                        state.redeem_outcomes = dto.outcomes;
+                        state.redeem_preview = None;
+                        state.identity_error = None;
+                        let base = state.base().to_string();
+                        let channel = state.channel.clone();
+                        fetch(pane, base, &channel)
+                    }
+                    Ok(IdentityResult::Parked(n)) => {
+                        state.identity_form = None;
+                        state.identity_error = None;
+                        state.identity_notice =
+                            Some(format!("parked {n} grant{}", if n == 1 { "" } else { "s" }));
+                        let base = state.base().to_string();
+                        let channel = state.channel.clone();
+                        fetch(pane, base, &channel)
+                    }
+                    Err(err) => {
+                        state.identity_error = Some(err);
+                        Task::none()
+                    }
+                }
+            }
+            Message::Tick => Task::none(),
             Message::SubstratesLoaded(paths) => {
                 // Default the new-channel substrate to the first registered one.
                 self.new_channel_repo = paths.first().cloned();
@@ -1558,7 +2018,54 @@ impl App {
                 Task::none()
             }
             Message::SettingsLoaded(settings) => {
+                // Read once here, not from the view — `load_signing_key`
+                // is a blocking file read + TOML parse, and views run
+                // every frame.
+                self.device_key_fingerprint = settings
+                    .as_ref()
+                    .and_then(|s| s.identity.as_ref())
+                    .and_then(|i| load_signing_key(&i.email))
+                    .map(|key| device_fingerprint(key.public_key().as_str()));
                 self.settings = settings;
+                Task::none()
+            }
+            Message::JoinInviteChanged(value) => {
+                self.join_invite = value;
+                Task::none()
+            }
+            Message::JoinSubmit => {
+                let invite = self.join_invite.trim().to_string();
+                if invite.is_empty() || self.join_pending {
+                    return Task::none();
+                }
+                self.join_pending = true;
+                self.join_error = None;
+                // Never leave a stale success block on screen behind a new
+                // attempt's error — the founder must never be handed a
+                // previous paste's enroll code as if it were this one's.
+                self.join_result = None;
+                post_device_enroll(HOST.to_string(), invite, None)
+            }
+            Message::JoinDone(result) => {
+                self.join_pending = false;
+                match result {
+                    Ok(enrolled) => {
+                        // The mint may have been for this device's own git
+                        // identity (if it matches the invite's email) —
+                        // refresh the cached fingerprint so "this device"
+                        // doesn't keep reporting "no device key" after a
+                        // successful join.
+                        if let Some(identity) =
+                            self.settings.as_ref().and_then(|s| s.identity.as_ref())
+                        {
+                            self.device_key_fingerprint = load_signing_key(&identity.email)
+                                .map(|key| device_fingerprint(key.public_key().as_str()));
+                        }
+                        self.join_result = Some(enrolled);
+                        self.join_invite.clear();
+                    }
+                    Err(err) => self.join_error = Some(err),
+                }
                 Task::none()
             }
             Message::RepoPathChanged(value) => {
@@ -1822,7 +2329,21 @@ impl App {
         // agents work and sync pulls entries (panes are left alone).
         let tick =
             iced::time::every(std::time::Duration::from_secs(20)).map(|_| Message::AutoRefresh);
-        iced::Subscription::batch(streams.into_iter().chain([tick]))
+        // The invite countdown's 1-second tick — live ONLY while some
+        // pane has its invite form open AND showing a minted, unexpired
+        // code, so the app never wakes every second once the form is
+        // closed, dismissed, or the code has expired.
+        let now = now_millis();
+        let counting_down = self.panes.iter().any(|(_, state)| {
+            invite_countdown_live(
+                state.identity_form.as_ref() == Some(&IdentityForm::Invite),
+                state.invite_minted.as_ref().map(|dto| dto.expires_at),
+                now,
+            )
+        });
+        let countdown_tick = counting_down
+            .then(|| iced::time::every(std::time::Duration::from_secs(1)).map(|_| Message::Tick));
+        iced::Subscription::batch(streams.into_iter().chain([tick]).chain(countdown_tick))
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -2092,22 +2613,96 @@ fn settings_panel(app: &App) -> Element<'_, Message> {
             subs = subs.push(text(p.clone()).size(12).color(TEXT));
         }
         col = col.push(admin_card(subs));
-        let identity = s
-            .identity
-            .as_ref()
-            .map(|i| format!("{} <{}>", i.name, i.email))
-            .unwrap_or_else(|| "(no git identity)".into());
-        col = col.push(admin_card(
-            column![
-                text("acts authored as").size(13).color(TEAL),
-                text(identity).size(12).color(TEXT),
-            ]
-            .spacing(3),
-        ));
+        let mut device = column![text("this device").size(13).color(TEAL)].spacing(3);
+        match &s.identity {
+            Some(i) => {
+                device = device.push(
+                    text(format!("{} <{}>", i.name, i.email))
+                        .size(12)
+                        .color(TEXT),
+                );
+                device = device.push(match &app.device_key_fingerprint {
+                    Some(fp) => row![
+                        badge("key on file", GREEN),
+                        text(fp.clone()).size(11).color(MUTED),
+                    ]
+                    .spacing(6)
+                    .align_y(Center),
+                    None => row![
+                        text("no device key on file — join a channel below to mint one")
+                            .size(12)
+                            .color(YELLOW)
+                    ],
+                });
+            }
+            None => {
+                device = device.push(text("(no git identity)").size(12).color(MUTED));
+            }
+        }
+        col = col.push(admin_card(device));
         col = col.push(text(format!("junto {}", s.version)).size(11).color(MUTED));
     } else {
         col = col.push(text("loading…").size(12).color(MUTED));
     }
+
+    // Join a channel: paste a founder's invite to mint this device's key
+    // pair (`POST /devices/enroll`) — the joiner half of pairing a second
+    // machine, replacing `junto enroll` in a terminal.
+    let mut join = column![text("join a channel").size(13).color(TEAL)].spacing(6);
+    join = join.push(
+        text_input("paste an invite (junto://enroll?code=…)…", &app.join_invite)
+            .on_input(Message::JoinInviteChanged)
+            .size(12)
+            .padding(6),
+    );
+    let can_join = !app.join_pending && !app.join_invite.trim().is_empty();
+    join = join.push(
+        button(text(if app.join_pending {
+            "joining…"
+        } else {
+            "join"
+        }))
+        .on_press_maybe(can_join.then_some(Message::JoinSubmit))
+        .padding(6),
+    );
+    if let Some(err) = &app.join_error {
+        join = join.push(text(format!("⚠ {err}")).size(11).color(RED));
+    }
+    if let Some(enrolled) = &app.join_result {
+        join = join.push(
+            column![
+                text(format!("joined as {}", enrolled.email))
+                    .size(12)
+                    .color(GREEN),
+                row![
+                    text("enroll code (hand this to the founder)")
+                        .size(12)
+                        .color(MUTED),
+                    copy_button(enrolled.url.clone()),
+                ]
+                .spacing(6)
+                .align_y(Center),
+                text(enrolled.url.clone()).size(10).color(TEXT),
+                text(format!(
+                    "fingerprint (read aloud): {}",
+                    enrolled.fingerprint
+                ))
+                .size(11)
+                .color(TEXT),
+                text(format!(
+                    "transport fingerprint: {}",
+                    enrolled.transport_fingerprint
+                ))
+                .size(11)
+                .color(TEXT),
+                text("your secret key never leaves this machine")
+                    .size(11)
+                    .color(MUTED),
+            ]
+            .spacing(4),
+        );
+    }
+    col = col.push(admin_card(join));
 
     // Register a repo as a home substrate — the GUI `junto init`.
     let mut repo = column![
@@ -2505,6 +3100,359 @@ fn lifecycle_form(id: pane_grid::Pane, pane: &Pane, kind: LifecycleKind) -> Elem
         .into()
 }
 
+/// The party disclosure that replaces the old flat `party: …` text row: a
+/// header (member count + total device count) that expands into one row
+/// per member, each with its own device rows underneath, plus — for a
+/// founder — the invite/redeem acts bar. Read-only until `Pane::keys` has
+/// loaded.
+fn members_disclosure<'a>(id: pane_grid::Pane, pane: &'a Pane) -> Element<'a, Message> {
+    let Some(keys) = &pane.keys else {
+        return match &pane.keys_error {
+            Some(err) => text(format!("members: {err}")).size(12).color(RED).into(),
+            None => text("members · loading…").size(12).color(MUTED).into(),
+        };
+    };
+    let device_count: usize = keys.members.iter().map(|m| m.devices.len()).sum();
+    let header = button(
+        text(format!(
+            "{} members ({}) · devices: {device_count}",
+            if pane.members_open { "▾" } else { "▸" },
+            keys.members.len(),
+        ))
+        .size(12),
+    )
+    .on_press(Message::MembersToggle(id))
+    .padding(6)
+    .style(|_t, _s| chip_style(MUTED, false));
+
+    let mut col = column![header].spacing(6);
+    if let Some(err) = &pane.keys_error {
+        col = col.push(text(format!("⚠ {err}")).size(11).color(RED));
+    }
+    if pane.members_open {
+        for member in &keys.members {
+            col = col.push(member_row(id, pane, keys, member));
+        }
+        if keys.viewer_is_founder {
+            let mut acts = row![text("members ▸").size(11).color(MUTED)]
+                .spacing(6)
+                .align_y(Center);
+            for form in [IdentityForm::Invite, IdentityForm::Redeem] {
+                let active = pane.identity_form.as_ref() == Some(&form);
+                let label = form.label();
+                acts = acts.push(
+                    button(text(label).size(11))
+                        .on_press(Message::IdentitySelect(id, form))
+                        .padding([2, 8])
+                        .style(move |_t, _s| chip_style(TEAL, active)),
+                );
+            }
+            col = col.push(acts);
+            if let Some(form @ (IdentityForm::Invite | IdentityForm::Redeem)) = &pane.identity_form
+            {
+                col = col.push(identity_form(id, pane, form));
+            }
+            if let Some(notice) = &pane.identity_notice {
+                col = col.push(
+                    row![
+                        text(notice.clone()).size(11).color(GREEN),
+                        button(text("dismiss").size(10))
+                            .on_press(Message::IdentityCancel(id))
+                            .padding([1, 6])
+                            .style(|_t, _s| chip_style(MUTED, false)),
+                    ]
+                    .spacing(8)
+                    .align_y(Center),
+                );
+            }
+        }
+    }
+    col.into()
+}
+
+/// One member row: display name, kind badge, and — for a founder, on a
+/// still-active non-founder member — a revoke button; then the
+/// member-summary line and one row per device, each with its own retire
+/// button while active. The retire/revoke form opens directly under its
+/// target row (never a separate global picker).
+fn member_row<'a>(
+    id: pane_grid::Pane,
+    pane: &'a Pane,
+    keys: &'a KeysDto,
+    member: &'a KeyMemberDto,
+) -> Element<'a, Message> {
+    let kind_badge_color = if member.kind == "agent" { MAUVE } else { TEAL };
+    let mut head = row![
+        text(&member.display_name).size(12),
+        badge(&member.kind, kind_badge_color),
+    ]
+    .spacing(6)
+    .align_y(Center);
+    let can_revoke =
+        keys.viewer_is_founder && !member.revoked && member.email != keys.founder_email;
+    if can_revoke {
+        let target = IdentityForm::Revoke {
+            email: member.email.clone(),
+        };
+        let active = pane.identity_form.as_ref() == Some(&target);
+        head = head.push(
+            button(text("revoke").size(10))
+                .on_press(Message::IdentitySelect(id, target))
+                .padding([1, 6])
+                .style(move |_t, _s| chip_style(RED, active)),
+        );
+    }
+
+    let mut col = column![head, text(member_summary(member)).size(11).color(MUTED)]
+        .spacing(3)
+        .padding(Padding::default().left(14));
+    for grant in &member.devices {
+        let mut line = row![text(device_line(grant)).size(11).color(MUTED)]
+            .spacing(6)
+            .align_y(Center);
+        let can_retire = keys.viewer_is_founder && grant.retired_at.is_none();
+        if can_retire {
+            let target = IdentityForm::Retire {
+                grant: grant.granted_by.clone(),
+            };
+            let active = pane.identity_form.as_ref() == Some(&target);
+            line = line.push(
+                button(text("retire").size(10))
+                    .on_press(Message::IdentitySelect(id, target))
+                    .padding([1, 6])
+                    .style(move |_t, _s| chip_style(YELLOW, active)),
+            );
+        }
+        col = col.push(line);
+        if let Some(form @ IdentityForm::Retire { grant: g }) = &pane.identity_form
+            && *g == grant.granted_by
+        {
+            col = col.push(identity_form(id, pane, form));
+        }
+    }
+    if let Some(form @ IdentityForm::Revoke { email }) = &pane.identity_form
+        && *email == member.email
+    {
+        col = col.push(identity_form(id, pane, form));
+    }
+    col.into()
+}
+
+/// The inline form for a founder identity act — the `IdentityForm`
+/// analogue of `lifecycle_form`: the inputs it needs, a confirm/cancel row
+/// (confirm shows `working…` while `identity_pending`, cancel always
+/// enabled), and any error underneath. Redeem is two-phase: a first
+/// submit previews (`/devices/preview`, nothing appended yet); once a
+/// preview is on hand, the kind picker appears (no default —
+/// `docs/adr/0035`) and a second submit actually redeems.
+fn identity_form<'a>(
+    id: pane_grid::Pane,
+    pane: &'a Pane,
+    form: &'a IdentityForm,
+) -> Element<'a, Message> {
+    let mut col = column![].spacing(6);
+    // Whether the confirm button may activate at all — each kind's own
+    // required-input rule, checked here so an unmet requirement makes the
+    // button simply absent-of-`on_press`, never present-but-silently-refusing.
+    let mut ready = true;
+    match form {
+        IdentityForm::Invite => {
+            col = col.push(
+                text_input("member email…", &pane.identity_member)
+                    .on_input(move |v| Message::IdentityInput(id, IdentityField::Member, v))
+                    .size(12)
+                    .padding(6),
+            );
+            let mut channels = row![text("channels ▸").size(11).color(MUTED)]
+                .spacing(6)
+                .align_y(Center);
+            for (idx, (name, ticked)) in pane.identity_channels.iter().enumerate() {
+                channels = channels.push(
+                    checkbox(name.clone(), *ticked)
+                        .on_toggle(move |_| Message::IdentityChannelToggle(id, idx))
+                        .size(13)
+                        .text_size(11),
+                );
+            }
+            col = col.push(channels);
+            let any_channel = pane.identity_channels.iter().any(|(_, on)| *on);
+            ready = !pane.identity_member.trim().is_empty() && any_channel;
+            if let Some(dto) = &pane.invite_minted {
+                let remaining = countdown(dto.expires_at, now_millis());
+                let status: Element<Message> = if remaining == "expired" {
+                    text("expired — mint another").size(11).color(YELLOW).into()
+                } else {
+                    column![
+                        row![
+                            text(dto.url.clone()).size(11).color(TEAL),
+                            copy_button(dto.url.clone()),
+                            text(remaining).size(11).color(MUTED),
+                        ]
+                        .spacing(8)
+                        .align_y(Center),
+                        text(format!("covers: {}", dto.channels.join(", ")))
+                            .size(10)
+                            .color(MUTED),
+                    ]
+                    .spacing(2)
+                    .into()
+                };
+                col = col.push(status);
+            }
+        }
+        IdentityForm::Redeem => {
+            if !pane.redeem_outcomes.is_empty() {
+                let mut outcomes = column![].spacing(3);
+                for outcome in &pane.redeem_outcomes {
+                    let color = match outcome.result.as_str() {
+                        "granted" => GREEN,
+                        "already_a_member" | "invite_already_used" => YELLOW,
+                        _ => RED,
+                    };
+                    let name = outcome
+                        .channel_name
+                        .clone()
+                        .unwrap_or_else(|| outcome.channel.clone());
+                    let detail = outcome
+                        .detail
+                        .as_deref()
+                        .map(|d| format!(": {d}"))
+                        .unwrap_or_default();
+                    outcomes = outcomes.push(
+                        text(format!("{name} — {}{detail}", outcome.result))
+                            .size(11)
+                            .color(color),
+                    );
+                    if let Some(warning) = outcome.warning.as_deref() {
+                        outcomes =
+                            outcomes.push(text(format!("  {warning}")).size(10).color(YELLOW));
+                    }
+                }
+                col = col.push(outcomes);
+            } else {
+                col = col.push(
+                    text_input("enroll code (pasted invite)…", &pane.identity_paste)
+                        .on_input(move |v| Message::IdentityInput(id, IdentityField::Paste, v))
+                        .size(12)
+                        .padding(6),
+                );
+                if let Some(preview) = &pane.redeem_preview {
+                    let channel_set = preview
+                        .channels
+                        .iter()
+                        .map(|c| c.name.clone().unwrap_or_else(|| c.id.clone()))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    col = col.push(
+                        text(format!(
+                            "{} <{}> · {} · transport {} · {channel_set}",
+                            preview.display_name,
+                            preview.email,
+                            preview.fingerprint,
+                            preview.transport_fingerprint
+                        ))
+                        .size(11)
+                        .color(MUTED),
+                    );
+                    let mut kind_row = row![text("kind ▸").size(11).color(MUTED)]
+                        .spacing(6)
+                        .align_y(Center);
+                    for kind in ["human", "agent"] {
+                        let active = pane.identity_kind == kind;
+                        kind_row = kind_row.push(
+                            button(text(kind).size(11))
+                                .on_press(Message::IdentityInput(
+                                    id,
+                                    IdentityField::Kind,
+                                    kind.to_string(),
+                                ))
+                                .padding([2, 8])
+                                .style(move |_t, _s| chip_style(TEAL, active)),
+                        );
+                    }
+                    col = col.push(kind_row);
+                    ready = !pane.identity_kind.is_empty();
+                } else {
+                    ready = !pane.identity_paste.trim().is_empty();
+                }
+            }
+        }
+        IdentityForm::Retire { .. } => {
+            col = col.push(
+                text_input("rationale (required)…", &pane.identity_rationale)
+                    .on_input(move |v| Message::IdentityInput(id, IdentityField::Rationale, v))
+                    .on_submit(Message::IdentitySubmit(id))
+                    .size(12)
+                    .padding(6),
+            );
+            ready = !pane.identity_rationale.trim().is_empty();
+        }
+        IdentityForm::Revoke { .. } => {
+            col = col.push(
+                text("the member stays in the party; only their entries after now stop counting.")
+                    .size(11)
+                    .color(MUTED),
+            );
+            col = col.push(
+                text_input("rationale (required)…", &pane.identity_rationale)
+                    .on_input(move |v| Message::IdentityInput(id, IdentityField::Rationale, v))
+                    .on_submit(Message::IdentitySubmit(id))
+                    .size(12)
+                    .padding(6),
+            );
+            ready = !pane.identity_rationale.trim().is_empty();
+        }
+    }
+
+    let outcomes_shown = matches!(form, IdentityForm::Redeem) && !pane.redeem_outcomes.is_empty();
+    if outcomes_shown {
+        col = col.push(
+            button(text("dismiss").size(11))
+                .on_press(Message::IdentityCancel(id))
+                .padding([3, 10])
+                .style(|_t, _s| chip_style(MUTED, false)),
+        );
+    } else {
+        let confirm_label = if pane.identity_pending {
+            "working…"
+        } else {
+            form.label()
+        };
+        let mut confirm = button(text(confirm_label).size(11))
+            .padding([3, 10])
+            .style(|_t, _s| chip_style(GREEN, true));
+        if !pane.identity_pending && ready {
+            confirm = confirm.on_press(Message::IdentitySubmit(id));
+        }
+        col = col.push(
+            row![
+                confirm,
+                button(text("cancel").size(11))
+                    .on_press(Message::IdentityCancel(id))
+                    .padding([3, 10])
+                    .style(|_t, _s| chip_style(MUTED, false)),
+            ]
+            .spacing(6),
+        );
+    }
+    if let Some(err) = &pane.identity_error {
+        col = col.push(text(format!("⚠ {err}")).size(11).color(RED));
+    }
+    container(col)
+        .padding(8)
+        .width(Fill)
+        .style(|_theme| container::Style {
+            background: Some(Background::Color(Color { a: 0.4, ..SURFACE })),
+            border: Border {
+                color: BORDER,
+                width: 1.0,
+                radius: 4.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
 /// The annotation composer: a signed, span-anchored (or stream-anchored)
 /// comment on a remote-watched session. Rendered only while
 /// `pane.annotate_tx.is_some()` — the same condition Task 9's write-half
@@ -2568,21 +3516,14 @@ fn pane_body<'a>(
     // Parsed Markdown for a session memo entry's summary, if any.
     let summary_md_for = |entry: &EntryDto| pane.entry_md.get(&entry.id).map(Vec::as_slice);
 
-    // The channel's own header: the party, a closed badge, and the lifecycle
-    // acts (lineage lives in the top window-wide branch graph).
+    // The channel's own header: the members disclosure, a closed badge,
+    // and the lifecycle acts (lineage lives in the top window-wide branch
+    // graph).
     let mut header = column![].spacing(6);
-    let mut party_row = row![].spacing(8).align_y(Center);
-    if !dto.party.is_empty() {
-        party_row = party_row.push(
-            text(format!("party: {}", dto.party.join(", ")))
-                .size(12)
-                .color(MUTED),
-        );
-    }
+    header = header.push(members_disclosure(id, pane));
     if dto.closed {
-        party_row = party_row.push(badge("closed", RED));
+        header = header.push(row![badge("closed", RED)].spacing(8).align_y(Center));
     }
-    header = header.push(party_row);
     // Lifecycle act buttons; a closed channel only offers reopen.
     let acts: &[LifecycleKind] = if dto.closed {
         &[LifecycleKind::Reopen, LifecycleKind::Rename]
@@ -3015,6 +3956,97 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Epoch millis → an ISO-8601 date (`YYYY-MM-DD`), UTC. A small
+/// civil-calendar conversion (Howard Hinnant's `civil_from_days`) rather
+/// than a new date/time dependency — a retired grant's `retired_at` is
+/// the only place this crate needs the date portion of a timestamp.
+fn iso_date(millis: i64) -> String {
+    let (y, m, d) = civil_from_days(millis.div_euclid(86_400_000));
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Days since the Unix epoch → `(year, month, day)`, UTC. Standard
+/// proleptic-Gregorian conversion (Hinnant's `civil_from_days`).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// The current wall clock as epoch millis — `0` on a clock error (never
+/// panics; only ever compared against a future `expires_at`, so losing to
+/// `0` just reads as "not counting down" instead of crashing the view).
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Whether the invite countdown's 1-second tick should be running for one
+/// pane: only while its invite form is open AND a minted, unexpired code
+/// is actually on screen — never merely because a code is retained in
+/// state (`Message::IdentitySelect`'s toggle-off already clears it on
+/// close, but this predicate stays defensive so the subscription and the
+/// visible form can never disagree about whether it should be ticking).
+fn invite_countdown_live(form_open: bool, expires_at: Option<i64>, now: i64) -> bool {
+    form_open && expires_at.is_some_and(|expires_at| now < expires_at)
+}
+
+/// One device row: `fingerprint · granted <entry-id-prefix> · active`, or
+/// `· retired <iso-date>`. Never says anything else — a retired grant is
+/// not the same as a removed member (`docs/adr/0035`).
+fn device_line(grant: &KeyGrantDto) -> String {
+    let prefix = truncate(&grant.granted_by, 8);
+    match grant.retired_at {
+        Some(ts) => format!(
+            "{} · granted {prefix} · retired {}",
+            grant.fingerprint,
+            iso_date(ts)
+        ),
+        None => format!("{} · granted {prefix} · active", grant.fingerprint),
+    }
+}
+
+/// One member's device-count summary: `N active device(s)`, or `no active
+/// devices` when every grant is retired — deliberately never says
+/// "removed": a revoked member stays in the party (`docs/adr/0035`).
+fn member_summary(member: &KeyMemberDto) -> String {
+    let active = member
+        .devices
+        .iter()
+        .filter(|g| g.retired_at.is_none())
+        .count();
+    match active {
+        0 => "no active devices".to_string(),
+        1 => "1 active device".to_string(),
+        n => format!("{n} active devices"),
+    }
+}
+
+/// A minted invite's countdown, from its `expires_at` and the current
+/// wall clock (both epoch millis) — `"expires in M:SS"`, or `"expired"`
+/// at or past zero. Split from the wall-clock read so it's testable
+/// without mocking time.
+fn countdown(expires_at: i64, now: i64) -> String {
+    let remaining_secs = (expires_at - now).div_euclid(1000);
+    if remaining_secs <= 0 {
+        return "expired".to_string();
+    }
+    format!(
+        "expires in {}:{:02}",
+        remaining_secs / 60,
+        remaining_secs % 60
+    )
+}
+
 /// Parse the annotation composer's "lines" field: `"12"` (a single line) or
 /// `"12-14"` (an inclusive range). Pure delegation to [`Span::new`], which
 /// already enforces 1-indexing and a non-inverted range — this only splits
@@ -3123,6 +4155,17 @@ fn dot(color: Color) -> Element<'static, Message> {
         .into()
 }
 
+/// Which authorship badges an entry card shows: `(show_unrecognized,
+/// show_unverified)`. Pure — extracted from `entry_card` so the suppression
+/// rule is testable without a renderer. `unverified` is suppressed whenever
+/// `unrecognized` is set: that badge already signals distrust louder
+/// (mirrors the web's reasoning, `crates/junto/src/render.rs`).
+fn entry_badges(entry: &EntryDto) -> (bool, bool) {
+    let show_unrecognized = entry.unrecognized;
+    let show_unverified = entry.unverified && !entry.unrecognized;
+    (show_unrecognized, show_unverified)
+}
+
 /// One timeline entry as a card: a colour-coded kind badge + author + status,
 /// over the summary text.
 #[allow(clippy::too_many_arguments)]
@@ -3145,8 +4188,12 @@ fn entry_card<'a>(
     if let Some(status) = &entry.status {
         head = head.push(badge(status, status_color(status)));
     }
-    if entry.unrecognized {
-        head = head.push(badge("unrecognized", MUTED));
+    let (show_unrecognized, show_unverified) = entry_badges(entry);
+    if show_unrecognized {
+        head = head.push(badge("unrecognized", RED));
+    }
+    if show_unverified {
+        head = head.push(badge("unverified", YELLOW));
     }
     head = head.push(Space::with_width(Fill));
     head = head.push(copy_button(entry.summary.clone()));
@@ -3496,6 +4543,21 @@ impl Pane {
             lifecycle_error: None,
             brief_md: None,
             brief_text: None,
+            keys: None,
+            keys_error: None,
+            members_open: false,
+            identity_form: None,
+            identity_pending: false,
+            identity_error: None,
+            invite_minted: None,
+            redeem_preview: None,
+            redeem_outcomes: Vec::new(),
+            identity_member: String::new(),
+            identity_channels: Vec::new(),
+            identity_paste: String::new(),
+            identity_kind: String::new(),
+            identity_rationale: String::new(),
+            identity_notice: None,
         }
     }
 
@@ -3834,6 +4896,19 @@ fn fetch(pane: pane_grid::Pane, base: String, channel: &str) -> Task<Message> {
     )
 }
 
+/// Fetch a channel's key roster (`keys.json`) — the members-and-devices
+/// disclosure's data source (device-key-enrollment plan, Task 13).
+fn fetch_keys(pane: pane_grid::Pane, base: String, channel: &str) -> Task<Message> {
+    let url = format!("{base}/channels/{channel}/keys.json");
+    Task::perform(
+        async move {
+            let response = reqwest::get(&url).await.map_err(|e| e.to_string())?;
+            response.json::<KeysDto>().await.map_err(|e| e.to_string())
+        },
+        move |result| Message::KeysFetched(pane, result),
+    )
+}
+
 /// Fetch the whole lineage DAG for the always-visible top branch graph.
 fn fetch_lineage_graph() -> Task<Message> {
     let url = format!("{HOST}/lineage.json");
@@ -3972,6 +5047,27 @@ fn post_delete_agent(slug: String) -> Task<Message> {
     )
 }
 
+/// POST an enroll (`/devices/enroll`) — mints this device's own signing
+/// and transport key pair on the host from a founder's pasted invite,
+/// modelled on `post_save_agent`/`simple_post_result` but, per that
+/// endpoint's JSON response, routed through `post_json_result` instead.
+/// `name` is the display name to enroll under; `None` lets the host fall
+/// back to this machine's git identity, then the invite email's local
+/// part.
+fn post_device_enroll(base: String, invite: String, name: Option<String>) -> Task<Message> {
+    let url = format!("{base}/devices/enroll");
+    Task::perform(
+        async move {
+            let mut form = vec![("invite", invite)];
+            if let Some(name) = name {
+                form.push(("name", name));
+            }
+            post_json_result::<EnrolledDto>(url, form, "join").await
+        },
+        Message::JoinDone,
+    )
+}
+
 /// Shared POST → `Result<(), String>` helper: success when the (redirect-
 /// followed) status is 2xx, else the status + body as an error.
 async fn simple_post_result(url: &str, form: &[(&str, String)], what: &str) -> Result<(), String> {
@@ -3989,6 +5085,218 @@ async fn simple_post_result(url: &str, form: &[(&str, String)], what: &str) -> R
         }
         Err(err) => Err(format!("request failed: {err}")),
     }
+}
+
+/// Turn a failed response's status, content-type, and body into a short
+/// human string a panel can show directly — never the raw body. A JSON
+/// content-type body is parsed for a `message` field; anything else — an
+/// unrecognized JSON shape (with no `message` to extract — the caller
+/// wants that body's *own* fields, e.g. `POST /members`'s 409
+/// `{"outcomes":[…]}`, which belongs through `post_json_result_accepting`
+/// instead, never through here), an empty/unparseable body, or in
+/// particular the identity endpoints' plain-text refusals — which the
+/// host's router-wide `prettify_errors` (`crates/junto/src/web.rs`)
+/// rewrites into a styled HTML error page — all collapse to the same
+/// fixed, status-naming sentence, so a caller here never renders a raw
+/// body (HTML or otherwise) in an error box.
+fn describe_failed_response(status: u16, content_type: Option<&str>, body: &str) -> String {
+    let is_json = content_type.is_some_and(|ct| ct.starts_with("application/json"));
+    if is_json
+        && let Some(message) = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|value| value.get("message")?.as_str().map(str::to_string))
+    {
+        return message;
+    }
+    format!("request failed ({status}); see the host log for details")
+}
+
+/// The `post_json`/`post_json_result_accepting` parse decision, factored
+/// out of the network call so it's unit-testable: on a 2xx status, a body
+/// that fails to parse as `T` genuinely is a bug worth surfacing as a
+/// parse error; on an accepted non-2xx status (`post_json_result_accepting`'s
+/// `extra_status`), a body that fails to parse as `T` is expected — that
+/// status is only sometimes structured (e.g. `POST /members`'s 409 is
+/// `{"outcomes":[…]}"` for a rejected-but-recorded outcome, but the
+/// router's HTML error page for a stale invite) — so it degrades through
+/// `describe_failed_response` instead of reporting a raw parse error.
+fn parse_or_describe<T: DeserializeOwned>(
+    status: u16,
+    content_type: Option<&str>,
+    body: &str,
+    what: &str,
+) -> Result<T, String> {
+    match serde_json::from_str::<T>(body) {
+        Ok(value) => Ok(value),
+        Err(err) if (200..300).contains(&status) => {
+            Err(format!("{what}: couldn't parse the response: {err}"))
+        }
+        Err(_) => Err(describe_failed_response(status, content_type, body)),
+    }
+}
+
+/// Shared POST → `Result<T, String>` core behind `post_json_result` and
+/// `post_json_result_accepting`: reads the response once, then hands the
+/// status/content-type/body to `parse_or_describe` when `accept` returns
+/// true for the status, else straight to `describe_failed_response`. The
+/// two callers differ only in which statuses carry a `T` to parse — never
+/// in how a genuine failure is reported.
+async fn post_json<T: DeserializeOwned>(
+    url: &str,
+    form: &[(&str, String)],
+    what: &str,
+    accept: impl Fn(u16) -> bool,
+) -> Result<T, String> {
+    let resp = match reqwest::Client::new().post(url).form(form).send().await {
+        Ok(resp) => resp,
+        Err(err) => return Err(format!("{what}: request failed: {err}")),
+    };
+    let status = resp.status().as_u16();
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let body = resp.text().await.unwrap_or_default();
+    if !accept(status) {
+        return Err(describe_failed_response(
+            status,
+            content_type.as_deref(),
+            &body,
+        ));
+    }
+    parse_or_describe(status, content_type.as_deref(), &body, what)
+}
+
+/// Shared POST → `Result<T, String>` helper: parses a JSON body into `T`
+/// on 2xx; on failure, `describe_failed_response` turns the status,
+/// content-type, and body into a short human string — never the raw body.
+/// Beside `simple_post_result`, which returns `()` instead of a parsed
+/// body. `post_device_enroll` (Task 12) uses this; an endpoint that
+/// returns a structured body on a specific non-2xx status too (e.g.
+/// `POST /members`'s 409 outcomes) wants `post_json_result_accepting`
+/// instead.
+async fn post_json_result<T: DeserializeOwned>(
+    url: String,
+    form: Vec<(&'static str, String)>,
+    what: &'static str,
+) -> Result<T, String> {
+    post_json(&url, &form, what, |status| (200..300).contains(&status)).await
+}
+
+/// Like `post_json_result`, but also parses `T` from `extra_status` (e.g.
+/// `409`) instead of treating it as a failure. Some endpoints
+/// (`POST /members`) return their per-channel outcomes WITH a non-2xx
+/// status by contract; collapsing that into a bare error string would
+/// force the caller to string-scrape the JSON back out of
+/// `describe_failed_response`'s output, which never dumps a raw body
+/// anyway. `post_redeem` (below) is this function's first real caller —
+/// `POST /members`'s 409, the channel-pane members disclosure (Task 13) —
+/// matching `crates/junto/src/keys.rs::has_transport_key`'s own precedent
+/// for kernel API landed ahead of its wiring.
+async fn post_json_result_accepting<T: DeserializeOwned>(
+    url: String,
+    form: Vec<(&'static str, String)>,
+    what: &'static str,
+    extra_status: u16,
+) -> Result<T, String> {
+    post_json(&url, &form, what, move |status| {
+        (200..300).contains(&status) || status == extra_status
+    })
+    .await
+}
+
+/// POST a founder-issued enrollment invite (`/invites`) covering one or
+/// more channels (device-key-enrollment plan, Task 13).
+fn post_invite(
+    pane: pane_grid::Pane,
+    base: String,
+    member: String,
+    channels: Vec<String>,
+) -> Task<Message> {
+    let url = format!("{base}/invites");
+    Task::perform(
+        async move {
+            let mut form = vec![("member", member)];
+            form.extend(channels.into_iter().map(|c| ("channel", c)));
+            post_json_result::<InviteMintedDto>(url, form, "invite")
+                .await
+                .map(IdentityResult::Minted)
+        },
+        move |result| Message::IdentityDone(pane, result),
+    )
+}
+
+/// POST an enroll code's read-only preview (`/devices/preview`) — what
+/// redeeming it would grant, before anything is appended. The founder
+/// must see this before the kind picker, since the channel set never
+/// travels inside the code itself.
+fn post_preview_enroll(pane: pane_grid::Pane, base: String, enroll: String) -> Task<Message> {
+    let url = format!("{base}/devices/preview");
+    Task::perform(
+        async move {
+            post_json_result::<EnrollPreviewDto>(url, vec![("enroll", enroll)], "preview")
+                .await
+                .map(IdentityResult::Previewed)
+        },
+        move |result| Message::IdentityDone(pane, result),
+    )
+}
+
+/// POST an enrollment redemption (`POST /members`) across every channel
+/// its invite still covers. `409` carries a structured per-channel
+/// outcome, not a bare failure — routed through
+/// `post_json_result_accepting` so that body's truth reaches the panel
+/// either way.
+fn post_redeem(pane: pane_grid::Pane, base: String, enroll: String, kind: String) -> Task<Message> {
+    let url = format!("{base}/members");
+    Task::perform(
+        async move {
+            post_json_result_accepting::<RedeemedDto>(
+                url,
+                vec![("enroll", enroll), ("kind", kind)],
+                "redeem",
+                409,
+            )
+            .await
+            .map(IdentityResult::Redeemed)
+        },
+        move |result| Message::IdentityDone(pane, result),
+    )
+}
+
+/// POST a retire or revoke act — the two "park a key grant" endpoints,
+/// both requiring a rationale (device-key-enrollment plan, Task 10).
+/// `target` selects the route: a grant retires by the entry that
+/// authorized it; a revoke parks every active grant an email holds.
+fn post_park(
+    pane: pane_grid::Pane,
+    base: String,
+    channel: String,
+    target: IdentityForm,
+    rationale: String,
+) -> Task<Message> {
+    #[derive(Deserialize)]
+    struct ParkedDto {
+        parked: usize,
+    }
+    let url = match &target {
+        IdentityForm::Retire { grant } => format!("{base}/channels/{channel}/keys/{grant}/retire"),
+        IdentityForm::Revoke { email } => {
+            format!("{base}/channels/{channel}/members/{email}/revoke")
+        }
+        IdentityForm::Invite | IdentityForm::Redeem => {
+            unreachable!("post_park is only ever called with Retire/Revoke")
+        }
+    };
+    Task::perform(
+        async move {
+            post_json_result::<ParkedDto>(url, vec![("rationale", rationale)], "park")
+                .await
+                .map(|dto| IdentityResult::Parked(dto.parked))
+        },
+        move |result| Message::IdentityDone(pane, result),
+    )
 }
 
 /// Fetch a channel's curated brief (recall bridge) as Markdown text.
@@ -4161,6 +5469,21 @@ fn load_signing_key(email: &str) -> Option<SigningKey> {
     let file: KeysFile = toml::from_str(&text).ok()?;
     let record = file.keys.into_iter().find(|record| record.email == email)?;
     SigningKey::from_secret_hex(&record.secret).ok()
+}
+
+/// The 16-hex fingerprint the host derives from a public key
+/// (`crates/junto/src/identity.rs::fingerprint`): strip the `ed25519:`
+/// prefix, take the first 16 hex chars. Takes the key's raw string form
+/// (`SigningKey::public_key().as_str()`/`PublicKey::as_str()`) rather than
+/// a typed key, since the GUI derives this locally and must agree with the
+/// host's format byte-for-byte, or the two screens show different ids for
+/// one key.
+fn device_fingerprint(key: &str) -> String {
+    key.strip_prefix("ed25519:")
+        .unwrap_or(key)
+        .chars()
+        .take(16)
+        .collect()
 }
 
 /// Serialize and send one `WireFrame` over the live websocket's write half.
@@ -4739,6 +6062,89 @@ mod tests {
     }
 
     #[test]
+    fn device_fingerprint_matches_the_hosts_sixteen_chars() {
+        // The GUI derives a fingerprint locally; it must agree with the host's
+        // identity::fingerprint, or the two screens show different ids for one key.
+        let key = "ed25519:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(device_fingerprint(key), "0123456789abcdef");
+    }
+
+    #[test]
+    fn describe_failed_response_prefers_a_json_message_and_never_dumps_a_raw_body() {
+        assert_eq!(
+            describe_failed_response(400, Some("application/json"), r#"{"message":"nope"}"#),
+            "nope"
+        );
+        // A JSON body with no recognized "message" field is never dumped
+        // into the panel raw — same fixed sentence as every other failure
+        // shape. A structured non-2xx body a caller actually wants (e.g.
+        // `POST /members`'s 409 `{"outcomes":[…]}`) belongs through
+        // `post_json_result_accepting`, never through this string.
+        assert_eq!(
+            describe_failed_response(409, Some("application/json"), r#"{"outcomes":[1,2]}"#),
+            "request failed (409); see the host log for details"
+        );
+        // An empty or unparseable JSON-content-type body still yields a
+        // non-empty, status-naming string — never a blank ⚠ box.
+        let empty = describe_failed_response(500, Some("application/json"), "");
+        assert!(!empty.is_empty(), "never a blank error string");
+        assert!(empty.contains("500"), "names the status: {empty}");
+        // The identity endpoints' plain-text refusals arrive here as the
+        // host's `prettify_errors` HTML error page — never rendered raw.
+        let html = describe_failed_response(
+            400,
+            Some("text/html; charset=utf-8"),
+            "<html><body><h1>That needs a small fix</h1><p>this invite has expired</p></body></html>",
+        );
+        assert!(
+            !html.contains('<'),
+            "no raw markup leaks into the panel: {html}"
+        );
+        assert!(
+            !html.to_lowercase().contains("html"),
+            "no mention of the wrapper format: {html}"
+        );
+    }
+
+    #[test]
+    fn parse_or_describe_degrades_an_unparseable_accepted_non_2xx_body() {
+        // An accepted non-2xx status (e.g. `POST /members`'s 409) is only
+        // SOMETIMES structured — a stale invite's refusal arrives as the
+        // router's HTML error page, not `{"outcomes":[…]}`. That must
+        // degrade through `describe_failed_response`'s human sentence,
+        // never a raw serde parse-error string or markup.
+        let result: Result<serde_json::Value, String> = parse_or_describe(
+            409,
+            Some("text/html; charset=utf-8"),
+            "<html><body>this invite has expired</body></html>",
+            "members",
+        );
+        let err = result.expect_err("an HTML body never parses as JSON");
+        assert!(
+            !err.contains("couldn't parse"),
+            "not a developer-facing parse-error string: {err}"
+        );
+        assert!(
+            !err.contains('<'),
+            "no raw markup leaks into the panel: {err}"
+        );
+        assert_eq!(err, "request failed (409); see the host log for details");
+    }
+
+    #[test]
+    fn parse_or_describe_reports_a_parse_error_for_a_malformed_2xx_body() {
+        // A 2xx that fails to parse as `T` genuinely is a bug — still
+        // worth surfacing as a parse error, unlike the accepted-non-2xx case.
+        let result: Result<serde_json::Value, String> =
+            parse_or_describe(200, Some("application/json"), "not json", "join");
+        let err = result.expect_err("malformed JSON never parses");
+        assert!(
+            err.contains("couldn't parse"),
+            "surfaced as a parse error: {err}"
+        );
+    }
+
+    #[test]
     fn parse_span_accepts_single_and_range_and_rejects_malformed() {
         assert_eq!(parse_span("12"), Span::new(12, 12).ok());
         assert_eq!(parse_span("12-14"), Span::new(12, 14).ok());
@@ -4750,5 +6156,112 @@ mod tests {
         assert_eq!(parse_span(""), None, "empty input is rejected");
         assert_eq!(parse_span("12-"), None, "a dangling range is rejected");
         assert_eq!(parse_span("-12"), None, "a missing start is rejected");
+    }
+
+    /// All fields defaulted or empty — a minimal `EntryDto` for tests that
+    /// only care about the authorship-badge fields.
+    fn sample_entry() -> EntryDto {
+        EntryDto {
+            id: String::new(),
+            author: String::new(),
+            kind: String::new(),
+            summary: String::new(),
+            status: None,
+            unrecognized: false,
+            unverified: false,
+            target: None,
+            frame: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn entry_badges_suppress_unverified_on_an_unrecognized_card() {
+        let both = EntryDto {
+            unrecognized: true,
+            unverified: true,
+            ..sample_entry()
+        };
+        assert_eq!(entry_badges(&both), (true, false));
+        let only_unverified = EntryDto {
+            unrecognized: false,
+            unverified: true,
+            ..sample_entry()
+        };
+        assert_eq!(entry_badges(&only_unverified), (false, true));
+        let clean = EntryDto {
+            unrecognized: false,
+            unverified: false,
+            ..sample_entry()
+        };
+        assert_eq!(entry_badges(&clean), (false, false));
+    }
+
+    #[test]
+    fn device_line_reads_active_and_retired_differently() {
+        let active = KeyGrantDto {
+            fingerprint: "abc".into(),
+            transport_fingerprint: Some("def".into()),
+            granted_by: "e1".into(),
+            retired_at: None,
+        };
+        let retired = KeyGrantDto {
+            fingerprint: "abc".into(),
+            transport_fingerprint: None,
+            granted_by: "e1".into(),
+            retired_at: Some(1_781_000_000_000),
+        };
+        assert!(device_line(&active).contains("active"));
+        assert!(device_line(&retired).contains("retired"));
+        assert!(device_line(&retired).contains("2026"));
+    }
+
+    #[test]
+    fn a_member_with_every_grant_retired_reads_as_no_active_devices() {
+        let m = KeyMemberDto {
+            display_name: "Dan".into(),
+            email: "d@x.com".into(),
+            kind: "human".into(),
+            devices: vec![KeyGrantDto {
+                fingerprint: "abc".into(),
+                granted_by: "e1".into(),
+                retired_at: Some(1),
+                ..Default::default()
+            }],
+            revoked: true,
+        };
+        let summary = member_summary(&m);
+        assert!(summary.contains("no active devices"), "{summary}");
+        assert!(
+            !summary.to_lowercase().contains("removed"),
+            "never imply removal: {summary}"
+        );
+    }
+
+    #[test]
+    fn countdown_reads_down_to_expiry_then_says_expired() {
+        assert_eq!(countdown(60_000, 0), "expires in 1:00");
+        assert_eq!(countdown(1_000, 0), "expires in 0:01");
+        assert_eq!(countdown(0, 0), "expired");
+        assert_eq!(countdown(-5_000, 0), "expired");
+    }
+
+    #[test]
+    fn invite_countdown_live_requires_both_an_open_form_and_an_unexpired_code() {
+        assert!(
+            !invite_countdown_live(false, Some(60_000), 0),
+            "a closed form never ticks, even with an unexpired code retained in state"
+        );
+        assert!(
+            !invite_countdown_live(true, None, 0),
+            "an open form with no minted code never ticks"
+        );
+        assert!(
+            !invite_countdown_live(true, Some(0), 0),
+            "an open form with an expired code never ticks"
+        );
+        assert!(
+            invite_countdown_live(true, Some(60_000), 0),
+            "an open form with an unexpired code ticks"
+        );
     }
 }

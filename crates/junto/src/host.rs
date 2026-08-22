@@ -383,6 +383,49 @@ impl Host {
         }
     }
 
+    /// Attach `member`'s transport key (`docs/adr/0033` two-key
+    /// separation) — mirrors [`Self::keyed`], but for
+    /// [`Member::with_transport_key`]/`keys::transport_key`: from
+    /// `transport_key` when the caller supplied one, or minted/reused
+    /// locally when none is supplied AND `local_mint_allowed` — the exact
+    /// condition [`Host::add_member`] already established was legitimate
+    /// for the *signing* key (its own `key` param was absent). Gating on
+    /// that, rather than blindly minting whenever `transport_key` alone is
+    /// `None`, matters: a caller that supplied a signing key but not a
+    /// transport key is describing a remote identity this host has no
+    /// authority over, and must never mint a transport key for it either
+    /// — silently doing so would reopen the exact "minted on the wrong
+    /// machine" bug `docs/adr/0033` exists to close, just for the
+    /// transport half. Best-effort like `keyed`: a key-store failure
+    /// leaves the member without a transport key rather than blocking.
+    /// Only [`Host::add_member`] calls this — [`Host::open_channel`]'s
+    /// founder genesis does not carry a transport key yet; no caller needs
+    /// a founder's transport key before a later transport slice consumes
+    /// it.
+    fn keyed_transport(
+        &self,
+        member: Member,
+        transport_key: Option<PublicKey>,
+        local_mint_allowed: bool,
+    ) -> Member {
+        if let Some(transport_key) = transport_key {
+            return member.with_transport_key(transport_key);
+        }
+        if !local_mint_allowed {
+            return member;
+        }
+        let key = self
+            .member_home()
+            .and_then(|home| crate::keys::transport_key(&home, &member.email));
+        match key {
+            Ok(key) => member.with_transport_key(key.public_key()),
+            Err(err) => {
+                tracing::warn!("minting a transport key for {}: {err:#}", member.email);
+                member
+            }
+        }
+    }
+
     /// Sign `entry` with its author's machine-local key (`docs/adr/0033`),
     /// minting the keypair on first use. Best-effort by design: verification
     /// is a surfaced projection fact, never a gate — so a signing failure
@@ -578,6 +621,7 @@ impl Host {
         granted_by: &Member,
         member: Member,
         key: Option<PublicKey>,
+        transport_key: Option<PublicKey>,
     ) -> Result<crate::members::Minted> {
         let resolution = self.resolve(channel).await?;
         let (ledger, id) = match resolution {
@@ -641,11 +685,23 @@ impl Host {
         // supplied the new member's own key (the keyless/interactive path;
         // `junto add-member --enroll` always supplies one), this host must
         // decide whether it may legitimately mint one itself.
-        // `keys::has_signing_key` — never `signing_key`, which mints as a
-        // side effect of the lookup — answers "does a key already exist"
-        // without creating one: if this machine already holds a key for
-        // this email, reuse is legitimate no matter the member kind (e.g.
-        // the founder joining a second channel). Otherwise an agent may
+        // `keys::has_authored_signing_key` — never `has_signing_key`, and
+        // never `signing_key`, which mints as a side effect of the lookup
+        // — answers "does an AUTHORED key already exist" without creating
+        // one: if this machine minted that key for an identity it already
+        // had authority over (an agent it created, or a human already
+        // speaking through it — `sign_entry`'s own mint-on-first-use),
+        // reuse is legitimate no matter the member kind (e.g. the founder
+        // joining a second channel). `has_signing_key` alone is NOT
+        // enough (finding 9a, final fix wave): `/devices/enroll` and
+        // `junto enroll` deliberately have no founder check, and mint a
+        // key on THIS host for whatever email a composed invite names —
+        // an unauthorized caller could plant one there for a target
+        // email before this keyless grant ever runs, pre-satisfying mere
+        // existence. Those two callers mint through
+        // `keys::enrolled_signing_key` instead, which records the fresh
+        // key `authored: false`, so it can never stand in for "this
+        // machine already spoke as this identity". Otherwise an agent may
         // mint fresh — it runs on this machine by construction — but a
         // human may not: minting a key for a human whose machine is not
         // this one is exactly the bug this plan exists to close (a keypair
@@ -653,16 +709,17 @@ impl Host {
         // own).
         if key.is_none() {
             let home = self.member_home()?;
-            let already_local = crate::keys::has_signing_key(&home, &member.email)?;
+            let already_local = crate::keys::has_authored_signing_key(&home, &member.email)?;
             if !already_local && member.kind == MemberKind::Human {
                 bail!(
                     "{} has no signing key on this machine, and none was supplied — a human \
                      member's key must come from their own device, not be minted here. This \
                      requires terminal access: run `junto invite --member {} --channel \
-                     {channel}`, have them run `junto enroll --invite <url>`, then finish with \
-                     `junto add-member --enroll <their-enroll-url> --channel {channel}`. A \
-                     caller without terminal access (e.g. over MCP) cannot complete this \
-                     exchange itself — hand it off to someone who can run those commands",
+                     {channel}`, have them run `junto enroll --invite <url>` on their own \
+                     machine, then finish with `junto add-member --enroll <their-enroll-url> \
+                     --kind human`. A caller without terminal access (e.g. over MCP) cannot \
+                     complete this exchange itself — hand it off to someone who can run those \
+                     commands",
                     member.email,
                     member.email
                 );
@@ -671,8 +728,12 @@ impl Host {
 
         // The grant carries the new member's public key — how the keyring
         // grows (`docs/adr/0033`). An agent's key is its own, minted like its
-        // member code — never its operator's.
+        // member code — never its operator's. The transport half follows the
+        // same rule (`docs/adr/0033` two-key separation) — never the
+        // operator's, and never a copy of the signing key.
+        let local_mint_allowed = key.is_none();
         let member = self.keyed(member, key);
+        let member = self.keyed_transport(member, transport_key, local_mint_allowed);
         let mut grant = LedgerEntry {
             signature: None,
             id: EntryId::new(),
@@ -1400,7 +1461,7 @@ mod lineage_tests {
             .await
             .unwrap();
         let agent = Member::agent("Worker", "worker@agents.junto");
-        host.add_member("signed", &dan(), agent.clone(), None)
+        host.add_member("signed", &dan(), agent.clone(), None, None)
             .await
             .unwrap();
 
@@ -1440,7 +1501,7 @@ mod lineage_tests {
         host.open_channel(None, "acme", dan(), None).await.unwrap();
         let alice_key = junto_kernel::SigningKey::from_secret_bytes([7; 32]);
         let alice = Member::human("Alice", "alice@example.com");
-        host.add_member("acme", &dan(), alice, Some(alice_key.public_key()))
+        host.add_member("acme", &dan(), alice, Some(alice_key.public_key()), None)
             .await
             .unwrap();
 
@@ -1458,7 +1519,7 @@ mod lineage_tests {
         host.open_channel(None, "acme", dan(), None).await.unwrap();
         let alice_key = junto_kernel::SigningKey::from_secret_bytes([7; 32]);
         let alice = Member::human("Alice", "alice@example.com");
-        host.add_member("acme", &dan(), alice, Some(alice_key.public_key()))
+        host.add_member("acme", &dan(), alice, Some(alice_key.public_key()), None)
             .await
             .unwrap();
 
@@ -1475,6 +1536,46 @@ mod lineage_tests {
         );
     }
 
+    /// The central integration point this task exists for: an enroll
+    /// payload supplying BOTH halves flows through `Host::add_member` into
+    /// the projected grant unchanged — the recorded transport key is the
+    /// one supplied, not a locally minted one, and it rides the SAME grant
+    /// as the signing key (not a separate one).
+    #[tokio::test]
+    async fn add_member_with_a_supplied_transport_key_records_the_pair() {
+        let (_dirs, host) = lineage_host(1);
+        host.open_channel(None, "acme", dan(), None).await.unwrap();
+        let alice_key = junto_kernel::SigningKey::from_secret_bytes([7; 32]);
+        let alice_transport_key = junto_kernel::SigningKey::from_secret_bytes([8; 32]);
+        let alice = Member::human("Alice", "alice@example.com");
+        host.add_member(
+            "acme",
+            &dan(),
+            alice,
+            Some(alice_key.public_key()),
+            Some(alice_transport_key.public_key()),
+        )
+        .await
+        .unwrap();
+
+        let (_, view) = project(&host, "acme").await;
+        let grant = view
+            .keyring
+            .get("alice@example.com")
+            .and_then(|grants| grants.first())
+            .expect("alice has a keyring grant");
+        assert_eq!(
+            grant.key,
+            alice_key.public_key(),
+            "the recorded signing key is the one supplied"
+        );
+        assert_eq!(
+            grant.transport_key,
+            Some(alice_transport_key.public_key()),
+            "the recorded transport key is the one supplied, not a locally minted one"
+        );
+    }
+
     /// The core fix's other half: a keyless grant for a human this host has
     /// no local key for (and was handed no key) must be refused, not
     /// silently mint one on the founder's machine.
@@ -1484,7 +1585,7 @@ mod lineage_tests {
         host.open_channel(None, "acme", dan(), None).await.unwrap();
         let bob = Member::human("Bob", "bob@example.com");
         let err = host
-            .add_member("acme", &dan(), bob, None)
+            .add_member("acme", &dan(), bob, None, None)
             .await
             .unwrap_err();
         assert!(
@@ -1497,18 +1598,67 @@ mod lineage_tests {
         );
     }
 
+    /// Finding 9a (final fix wave): a key planted by `/devices/enroll`'s
+    /// own mint (`keys::enrolled_signing_key`, simulated directly here —
+    /// `enroll_device`'s own web-layer test covers the endpoint) must NOT
+    /// pre-satisfy the keyless-human reuse check just by existing —
+    /// `/devices/enroll` has no founder check, so an unauthorized caller
+    /// could otherwise plant a key for a target email and have this
+    /// ordinary keyless grant silently mint the human's membership onto
+    /// it instead of refusing, exactly the state `has_authored_signing_key`
+    /// (not `has_signing_key`) exists to prevent.
+    #[tokio::test]
+    async fn add_member_refuses_a_human_whose_only_local_key_is_enroll_sourced() {
+        let (dirs, host) = lineage_host(1);
+        host.open_channel(None, "acme", dan(), None).await.unwrap();
+        crate::keys::enrolled_signing_key(member_home(&dirs), "victim@example.com").unwrap();
+        let victim = Member::human("Victim", "victim@example.com");
+        let err = host
+            .add_member("acme", &dan(), victim, None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("enroll"),
+            "the refusal should point at the enrollment path even though a key exists: {err}"
+        );
+    }
+
     /// The keyless/interactive path must keep working for the local-agent
     /// case: an agent runs on this machine by construction, so first-use
-    /// minting is legitimate.
+    /// minting is legitimate — and that must mint BOTH halves, not just
+    /// the signing key, giving `keys::has_transport_key` its first real
+    /// caller. Asserted at BOTH layers: `has_transport_key` pins that the
+    /// key was minted on disk, and the projected grant pins that it was
+    /// actually attached to the member and published — a mutation that
+    /// drops the `member.with_transport_key(key.public_key())` attach
+    /// (leaving the mint side effect intact) would still pass the first
+    /// assertion alone.
     #[tokio::test]
     async fn add_member_keyless_still_mints_for_a_local_agent() {
         let (dirs, host) = lineage_host(1);
         host.open_channel(None, "acme", dan(), None).await.unwrap();
         let worker = Member::agent("Worker", "worker@agents.junto");
-        host.add_member("acme", &dan(), worker, None).await.unwrap();
+        host.add_member("acme", &dan(), worker, None, None)
+            .await
+            .unwrap();
         assert!(
             crate::keys::has_signing_key(member_home(&dirs), "worker@agents.junto").unwrap(),
             "an agent's key is minted like its member code (docs/adr/0033)"
+        );
+        assert!(
+            crate::keys::has_transport_key(member_home(&dirs), "worker@agents.junto").unwrap(),
+            "the transport half is minted alongside the signing key on the same local path"
+        );
+        let (_, view) = project(&host, "acme").await;
+        let grant = view
+            .keyring
+            .get("worker@agents.junto")
+            .and_then(|grants| grants.first())
+            .expect("worker has a keyring grant");
+        assert!(
+            grant.transport_key.is_some(),
+            "the minted transport key must actually be attached to the grant, not just \
+             written to keys.toml: {grant:?}"
         );
     }
 
@@ -1525,7 +1675,9 @@ mod lineage_tests {
         host.open_channel(None, "second", eve.clone(), None)
             .await
             .unwrap();
-        host.add_member("second", &eve, dan(), None).await.unwrap();
+        host.add_member("second", &eve, dan(), None, None)
+            .await
+            .unwrap();
 
         // The deciding claim: the grant actually recorded on 'second's
         // keyring is the PRE-EXISTING key, not a value `keyed` obtained by
@@ -1566,6 +1718,7 @@ mod lineage_tests {
             &dan(),
             Member::human("Alice", "alice@example.com"),
             Some(key_a.public_key()),
+            None,
         )
         .await
         .unwrap();
@@ -1574,6 +1727,7 @@ mod lineage_tests {
             &dan(),
             Member::human("Alice", "alice@example.com"),
             Some(key_b.public_key()),
+            None,
         )
         .await
         .unwrap();
@@ -1621,6 +1775,7 @@ mod lineage_tests {
             &dan(),
             Member::human("Alice", "alice@example.com"),
             Some(key_a.public_key()),
+            None,
         )
         .await
         .unwrap();
@@ -1633,6 +1788,7 @@ mod lineage_tests {
             &dan(),
             Member::human("Alice Renamed", "alice@example.com"),
             Some(key_b.public_key()),
+            None,
         )
         .await
         .unwrap();
@@ -1667,6 +1823,7 @@ mod lineage_tests {
             &dan(),
             Member::human("Alice", "alice@example.com"),
             Some(key_a.public_key()),
+            None,
         )
         .await
         .unwrap();
@@ -1675,6 +1832,7 @@ mod lineage_tests {
             &dan(),
             Member::human("Alice", "alice@example.com"),
             Some(key_a.public_key()),
+            None,
         )
         .await
         .unwrap();
@@ -1719,6 +1877,7 @@ mod lineage_tests {
             &dan(),
             Member::human("Bob", "bob@example.com"),
             Some(key_a.public_key()),
+            None,
         )
         .await
         .unwrap();
@@ -1726,6 +1885,7 @@ mod lineage_tests {
             "acme",
             &dan(),
             Member::human("Bob", "bob@example.com"),
+            None,
             None,
         )
         .await
@@ -1765,6 +1925,7 @@ mod lineage_tests {
             &dan(),
             Member::human("Alice", "alice@example.com"),
             Some(key_a.public_key()),
+            None,
         )
         .await
         .unwrap();
@@ -1811,6 +1972,7 @@ mod lineage_tests {
             &dan(),
             Member::human("Alice", "alice@example.com"),
             Some(key_a.public_key()),
+            None,
         )
         .await
         .unwrap();
@@ -1857,7 +2019,7 @@ mod lineage_tests {
 
         // The founder grants membership to themself, carrying a second
         // device's key.
-        host.add_member("acme", &dan(), dan(), Some(key_b.public_key()))
+        host.add_member("acme", &dan(), dan(), Some(key_b.public_key()), None)
             .await
             .unwrap();
 

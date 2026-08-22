@@ -96,7 +96,9 @@ pub async fn run(
     if let Some(agent) = agent {
         let granted_by = host::git_user(&repo)?;
         let email = agent.email.clone();
-        let minted = host.add_member(&channel, &granted_by, agent, None).await?;
+        let minted = host
+            .add_member(&channel, &granted_by, agent, None, None)
+            .await?;
         binding::write_local_member_code(&repo, &minted.code)?;
         println!(
             "granted {email} membership in '{channel}' and wrote its code relay \

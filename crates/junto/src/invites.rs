@@ -21,6 +21,9 @@
 //! — identity is the more fundamental error) — because Task 8 surfaces this
 //! diagnosis to a human, not just a pass/fail.
 //!
+//! One token may cover several channels, and `channels_for` is the read that
+//! recovers them: all channels the token still covers (unconsumed and unexpired).
+//!
 //! `consume`'s single-use guarantee is a plain read-modify-write over
 //! `invites.toml` (`load` → check → mutate → `save`, the same shape as
 //! `members.rs::mint`) — it holds against **sequential** redemption
@@ -33,11 +36,13 @@
 //! here alone would be scope this task doesn't need.
 //!
 //! `junto invite` (Task 6) calls `issue`, `junto add-member --enroll`
-//! (Task 8) calls `consume`, and `junto invite` itself calls `prune` at
-//! its own top (final fix wave, finding 1 — `prune` fell between Task 9's
+//! (Task 4's `redeem_enrollment`) calls `consume` once per channel a
+//! token still covers, and `junto invite` itself calls `prune` at its
+//! own top (final fix wave, finding 1 — `prune` fell between Task 9's
 //! brief, which shipped `keys list`/`revoke-member`/`retire-device`
-//! instead, and Task 6's, written before `prune` existed): none of the
-//! three carries `#[allow(dead_code)]` any more.
+//! instead, and Task 6's, written before `prune` existed).
+//! `redeem_enrollment` is also `channels_for`'s first production caller
+//! (Task 4) — it no longer carries `#[allow(dead_code)]`.
 
 use std::path::{Path, PathBuf};
 
@@ -157,31 +162,51 @@ pub fn consume(
 ) -> Result<Consumed> {
     let mut file = load(junto_home)?;
     let hash = token_sha256(token);
-    let Some(record) = file
+
+    // Collect all records with matching token hash.
+    let mut matching_hash: Vec<_> = file
         .invites
         .iter_mut()
-        .find(|record| record.token_sha256 == hash)
-    else {
-        return Ok(Consumed::Unknown);
-    };
+        .filter(|record| record.token_sha256 == hash)
+        .collect();
 
-    if record.consumed_at.is_some() {
-        return Ok(Consumed::AlreadyUsed);
+    if matching_hash.is_empty() {
+        return Ok(Consumed::Unknown);
     }
-    // Identity checked before scope: if both are wrong, the more
-    // fundamental fact — this wasn't granted to you at all — is what the
-    // human needs to see, not a channel mismatch that invites debugging
-    // the wrong thing.
-    if record.member_email != member_email {
+
+    // Check if ANY matching-hash record has the right member email.
+    // Identity is the more fundamental error: if both member and channel are
+    // wrong, the human needs to see WrongMember, not WrongChannel.
+    if !matching_hash.iter().any(|r| r.member_email == member_email) {
         return Ok(Consumed::WrongMember);
     }
-    if record.channel != channel {
+
+    // Find the record for the specific channel AND member — narrowed to
+    // both, not channel alone (Task 4 finding, ruled non-blocking when
+    // raised by the store task, closed here): `issue` writes one member
+    // per every channel of a token today, so this was unreachable, but
+    // Task 4's multi-channel redemption caller makes multi-record tokens
+    // (different members per channel) routine — without this, a token
+    // whose records carry different members per channel could let one
+    // member's request select another member's record for that channel.
+    // `WrongMember`-before-`WrongChannel` precedence above is untouched:
+    // this only narrows which record counts as "the channel's record".
+    let Some(record) = matching_hash
+        .iter_mut()
+        .find(|r| r.channel == channel && r.member_email == member_email)
+    else {
         return Ok(Consumed::WrongChannel);
+    };
+
+    // Check the state of THIS specific record.
+    if record.consumed_at.is_some() {
+        return Ok(Consumed::AlreadyUsed);
     }
     if now_ms() > record.expires_at {
         return Ok(Consumed::Expired);
     }
 
+    // Mark this record consumed.
     record.consumed_at = Some(now_ms());
     save(junto_home, &file)?;
     Ok(Consumed::Ok)
@@ -203,6 +228,35 @@ pub fn prune(junto_home: &Path) -> Result<usize> {
         save(junto_home, &file)?;
     }
     Ok(removed)
+}
+
+/// Recover the channels this token still covers FOR `member_email` — all
+/// records whose hash matches, whose `member_email` matches (finding 9b,
+/// final fix wave: the comparison [`consume`] already makes, so a token
+/// answering FOR one identity can never enumerate a channel set issued
+/// for another), `consumed_at` is `None`, and `expires_at >= now_ms()`,
+/// in file order (which is issue order). An unknown token, or a token
+/// whose records name a different member, yields an empty vec, not an
+/// error. This is a read: it does not consume, write, or prune anything.
+///
+/// # Errors
+/// Returns an error if `<junto-home>/invites.toml` cannot be read or parsed.
+pub fn channels_for(junto_home: &Path, token: &str, member_email: &str) -> Result<Vec<String>> {
+    let file = load(junto_home)?;
+    let hash = token_sha256(token);
+    let current_time = now_ms();
+    let channels = file
+        .invites
+        .iter()
+        .filter(|record| {
+            record.token_sha256 == hash
+                && record.member_email == member_email
+                && record.consumed_at.is_none()
+                && record.expires_at >= current_time
+        })
+        .map(|record| record.channel.clone())
+        .collect();
+    Ok(channels)
 }
 
 fn now_ms() -> i64 {
@@ -301,6 +355,30 @@ mod tests {
     }
 
     #[test]
+    fn consume_never_selects_another_members_record_for_the_same_channel() {
+        // One token, two channels, DIFFERENT members per channel — the
+        // shape Task 4's multi-channel redemption makes routine. Dan
+        // presenting the right token for `chan-b` must never be able to
+        // consume Eve's record for that channel just because his own
+        // hash-matching record (for `chan-a`) proves the token is his.
+        let home = tempfile::tempdir().unwrap();
+        let token = "t".repeat(43);
+        issue(home.path(), &token, "dan@x.com", "chan-a", future()).unwrap();
+        issue(home.path(), &token, "eve@x.com", "chan-b", future()).unwrap();
+
+        assert!(matches!(
+            consume(home.path(), &token, "dan@x.com", "chan-b").unwrap(),
+            Consumed::WrongChannel
+        ));
+
+        // Eve's own record is untouched — still redeemable by her.
+        assert!(matches!(
+            consume(home.path(), &token, "eve@x.com", "chan-b").unwrap(),
+            Consumed::Ok
+        ));
+    }
+
+    #[test]
     fn an_unknown_token_is_refused() {
         let home = tempfile::tempdir().unwrap();
         assert!(matches!(
@@ -344,6 +422,134 @@ mod tests {
         ));
         assert!(matches!(
             consume(home.path(), &fresh, "dan@x.com", "junto-dev").unwrap(),
+            Consumed::Ok
+        ));
+    }
+
+    #[test]
+    fn channels_for_returns_every_channel_the_token_still_covers() {
+        let home = tempfile::tempdir().unwrap();
+        let token = "t".repeat(43);
+        issue(home.path(), &token, "dan@x.com", "chan-a", future()).unwrap();
+        issue(home.path(), &token, "dan@x.com", "chan-b", future()).unwrap();
+        assert_eq!(
+            channels_for(home.path(), &token, "dan@x.com").unwrap(),
+            vec!["chan-a".to_string(), "chan-b".to_string()]
+        );
+    }
+
+    /// Finding 9b (final fix wave): a token whose records are issued for a
+    /// DIFFERENT member must never enumerate that member's channels — the
+    /// same identity check `consume` already makes, applied to the
+    /// read-only preview path so a leaked or tampered enroll payload's
+    /// claimed email cannot see a channel set it is not entitled to.
+    #[test]
+    fn channels_for_omits_a_channel_issued_for_a_different_member() {
+        let home = tempfile::tempdir().unwrap();
+        let token = "t".repeat(43);
+        issue(home.path(), &token, "dan@x.com", "chan-a", future()).unwrap();
+        assert_eq!(
+            channels_for(home.path(), &token, "someone-else@x.com").unwrap(),
+            Vec::<String>::new(),
+            "a different claimed email must see nothing this token covers"
+        );
+        assert_eq!(
+            channels_for(home.path(), &token, "dan@x.com").unwrap(),
+            vec!["chan-a".to_string()],
+            "the rightful member still sees it"
+        );
+    }
+
+    #[test]
+    fn channels_for_omits_a_consumed_channel_and_keeps_the_rest() {
+        // The property redemption retries depend on: a partial success leaves the
+        // remainder recoverable from the same code.
+        let home = tempfile::tempdir().unwrap();
+        let token = "t".repeat(43);
+        issue(home.path(), &token, "dan@x.com", "chan-a", future()).unwrap();
+        issue(home.path(), &token, "dan@x.com", "chan-b", future()).unwrap();
+        assert!(matches!(
+            consume(home.path(), &token, "dan@x.com", "chan-a").unwrap(),
+            Consumed::Ok
+        ));
+        assert_eq!(
+            channels_for(home.path(), &token, "dan@x.com").unwrap(),
+            vec!["chan-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn channels_for_omits_an_expired_channel() {
+        let home = tempfile::tempdir().unwrap();
+        let token = "t".repeat(43);
+        issue(home.path(), &token, "dan@x.com", "stale", past()).unwrap();
+        issue(home.path(), &token, "dan@x.com", "live", future()).unwrap();
+        assert_eq!(
+            channels_for(home.path(), &token, "dan@x.com").unwrap(),
+            vec!["live".to_string()]
+        );
+    }
+
+    #[test]
+    fn channels_for_an_unknown_token_is_empty_not_an_error() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(
+            channels_for(home.path(), &"z".repeat(43), "dan@x.com")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn channels_for_does_not_consume() {
+        // A read that burned the token would make the redeem screen's preview
+        // destructive — the exact bug this assertion exists to prevent.
+        let home = tempfile::tempdir().unwrap();
+        let token = "t".repeat(43);
+        issue(home.path(), &token, "dan@x.com", "chan-a", future()).unwrap();
+        channels_for(home.path(), &token, "dan@x.com").unwrap();
+        assert!(matches!(
+            consume(home.path(), &token, "dan@x.com", "chan-a").unwrap(),
+            Consumed::Ok
+        ));
+    }
+
+    #[test]
+    fn consume_redeems_a_later_channel_first() {
+        let home = tempfile::tempdir().unwrap();
+        let token = "t".repeat(43);
+        issue(home.path(), &token, "dan@x.com", "chan-a", future()).unwrap();
+        issue(home.path(), &token, "dan@x.com", "chan-b", future()).unwrap();
+        // Redeem "chan-b" FIRST to test that the second record is found and redeemed.
+        assert!(matches!(
+            consume(home.path(), &token, "dan@x.com", "chan-b").unwrap(),
+            Consumed::Ok
+        ));
+        // Then redeem "chan-a".
+        assert!(matches!(
+            consume(home.path(), &token, "dan@x.com", "chan-a").unwrap(),
+            Consumed::Ok
+        ));
+    }
+
+    #[test]
+    fn consume_reports_already_used_per_channel_not_per_token() {
+        let home = tempfile::tempdir().unwrap();
+        let token = "t".repeat(43);
+        issue(home.path(), &token, "dan@x.com", "chan-a", future()).unwrap();
+        issue(home.path(), &token, "dan@x.com", "chan-b", future()).unwrap();
+        // Consume "chan-a" twice.
+        assert!(matches!(
+            consume(home.path(), &token, "dan@x.com", "chan-a").unwrap(),
+            Consumed::Ok
+        ));
+        assert!(matches!(
+            consume(home.path(), &token, "dan@x.com", "chan-a").unwrap(),
+            Consumed::AlreadyUsed
+        ));
+        // But "chan-b" can still be redeemed; the token is not burned for all channels.
+        assert!(matches!(
+            consume(home.path(), &token, "dan@x.com", "chan-b").unwrap(),
             Consumed::Ok
         ));
     }
