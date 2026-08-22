@@ -2281,28 +2281,39 @@ impl InviteForm {
 
 /// Mint a founder-issued, multi-channel enrollment invite over HTTP
 /// (device-key-enrollment plan) — the human-surface counterpart of `junto
-/// invite` (`main.rs::mint_invite`). The authority rules are **identical**
-/// to that CLI path on purpose: both surfaces mint the same kind of bearer
-/// grant, and any drift between them would let one surface issue an
-/// invite the other would refuse.
+/// invite` (`main.rs::mint_invite`). The authority and validation rules
+/// mirror that CLI path closely, on purpose: both surfaces mint the same
+/// kind of bearer grant, and drift between them is exactly how a code the
+/// CLI would refuse could get minted here (or vice versa) — see the
+/// `member` bounds below, added after a review caught this endpoint
+/// skipping them.
 ///
 /// `invites::prune` runs first (this is the human surface's most likely
-/// "actively enrolling" moment, mirroring why the CLI prunes here too),
-/// then every named channel is resolved and re-projected with
-/// [`project_fresh`] (not the cached [`project`] — a `revoke-member` in a
-/// separate process must be visible to the very next mint) and checked
-/// with [`crate::identity::require_founder`] — **before** a token is
-/// minted or any record is issued. An invite the caller cannot complete
-/// for even one named channel is refused whole, nothing left behind (400
-/// for a malformed/empty channel set, 403 naming the offending channel for
-/// an authority failure). Two spellings of the same channel (a name and
-/// its id) collapse to one record, deduped on the canonical id, first-seen
-/// order.
+/// "actively enrolling" moment, mirroring why the CLI prunes here too).
+/// `member` is then checked non-empty (after trimming) and within
+/// `enroll::MAX_FIELD_CHARS` — a blank member would mint a real,
+/// redeemable record for the empty string (`invites::consume` compares
+/// the payload's email to the record's, and `""` matches `""`), and an
+/// oversized one would mint a code `enroll::decode_invite`'s
+/// `check_field_bounds` could only ever reject later, burning the
+/// resolution work and the token for nothing (`main.rs::mint_invite`
+/// checks the same bound, at `main.rs:880-885`). Every named channel is
+/// then resolved and re-projected with [`project_fresh`] (not the cached
+/// [`project`] — a `revoke-member` in a separate process must be visible
+/// to the very next mint) and checked with
+/// [`crate::identity::require_founder`] — **before** a token is minted or
+/// any record is issued. An invite the caller cannot complete for even
+/// one named channel is refused whole, nothing left behind (400 for a
+/// malformed/empty channel set or member, 403 naming the offending
+/// channel for an authority failure). Two spellings of the same channel
+/// (a name and its id) collapse to one record, deduped on the canonical
+/// id, first-seen order.
 async fn mint_invite(
     State(host): State<Arc<Host>>,
     Form(pairs): Form<Vec<(String, String)>>,
 ) -> Response {
     let form = InviteForm::from_pairs(&pairs);
+    let member = form.member.trim().to_string();
 
     let junto_home = match crate::host::junto_home() {
         Ok(home) => home,
@@ -2310,6 +2321,24 @@ async fn mint_invite(
     };
     if let Err(err) = crate::invites::prune(&junto_home) {
         return internal(err.to_string());
+    }
+
+    if member.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "an invite must name a member".to_string(),
+        )
+            .into_response();
+    }
+    if member.chars().count() > crate::enroll::MAX_FIELD_CHARS {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "member exceeds the {}-char limit",
+                crate::enroll::MAX_FIELD_CHARS
+            ),
+        )
+            .into_response();
     }
 
     if form.channel.is_empty() {
@@ -2340,7 +2369,7 @@ async fn mint_invite(
             Err(response) => return response,
         };
         let caller = match crate::host::git_user(&substrate) {
-            Ok(member) => member,
+            Ok(caller) => caller,
             Err(err) => return internal(err.to_string()),
         };
         if let Err(err) = crate::identity::require_founder(&view, &caller, channel) {
@@ -2355,8 +2384,7 @@ async fn mint_invite(
     let token = crate::enroll::mint_invite_token();
     let expires_at = Timestamp::now().as_millis() + crate::enroll::MAX_INVITE_TTL_MS;
     for canonical in &canonical_channels {
-        if let Err(err) =
-            crate::invites::issue(&junto_home, &token, &form.member, canonical, expires_at)
+        if let Err(err) = crate::invites::issue(&junto_home, &token, &member, canonical, expires_at)
         {
             return internal(err.to_string());
         }
@@ -2365,7 +2393,7 @@ async fn mint_invite(
     let payload = crate::enroll::InvitePayload {
         v: crate::enroll::PAYLOAD_VERSION,
         invite_token: token,
-        member_email: form.member,
+        member_email: member,
         channels: canonical_channels.clone(),
         expires_at,
     };
@@ -4173,6 +4201,80 @@ mod tests {
             !junto_home.join("invites.toml").exists(),
             "nothing issued for an empty channel set"
         );
+    }
+
+    #[tokio::test]
+    async fn post_invites_refuses_a_blank_member() {
+        let fx = invite_fixture().await;
+        let pairs = vec![
+            ("member".to_string(), "   ".to_string()),
+            ("channel".to_string(), "chan-a".to_string()),
+        ];
+        let response = mint_invite(State(fx.host.clone()), Form(pairs)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let junto_home = crate::host::junto_home().unwrap();
+        assert!(
+            !junto_home.join("invites.toml").exists(),
+            "nothing issued for a blank member"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_invites_refuses_an_oversized_member() {
+        let fx = invite_fixture().await;
+        let pairs = vec![
+            (
+                "member".to_string(),
+                "x".repeat(crate::enroll::MAX_FIELD_CHARS + 1),
+            ),
+            ("channel".to_string(), "chan-a".to_string()),
+        ];
+        let response = mint_invite(State(fx.host.clone()), Form(pairs)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let junto_home = crate::host::junto_home().unwrap();
+        assert!(
+            !junto_home.join("invites.toml").exists(),
+            "nothing issued for a member over the field-length cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_invites_dedupes_two_spellings_of_the_same_channel() {
+        let fx = invite_fixture().await;
+        let Resolution::Resolved { id: chan_a_id, .. } = fx.host.resolve("chan-a").await.unwrap()
+        else {
+            panic!("chan-a resolves");
+        };
+
+        // One channel, named twice: once by its display name, once by the
+        // canonical id that name resolves to.
+        let pairs = vec![
+            ("member".to_string(), "eve@example.com".to_string()),
+            ("channel".to_string(), "chan-a".to_string()),
+            ("channel".to_string(), chan_a_id.to_string()),
+        ];
+        let response = mint_invite(State(fx.host.clone()), Form(pairs)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_text(response).await;
+        let json: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+
+        let channels = json["channels"].as_array().expect("channels array");
+        assert_eq!(
+            channels.len(),
+            1,
+            "two spellings of one channel collapse to one record: {channels:?}"
+        );
+        assert_eq!(channels[0], chan_a_id.to_string());
+
+        let url = json["url"].as_str().expect("url string");
+        let decoded = crate::enroll::decode_invite(url).expect("decodes");
+        assert_eq!(decoded.channels.len(), 1);
+
+        let junto_home = crate::host::junto_home().unwrap();
+        let covers = crate::invites::channels_for(&junto_home, &decoded.invite_token).unwrap();
+        assert_eq!(covers.len(), 1, "one issued record, not two: {covers:?}");
     }
 
     /// A freshly encoded, currently-valid invite for `email` — built
