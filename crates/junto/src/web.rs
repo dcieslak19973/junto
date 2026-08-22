@@ -48,6 +48,7 @@ pub fn router(host: Arc<Host>) -> Router {
         .route("/channels", post(open_channel))
         .route("/repos", post(setup_repo))
         .route("/invites", post(mint_invite))
+        .route("/devices/enroll", post(enroll_device))
         .route("/channels/{channel}", get(channel_page))
         .route("/channels/{channel}/sessions", post(launch_session))
         .route(
@@ -2391,6 +2392,123 @@ struct InviteMintedDto {
     channels: Vec<String>,
 }
 
+/// The form body for enrolling this machine's device key from an invite.
+/// Deliberately has no `email` field — see [`enroll_device`]'s doc comment
+/// for why one must never be added.
+#[derive(Debug, Deserialize)]
+struct EnrollForm {
+    invite: String,
+    name: Option<String>,
+}
+
+/// Mint this device's own signing and transport keypairs from a founder's
+/// invite (device-key-enrollment plan) — the human-surface counterpart of
+/// `junto enroll` (`main.rs::enroll`).
+///
+/// This is the **only** endpoint in this codebase that may cause a mint of
+/// fresh secret material (a device's Ed25519 signing and transport private
+/// keys, `docs/adr/0033`) — every other write here operates on identity
+/// already minted elsewhere. It must therefore **never** be reachable from
+/// the mobile/remote read-only role (`docs/adr/0012`'s localhost-only write
+/// surface): a network peer must never be able to trigger a local key mint
+/// on this machine.
+///
+/// The enrolled email comes **only** from the decoded invite, never from
+/// the form — there is deliberately no `email` field on [`EnrollForm`].
+/// The invite token is itself the authorization (`invites::consume`'s
+/// `WrongMember` check downstream verifies it), so accepting a caller-
+/// supplied email would let anyone holding a valid invite for one address
+/// mint a keypair under a *different* one merely by typing it in. `name`
+/// supplies only the display name, defaulting to this machine's git
+/// identity and, failing that, the invite email's local part. No founder
+/// check and no member code: the invite token is the authorization, and
+/// the caller is this machine's own localhost (`docs/adr/0012`).
+async fn enroll_device(Form(form): Form<EnrollForm>) -> Response {
+    let invite = match crate::enroll::decode_invite(&form.invite) {
+        Ok(invite) => invite,
+        Err(err) => {
+            // Distinguish expiry from every other malformed shape — an
+            // expired invite is routine (ask the founder for a fresh one),
+            // everything else is a bug in whatever produced the code.
+            let message = if err.to_string().contains("expired") {
+                "this invite has expired; ask the founder to mint a fresh one".to_string()
+            } else {
+                format!("invalid invite: {err}")
+            };
+            return (StatusCode::BAD_REQUEST, message).into_response();
+        }
+    };
+
+    let junto_home = match crate::host::junto_home() {
+        Ok(home) => home,
+        Err(err) => return internal(err.to_string()),
+    };
+
+    let display_name = form
+        .name
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| {
+            crate::host::git_user(std::path::Path::new("."))
+                .ok()
+                .map(|member| member.display_name)
+        })
+        .unwrap_or_else(|| {
+            invite
+                .member_email
+                .split('@')
+                .next()
+                .unwrap_or(&invite.member_email)
+                .to_string()
+        });
+
+    // No secret, no seed, and no full public key may reach the response,
+    // a log line, or an error message from here down — only fingerprints.
+    let key = match crate::keys::signing_key(&junto_home, &invite.member_email) {
+        Ok(key) => key,
+        Err(err) => return internal(err.to_string()),
+    };
+    let transport_key = match crate::keys::transport_key(&junto_home, &invite.member_email) {
+        Ok(key) => key,
+        Err(err) => return internal(err.to_string()),
+    };
+
+    let payload = crate::enroll::EnrollPayload {
+        v: crate::enroll::PAYLOAD_VERSION,
+        invite_token: invite.invite_token,
+        email: invite.member_email.clone(),
+        display_name,
+        public_key: key.public_key(),
+        transport_public_key: transport_key.public_key(),
+        expires_at: invite.expires_at,
+    };
+    let url = match crate::enroll::encode_enroll(&payload) {
+        Ok(url) => url,
+        Err(err) => return internal(err.to_string()),
+    };
+
+    axum::Json(EnrolledDto {
+        url,
+        email: invite.member_email,
+        fingerprint: crate::identity::fingerprint(&key.public_key()),
+        transport_fingerprint: crate::identity::fingerprint(&transport_key.public_key()),
+    })
+    .into_response()
+}
+
+/// `POST /devices/enroll`'s response: the shareable `junto://enroll?
+/// code=…` URI plus both fingerprints — never the whole public keys, never
+/// a secret. Unlike [`KeyGrantDto::transport_fingerprint`] (`Option`, for a
+/// grant made before transport keys existed), `transport_fingerprint` here
+/// is **never** optional: a device enrolling under the current payload
+/// version always mints both keypairs in the same step.
+#[derive(Serialize)]
+struct EnrolledDto {
+    url: String,
+    email: String,
+    fingerprint: String,
+    transport_fingerprint: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4054,6 +4172,125 @@ mod tests {
         assert!(
             !junto_home.join("invites.toml").exists(),
             "nothing issued for an empty channel set"
+        );
+    }
+
+    /// A freshly encoded, currently-valid invite for `email` — built
+    /// directly (not through `mint_invite`), since these tests exercise
+    /// only the enroll side.
+    fn valid_invite_payload(email: &str) -> crate::enroll::InvitePayload {
+        crate::enroll::InvitePayload {
+            v: crate::enroll::PAYLOAD_VERSION,
+            invite_token: crate::enroll::mint_invite_token(),
+            member_email: email.to_string(),
+            channels: vec!["chan-x".to_string()],
+            expires_at: Timestamp::now().as_millis() + 60_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn post_devices_enroll_mints_for_the_invites_email_and_echoes_only_the_public_half() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let invite = valid_invite_payload("eve@example.com");
+        let url = crate::enroll::encode_invite(&invite).expect("encodes");
+
+        let response = enroll_device(Form(EnrollForm {
+            invite: url,
+            name: Some("Eve's Laptop".to_string()),
+        }))
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_text(response).await;
+        let json: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+
+        let enrolled_url = json["url"].as_str().expect("url string");
+        let decoded = crate::enroll::decode_enroll(enrolled_url).expect("decodes");
+        assert_eq!(decoded.email, "eve@example.com");
+        assert_eq!(json["email"], "eve@example.com");
+
+        let junto_home = crate::host::junto_home().unwrap();
+        let key = crate::keys::signing_key(&junto_home, "eve@example.com").expect("minted");
+        let transport = crate::keys::transport_key(&junto_home, "eve@example.com").expect("minted");
+        assert_eq!(
+            json["fingerprint"],
+            crate::identity::fingerprint(&key.public_key())
+        );
+        assert_eq!(
+            json["transport_fingerprint"],
+            crate::identity::fingerprint(&transport.public_key())
+        );
+
+        // Never the 64-hex secret from keys.toml, for either key.
+        assert!(
+            !body.contains(&key.to_secret_hex()),
+            "signing secret leaked: {body}"
+        );
+        assert!(
+            !body.contains(&transport.to_secret_hex()),
+            "transport secret leaked: {body}"
+        );
+
+        let keys_toml = std::fs::read_to_string(junto_home.join("keys.toml")).unwrap();
+        assert!(
+            keys_toml.contains("eve@example.com"),
+            "keys.toml now holds the invite's email: {keys_toml}"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_devices_enroll_ignores_an_email_supplied_by_the_caller() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let invite = valid_invite_payload("eve@example.com");
+        let url = crate::enroll::encode_invite(&invite).expect("encodes");
+
+        // A raw urlencoded body — the real extraction path a browser POST
+        // takes — carrying an extra `email` key `EnrollForm` has no field
+        // for. Serde's default (non-`deny_unknown_fields`) struct
+        // deserialization silently drops it; this pins that behavior.
+        let body = format!("invite={url}&email=attacker@x.com&name=Eve");
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(axum::body::Body::from(body))
+            .expect("request");
+        let Form(form) =
+            <Form<EnrollForm> as axum::extract::FromRequest<()>>::from_request(request, &())
+                .await
+                .expect("deserializes despite the extra `email` field");
+
+        let response = enroll_device(Form(form)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json: serde_json::Value =
+            serde_json::from_str(&body_text(response).await).expect("valid json");
+        assert_eq!(
+            json["email"], "eve@example.com",
+            "the invite's email wins, never the caller-supplied one"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_devices_enroll_refuses_an_expired_invite_before_minting() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let mut invite = valid_invite_payload("eve@example.com");
+        invite.expires_at = Timestamp::now().as_millis() - crate::enroll::MAX_INVITE_TTL_MS;
+        let url = crate::enroll::encode_invite(&invite).expect("encodes");
+
+        let response = enroll_device(Form(EnrollForm {
+            invite: url,
+            name: None,
+        }))
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_text(response).await;
+        assert!(body.to_lowercase().contains("expir"), "{body}");
+
+        let junto_home = crate::host::junto_home().unwrap();
+        assert!(
+            !junto_home.join("keys.toml").exists(),
+            "no key minted for an expired invite"
         );
     }
 }
