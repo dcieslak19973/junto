@@ -18,8 +18,8 @@ use iced::widget::{
     text, text_input,
 };
 use iced::{
-    Background, Border, Center, Color, Element, Fill, Length, Point, Rectangle, Renderer, Size,
-    Task, Theme, mouse,
+    Background, Border, Center, Color, Element, Fill, Length, Padding, Point, Rectangle, Renderer,
+    Size, Task, Theme, mouse,
 };
 use junto_kernel::{
     Anchor, Annotation, AnnotationId, CodeAnchor, CommitOid, ContentDigest, EntryId, Member,
@@ -250,6 +250,12 @@ struct Pane {
     brief_md: Option<Vec<markdown::Item>>,
     /// The humanized brief text, kept so it can be copied to the clipboard.
     brief_text: Option<String>,
+    /// The channel's key roster (`keys.json`) — the members-and-devices
+    /// disclosure's data (device-key-enrollment plan, Task 13). `None`
+    /// until the first fetch lands.
+    keys: Option<KeysDto>,
+    /// Whether the members disclosure is expanded.
+    members_open: bool,
 }
 
 enum Content {
@@ -420,6 +426,9 @@ struct ChannelDto {
     name: Option<String>,
     #[allow(dead_code)]
     closed: bool,
+    /// Superseded by `keys.json`'s roster (Task 13's members disclosure);
+    /// kept for DTO fidelity with the host, unread by the surface.
+    #[allow(dead_code)]
     party: Vec<String>,
     /// The channel's remembered workspace repo, if any (a returning channel).
     #[serde(default)]
@@ -528,6 +537,62 @@ enum ArtifactContent {
 struct ArtifactDto {
     format: String,
     content: String,
+}
+
+/// `keys.json`'s response — mirrors `crates/junto/src/web.rs::KeysDto`
+/// field-for-field (device-key-enrollment plan, Task 13).
+#[derive(Debug, Clone, Deserialize)]
+struct KeysDto {
+    /// Unread until the founder-only revoke act lands.
+    #[allow(dead_code)]
+    founder_email: String,
+    /// The git identity this host writes as. `None` when `git_user` fails
+    /// (no git config) — the endpoint still answers 200 (reading a roster
+    /// needs no identity of its own). Kept for DTO fidelity with the host;
+    /// unread until the founder-only acts land.
+    #[allow(dead_code)]
+    viewer_email: Option<String>,
+    /// Whether the viewer may perform the founder-only acts — unread
+    /// until those acts land.
+    #[allow(dead_code)]
+    viewer_is_founder: bool,
+    /// `view.party` order — founder first; never sorted here, the host's
+    /// replicas already agree on it.
+    members: Vec<KeyMemberDto>,
+}
+
+/// One party member, mirrors `KeyMemberDto`.
+#[derive(Debug, Clone, Deserialize)]
+struct KeyMemberDto {
+    display_name: String,
+    /// Unread until the founder-only revoke act lands.
+    #[allow(dead_code)]
+    email: String,
+    /// "human" | "agent".
+    kind: String,
+    /// Canonical grant order — never sorted here either.
+    devices: Vec<KeyGrantDto>,
+    /// Every grant retired (`docs/adr/0035`'s all-retired rule). Never
+    /// implies the member left the party — they stay listed. Unread
+    /// until the founder-only revoke act lands.
+    #[allow(dead_code)]
+    revoked: bool,
+}
+
+/// One key grant, mirrors `KeyGrantDto`.
+#[derive(Debug, Clone, Deserialize, Default)]
+struct KeyGrantDto {
+    /// 16 hex chars of the signing key.
+    fingerprint: String,
+    /// 16 hex chars of the transport key — `None` for a grant made before
+    /// transport keys existed. Kept for DTO fidelity; the disclosure's
+    /// device line shows the signing fingerprint only.
+    #[allow(dead_code)]
+    transport_fingerprint: Option<String>,
+    /// The entry id that authorized this key.
+    granted_by: String,
+    /// Epoch millis, when retired.
+    retired_at: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -686,6 +751,11 @@ enum Message {
     PluginRemove(usize),
     PluginBrowse(usize),
     PluginPicked(usize, Option<String>),
+    // --- members & devices disclosure (read-only; acts follow) ---
+    /// `keys.json` arrived for a pane (device-key-enrollment plan, Task 13).
+    KeysFetched(pane_grid::Pane, Result<KeysDto, String>),
+    /// Expand/collapse the members disclosure.
+    MembersToggle(pane_grid::Pane),
 }
 
 impl App {
@@ -898,13 +968,18 @@ impl App {
                         state.content = Content::Loaded(dto);
                         let base = state.base().to_string();
                         let channel = state.channel.clone();
-                        // Jump to the newest entry (bottom) and refresh the brief.
+                        // Jump to the newest entry (bottom), refresh the
+                        // brief, and refresh the key roster the members
+                        // disclosure reads (device-key-enrollment plan,
+                        // Task 13) — every view.json load keeps keys.json
+                        // in step.
                         Task::batch([
                             scrollable::snap_to(
                                 state.scroll_id.clone(),
                                 scrollable::RelativeOffset::END,
                             ),
-                            fetch_brief(pane, base, channel),
+                            fetch_brief(pane, base.clone(), channel.clone()),
+                            fetch_keys(pane, base, &channel),
                         ])
                     }
                     Err(err) => {
@@ -1523,6 +1598,21 @@ impl App {
                         Task::none()
                     }
                 }
+            }
+            // --- members & devices disclosure (read-only; acts follow) ---
+            Message::KeysFetched(pane, result) => {
+                if let Some(state) = self.panes.get_mut(pane)
+                    && let Ok(dto) = result
+                {
+                    state.keys = Some(dto);
+                }
+                Task::none()
+            }
+            Message::MembersToggle(pane) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    state.members_open = !state.members_open;
+                }
+                Task::none()
             }
             Message::SubstratesLoaded(paths) => {
                 // Default the new-channel substrate to the first registered one.
@@ -2673,6 +2763,56 @@ fn lifecycle_form(id: pane_grid::Pane, pane: &Pane, kind: LifecycleKind) -> Elem
         .into()
 }
 
+/// The party disclosure that replaces the old flat `party: …` text row: a
+/// header (member count + total device count) that expands into one row
+/// per member, each with its own device rows underneath. Read-only until
+/// `Pane::keys` has loaded (founder acts land in a follow-up commit).
+fn members_disclosure<'a>(id: pane_grid::Pane, pane: &'a Pane) -> Element<'a, Message> {
+    let Some(keys) = &pane.keys else {
+        return text("members · loading…").size(12).color(MUTED).into();
+    };
+    let device_count: usize = keys.members.iter().map(|m| m.devices.len()).sum();
+    let header = button(
+        text(format!(
+            "{} members ({}) · devices: {device_count}",
+            if pane.members_open { "▾" } else { "▸" },
+            keys.members.len(),
+        ))
+        .size(12),
+    )
+    .on_press(Message::MembersToggle(id))
+    .padding(6)
+    .style(|_t, _s| chip_style(MUTED, false));
+
+    let mut col = column![header].spacing(6);
+    if pane.members_open {
+        for member in &keys.members {
+            col = col.push(member_row(member));
+        }
+    }
+    col.into()
+}
+
+/// One member row: display name, kind badge, the member-summary line,
+/// and one row per device underneath.
+fn member_row(member: &KeyMemberDto) -> Element<'_, Message> {
+    let kind_badge_color = if member.kind == "agent" { MAUVE } else { TEAL };
+    let head = row![
+        text(&member.display_name).size(12),
+        badge(&member.kind, kind_badge_color),
+    ]
+    .spacing(6)
+    .align_y(Center);
+
+    let mut col = column![head, text(member_summary(member)).size(11).color(MUTED)]
+        .spacing(3)
+        .padding(Padding::default().left(14));
+    for grant in &member.devices {
+        col = col.push(text(device_line(grant)).size(11).color(MUTED));
+    }
+    col.into()
+}
+
 /// The annotation composer: a signed, span-anchored (or stream-anchored)
 /// comment on a remote-watched session. Rendered only while
 /// `pane.annotate_tx.is_some()` — the same condition Task 9's write-half
@@ -2736,21 +2876,14 @@ fn pane_body<'a>(
     // Parsed Markdown for a session memo entry's summary, if any.
     let summary_md_for = |entry: &EntryDto| pane.entry_md.get(&entry.id).map(Vec::as_slice);
 
-    // The channel's own header: the party, a closed badge, and the lifecycle
-    // acts (lineage lives in the top window-wide branch graph).
+    // The channel's own header: the members disclosure, a closed badge,
+    // and the lifecycle acts (lineage lives in the top window-wide branch
+    // graph).
     let mut header = column![].spacing(6);
-    let mut party_row = row![].spacing(8).align_y(Center);
-    if !dto.party.is_empty() {
-        party_row = party_row.push(
-            text(format!("party: {}", dto.party.join(", ")))
-                .size(12)
-                .color(MUTED),
-        );
-    }
+    header = header.push(members_disclosure(id, pane));
     if dto.closed {
-        party_row = party_row.push(badge("closed", RED));
+        header = header.push(row![badge("closed", RED)].spacing(8).align_y(Center));
     }
-    header = header.push(party_row);
     // Lifecycle act buttons; a closed channel only offers reopen.
     let acts: &[LifecycleKind] = if dto.closed {
         &[LifecycleKind::Reopen, LifecycleKind::Rename]
@@ -3180,6 +3313,61 @@ fn truncate(s: &str, max: usize) -> String {
         format!("{}…", s.chars().take(max - 1).collect::<String>())
     } else {
         s.to_string()
+    }
+}
+
+/// Epoch millis → an ISO-8601 date (`YYYY-MM-DD`), UTC. A small
+/// civil-calendar conversion (Howard Hinnant's `civil_from_days`) rather
+/// than a new date/time dependency — a retired grant's `retired_at` is
+/// the only place this crate needs the date portion of a timestamp.
+fn iso_date(millis: i64) -> String {
+    let (y, m, d) = civil_from_days(millis.div_euclid(86_400_000));
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Days since the Unix epoch → `(year, month, day)`, UTC. Standard
+/// proleptic-Gregorian conversion (Hinnant's `civil_from_days`).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// One device row: `fingerprint · granted <entry-id-prefix> · active`, or
+/// `· retired <iso-date>`. Never says anything else — a retired grant is
+/// not the same as a removed member (`docs/adr/0035`).
+fn device_line(grant: &KeyGrantDto) -> String {
+    let prefix = truncate(&grant.granted_by, 8);
+    match grant.retired_at {
+        Some(ts) => format!(
+            "{} · granted {prefix} · retired {}",
+            grant.fingerprint,
+            iso_date(ts)
+        ),
+        None => format!("{} · granted {prefix} · active", grant.fingerprint),
+    }
+}
+
+/// One member's device-count summary: `N active device(s)`, or `no active
+/// devices` when every grant is retired — deliberately never says
+/// "removed": a revoked member stays in the party (`docs/adr/0035`).
+fn member_summary(member: &KeyMemberDto) -> String {
+    let active = member
+        .devices
+        .iter()
+        .filter(|g| g.retired_at.is_none())
+        .count();
+    match active {
+        0 => "no active devices".to_string(),
+        1 => "1 active device".to_string(),
+        n => format!("{n} active devices"),
     }
 }
 
@@ -3679,6 +3867,8 @@ impl Pane {
             lifecycle_error: None,
             brief_md: None,
             brief_text: None,
+            keys: None,
+            members_open: false,
         }
     }
 
@@ -4014,6 +4204,19 @@ fn fetch(pane: pane_grid::Pane, base: String, channel: &str) -> Task<Message> {
                 .map_err(|e| e.to_string())
         },
         move |result| Message::Fetched(pane, result),
+    )
+}
+
+/// Fetch a channel's key roster (`keys.json`) — the members-and-devices
+/// disclosure's data source (device-key-enrollment plan, Task 13).
+fn fetch_keys(pane: pane_grid::Pane, base: String, channel: &str) -> Task<Message> {
+    let url = format!("{base}/channels/{channel}/keys.json");
+    Task::perform(
+        async move {
+            let response = reqwest::get(&url).await.map_err(|e| e.to_string())?;
+            response.json::<KeysDto>().await.map_err(|e| e.to_string())
+        },
+        move |result| Message::KeysFetched(pane, result),
     )
 }
 
@@ -5210,5 +5413,46 @@ mod tests {
             ..sample_entry()
         };
         assert_eq!(entry_badges(&clean), (false, false));
+    }
+
+    #[test]
+    fn device_line_reads_active_and_retired_differently() {
+        let active = KeyGrantDto {
+            fingerprint: "abc".into(),
+            transport_fingerprint: Some("def".into()),
+            granted_by: "e1".into(),
+            retired_at: None,
+        };
+        let retired = KeyGrantDto {
+            fingerprint: "abc".into(),
+            transport_fingerprint: None,
+            granted_by: "e1".into(),
+            retired_at: Some(1_781_000_000_000),
+        };
+        assert!(device_line(&active).contains("active"));
+        assert!(device_line(&retired).contains("retired"));
+        assert!(device_line(&retired).contains("2026"));
+    }
+
+    #[test]
+    fn a_member_with_every_grant_retired_reads_as_no_active_devices() {
+        let m = KeyMemberDto {
+            display_name: "Dan".into(),
+            email: "d@x.com".into(),
+            kind: "human".into(),
+            devices: vec![KeyGrantDto {
+                fingerprint: "abc".into(),
+                granted_by: "e1".into(),
+                retired_at: Some(1),
+                ..Default::default()
+            }],
+            revoked: true,
+        };
+        let summary = member_summary(&m);
+        assert!(summary.contains("no active devices"), "{summary}");
+        assert!(
+            !summary.to_lowercase().contains("removed"),
+            "never imply removal: {summary}"
+        );
     }
 }
