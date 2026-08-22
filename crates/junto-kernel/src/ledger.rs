@@ -924,11 +924,10 @@ impl<S: SubstrateProvider> Ledger<S> {
     /// Two passes: collect the attachments in canonical order, then drop the
     /// ones any `SubjectDetached` targets, regardless of the detachment's own
     /// position relative to its target. This is deliberately
-    /// **order-insensitive** — unlike `project_sessions`, which only applies
-    /// a `SessionUpdated` that comes after its session's start — because a
-    /// detachment withdraws its target outright: replicas must agree on the
-    /// live set even when clocks skew or two entries' timestamps collide,
-    /// and tie-breaking on canonical order would let that agreement drift.
+    /// **order-insensitive**: a detachment withdraws its target outright, so
+    /// replicas must agree on the live set even when clocks skew or two
+    /// entries' timestamps collide, and tie-breaking on canonical order
+    /// would let that agreement drift.
     fn project_subjects(entries: &[&LedgerEntry]) -> Vec<(EntryId, Subject)> {
         let mut attached: Vec<(EntryId, Subject)> = Vec::new();
         let mut detached: HashSet<EntryId> = HashSet::new();
