@@ -4,18 +4,23 @@
 //! Two codes carry a new device into a channel:
 //!
 //! - **invite**, minted by a founder (`junto invite`): a bearer grant that
-//!   `member_email` may join `channel`, proven by presenting
-//!   [`InvitePayload::invite_token`]. The token is a secret — anyone holding
+//!   `member_email` may join every channel in `channels`, proven by
+//!   presenting [`InvitePayload::invite_token`]. The token is a secret —
+//!   anyone holding
 //!   the decoded payload can redeem the grant it names (`invites::consume`
 //!   is the redemption check) — so this code must be delivered only to the
 //!   intended member.
 //! - **enroll**, minted by the new device (`junto enroll --invite …`): the
 //!   device's freshly generated public key, echoed back alongside the
-//!   invite token that proves which grant it is answering. Unlike the
-//!   invite, this carries **no secret** — a public key grants nothing by
-//!   itself; authority comes entirely from the founder's own act of
-//!   recording it on the ledger (`junto add-member`). So the enroll code is
-//!   safe to paste into a chat, read aloud, or leave in shell history.
+//!   SAME [`InvitePayload::invite_token`] that proves which grant it is
+//!   answering ([`EnrollPayload::invite_token`]). That echo means the
+//!   enroll code carries the identical bearer secret the invite code
+//!   does — anyone who sees a decoded enroll code can redeem the invite
+//!   it names for a device of their own, exactly as if they held the
+//!   invite code itself. It is NOT safe to paste into a chat, read
+//!   aloud, or leave in shell history — treat it with the same care as
+//!   the invite: deliver it only to the founder completing this
+//!   redemption.
 //!
 //! Both shapes are modelled on Orca's shipped `orca environment add
 //! --pairing-code` envelope, read out of the app rather than guessed: a
@@ -65,11 +70,16 @@ pub const MAX_CODE_CHARS: usize = 132_096;
 /// content (e.g. a `channel` name someone pasted a book into).
 pub const MAX_FIELD_CHARS: usize = 4_096;
 
+/// Maximum number of channels a single invite may name — a founder
+/// ticking more than 32 channels in one pass is a mistake, and an
+/// unbounded set makes redemption fan out unboundedly.
+pub const MAX_INVITE_CHANNELS: usize = 32;
+
 /// The current version this crate produces and accepts. `decode_invite` and
 /// `decode_enroll` reject any other value in a payload's `v` field, so a
 /// future format change can be introduced without a mis-parsed old payload
 /// silently passing as valid.
-const PAYLOAD_VERSION: u8 = 1;
+pub(crate) const PAYLOAD_VERSION: u8 = 2;
 
 /// The payload behind a `junto://invite?code=…` URI — see the module docs
 /// for what it grants and why [`invite_token`](Self::invite_token) is a
@@ -79,7 +89,8 @@ pub struct InvitePayload {
     pub v: u8,
     pub invite_token: String,
     pub member_email: String,
-    pub channel: String,
+    #[serde(default)]
+    pub channels: Vec<String>,
     pub expires_at: i64,
 }
 
@@ -92,6 +103,10 @@ pub struct EnrollPayload {
     pub email: String,
     pub display_name: String,
     pub public_key: PublicKey,
+    /// The device's transport public key (`docs/adr/0033` two-key
+    /// separation) — required, not optional: a device enrolling under v2
+    /// always mints both keypairs in the same step.
+    pub transport_public_key: PublicKey,
     pub expires_at: i64,
 }
 
@@ -132,21 +147,29 @@ pub fn decode_invite(url: &str) -> Result<InvitePayload> {
     let payload: InvitePayload =
         serde_json::from_str(&json).context("parsing invite payload JSON")?;
     check_version(payload.v)?;
-    check_field_bounds([
-        ("invite_token", payload.invite_token.as_str()),
-        ("member_email", payload.member_email.as_str()),
-        ("channel", payload.channel.as_str()),
-    ])?;
+    check_channel_set(&payload.channels)?;
+    check_field_bounds(
+        [
+            ("invite_token", payload.invite_token.as_str()),
+            ("member_email", payload.member_email.as_str()),
+        ]
+        .into_iter()
+        .chain(payload.channels.iter().map(|c| ("channel", c.as_str()))),
+    )?;
     check_expiry(payload.expires_at)?;
     Ok(payload)
 }
 
 /// Decode and validate a `junto://enroll?code=…` URI. See the module docs
-/// for the validation order.
+/// for the validation order. Also refuses a payload whose transport key
+/// equals its signing key (finding 3, final fix wave): the two keys must
+/// stay distinct (`docs/adr/0033` two-key separation) — a transport key is
+/// never a verification key, and an altered or malformed code that
+/// collapses them to one must never decode successfully.
 ///
 /// # Errors
 /// Returns an error for an oversized, malformed, wrong-version, out-of-
-/// bounds, or expired code.
+/// bounds, expired, or key-collapsed code.
 pub fn decode_enroll(url: &str) -> Result<EnrollPayload> {
     let json = decode_code(url, "enroll")?;
     let payload: EnrollPayload =
@@ -158,6 +181,13 @@ pub fn decode_enroll(url: &str) -> Result<EnrollPayload> {
         ("display_name", payload.display_name.as_str()),
     ])?;
     check_expiry(payload.expires_at)?;
+    if payload.public_key == payload.transport_public_key {
+        bail!(
+            "enroll payload names the same key for both signing and transport — the two \
+             keys must be distinct (docs/adr/0033); this code is malformed or was tampered \
+             with"
+        );
+    }
     Ok(payload)
 }
 
@@ -180,7 +210,24 @@ fn decode_code(url: &str, host: &str) -> Result<String> {
 
 fn check_version(v: u8) -> Result<()> {
     if v != PAYLOAD_VERSION {
-        bail!("unsupported payload version {v} (expected {PAYLOAD_VERSION})");
+        bail!(
+            "unsupported payload version {v} (expected {PAYLOAD_VERSION}) — this code came \
+             from an older junto; mint a new one"
+        );
+    }
+    Ok(())
+}
+
+/// Refuse an invite naming no channels — redemption would burn a token
+/// and grant nothing — or naming more than `MAX_INVITE_CHANNELS`. Each
+/// channel's own length is bounded separately, by `check_field_bounds`
+/// alongside `invite_token` and `member_email`.
+fn check_channel_set(channels: &[String]) -> Result<()> {
+    if channels.is_empty() {
+        bail!("an invite must name at least one channel");
+    }
+    if channels.len() > MAX_INVITE_CHANNELS {
+        bail!("an invite may name at most {MAX_INVITE_CHANNELS} channels");
     }
     Ok(())
 }
@@ -226,23 +273,48 @@ mod tests {
 
     fn sample_invite() -> InvitePayload {
         InvitePayload {
-            v: 1,
+            v: PAYLOAD_VERSION,
             invite_token: mint_invite_token(),
             member_email: "dan@example.com".to_string(),
-            channel: "junto-dev".to_string(),
+            channels: vec!["junto-dev".to_string()],
             expires_at: Timestamp::now().as_millis() + 60_000,
         }
     }
 
+    fn sample_signing_secret_hex() -> String {
+        "a".repeat(64)
+    }
+
+    fn sample_transport_secret_hex() -> String {
+        "b".repeat(64)
+    }
+
     fn sample_enroll() -> EnrollPayload {
         EnrollPayload {
-            v: 1,
+            v: PAYLOAD_VERSION,
             invite_token: mint_invite_token(),
             email: "dan@example.com".to_string(),
             display_name: "Dan's Laptop".to_string(),
-            public_key: PublicKey::new(format!("ed25519:{}", "a".repeat(64))).unwrap(),
+            public_key: junto_kernel::SigningKey::from_secret_hex(&sample_signing_secret_hex())
+                .unwrap()
+                .public_key(),
+            transport_public_key: junto_kernel::SigningKey::from_secret_hex(
+                &sample_transport_secret_hex(),
+            )
+            .unwrap()
+            .public_key(),
             expires_at: Timestamp::now().as_millis() + 60_000,
         }
+    }
+
+    #[test]
+    fn an_enroll_payload_carries_both_public_halves_and_no_secret() {
+        let url = encode_enroll(&sample_enroll()).unwrap();
+        let decoded = decode_enroll(&url).unwrap();
+        assert_ne!(decoded.public_key, decoded.transport_public_key);
+        // Neither secret may appear anywhere in the code that crosses machines.
+        assert!(!url.contains(&sample_signing_secret_hex()));
+        assert!(!url.contains(&sample_transport_secret_hex()));
     }
 
     #[test]
@@ -254,15 +326,32 @@ mod tests {
     }
 
     #[test]
-    fn enroll_round_trips_and_carries_no_secret() {
+    fn enroll_round_trips_and_carries_no_private_key_field() {
         let p = sample_enroll();
         let url = encode_enroll(&p).unwrap();
         assert!(url.starts_with("junto://enroll?code="));
         assert_eq!(decode_enroll(&url).unwrap(), p);
-        // `EnrollPayload` has no secret-key field to begin with — only a
-        // `PublicKey` — so there is nothing here for a leak to expose; the
-        // type makes "safe to paste or read aloud" true by construction,
-        // not by convention.
+        // `EnrollPayload` has no secret-KEY field — only a `PublicKey` —
+        // so a leak can never expose a private key this way. It STILL
+        // carries `invite_token`, the invite's own bearer secret, echoed
+        // back verbatim (finding 7, final fix wave): the enroll code is
+        // exactly as sensitive as the invite code, never "safe to paste
+        // or read aloud" — see the corrected module doc.
+        assert_eq!(decode_enroll(&url).unwrap().invite_token, p.invite_token);
+    }
+
+    /// Finding 3 (final fix wave): `decode_enroll` must refuse a payload
+    /// whose transport key collapses to its signing key — the one
+    /// boundary where the two-key separation invariant (`docs/adr/0033`)
+    /// is actually guarded, since the enroll code is unsigned and travels
+    /// by paste.
+    #[test]
+    fn decode_enroll_refuses_when_transport_key_equals_signing_key() {
+        let mut p = sample_enroll();
+        p.transport_public_key = p.public_key.clone();
+        let url = encode_enroll(&p).unwrap();
+        let err = decode_enroll(&url).unwrap_err();
+        assert!(err.to_string().contains("distinct"), "{err}");
     }
 
     #[test]
@@ -300,7 +389,7 @@ mod tests {
     #[test]
     fn a_wrong_version_is_refused() {
         let mut p = sample_invite();
-        p.v = 2;
+        p.v = PAYLOAD_VERSION + 1;
         let url = encode_invite(&p).unwrap();
         assert!(decode_invite(&url).is_err());
     }
@@ -318,7 +407,7 @@ mod tests {
     #[test]
     fn a_field_beyond_the_bound_is_refused() {
         let mut p = sample_invite();
-        p.channel = "x".repeat(MAX_FIELD_CHARS + 1);
+        p.channels = vec!["x".repeat(MAX_FIELD_CHARS + 1)];
         let url = encode_invite(&p).unwrap();
         assert!(decode_invite(&url).is_err());
     }
@@ -383,5 +472,74 @@ mod tests {
         assert_eq!(url.len(), MAX_CODE_CHARS);
         let err = decode_invite(&url).unwrap_err();
         assert!(!err.to_string().contains("exceeds"));
+    }
+
+    #[test]
+    fn a_v2_invite_round_trips_a_multi_channel_set() {
+        let mut p = sample_invite();
+        p.channels = vec!["one".to_string(), "two".to_string(), "three".to_string()];
+        let url = encode_invite(&p).unwrap();
+        assert!(url.starts_with("junto://invite?code="));
+        assert_eq!(
+            decode_invite(&url).unwrap(),
+            p,
+            "the whole set survives the round trip"
+        );
+    }
+
+    #[test]
+    fn an_empty_channel_set_is_refused() {
+        // An invite that grants nothing is a bug in the caller, not a valid code:
+        // redemption would burn a token and append nothing.
+        let mut p = sample_invite();
+        p.channels = Vec::new();
+        let url = encode_invite(&p).unwrap();
+        let err = decode_invite(&url).unwrap_err().to_string();
+        assert!(err.contains("at least one channel"), "{err}");
+    }
+
+    #[test]
+    fn a_channel_set_beyond_the_cap_is_refused() {
+        let mut p = sample_invite();
+        p.channels = (0..MAX_INVITE_CHANNELS + 1)
+            .map(|i| format!("c{i}"))
+            .collect();
+        let url = encode_invite(&p).unwrap();
+        let err = decode_invite(&url).unwrap_err().to_string();
+        assert!(err.contains(&MAX_INVITE_CHANNELS.to_string()), "{err}");
+    }
+
+    #[test]
+    fn a_channel_set_at_exactly_the_cap_is_not_rejected_for_count() {
+        // Same shape as the over-the-cap case, one element fewer: MUST NOT
+        // be rejected by the count check — pins `>` rather than `>=` in
+        // the cap comparison.
+        let mut p = sample_invite();
+        p.channels = (0..MAX_INVITE_CHANNELS).map(|i| format!("c{i}")).collect();
+        let url = encode_invite(&p).unwrap();
+        assert!(decode_invite(&url).is_ok());
+    }
+
+    #[test]
+    fn a_channel_name_beyond_the_field_bound_is_refused() {
+        // The per-element bound, not the set bound: one absurd element in an
+        // otherwise sane set. A mutation that only checks the Vec length passes
+        // the test above and fails this one.
+        let mut p = sample_invite();
+        p.channels = vec!["fine".to_string(), "x".repeat(MAX_FIELD_CHARS + 1)];
+        let url = encode_invite(&p).unwrap();
+        assert!(decode_invite(&url).is_err());
+    }
+
+    #[test]
+    fn a_v1_invite_is_refused_with_instructions_to_mint_a_new_one() {
+        // Hand-build a v1 body: the struct can no longer express it.
+        let body = r#"{"v":1,"invite_token":"t","member_email":"dan@x.com","channel":"junto-dev","expires_at":0}"#;
+        let url = format!(
+            "junto://invite?code={}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(body)
+        );
+        let err = decode_invite(&url).unwrap_err().to_string();
+        assert!(err.contains("mint a new one"), "{err}");
     }
 }

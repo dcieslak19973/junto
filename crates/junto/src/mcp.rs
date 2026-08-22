@@ -592,7 +592,7 @@ impl JuntoMcp {
         let email = member.email.clone();
         let minted = self
             .host
-            .add_member(&req.channel, &granted_by, member, None)
+            .add_member(&req.channel, &granted_by, member, None, None)
             .await
             .map_err(|err| invalid(err.to_string()))?;
         let code_note = if minted.newly_minted {

@@ -486,12 +486,10 @@ fn classify_auth_failure(view: &ChannelView, email: &str) -> AuthFailure {
     if !view.party.iter().any(|member| member.email == email) {
         return AuthFailure::NotAMember;
     }
-    match view.keyring.get(email) {
-        Some(grants) if !grants.is_empty() && grants.iter().all(|g| g.retired_at.is_some()) => {
-            AuthFailure::Revoked
-        }
-        _ => AuthFailure::Unenrolled,
+    if crate::identity::is_revoked(view, email) {
+        return AuthFailure::Revoked;
     }
+    AuthFailure::Unenrolled
 }
 
 /// Render an [`AuthFailure`] as the text a real human on the other end of
@@ -973,6 +971,7 @@ mod tests {
             &Member::human("Dan", "dan@x.com"),
             Member::human("Dan", "dan@x.com"),
             Some(key_b.public_key()),
+            None,
         )
         .await
         .expect("enroll dan's second device");
@@ -1034,6 +1033,7 @@ mod tests {
             &Member::human("Dan", "dan@x.com"),
             Member::human("Dan", "dan@x.com"),
             Some(key_b.public_key()),
+            None,
         )
         .await
         .expect("enroll dan's second device");
@@ -1149,6 +1149,7 @@ mod tests {
             &founder,
             Member::human("Alice", "alice@example.com"),
             Some(key_a.public_key()),
+            None,
         )
         .await
         .expect("enroll alice's first device");
@@ -1157,6 +1158,7 @@ mod tests {
             &founder,
             Member::human("Alice", "alice@example.com"),
             Some(key_b.public_key()),
+            None,
         )
         .await
         .expect("enroll alice's second device");
@@ -1990,7 +1992,7 @@ mod tests {
                 "invite" => {
                     let channel = std::env::var("JUNTO_E2E_CHANNEL").expect("channel env");
                     let member = std::env::var("JUNTO_E2E_MEMBER").expect("member env");
-                    crate::invite(channel, member)
+                    crate::invite(vec![channel], member)
                         .await
                         .expect("worker: invite");
                 }
@@ -2060,7 +2062,7 @@ mod tests {
         // OBSERVABLE side effect is the ledger append, not its println,
         // so no worker process is needed for this leg.
         crate::add_member(
-            channel.to_string(),
+            None,
             None,
             None,
             Some("human".to_string()),
@@ -2120,6 +2122,7 @@ mod tests {
                 &channel.to_string(),
                 &Member::human("Dan", "dan@x.com"),
                 Member::agent("Worker", "worker@agents.junto"),
+                None,
                 None,
             )
             .await
@@ -2261,6 +2264,7 @@ mod tests {
                 &Member::human("Dan", "dan@x.com"),
                 Member::human("Alice", "alice@example.com"),
                 Some(key_b.public_key()),
+                None,
             )
             .await
             .expect("grant alice's second device");
@@ -2455,6 +2459,7 @@ mod tests {
             &founder,
             Member::human("Alice", "alice@example.com"),
             Some(alice_key.public_key()),
+            None,
         )
         .await
         .expect("grant alice a device");

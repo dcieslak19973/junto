@@ -1491,8 +1491,8 @@ git commit -m "feat(host): channel names need not be unique; recall skips scratc
 ### Task 10: Dogfood it, then write the ADRs
 
 **Files:**
-- Create: `docs/adr/0036-subjects-and-mounts.md`
-- Create: `docs/adr/0037-the-collapse-cheap-channels-and-derived-standing.md`
+- Create: `docs/adr/0037-subjects-and-mounts.md`
+- Create: `docs/adr/0038-the-collapse-cheap-channels-and-derived-standing.md`
 
 - [ ] **Step 1: Dogfood — open a repo-free channel and run a session in it**
 
@@ -1502,11 +1502,11 @@ With the host running (`cargo run -p junto -- serve`), open a channel with no na
 
 Record an assertion in channel `3c38ead9-4907-4646-99b7-23b21933da35` stating what was run and what was observed, with the session id as provenance. If anything failed, record that instead — a dogfood that found a bug is the more valuable entry.
 
-- [ ] **Step 3: Write ADR 0036 — Subjects and Mounts**
+- [ ] **Step 3: Write ADR 0037 — Subjects and Mounts**
 
 Cover: the durable/machine-local split and why paths stay out of the ledger; capabilities computed per executing host rather than recorded; why `SubjectKind` is a closed kernel enum while providers stay behind adapters; and the rule-of-three deferral of `SubjectProvider` until a third kind exists.
 
-- [ ] **Step 4: Write ADR 0037 — the collapse**
+- [ ] **Step 4: Write ADR 0038 — the collapse**
 
 Cover: the human/agent asymmetry that preserves ADR 0014's defence against stray writes while deleting the ceremony; derived channel standing as the filter that makes cheap channels safe; names no longer unique; and the decision that the noun stays `Channel`.
 
@@ -1516,8 +1516,8 @@ Cover: the human/agent asymmetry that preserves ADR 0014's defence against stray
 rtk cargo fmt --check
 rtk cargo clippy --workspace --all-targets -- -D warnings
 rtk cargo test --workspace
-git add docs/adr/0036-subjects-and-mounts.md docs/adr/0037-the-collapse-cheap-channels-and-derived-standing.md
-git commit -m "docs: ADRs 0036/0037 — subjects, mounts, and the collapse"
+git add docs/adr/0037-subjects-and-mounts.md docs/adr/0038-the-collapse-cheap-channels-and-derived-standing.md
+git commit -m "docs: ADRs 0037/0038 — subjects, mounts, and the collapse"
 ```
 
 ---

@@ -14,6 +14,7 @@ mod enroll;
 mod forge;
 mod grader;
 mod host;
+mod identity;
 mod init;
 mod invites;
 mod keys;
@@ -35,7 +36,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use junto_kernel::{
-    ChannelId, ChannelStanding, ChannelView, EntryId, EntryPayload, LedgerEntry, Member, PublicKey,
+    ChannelId, ChannelStanding, EntryId, EntryPayload, LedgerEntry, Member, MemberKind, PublicKey,
     Timestamp,
 };
 use rmcp::transport::streamable_http_server::{
@@ -125,7 +126,11 @@ enum Command {
     /// MemberAdded entry and mint the new member's machine-local code (or,
     /// with --enroll, attach the key an enrolled device already minted for
     /// itself). The granter is the home substrate's git user, who must be
-    /// the channel's founding member.
+    /// the channel's founding member. `--enroll` takes no `--channel`: the
+    /// set of channels redeemed comes from the invite the enrolled device
+    /// answered (device-key-enrollment plan, Task 4's `redeem_enrollment`)
+    /// — one invite may cover several channels (Task 3), and every one it
+    /// still covers is redeemed in one call, reported per channel.
     AddMember {
         /// The new member's email (the stable identity key). Required
         /// unless --enroll is passed, whose payload already carries the
@@ -150,9 +155,13 @@ enum Command {
         /// not be derived from the act of enrolling.
         #[arg(long, required = true)]
         kind: Option<String>,
-        /// Channel name or id.
-        #[arg(long)]
-        channel: String,
+        /// Channel name or id. Required unless `--enroll` is passed: with
+        /// `--enroll`, the channel set comes from the invite the enrolled
+        /// device answered, never a single flag — accepting one here would
+        /// reintroduce exactly the name-vs-id divergence a name-addressed
+        /// enrollment used to risk.
+        #[arg(long, required_unless_present = "enroll", conflicts_with = "enroll")]
+        channel: Option<String>,
         /// The granter's display name. Defaults to the home substrate's git
         /// user — override when the founder's recorded identity differs from
         /// git config (identity is claimed; the terminal is the trust anchor).
@@ -166,36 +175,42 @@ enum Command {
         /// brief carries it — no hand-copying.
         #[arg(long)]
         checkout: Option<PathBuf>,
-        /// Complete an enrollment (device-key-enrollment plan, Task 8): the
-        /// third leg of the three-step exchange. `<url>` is the
+        /// Complete an enrollment (device-key-enrollment plan, Task 4/8):
+        /// the third leg of the three-step exchange. `<url>` is the
         /// `junto://enroll?code=…` URI from `junto enroll`; its embedded
         /// public key becomes the member's key — this machine never mints
-        /// one for them (docs/adr/0033). Requires the invite that produced
-        /// it still be unredeemed and unexpired; conflicts with `email`/
-        /// `--name` — those come from the enroll payload the device
-        /// echoed back, and retyping them here risks silent divergence
-        /// from what was actually enrolled. `--kind` does NOT conflict
-        /// here: the device proves it holds a keypair, never who holds
-        /// it, so the founder still declares human-or-agent, exactly as
-        /// on the keyless path.
-        #[arg(long, conflicts_with_all = ["email", "name"])]
+        /// one for them (docs/adr/0033). Redeems EVERY channel the invite
+        /// that minted it still covers, one outcome printed per channel;
+        /// conflicts with `email`/`--name`/`--channel` — the first two
+        /// come from the enroll payload the device echoed back (retyping
+        /// them here risks silent divergence from what was actually
+        /// enrolled), and the last is meaningless here: the channel set
+        /// comes from the invite store, not a flag. `--kind` does NOT
+        /// conflict here: the device proves it holds a keypair, never who
+        /// holds it, so the founder still declares human-or-agent,
+        /// exactly as on the keyless path.
+        #[arg(long, conflicts_with_all = ["email", "name", "channel"])]
         enroll: Option<String>,
     },
     /// Mint a founder-issued enrollment invite (device-key-enrollment
     /// plan, Task 6): the first leg of the three-step exchange that lets a
-    /// new device join without a private key ever leaving it. Only the
-    /// channel's founding member may issue one — an invite the caller
-    /// cannot themselves complete would send the recipient through the
-    /// whole exchange to fail at `junto add-member`.
+    /// new device join without a private key ever leaving it. One invite
+    /// may cover several channels (Task 3): `--channel` is repeatable, and
+    /// founder authority is required on every one of them before anything
+    /// is minted — an invite the caller cannot themselves complete for
+    /// even one channel would send the recipient through the whole
+    /// exchange to fail at `junto add-member`.
     Invite {
         /// The new member's email — the invite is a grant for exactly this
         /// identity; `junto enroll` reads it back off the invite, never
         /// re-typed by the enrolling device.
         #[arg(long)]
         member: String,
-        /// Channel name or id to invite them into.
-        #[arg(long)]
-        channel: String,
+        /// Channel name or id to invite them into. Repeatable — one
+        /// invite may name several channels, capped at
+        /// `enroll::MAX_INVITE_CHANNELS`.
+        #[arg(long = "channel", required = true, num_args = 1..)]
+        channel: Vec<String>,
     },
     /// Mint this device's own keypair and emit its public half
     /// (device-key-enrollment plan, Task 7): the second leg of the
@@ -377,20 +392,25 @@ async fn main() -> Result<()> {
 /// the host. No code is demanded here: whoever can run commands on this
 /// machine can edit the code store anyway; codes guard the network surfaces.
 ///
-/// With `--enroll`, this completes the three-step exchange
-/// (device-key-enrollment plan, Task 8): the member's email, display name,
-/// and public key come from the validated enroll payload, never re-typed,
-/// and the invite token is burned via `invites::consume` before anything
-/// is recorded — see the ordering comment at the call site below. `kind`
-/// is the one thing the payload cannot supply (the device proves it holds
-/// a keypair, not who holds it), so it is still taken from `--kind`,
-/// exactly as on the keyless path below.
+/// With `--enroll`, this redeems the enrolled device's payload across
+/// EVERY channel its invite still covers (device-key-enrollment plan,
+/// Task 4) via [`redeem_enrollment`] — one outcome line per channel,
+/// never a single email/name/channel triple. `--kind` is still the one
+/// thing the payload cannot supply (the device proves it holds a
+/// keypair, not who holds it), so it is still taken from `--kind`,
+/// exactly as on the keyless path below. `--author-name`/`--author-email`
+/// apply on BOTH paths (review round 2): built once, up front, and
+/// threaded into `redeem_enrollment` as an explicit override so a
+/// founder whose git config does not name the granting identity can
+/// still complete an enrollment — `None` falls back to this machine's
+/// git identity in each channel's own home substrate, exactly
+/// `Host::add_member`'s own keyless-path default.
 // Every parameter is a distinct clap flag on `Command::AddMember`; a struct
 // would just be `Command::AddMember`'s own fields duplicated one call site
 // away — no clarity gained.
 #[allow(clippy::too_many_arguments)]
 async fn add_member(
-    channel: String,
+    channel: Option<String>,
     email: Option<String>,
     name: Option<String>,
     kind: Option<String>,
@@ -400,108 +420,81 @@ async fn add_member(
     enroll_url: Option<String>,
 ) -> Result<()> {
     let host = host::Host::from_registry(host::junto_home()?);
-    // Resolve once, up front, to the CANONICAL id — not whatever the caller
-    // typed. `--enroll`'s `invites::consume` compares the channel string
-    // exactly against what `junto invite` stored (invites.rs:184), and
-    // `--channel` here is a SEPARATE invocation from `junto invite`'s that
-    // may be a human-typed name: passing it through raw would return a
-    // confidently-wrong `WrongChannel` for the exact channel the invite was
-    // issued for. Also yields `ledger`, so the revocation-cutoff check
-    // below can project the pre-enrollment view without a second
-    // resolve.
-    let (substrate, ledger, id) = resolve_channel(&host, &channel).await?;
-
-    // Whether this member's key came from `--enroll` — once true, the
-    // invite token below is already burned, so every failure from here on
-    // must say so (see `spent_token_context`).
-    let mut enrolled = false;
-    let (member, key) = match enroll_url {
-        Some(url) => {
-            let payload = enroll::decode_enroll(&url).map_err(|err| {
-                if err.to_string().contains("expired") {
-                    err.context(
-                        "enroll codes are short-lived (about 10 minutes); ask them to run \
-                         `junto enroll` again against a fresh invite",
-                    )
-                } else {
-                    err
-                }
-            })?;
-            // Burn the invite token BEFORE recording the member: this fails
-            // closed. A transient append failure after a successful consume
-            // costs the founder one `junto invite` re-run; appending first
-            // and burning the token after would instead leave a live,
-            // replayable token behind an already-recorded member.
-            let consumed = invites::consume(
-                &host::junto_home()?,
-                &payload.invite_token,
-                &payload.email,
-                &id.to_string(),
-            )?;
-            if let Some(err) = consumed_error(consumed, &payload.email, &channel) {
-                return Err(err);
-            }
-            enrolled = true;
-            // The device proved it holds a keypair; it did not prove who
-            // holds it. `--kind` is required here too (see the field doc
-            // on `Command::AddMember::kind`), so the founder — the trust
-            // anchor for who is admitted (docs/adr/0017) — still declares
-            // whether this identity is a human or an agent. Only email,
-            // display name, and key come from the payload, exactly as
-            // before: those the enrolling device genuinely knows better
-            // than a retyped flag could.
-            let kind = kind.expect("clap requires --kind on every add-member invocation");
-            let member = match kind.as_str() {
-                "human" => Member::human(&payload.display_name, &payload.email),
-                "agent" => Member::agent(&payload.display_name, &payload.email),
-                other => bail!("--kind must be 'human' or 'agent', not '{other}'"),
-            };
-            (member, Some(payload.public_key.clone()))
-        }
-        None => {
-            let email = email.expect("clap requires email unless --enroll is passed");
-            let name = name.expect("clap requires --name unless --enroll is passed");
-            let kind = kind.expect("clap requires --kind on every add-member invocation");
-            let member = match kind.as_str() {
-                "human" => Member::human(&name, &email),
-                "agent" => Member::agent(&name, &email),
-                other => bail!("--kind must be 'human' or 'agent', not '{other}'"),
-            };
-            (member, None)
-        }
+    let kind = kind.expect("clap requires --kind on every add-member invocation");
+    let member_kind = match kind.as_str() {
+        "human" => MemberKind::Human,
+        "agent" => MemberKind::Agent,
+        other => bail!("--kind must be 'human' or 'agent', not '{other}'"),
     };
-    let email = member.email.clone();
-    // Finding 2, part 3 (final fix wave): re-enrolling a member who
-    // currently has a revocation cutoff silently restores it — say so.
-    // Advisory only, gated to `--enroll` (the real re-enrollment path);
-    // never refuses, since re-admission is legitimate (docs/adr/0035).
-    if enrolled {
-        let view = spent_token_context(
-            ledger
-                .lock()
-                .await
-                .project(&id)
-                .await
-                .map_err(anyhow::Error::from),
-            enrolled,
-        )?;
-        if let Some(warning) = revocation_cutoff_warning(&view, &email, &channel) {
-            println!("{warning}");
+    let author_override = match (author_name, author_email) {
+        (Some(name), Some(email)) => Some(Member::human(name, email)),
+        (None, None) => None,
+        _ => bail!("pass both --author-name and --author-email, or neither"),
+    };
+
+    if let Some(url) = enroll_url {
+        let payload = enroll::decode_enroll(&url).map_err(|err| {
+            if err.to_string().contains("expired") {
+                err.context(
+                    "enroll codes are short-lived (about 10 minutes); ask them to run \
+                     `junto enroll` again against a fresh invite",
+                )
+            } else {
+                err
+            }
+        })?;
+        // Snapshot BEFORE the run: `redeem_enrollment` returns no `Minted`
+        // (its return type is the fixed `(host, payload, kind, granted_by)
+        // -> Vec<(String, RedeemOutcome)>` contract), so whether the code
+        // is newly minted is read back from its own existence now vs.
+        // after — the code itself is a per-identity-per-machine artifact
+        // (`docs/adr/0017`), unaffected by which channel(s) granted.
+        let had_code_before = member_code_for(&payload.email)?.is_some();
+        let outcomes = redeem_enrollment(&host, &payload, member_kind, author_override).await?;
+        let mut granted_any = false;
+        for (channel, outcome) in &outcomes {
+            println!("{}", redeem_line(channel, outcome));
+            if matches!(outcome, RedeemOutcome::Granted { .. }) {
+                granted_any = true;
+            }
         }
+        if !granted_any {
+            bail!("no channel was granted membership — see the outcomes above for why");
+        }
+        if let Some(code) = member_code_for(&payload.email)? {
+            if let Some(checkout) = checkout {
+                let checkout = dunce::canonicalize(&checkout)
+                    .with_context(|| format!("checkout {} not found", checkout.display()))?;
+                binding::write_local_member_code(&checkout, &code)?;
+                println!(
+                    "wrote their code relay into {} ({} — gitignored; the session brief \
+                     carries it)",
+                    checkout.display(),
+                    binding::LOCAL_BINDING
+                );
+            } else {
+                println!("{}", member_code_line(&code, !had_code_before));
+            }
+        }
+        return Ok(());
     }
 
-    let granted_by = match (author_name, author_email) {
-        (Some(name), Some(email)) => Ok(Member::human(name, email)),
-        (None, None) => host::git_user(&substrate),
-        _ => Err(anyhow!(
-            "pass both --author-name and --author-email, or neither"
-        )),
+    let channel = channel.expect("clap requires --channel unless --enroll is passed");
+    let (substrate, _ledger, _id) = resolve_channel(&host, &channel).await?;
+    let email = email.expect("clap requires email unless --enroll is passed");
+    let name = name.expect("clap requires --name unless --enroll is passed");
+    let member = match member_kind {
+        MemberKind::Human => Member::human(&name, &email),
+        MemberKind::Agent => Member::agent(&name, &email),
     };
-    let granted_by = spent_token_context(granted_by, enrolled)?;
-    let minted = spent_token_context(
-        host.add_member(&channel, &granted_by, member, key).await,
-        enrolled,
-    )?;
+
+    let granted_by = match author_override {
+        Some(member) => member,
+        None => host::git_user(&substrate)?,
+    };
+    let minted = host
+        .add_member(&channel, &granted_by, member, None, None)
+        .await?;
     println!("added {email} to channel '{channel}'");
     if let Some(checkout) = checkout {
         let checkout = dunce::canonicalize(&checkout)
@@ -512,17 +505,293 @@ async fn add_member(
             checkout.display(),
             binding::LOCAL_BINDING
         );
-    } else if minted.newly_minted {
-        println!(
-            "their member code is {} — hand it to them once (for an agent: pass --checkout \
-             <dir> to write it into that checkout's {} so the session brief carries it)",
-            minted.code,
-            binding::LOCAL_BINDING
-        );
     } else {
-        println!("they already had a member code on this machine; it still applies");
+        println!("{}", member_code_line(&minted.code, minted.newly_minted));
     }
     Ok(())
+}
+
+/// The line `add_member` prints for a member's machine-local code once a
+/// grant lands — `--checkout` bypasses this entirely (it writes the code
+/// into the checkout instead and prints its own line) — split out so the
+/// newly-minted-vs-already-had distinction (review round 2, restored
+/// after the multi-channel `--enroll` path briefly lost it) is testable
+/// without capturing stdout, which this crate carries no dependency for
+/// (see `git_repo`'s own test-module doc).
+fn member_code_line(code: &str, newly_minted: bool) -> String {
+    if newly_minted {
+        format!(
+            "their member code is {code} — hand it to them once (for an agent: pass --checkout \
+             <dir> to write it into that checkout's {} so the session brief carries it)",
+            binding::LOCAL_BINDING
+        )
+    } else {
+        "they already had a member code on this machine; it still applies".to_string()
+    }
+}
+
+/// One channel's result from [`redeem_enrollment`] (device-key-enrollment
+/// plan, Task 4): the shared vocabulary [`redeem_line`] renders for the
+/// CLI, and the HTTP redemption endpoint (a later task) will render for
+/// its own response body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RedeemOutcome {
+    /// The channel's `MemberAdded` was appended. `warning` carries
+    /// [`identity::revocation_cutoff_warning`]'s text when re-admitting
+    /// this email drops an existing revocation cutoff (finding 5, final
+    /// fix wave) — `None` on every ordinary grant. Data, not a
+    /// `println!`, so both the CLI (`redeem_line`) and the HTTP endpoint
+    /// (`RedeemOutcomeDto`, `web.rs`) can surface it; the HTTP path has
+    /// no host log a founder could read a bare `println!` from.
+    Granted { warning: Option<String> },
+    /// The email was already on the channel's roster with an ACTIVE grant
+    /// for the payload's own key — exactly `Host::add_member`'s own
+    /// no-op condition (`host.rs`, `add_member`, the party/keyring check),
+    /// detected before the call so it is reported, never hidden behind a
+    /// `Granted` that did not actually append anything.
+    AlreadyAMember,
+    /// `invites::consume` reported `AlreadyUsed` for this channel: a
+    /// duplicate covered-channel record for the same token whose earlier
+    /// twin was already consumed.
+    InviteAlreadyUsed,
+    /// The caller is not this channel's founding member. Refused WITHOUT
+    /// consuming — the invite record stays live for a retry.
+    NotFounder,
+    /// Anything else: a `consume` outcome besides `Ok`/`AlreadyUsed`
+    /// (`Unknown`, `Expired`, `WrongMember`, `WrongChannel`), or
+    /// `Host::add_member` itself erroring after a successful `consume`.
+    Failed(String),
+}
+
+/// One printed line per channel [`redeem_enrollment`] attempted — every
+/// variant reads distinctly, so a mixed run's output never leaves the
+/// human guessing which lines are the good news. `Granted`'s cutoff
+/// warning, when present, prints as its own indented follow-up line
+/// (finding 5, final fix wave) — never silently dropped on the CLI path.
+fn redeem_line(channel: &str, outcome: &RedeemOutcome) -> String {
+    match outcome {
+        RedeemOutcome::Granted { warning: None } => format!("{channel}: granted"),
+        RedeemOutcome::Granted {
+            warning: Some(warning),
+        } => format!("{channel}: granted\n  {warning}"),
+        RedeemOutcome::AlreadyAMember => {
+            format!("{channel}: already a member with this key — nothing to grant")
+        }
+        RedeemOutcome::InviteAlreadyUsed => {
+            format!("{channel}: invite already used for this channel")
+        }
+        RedeemOutcome::NotFounder => format!("{channel}: refused — not this channel's founder"),
+        RedeemOutcome::Failed(reason) => format!("{channel}: failed — {reason}"),
+    }
+}
+
+/// Sentinel marking [`redeem_enrollment`]'s one legitimate refusal — the
+/// presented invite token covers no channel this machine can redeem
+/// (device-key-enrollment plan, Task 4/9). A typed marker, not a string
+/// comparison: `web.rs`'s `/members` endpoint downcasts for this
+/// (`err.downcast_ref::<InviteExhausted>()`) to tell this ONE 409 apart
+/// from every other `Err` (a genuine failure, e.g. an unreadable invite
+/// store, mapped to 500) — a string match on this struct's `Display`
+/// text would silently drift out of sync the moment a `.context(..)`
+/// landed on the `?` sites above this `bail!`, or a second `bail!` reused
+/// the same wording deeper in the engine. `/devices/preview` (`web.rs`,
+/// Task 9) shares the identical wording by displaying this same type,
+/// never a duplicated literal.
+#[derive(Debug)]
+pub(crate) struct InviteExhausted;
+
+impl std::fmt::Display for InviteExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "this enroll code's invite token matches nothing this machine can redeem: it was \
+             never issued here, or every channel it covered has already redeemed; ask the \
+             founder to run `junto invite` again if you still need access",
+        )
+    }
+}
+
+impl std::error::Error for InviteExhausted {}
+
+/// Redeem `payload`'s invite across every channel it still covers
+/// (device-key-enrollment plan, Task 4): the engine `add_member`'s
+/// `--enroll` path calls, and the HTTP redemption endpoint (a later
+/// task) will call too — passing `granted_by: None` there, since that
+/// surface has no CLI flags to build an override from. The channel set
+/// comes from `invites::channels_for` — an empty set is an error naming
+/// both possible causes, since that one read cannot distinguish them: a
+/// token this machine never issued, and a token every one of whose
+/// channels has already been redeemed, both read back as "nothing left
+/// to cover".
+///
+/// `granted_by`: `Some(member)` uses that identity as the granter on
+/// EVERY redeemed channel (review round 2 — `--author-name`/
+/// `--author-email` on the CLI); `None` falls back to
+/// `host::git_user(&substrate)` per channel, exactly `Host::add_member`'s
+/// own keyless-path default.
+///
+/// Never `bail!`s mid-set: every channel in the covered set gets an
+/// outcome, in `channels_for`'s order — a partial run's caller still
+/// sees the whole picture, and can decide (as `add_member` does) whether
+/// the run as a whole succeeded. See [`redeem_one_channel`] for the
+/// per-channel ordering.
+pub(crate) async fn redeem_enrollment(
+    host: &host::Host,
+    payload: &enroll::EnrollPayload,
+    kind: MemberKind,
+    granted_by: Option<Member>,
+) -> Result<Vec<(String, RedeemOutcome)>> {
+    let junto_home = host::junto_home()?;
+    let channels = invites::channels_for(&junto_home, &payload.invite_token, &payload.email)?;
+    if channels.is_empty() {
+        bail!(InviteExhausted);
+    }
+
+    let member = match kind {
+        MemberKind::Human => Member::human(&payload.display_name, &payload.email),
+        MemberKind::Agent => Member::agent(&payload.display_name, &payload.email),
+    };
+
+    let mut outcomes = Vec::with_capacity(channels.len());
+    for channel in channels {
+        let outcome = redeem_one_channel(
+            host,
+            &junto_home,
+            payload,
+            &member,
+            &channel,
+            granted_by.as_ref(),
+        )
+        .await;
+        outcomes.push((channel, outcome));
+    }
+    Ok(outcomes)
+}
+
+/// One channel of [`redeem_enrollment`]'s set, in the required order:
+/// resolve to the canonical id, project, check founder authority, decide
+/// `AlreadyAMember`, `consume` for that id, then `Host::add_member`.
+///
+/// `AlreadyAMember` is decided BEFORE `consume` (review round 2, finding
+/// 4: burn only what appends) — like `NotFounder`, it never touches the
+/// invite record, so a channel that needed no append stays retryable
+/// (harmless: re-pasting the same code just reports `AlreadyAMember`
+/// again). Every OTHER outcome consumes: `consume` immediately precedes
+/// `Host::add_member`, so a downstream append failure still burns that
+/// channel's record (fails closed, matching the single-channel path's
+/// original ordering, `spent_token_context`'s doc comment) — only that
+/// channel's token is spent; every other channel's stays untouched.
+///
+/// Projects with `project_fresh`, not the cached `project` (finding 6,
+/// final fix wave): this decides founder authority and `AlreadyAMember`
+/// off the SAME fold every other authorization-critical reader in this
+/// codebase re-folds fresh for exactly this reason — a `revoke-member`/
+/// `retire-device` run in a separate process must be visible to the very
+/// next redemption, not hidden behind this process's cached projection.
+async fn redeem_one_channel(
+    host: &host::Host,
+    junto_home: &Path,
+    payload: &enroll::EnrollPayload,
+    member: &Member,
+    channel: &str,
+    granted_by_override: Option<&Member>,
+) -> RedeemOutcome {
+    let (substrate, ledger, id) = match resolve_channel(host, channel).await {
+        Ok(resolved) => resolved,
+        Err(err) => return RedeemOutcome::Failed(format!("{err:#}")),
+    };
+    let view = match ledger.lock().await.project_fresh(&id).await {
+        Ok(view) => view,
+        Err(err) => return RedeemOutcome::Failed(format!("{err:#}")),
+    };
+    let granted_by = match granted_by_override {
+        Some(member) => member.clone(),
+        None => match host::git_user(&substrate) {
+            Ok(member) => member,
+            Err(err) => return RedeemOutcome::Failed(format!("{err:#}")),
+        },
+    };
+    if view.party.is_empty() {
+        return RedeemOutcome::Failed(format!(
+            "channel '{channel}' has no genesis, so it has no founding member to grant \
+             membership"
+        ));
+    }
+    // The shared predicate (finding 4, final fix wave), never a
+    // hand-rewritten `founder.email != granted_by.email` comparison —
+    // `identity::require_founder`'s own `Result` is not used here: its
+    // `?`/bail idiom would stop the WHOLE redemption on the first
+    // non-founder channel, but every channel in the covered set must get
+    // its own outcome (this function's own doc comment, "never bails
+    // mid-set").
+    if !identity::is_founder(&view, &granted_by.email) {
+        return RedeemOutcome::NotFounder;
+    }
+
+    // Exactly `Host::add_member`'s own no-op condition (host.rs,
+    // `add_member`'s party/keyring check): the email is already on the
+    // roster AND that exact key already has an ACTIVE grant. Decided on
+    // THIS view, before `consume` runs — a *retired* grant for the same
+    // key does not count (re-admitting a revoked member must still
+    // append), matching `Host::add_member`'s own rule exactly.
+    let already_a_member = view.party.iter().any(|m| m.email == member.email)
+        && view.keyring.get(&member.email).is_some_and(|grants| {
+            grants
+                .iter()
+                .any(|grant| grant.key == payload.public_key && grant.retired_at.is_none())
+        });
+    if already_a_member {
+        return RedeemOutcome::AlreadyAMember;
+    }
+
+    // Burn the invite record BEFORE recording the member: this fails
+    // closed, exactly as the single-channel path always did.
+    let consumed =
+        match invites::consume(junto_home, &payload.invite_token, &payload.email, channel) {
+            Ok(consumed) => consumed,
+            Err(err) => return RedeemOutcome::Failed(format!("{err:#}")),
+        };
+    match consumed {
+        invites::Consumed::Ok => {}
+        invites::Consumed::AlreadyUsed => return RedeemOutcome::InviteAlreadyUsed,
+        other => {
+            let err = consumed_error(other, &payload.email, channel)
+                .expect("every non-Ok Consumed besides AlreadyUsed maps to an error");
+            return RedeemOutcome::Failed(format!("{err:#}"));
+        }
+    }
+
+    // Finding 2, part 3 (final fix wave): re-enrolling a member who
+    // currently has a revocation cutoff silently restores it — say so.
+    // Carried as DATA on the `Granted` outcome now, not a `println!`
+    // (finding 5, final fix wave): a `println!` never reaches the HTTP
+    // path, which has no host log for a founder to read, so both
+    // surfaces now render whatever this holds from the SAME value.
+    let warning = identity::revocation_cutoff_warning(&view, &member.email, channel);
+
+    // `{err:#}` (anyhow's alternate Debug), not `{err}`/`.to_string()`
+    // (review round 3, finding 1): `Display` renders only the outermost
+    // context — here `spent_token_context`'s "already burned" wrapper —
+    // and discards the actual cause (a substrate write failure, a
+    // signing failure, an unexpected refusal). The single-channel path
+    // this replaced returned the `Error` to `main`, which prints the
+    // full `Caused by` chain via `{:?}`; folding it into one `String`
+    // must not lose what that chain carried, especially for the HTTP
+    // endpoint, where this string is the client's only diagnostic.
+    let appended = spent_token_context(
+        host.add_member(
+            channel,
+            &granted_by,
+            member.clone(),
+            Some(payload.public_key.clone()),
+            Some(payload.transport_public_key.clone()),
+        )
+        .await,
+        true,
+    );
+    match appended {
+        Ok(_) => RedeemOutcome::Granted { warning },
+        Err(err) => RedeemOutcome::Failed(format!("{err:#}")),
+    }
 }
 
 /// Note, on `result`'s error, that `--enroll`'s invite token is already
@@ -591,45 +860,48 @@ fn member_code_for(email: &str) -> Result<Option<String>> {
         .map(|record| record.code))
 }
 
-/// `junto invite` — mint a founder-issued enrollment invite
-/// (device-key-enrollment plan, Task 6). Refuses if the channel does not
-/// exist, or if the caller (this machine's git user) is not the channel's
-/// founding member (`view.party.first()`) — an invite the caller cannot
-/// themselves complete is worse than an error.
+/// Everything `junto invite` produces before it prints anything: the
+/// payload to encode into the shareable URI, and the display labels —
+/// the spellings the founder actually typed, first-seen order, deduped
+/// by canonical id — for the line `invite_line` prints. Split out of
+/// `invite` so tests can inspect the minted token and payload directly,
+/// without capturing `invite`'s `println!` (this crate has, and may add,
+/// no stdout-capture dependency).
+#[derive(Debug)]
+struct MintedInvite {
+    payload: enroll::InvitePayload,
+    display_channels: Vec<String>,
+}
+
+/// One invite may cover several channels (Task 3): every one is resolved
+/// to its canonical id and checked with `require_founder` BEFORE a token
+/// is minted or anything is written — an invite the caller cannot
+/// complete for even one channel is refused whole, nothing issued,
+/// nothing minted. Two spellings that address the same channel (a name
+/// and its id, or two aliases) collapse to a single record, kept under
+/// the FIRST spelling the founder typed — `invite_line` must show what a
+/// human actually typed, never the raw canonical id underneath. Refuses
+/// more than `enroll::MAX_INVITE_CHANNELS` channels here too, rather than
+/// minting a code `decode_invite` would only reject later.
 ///
 /// Prunes `invites.toml` first (final fix wave, finding 1): every call
-/// appends a new record, so without this the file would grow without
+/// appends new records, so without this the file would grow without
 /// bound (`invites::prune`'s own doc comment) — `invite` is the one
 /// command guaranteed to run whenever a human is actively using this
 /// mechanism, so it is the natural place to reclaim long-expired ones.
-async fn invite(channel: String, member: String) -> Result<()> {
+async fn mint_invite(channels: Vec<String>, member: String) -> Result<MintedInvite> {
     invites::prune(&host::junto_home()?)?;
-    let host = host::Host::from_registry(host::junto_home()?);
-    let (substrate, ledger, id) = match host.resolve(&channel).await? {
-        host::Resolution::Resolved {
-            substrate,
-            ledger,
-            id,
-        } => (substrate, ledger, id),
-        host::Resolution::NotFound => {
-            bail!("no channel '{channel}' in any registered substrate")
-        }
-    };
-    let view = ledger.lock().await.project(&id).await?;
-    let Some(founder) = view.party.first() else {
-        bail!(
-            "channel '{channel}' has no genesis, so it has no founding member to issue \
-             invites (membership is not enforced on pre-genesis channels)"
-        );
-    };
-    let caller = host::git_user(&substrate)?;
-    if founder.email != caller.email {
-        bail!(
-            "only the founding member ({} <{}>) can issue invites for '{channel}' \
-             (docs/adr/0017)",
-            founder.display_name,
-            founder.email
-        );
+    // Finding 9c (final fix wave): validated up front, before any channel
+    // is resolved or founder-checked — matches `web.rs::mint_invite`'s
+    // order, and a blank/oversized member is refused before any of that
+    // work runs, not after. `invites::consume` compares the payload's
+    // email to the record's, and `""` matches `""`, so a blank member
+    // would otherwise mint a real, redeemable record for the empty
+    // string (the same reasoning `web.rs::mint_invite`'s own doc comment
+    // already gives for its HTTP twin).
+    let member = member.trim().to_string();
+    if member.is_empty() {
+        bail!("--member is required and must not be blank");
     }
     if member.chars().count() > enroll::MAX_FIELD_CHARS {
         bail!(
@@ -637,56 +909,104 @@ async fn invite(channel: String, member: String) -> Result<()> {
             enroll::MAX_FIELD_CHARS
         );
     }
+    if channels.len() > enroll::MAX_INVITE_CHANNELS {
+        bail!(
+            "an invite may name at most {} channels",
+            enroll::MAX_INVITE_CHANNELS
+        );
+    }
+
+    let host = host::Host::from_registry(host::junto_home()?);
+    // Resolve every channel and prove founder authority on every one
+    // BEFORE minting a token or issuing any record (see doc comment
+    // above) — an invite the caller cannot complete for even one channel
+    // must leave nothing behind.
+    let mut canonical_channels: Vec<String> = Vec::new();
+    let mut display_channels: Vec<String> = Vec::new();
+    for channel in &channels {
+        let (substrate, ledger, id) = resolve_channel(&host, channel).await?;
+        let view = ledger.lock().await.project(&id).await?;
+        let caller = host::git_user(&substrate)?;
+        identity::require_founder(&view, &caller, channel)?;
+        // The invite's channel field carries RESOLVED ids, not whatever
+        // the caller typed (a name or an id): `invites::consume` (Task 8)
+        // compares exactly, so an invite minted with `--channel <name>`
+        // must match an enrollment completed against `--channel <id>` for
+        // the same channel — otherwise the two legs of one exchange land
+        // on different strings and redemption fails with a misleading
+        // `WrongChannel`. Dedupe here, on the canonical id, so two
+        // spellings of one channel never produce two records — keeping
+        // the FIRST spelling as the display label, never the id a human
+        // never typed.
+        let canonical = id.to_string();
+        if !canonical_channels.contains(&canonical) {
+            canonical_channels.push(canonical);
+            display_channels.push(channel.clone());
+        }
+    }
 
     let token = enroll::mint_invite_token();
     let expires_at = Timestamp::now().as_millis() + enroll::MAX_INVITE_TTL_MS;
-    // The invite's channel field carries the RESOLVED id, not whatever the
-    // caller typed (a name or an id): `invites::consume` (Task 8) compares
-    // it exactly, so an invite minted with `--channel <name>` must match an
-    // enrollment completed against `--channel <id>` for the same channel —
-    // otherwise the two legs of one exchange land on different strings and
-    // redemption fails with a misleading `WrongChannel`.
-    let canonical_channel = id.to_string();
-    invites::issue(
-        &host::junto_home()?,
-        &token,
-        &member,
-        &canonical_channel,
-        expires_at,
-    )?;
-    let url = enroll::encode_invite(&enroll::InvitePayload {
-        v: 1,
-        invite_token: token,
-        member_email: member,
-        channel: canonical_channel,
-        expires_at,
-    })?;
-    println!("{}", invite_line(&url, expires_at));
+    for canonical in &canonical_channels {
+        invites::issue(&host::junto_home()?, &token, &member, canonical, expires_at)?;
+    }
+    Ok(MintedInvite {
+        payload: enroll::InvitePayload {
+            v: enroll::PAYLOAD_VERSION,
+            invite_token: token,
+            member_email: member,
+            channels: canonical_channels,
+            expires_at,
+        },
+        display_channels,
+    })
+}
+
+/// `junto invite` — mint a founder-issued enrollment invite
+/// (device-key-enrollment plan, Task 6); see [`mint_invite`] for the
+/// rules. This wrapper only encodes the minted payload into a shareable
+/// URI and prints it.
+async fn invite(channels: Vec<String>, member: String) -> Result<()> {
+    let minted = mint_invite(channels, member).await?;
+    let expires_at = minted.payload.expires_at;
+    let url = enroll::encode_invite(&minted.payload)?;
+    println!(
+        "{}",
+        invite_line(&url, expires_at, &minted.display_channels)
+    );
     Ok(())
 }
 
-/// Format `junto invite`'s output: the shareable URI plus a human-readable
-/// expiry, pinned so this shape is testable without a CLI harness.
-fn invite_line(url: &str, expires_at: i64) -> String {
-    format!("{url}\n(expires {})", render::iso_utc(expires_at))
+/// Format `junto invite`'s output: the shareable URI, every channel it
+/// covers, and a human-readable expiry, pinned so this shape is testable
+/// without a CLI harness.
+fn invite_line(url: &str, expires_at: i64, channels: &[String]) -> String {
+    format!(
+        "{url}\n(covers {})\n(expires {})",
+        channels.join(", "),
+        render::iso_utc(expires_at)
+    )
 }
 
 /// Build the `junto enroll` response payload from a validated invite. The
 /// invite token is echoed back verbatim (proves which grant this answers),
 /// the email comes from the invite itself — never re-typed by the device,
 /// which would defeat `invites::consume`'s `WrongMember` check — and
-/// `public_key` is the freshly minted (or reused) key's public half.
+/// `public_key`/`transport_public_key` are the freshly minted (or reused)
+/// keys' public halves (`docs/adr/0033` two-key separation).
 fn enroll_payload_from_invite(
     invite: &enroll::InvitePayload,
     key: &PublicKey,
+    transport_key: &PublicKey,
     name: &str,
 ) -> enroll::EnrollPayload {
     enroll::EnrollPayload {
-        v: 1,
+        v: enroll::PAYLOAD_VERSION,
         invite_token: invite.invite_token.clone(),
         email: invite.member_email.clone(),
         display_name: name.to_string(),
         public_key: key.clone(),
+        transport_public_key: transport_key.clone(),
         expires_at: invite.expires_at,
     }
 }
@@ -716,8 +1036,27 @@ async fn enroll(invite_url: String, name: Option<String>) -> Result<()> {
                 .display_name
         }
     };
-    let key = keys::signing_key(&host::junto_home()?, &invite.member_email)?;
-    let payload = enroll_payload_from_invite(&invite, &key.public_key(), &display_name);
+    // Finding 9c (final fix wave): bounded before it ever reaches the
+    // payload — an unbounded `--name` would mint a code
+    // `enroll::decode_enroll`'s own `check_field_bounds` could only ever
+    // reject later, on the founder's machine, burning the wasted encode
+    // for nothing (the same bound `mint_invite`'s `--member` already
+    // enforces).
+    if display_name.chars().count() > enroll::MAX_FIELD_CHARS {
+        bail!("--name exceeds the {}-char limit", enroll::MAX_FIELD_CHARS);
+    }
+    // Finding 9a (final fix wave): `enrolled_signing_key`, never
+    // `signing_key` — this mints for whatever email the decoded invite
+    // names, not a locally resolved identity, so it must record
+    // `authored: false` (see that function's doc comment).
+    let key = keys::enrolled_signing_key(&host::junto_home()?, &invite.member_email)?;
+    let transport_key = keys::transport_key(&host::junto_home()?, &invite.member_email)?;
+    let payload = enroll_payload_from_invite(
+        &invite,
+        &key.public_key(),
+        &transport_key.public_key(),
+        &display_name,
+    );
     let url = enroll::encode_enroll(&payload)?;
     println!("{url}");
     println!("this device's private key never leaves this machine — do not copy or share it");
@@ -795,119 +1134,6 @@ async fn resolve_channel(
     }
 }
 
-/// Refuse unless `caller` is `view`'s founding member (device-key-
-/// enrollment plan, Task 9) — revocation, like granting membership
-/// (`invite`, `add-member`), is a founder-only act.
-fn require_founder(view: &ChannelView, caller: &Member, channel: &str) -> Result<()> {
-    let Some(founder) = view.party.first() else {
-        bail!(
-            "channel '{channel}' has no genesis, so it has no founding member to authorize \
-             revocation (membership is not enforced on pre-genesis channels)"
-        );
-    };
-    if founder.email != caller.email {
-        bail!(
-            "only the founding member ({} <{}>) can revoke keys in '{channel}' \
-             (docs/adr/0033)",
-            founder.display_name,
-            founder.email
-        );
-    }
-    Ok(())
-}
-
-/// Every currently active grant for `email` — the set `revoke-member` parks
-/// in one act (device-key-enrollment plan, Task 9). Already-retired grants
-/// are skipped: parking one again would append a `Park` that
-/// [`junto_kernel::KeyGrant`]'s earliest-wins fold (Task 2) makes a no-op,
-/// reporting a success that changed nothing.
-fn grants_to_park(view: &ChannelView, email: &str) -> Vec<EntryId> {
-    view.keyring
-        .get(email)
-        .into_iter()
-        .flatten()
-        .filter(|grant| grant.retired_at.is_none())
-        .map(|grant| grant.granted_by)
-        .collect()
-}
-
-/// The warning `add-member --enroll` prints when `email` currently holds a
-/// revocation cutoff (finding 2, final fix wave): at least one grant and
-/// every one of them retired — the exact condition
-/// [`junto_kernel::ChannelView::unrecognized`]'s cutoff fold requires
-/// (`crates/junto-kernel/src/ledger.rs`'s `project_unrecognized`). `None`
-/// when there is no cutoff to disturb: no grant at all, or at least one
-/// still active.
-///
-/// Re-enrolling such a member is legitimate — `Host::add_member`
-/// deliberately re-grants a previously retired key — but the fresh grant
-/// it appends is unconditionally active, so it drops the cutoff and
-/// restores every entry `email` wrote after it back to recognized
-/// (standings, gate approvals, session and lineage folds included),
-/// silently unless this warns (`docs/adr/0035`'s "Re-admitting a revoked
-/// member" consequence). This only detects and names the condition; it
-/// never refuses — re-admission must still go through.
-fn revocation_cutoff_warning(view: &ChannelView, email: &str, channel: &str) -> Option<String> {
-    let grants = view.keyring.get(email)?;
-    if grants.is_empty() || grants.iter().any(|grant| grant.retired_at.is_none()) {
-        return None;
-    }
-    Some(format!(
-        "warning: {email} currently has a revocation cutoff in channel '{channel}' (every \
-         grant they hold is retired) — re-enrolling them grants a fresh ACTIVE key, which \
-         restores every entry they wrote after that cutoff (standings, gate approvals, \
-         session and lineage folds) back to recognized"
-    ))
-}
-
-/// A stable, 16-hex-char fingerprint for `key` (device-key-enrollment plan,
-/// Task 9) — safe to print on a shared terminal, unlike the full
-/// `ed25519:<64 hex>` public key. The 16 hex characters *after* the
-/// prefix, not the prefix itself, so two distinct keys never collide on
-/// the printed prefix.
-fn fingerprint(key: &PublicKey) -> String {
-    key.as_str()
-        .strip_prefix("ed25519:")
-        .unwrap_or(key.as_str())
-        .chars()
-        .take(16)
-        .collect()
-}
-
-/// The formatted lines `junto keys list` prints, one per grant: member,
-/// fingerprint (never the full public key), the granting entry id
-/// (`retire-device`'s `--grant` handle), and `active` or its retirement
-/// timestamp (device-key-enrollment plan, Task 9). Pure and sorted by
-/// email so it is testable without capturing stdout — `keys_list` prints
-/// exactly what this returns.
-fn keys_list_lines(view: &ChannelView, member: Option<&str>) -> Vec<String> {
-    let mut emails: Vec<&String> = match member {
-        Some(email) => view
-            .keyring
-            .keys()
-            .filter(|e| e.as_str() == email)
-            .collect(),
-        None => view.keyring.keys().collect(),
-    };
-    emails.sort();
-
-    let mut lines = Vec::new();
-    for email in emails {
-        for grant in &view.keyring[email] {
-            let status = match grant.retired_at {
-                Some(ts) => format!("retired {}", render::iso_utc(ts.as_millis())),
-                None => "active".to_string(),
-            };
-            lines.push(format!(
-                "{email}  {}  granted_by={}  {status}",
-                fingerprint(&grant.key),
-                grant.granted_by
-            ));
-        }
-    }
-    lines
-}
-
 /// `junto keys list` — print every grant in a channel (device-key-
 /// enrollment plan, Task 9); see [`keys_list_lines`] for the line shape.
 async fn keys_list(channel: String, member: Option<String>) -> Result<()> {
@@ -915,7 +1141,7 @@ async fn keys_list(channel: String, member: Option<String>) -> Result<()> {
     let (_substrate, ledger, id) = resolve_channel(&host, &channel).await?;
     let view = ledger.lock().await.project(&id).await?;
 
-    let lines = keys_list_lines(&view, member.as_deref());
+    let lines = identity::keys_list_lines(&view, member.as_deref());
     if lines.is_empty() {
         match member {
             Some(email) => println!("no key grants for {email} in channel '{channel}'"),
@@ -947,7 +1173,7 @@ async fn revoke_member(channel: String, member: String, rationale: String) -> Re
     let (substrate, ledger, id) = resolve_channel(&host, &channel).await?;
     let view = ledger.lock().await.project(&id).await?;
     let caller = host::git_user(&substrate)?;
-    require_founder(&view, &caller, &channel)?;
+    identity::require_founder(&view, &caller, &channel)?;
     // `require_founder` already proved `caller.email` IS the channel's
     // founder (only the founder passes that check) — so this alone tells
     // `member` apart from every other footgun this file already refuses
@@ -965,7 +1191,7 @@ async fn revoke_member(channel: String, member: String, rationale: String) -> Re
         );
     }
 
-    let targets = grants_to_park(&view, &member);
+    let targets = identity::grants_to_park(&view, &member);
     if targets.is_empty() {
         bail!(
             "{member} has no active key grants in channel '{channel}' — nothing to revoke \
@@ -1014,7 +1240,7 @@ async fn retire_device(channel: String, grant: String, rationale: String) -> Res
     let (substrate, ledger, id) = resolve_channel(&host, &channel).await?;
     let view = ledger.lock().await.project(&id).await?;
     let caller = host::git_user(&substrate)?;
-    require_founder(&view, &caller, &channel)?;
+    identity::require_founder(&view, &caller, &channel)?;
 
     match view
         .keyring
@@ -1030,6 +1256,18 @@ async fn retire_device(channel: String, grant: String, rationale: String) -> Res
             bail!("grant '{grant}' is already retired — parking it again would not change anything")
         }
         Some(_) => {}
+    }
+
+    // Finding 8 (final fix wave): refuse a retire that would leave the
+    // founder with zero active grants — byte-for-byte the cutoff
+    // `revoke-member` already refuses to hand the founder. Ordinary
+    // rotation (retiring one of several devices) is untouched.
+    if identity::retiring_would_strand_founder(&view, target) {
+        bail!(
+            "retiring '{grant}' would leave the founder of '{channel}' with zero active key \
+             grants — enroll the replacement device first (`junto add-member --enroll`), \
+             then retire this grant once the new one is in place"
+        );
     }
 
     let mut entry = LedgerEntry {
@@ -1229,7 +1467,7 @@ mod tests {
         // `iso_utc` to its raw-millis fallback must fail this test too, not
         // just pin "invite_line calls iso_utc".
         let expires_at = 1_700_000_000_000;
-        let line = invite_line(url, expires_at);
+        let line = invite_line(url, expires_at, &["acme".to_string()]);
         assert!(line.contains(url), "line should contain the URI: {line}");
         assert!(
             line.contains("2023-11-14 22:13 UTC"),
@@ -1237,23 +1475,90 @@ mod tests {
         );
     }
 
+    /// The flag is repeatable and the parse keeps order and multiplicity.
+    #[test]
+    fn invite_accepts_repeated_channel_flags() {
+        let cli = Cli::try_parse_from([
+            "junto",
+            "invite",
+            "--member",
+            "dan@x.com",
+            "--channel",
+            "one",
+            "--channel",
+            "two",
+        ])
+        .expect("parses");
+        let Command::Invite { channel, .. } = cli.command else {
+            panic!("expected invite");
+        };
+        assert_eq!(channel, vec!["one".to_string(), "two".to_string()]);
+    }
+
+    /// `--channel` with no value at all is still refused at parse time: an
+    /// invite for zero channels grants nothing.
+    #[test]
+    fn invite_requires_at_least_one_channel() {
+        assert!(Cli::try_parse_from(["junto", "invite", "--member", "dan@x.com"]).is_err());
+    }
+
+    /// The printed line names every channel, so the founder can see what
+    /// they are about to hand over before they paste it.
+    #[test]
+    fn invite_line_names_every_channel_and_the_expiry() {
+        let line = invite_line(
+            "junto://invite?code=abc",
+            1_781_000_000_000,
+            &["alpha".to_string(), "beta".to_string()],
+        );
+        assert!(line.contains("junto://invite?code=abc"), "{line}");
+        assert!(line.contains("alpha") && line.contains("beta"), "{line}");
+        assert!(line.contains("2026"), "{line}");
+    }
+
     #[test]
     fn enroll_payload_carries_the_invites_email_and_token_verbatim() {
         let invite = enroll::InvitePayload {
-            v: 1,
+            v: enroll::PAYLOAD_VERSION,
             invite_token: "tok-abc-123".to_string(),
             member_email: "dan@example.com".to_string(),
-            channel: "junto-dev".to_string(),
+            channels: vec!["junto-dev".to_string()],
             expires_at: 1_700_000_000_000,
         };
         let key = PublicKey::new(format!("ed25519:{}", "a".repeat(64))).unwrap();
-        let payload = enroll_payload_from_invite(&invite, &key, "Dan's Laptop");
-        assert_eq!(payload.v, 1);
+        let transport_key = PublicKey::new(format!("ed25519:{}", "b".repeat(64))).unwrap();
+        let payload = enroll_payload_from_invite(&invite, &key, &transport_key, "Dan's Laptop");
+        assert_eq!(payload.v, enroll::PAYLOAD_VERSION);
         assert_eq!(payload.invite_token, invite.invite_token);
         assert_eq!(payload.email, invite.member_email);
         assert_eq!(payload.public_key, key);
+        assert_eq!(payload.transport_public_key, transport_key);
         assert_eq!(payload.display_name, "Dan's Laptop");
         assert_eq!(payload.expires_at, invite.expires_at);
+    }
+
+    /// Finding 9c (final fix wave): `junto enroll --name` must be
+    /// bounded, exactly like `web.rs::enroll_device`'s own `name` field —
+    /// an unbounded value would mint a code `enroll::decode_enroll`'s own
+    /// `check_field_bounds` could only ever reject later, on the
+    /// founder's machine, after the round trip and a wasted key mint.
+    #[tokio::test]
+    async fn enroll_refuses_an_oversized_name() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (_repo, id) = setup_channel("acme").await;
+        let minted = mint_invite(vec![id.to_string()], "alice@example.com".to_string())
+            .await
+            .unwrap();
+        let url = enroll::encode_invite(&minted.payload).unwrap();
+        let err = enroll(url, Some("x".repeat(enroll::MAX_FIELD_CHARS + 1)))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("--name"), "{err}");
+        assert!(
+            !crate::keys::has_signing_key(&host::junto_home().unwrap(), "alice@example.com")
+                .unwrap(),
+            "no key should be minted for a refused oversized name"
+        );
     }
 
     fn git_repo() -> tempfile::TempDir {
@@ -1298,6 +1603,38 @@ mod tests {
             .await
             .unwrap();
         (repo, opened.id)
+    }
+
+    /// Register a fresh substrate repo and open `name` in it, founded by
+    /// `founder` rather than the repo's own git identity, by appending the
+    /// `ChannelOpened` genesis directly onto a fresh ledger — mirrors
+    /// `grant_key`'s direct-append approach below, since `git_repo()`'s
+    /// identity is fixed for the whole suite and cannot be swapped
+    /// mid-test. Lets a test put a channel's founder at odds with the
+    /// git user `host::git_user` will read back for that repo (device-
+    /// key-enrollment plan, Task 3's all-or-nothing `invite` rule).
+    async fn setup_channel_with_founder(
+        name: &str,
+        founder: Member,
+    ) -> (tempfile::TempDir, ChannelId) {
+        let repo = git_repo();
+        let junto_home = host::junto_home().unwrap();
+        host::register_substrate(&junto_home, repo.path()).unwrap();
+        let fixed = host::Host::fixed(vec![repo.path().to_path_buf()]);
+        let ledger = fixed.ledger_for(repo.path()).await.unwrap();
+        let id = ChannelId::new();
+        let genesis = LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel: id,
+            author: founder,
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::ChannelOpened {
+                name: Some(name.to_string()),
+            },
+        };
+        ledger.lock().await.append(genesis).await.unwrap();
+        (repo, id)
     }
 
     /// `docs/adr/0027`'s hazard, reproduced exactly as `brief` hits it: the
@@ -1488,11 +1825,12 @@ mod tests {
         expires_at: i64,
     ) -> String {
         enroll::encode_enroll(&enroll::EnrollPayload {
-            v: 1,
+            v: enroll::PAYLOAD_VERSION,
             invite_token: token.to_string(),
             email: email.to_string(),
             display_name: display_name.to_string(),
             public_key: key.clone(),
+            transport_public_key: PublicKey::new(format!("ed25519:{}", "9".repeat(64))).unwrap(),
             expires_at,
         })
         .unwrap()
@@ -1587,8 +1925,6 @@ mod tests {
         Cli::try_parse_from([
             "junto",
             "add-member",
-            "--channel",
-            "acme",
             "--enroll",
             "junto://enroll?code=x",
             "--kind",
@@ -1603,14 +1939,9 @@ mod tests {
     /// parse time, on both paths.
     #[test]
     fn add_member_enroll_still_requires_kind() {
-        let Err(err) = Cli::try_parse_from([
-            "junto",
-            "add-member",
-            "--channel",
-            "acme",
-            "--enroll",
-            "junto://enroll?code=x",
-        ]) else {
+        let Err(err) =
+            Cli::try_parse_from(["junto", "add-member", "--enroll", "junto://enroll?code=x"])
+        else {
             panic!("expected a clap parse error");
         };
         assert!(err.to_string().contains("--kind"), "{err}");
@@ -1626,8 +1957,6 @@ mod tests {
             "junto",
             "add-member",
             "alice@example.com",
-            "--channel",
-            "acme",
             "--enroll",
             "junto://enroll?code=x",
             "--kind",
@@ -1640,8 +1969,6 @@ mod tests {
         let Err(err) = Cli::try_parse_from([
             "junto",
             "add-member",
-            "--channel",
-            "acme",
             "--enroll",
             "junto://enroll?code=x",
             "--kind",
@@ -1654,15 +1981,605 @@ mod tests {
         assert!(err.to_string().contains("--name"), "{err}");
     }
 
-    /// Ruling from the task-8 brief: `--channel` on `add-member --enroll` is
-    /// a SEPARATE invocation from `junto invite`'s and may be a human-typed
-    /// name, but `invites::consume` compares the channel string exactly
-    /// against the CANONICAL id `junto invite` stores. `add_member` must
-    /// resolve `--channel` to that same id before calling `consume`, or a
-    /// name-addressed enrollment for a channel the invite really was issued
-    /// for comes back as a confidently-wrong `WrongChannel`.
+    /// `--channel` is now meaningless on the enroll path: the set comes
+    /// from the invite store, and accepting a name here would reintroduce
+    /// exactly the name-vs-id divergence
+    /// `add_member_enroll_uses_the_stores_canonical_channel_id_verbatim`
+    /// was written to prevent.
+    #[test]
+    fn add_member_enroll_refuses_a_channel_flag() {
+        let Err(err) = Cli::try_parse_from([
+            "junto",
+            "add-member",
+            "--enroll",
+            "junto://enroll?code=x",
+            "--kind",
+            "human",
+            "--channel",
+            "junto-dev",
+        ]) else {
+            panic!("--channel conflicts with --enroll");
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    /// The keyless path still requires `--channel`: nothing about this
+    /// task changes it. `email` is POSITIONAL (no `--email` flag exists
+    /// on `Command::AddMember`) — review round 3, finding 3: the
+    /// original body used `--email`, which clap rejects as an unknown
+    /// flag before ever reaching the missing-`--channel` check, so the
+    /// assertion passed for a reason unrelated to `--channel` at all and
+    /// stayed green even if `required_unless_present = "enroll"` were
+    /// removed from the `channel` field entirely.
+    #[test]
+    fn add_member_keyless_still_requires_channel() {
+        let Err(err) = Cli::try_parse_from([
+            "junto",
+            "add-member",
+            "a@b.c",
+            "--name",
+            "A",
+            "--kind",
+            "agent",
+        ]) else {
+            panic!("expected a clap parse error");
+        };
+        assert!(
+            err.kind() == clap::error::ErrorKind::MissingRequiredArgument
+                || err.to_string().contains("--channel"),
+            "{err}"
+        );
+    }
+
+    /// Guards `Host::add_member`'s human-key refusal message (`host.rs`):
+    /// every command it tells the operator to run must actually parse —
+    /// the exact bug that message itself carried until this fix (it named
+    /// a `--channel` flag on the `--enroll` path, which conflicts with
+    /// `--enroll` and always fails to parse). A later edit that breaks
+    /// any of these three commands' flags fails here before it can rot
+    /// the message back into unusable advice (finding 4, review round 1).
+    #[test]
+    fn add_member_refusal_message_commands_all_parse() {
+        Cli::try_parse_from([
+            "junto",
+            "invite",
+            "--member",
+            "alice@example.com",
+            "--channel",
+            "acme",
+        ])
+        .expect("`junto invite --member <email> --channel <channel>` must parse");
+
+        Cli::try_parse_from(["junto", "enroll", "--invite", "junto://invite?code=x"])
+            .expect("`junto enroll --invite <url>` must parse");
+
+        Cli::try_parse_from([
+            "junto",
+            "add-member",
+            "--enroll",
+            "junto://enroll?code=x",
+            "--kind",
+            "human",
+        ])
+        .expect("`junto add-member --enroll <url> --kind human` must parse");
+    }
+
+    #[test]
+    fn redeem_line_reads_differently_for_every_outcome() {
+        let cases = [
+            RedeemOutcome::Granted { warning: None },
+            RedeemOutcome::AlreadyAMember,
+            RedeemOutcome::InviteAlreadyUsed,
+            RedeemOutcome::NotFounder,
+            RedeemOutcome::Failed("append failed".into()),
+        ];
+        let lines: Vec<String> = cases.iter().map(|o| redeem_line("chan", o)).collect();
+        for line in &lines {
+            assert!(line.contains("chan"), "{line}");
+        }
+        let unique: std::collections::HashSet<&String> = lines.iter().collect();
+        assert_eq!(
+            unique.len(),
+            lines.len(),
+            "every outcome must read distinctly: {lines:?}"
+        );
+    }
+
+    /// Finding 5 (final fix wave): a `Granted` outcome's revocation-cutoff
+    /// warning must actually render on the CLI, not be silently dropped —
+    /// pins `redeem_line`'s follow-up line, killing a mutation that
+    /// matches only the `warning: None` arm (or ignores the field
+    /// entirely) and always prints the bare "granted" line.
+    #[test]
+    fn redeem_line_renders_the_granted_outcomes_warning() {
+        let line = redeem_line(
+            "chan",
+            &RedeemOutcome::Granted {
+                warning: Some("re-admission warning".to_string()),
+            },
+        );
+        assert!(line.contains("granted"), "{line}");
+        assert!(line.contains("re-admission warning"), "{line}");
+    }
+
+    /// The core guarantee: a mixed run grants what it can, reports the
+    /// rest, and burns ONLY the channels that actually appended — so the
+    /// same enroll code retries exactly the remainder. `mine-a`/`mine-b`
+    /// are founded by Dan (the git identity every `setup_channel`/
+    /// `setup_channel_with_founder` repo shares) and grant; `theirs` is
+    /// founded by Carol, so Dan cannot complete it — issued directly via
+    /// `invites::issue`, since `junto invite` itself refuses a set the
+    /// caller does not wholly found (Task 3); `already-mine` is founded
+    /// by Dan too, but alice already holds an ACTIVE grant for the
+    /// payload's own key there BEFORE this run, so it must report
+    /// `AlreadyAMember` and — review round 2, finding 4 — must NOT be
+    /// consumed either: `AlreadyAMember` appends nothing, so it stays
+    /// retryable exactly like `NotFounder`.
     #[tokio::test]
-    async fn add_member_enroll_resolves_channel_by_name_before_consuming_the_invite() {
+    async fn redeeming_a_mixed_set_burns_only_what_it_granted() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (_repo_a, id_a) = setup_channel("mine-a").await;
+        let (_repo_b, id_b) = setup_channel("mine-b").await;
+        let (repo_already, id_already) = setup_channel("already-mine").await;
+        let (_repo_c, id_c) =
+            setup_channel_with_founder("theirs", Member::human("Carol", "carol@example.com")).await;
+
+        let key = PublicKey::new(format!("ed25519:{}", "1".repeat(64))).unwrap();
+        let transport_key = PublicKey::new(format!("ed25519:{}", "2".repeat(64))).unwrap();
+
+        // Pre-seed "already-mine" with an ACTIVE grant for the payload's
+        // own key, directly (bypassing `Host::add_member`'s no-op guard —
+        // the same technique `grant_key` exists for).
+        let fixed_already = host::Host::fixed(vec![repo_already.path().to_path_buf()]);
+        let host::Resolution::Resolved {
+            ledger: already_ledger,
+            id: already_resolved_id,
+            ..
+        } = fixed_already
+            .resolve(&id_already.to_string())
+            .await
+            .unwrap()
+        else {
+            panic!("channel resolves");
+        };
+        grant_key(
+            &already_ledger,
+            already_resolved_id,
+            "alice@example.com",
+            &key,
+        )
+        .await;
+
+        let minted = mint_invite(
+            vec![
+                "mine-a".to_string(),
+                "mine-b".to_string(),
+                "already-mine".to_string(),
+            ],
+            "alice@example.com".to_string(),
+        )
+        .await
+        .unwrap();
+        let junto_home = host::junto_home().unwrap();
+        invites::issue(
+            &junto_home,
+            &minted.payload.invite_token,
+            "alice@example.com",
+            &id_c.to_string(),
+            minted.payload.expires_at,
+        )
+        .unwrap();
+
+        let payload = enroll::EnrollPayload {
+            v: enroll::PAYLOAD_VERSION,
+            invite_token: minted.payload.invite_token.clone(),
+            email: "alice@example.com".to_string(),
+            display_name: "Alice".to_string(),
+            public_key: key,
+            transport_public_key: transport_key,
+            expires_at: minted.payload.expires_at,
+        };
+
+        let host = host::Host::from_registry(junto_home.clone());
+        let outcomes = redeem_enrollment(&host, &payload, MemberKind::Human, None)
+            .await
+            .unwrap();
+        let outcome_map: std::collections::HashMap<&str, &RedeemOutcome> = outcomes
+            .iter()
+            .map(|(channel, outcome)| (channel.as_str(), outcome))
+            .collect();
+        assert_eq!(
+            outcome_map.get(id_a.to_string().as_str()),
+            Some(&&RedeemOutcome::Granted { warning: None })
+        );
+        assert_eq!(
+            outcome_map.get(id_b.to_string().as_str()),
+            Some(&&RedeemOutcome::Granted { warning: None })
+        );
+        assert_eq!(
+            outcome_map.get(id_c.to_string().as_str()),
+            Some(&&RedeemOutcome::NotFounder)
+        );
+        assert_eq!(
+            outcome_map.get(id_already.to_string().as_str()),
+            Some(&&RedeemOutcome::AlreadyAMember)
+        );
+
+        let mut remaining =
+            invites::channels_for(&junto_home, &payload.invite_token, &payload.email).unwrap();
+        remaining.sort();
+        let mut expected = vec![id_c.to_string(), id_already.to_string()];
+        expected.sort();
+        assert_eq!(
+            remaining, expected,
+            "only channels that did not append (NotFounder, AlreadyAMember) should remain \
+             retryable — the two that granted must be burned"
+        );
+    }
+
+    /// Task 4 finding 4 (review round 3): `RedeemOutcome::Failed` had no
+    /// coverage through the real engine — `redeem_one_channel` must
+    /// report `Failed` and KEEP GOING on a genuine post-consume
+    /// `Host::add_member` failure, and burn ONLY the channel that was
+    /// actually attempted. `members.toml` pre-created as a DIRECTORY (not
+    /// a file) makes `members::mint`'s final write fail — deterministic,
+    /// cross-platform, and genuinely downstream of a successful ledger
+    /// append (`Host::add_member`'s own tail call, after `guard.append`
+    /// already succeeded) — not a contrived error. Kills: a mutation
+    /// returning `Granted` on an append failure (assertion on
+    /// `mine-fails`'s outcome), one that `?`-propagates out of the loop
+    /// instead of continuing (assertion that `theirs`, issued and
+    /// processed AFTER the failing channel, still gets its own outcome),
+    /// and one that skips burning on a downstream failure or burns a
+    /// channel that was never attempted (the `channels_for` assertion).
+    #[tokio::test]
+    async fn a_failing_channel_reports_failed_and_the_run_keeps_going() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (repo_fails, id_fails) = setup_channel("mine-fails").await;
+        let (repo_theirs, id_theirs) =
+            setup_channel_with_founder("theirs", Member::human("Carol", "carol@example.com")).await;
+        let junto_home = host::junto_home().unwrap();
+
+        let minted = mint_invite(
+            vec!["mine-fails".to_string()],
+            "alice@example.com".to_string(),
+        )
+        .await
+        .unwrap();
+        invites::issue(
+            &junto_home,
+            &minted.payload.invite_token,
+            "alice@example.com",
+            &id_theirs.to_string(),
+            minted.payload.expires_at,
+        )
+        .unwrap();
+
+        let key = PublicKey::new(format!("ed25519:{}", "5".repeat(64))).unwrap();
+        let transport_key = PublicKey::new(format!("ed25519:{}", "6".repeat(64))).unwrap();
+        let payload = enroll::EnrollPayload {
+            v: enroll::PAYLOAD_VERSION,
+            invite_token: minted.payload.invite_token.clone(),
+            email: "alice@example.com".to_string(),
+            display_name: "Alice".to_string(),
+            public_key: key,
+            transport_public_key: transport_key,
+            expires_at: minted.payload.expires_at,
+        };
+
+        // An unwritable member-code store: `members.toml` is a DIRECTORY,
+        // so `members::mint`'s final write — called only AFTER a
+        // successful ledger append — fails.
+        let broken_home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(broken_home.path().join("members.toml")).unwrap();
+        let host = host::Host::fixed_with_member_home(
+            vec![
+                repo_fails.path().to_path_buf(),
+                repo_theirs.path().to_path_buf(),
+            ],
+            Some(broken_home.path().to_path_buf()),
+        );
+
+        let outcomes = redeem_enrollment(&host, &payload, MemberKind::Human, None)
+            .await
+            .unwrap();
+        let outcome_map: std::collections::HashMap<&str, &RedeemOutcome> = outcomes
+            .iter()
+            .map(|(channel, outcome)| (channel.as_str(), outcome))
+            .collect();
+        assert!(
+            matches!(
+                outcome_map.get(id_fails.to_string().as_str()),
+                Some(&&RedeemOutcome::Failed(_))
+            ),
+            "{outcomes:?}"
+        );
+        assert_eq!(
+            outcome_map.get(id_theirs.to_string().as_str()),
+            Some(&&RedeemOutcome::NotFounder),
+            "the run must keep going past the failing channel: {outcomes:?}"
+        );
+
+        let remaining =
+            invites::channels_for(&junto_home, &payload.invite_token, &payload.email).unwrap();
+        assert_eq!(
+            remaining,
+            vec![id_theirs.to_string()],
+            "the failing channel's record must still be burned (fails closed, matching a \
+             Granted channel's own ordering); the un-attempted NotFounder channel must not be"
+        );
+    }
+
+    /// One channel, redeemed twice within the same covered set — the
+    /// shape a duplicate `invites::issue` for the same (token, channel,
+    /// member) triplet produces. The first attempt grants; since
+    /// `AlreadyAMember` is decided BEFORE `consume` (review round 2,
+    /// finding 4), the second attempt sees the just-granted member on
+    /// its own fresh projection and reports `AlreadyAMember` without
+    /// touching its own (still-unconsumed) invite record at all — never
+    /// a silent second grant, and never a burned record for a channel
+    /// that appended nothing.
+    #[tokio::test]
+    async fn redeeming_a_duplicate_covered_channel_reports_already_a_member_not_a_second_grant() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (_repo, id) = setup_channel("acme").await;
+        let junto_home = host::junto_home().unwrap();
+        let token = enroll::mint_invite_token();
+        let expires_at = Timestamp::now().as_millis() + enroll::MAX_INVITE_TTL_MS;
+        invites::issue(
+            &junto_home,
+            &token,
+            "alice@example.com",
+            &id.to_string(),
+            expires_at,
+        )
+        .unwrap();
+        invites::issue(
+            &junto_home,
+            &token,
+            "alice@example.com",
+            &id.to_string(),
+            expires_at,
+        )
+        .unwrap();
+
+        let key = PublicKey::new(format!("ed25519:{}", "7".repeat(64))).unwrap();
+        let transport_key = PublicKey::new(format!("ed25519:{}", "8".repeat(64))).unwrap();
+        let payload = enroll::EnrollPayload {
+            v: enroll::PAYLOAD_VERSION,
+            invite_token: token.clone(),
+            email: "alice@example.com".to_string(),
+            display_name: "Alice".to_string(),
+            public_key: key,
+            transport_public_key: transport_key,
+            expires_at,
+        };
+        let host = host::Host::from_registry(junto_home.clone());
+
+        let outcomes = redeem_enrollment(&host, &payload, MemberKind::Human, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcomes,
+            vec![
+                (id.to_string(), RedeemOutcome::Granted { warning: None }),
+                (id.to_string(), RedeemOutcome::AlreadyAMember),
+            ]
+        );
+
+        let host::Resolution::Resolved {
+            ledger,
+            id: resolved_id,
+            ..
+        } = host.resolve(&id.to_string()).await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+        let view = ledger.lock().await.project(&resolved_id).await.unwrap();
+        let grants = view.keyring.get("alice@example.com").unwrap();
+        assert_eq!(
+            grants.iter().filter(|g| g.retired_at.is_none()).count(),
+            1,
+            "exactly one active grant, not two: {grants:?}"
+        );
+
+        // The second, un-attempted record was never consumed — a
+        // duplicate that resolves to `AlreadyAMember` burns nothing.
+        assert_eq!(
+            invites::channels_for(&junto_home, &token, "alice@example.com").unwrap(),
+            vec![id.to_string()],
+            "the un-consumed duplicate record stays retryable"
+        );
+    }
+
+    /// `consume`'s record lookup finds the FIRST matching (channel,
+    /// member) record regardless of its consumed state (invites.rs's
+    /// `.find()`), while `channels_for` filters consumed records out
+    /// before ever returning a channel string. A stale, already-consumed
+    /// record sharing a (channel, member) pair with a fresh, still-
+    /// covered one is exactly where those two reads can disagree:
+    /// `channels_for` still names the channel once (because of the fresh
+    /// record), but `consume` still lands on the stale one first — this
+    /// pins that `redeem_enrollment` surfaces that as `InviteAlreadyUsed`,
+    /// not a silent success, and is the one remaining way that outcome is
+    /// reachable now that `AlreadyAMember` is decided before `consume`.
+    #[tokio::test]
+    async fn a_stale_consumed_duplicate_record_reports_invite_already_used() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (_repo, id) = setup_channel("acme").await;
+        let junto_home = host::junto_home().unwrap();
+        let token = enroll::mint_invite_token();
+        let expires_at = Timestamp::now().as_millis() + enroll::MAX_INVITE_TTL_MS;
+        invites::issue(
+            &junto_home,
+            &token,
+            "alice@example.com",
+            &id.to_string(),
+            expires_at,
+        )
+        .unwrap();
+        invites::issue(
+            &junto_home,
+            &token,
+            "alice@example.com",
+            &id.to_string(),
+            expires_at,
+        )
+        .unwrap();
+        // The FIRST of the two records is consumed directly — as if an
+        // earlier redemption this run's own `channels_for` read never
+        // sees, because the SECOND record is still live.
+        assert!(matches!(
+            invites::consume(&junto_home, &token, "alice@example.com", &id.to_string()).unwrap(),
+            invites::Consumed::Ok
+        ));
+        assert_eq!(
+            invites::channels_for(&junto_home, &token, "alice@example.com").unwrap(),
+            vec![id.to_string()],
+            "the second record keeps the channel covered"
+        );
+
+        let key = PublicKey::new(format!("ed25519:{}", "3".repeat(64))).unwrap();
+        let transport_key = PublicKey::new(format!("ed25519:{}", "4".repeat(64))).unwrap();
+        let payload = enroll::EnrollPayload {
+            v: enroll::PAYLOAD_VERSION,
+            invite_token: token,
+            email: "alice@example.com".to_string(),
+            display_name: "Alice".to_string(),
+            public_key: key,
+            transport_public_key: transport_key,
+            expires_at,
+        };
+        let host = host::Host::from_registry(junto_home);
+        let outcomes = redeem_enrollment(&host, &payload, MemberKind::Human, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcomes,
+            vec![(id.to_string(), RedeemOutcome::InviteAlreadyUsed)]
+        );
+    }
+
+    /// A token this machine never issued reads back from `channels_for`
+    /// exactly like one that was issued and fully redeemed already — an
+    /// empty covered set either way — so the error must name both
+    /// possible causes rather than confidently guessing one.
+    #[tokio::test]
+    async fn an_enroll_code_with_no_remaining_channels_is_an_error_naming_both_causes() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let junto_home = host::junto_home().unwrap();
+        let host = host::Host::from_registry(junto_home);
+        let key = PublicKey::new(format!("ed25519:{}", "9".repeat(64))).unwrap();
+        let transport_key = PublicKey::new(format!("ed25519:{}", "a".repeat(64))).unwrap();
+        let payload = enroll::EnrollPayload {
+            v: enroll::PAYLOAD_VERSION,
+            invite_token: "z".repeat(43),
+            email: "alice@example.com".to_string(),
+            display_name: "Alice".to_string(),
+            public_key: key,
+            transport_public_key: transport_key,
+            expires_at: Timestamp::now().as_millis() + enroll::MAX_INVITE_TTL_MS,
+        };
+        let err = redeem_enrollment(&host, &payload, MemberKind::Human, None)
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("never issued"), "{text}");
+        assert!(text.contains("already redeemed"), "{text}");
+    }
+
+    /// Review round 2, concern 1: `--author-name`/`--author-email` must
+    /// still work on `--enroll` — without an override, `redeem_enrollment`
+    /// falls back to this machine's git identity per channel, which is
+    /// Dan (`git_repo`'s fixed config) here, not this channel's real
+    /// founder Carol, so the first attempt must fail outright (no channel
+    /// granted). The SAME token still covers the channel afterward
+    /// (`NotFounder` never consumes), so the second attempt, now WITH
+    /// `--author-email carol@example.com`, redeems it.
+    #[tokio::test]
+    async fn add_member_enroll_honors_an_author_override_when_git_config_names_someone_else() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (repo, id) =
+            setup_channel_with_founder("acme", Member::human("Carol", "carol@example.com")).await;
+        let junto_home = host::junto_home().unwrap();
+        let token = enroll::mint_invite_token();
+        let expires_at = Timestamp::now().as_millis() + enroll::MAX_INVITE_TTL_MS;
+        invites::issue(
+            &junto_home,
+            &token,
+            "alice@example.com",
+            &id.to_string(),
+            expires_at,
+        )
+        .unwrap();
+        let key = PublicKey::new(format!("ed25519:{}", "c".repeat(64))).unwrap();
+        let url = build_enroll_url(&token, "alice@example.com", "Alice", &key, expires_at);
+
+        let without_override = add_member(
+            None,
+            None,
+            None,
+            Some("human".to_string()),
+            None,
+            None,
+            None,
+            Some(url.clone()),
+        )
+        .await;
+        assert!(
+            without_override.is_err(),
+            "Dan (this machine's git identity) is not this channel's founder"
+        );
+
+        add_member(
+            None,
+            None,
+            None,
+            Some("human".to_string()),
+            Some("Carol".to_string()),
+            Some("carol@example.com".to_string()),
+            None,
+            Some(url),
+        )
+        .await
+        .unwrap();
+
+        let fixed = host::Host::fixed(vec![repo.path().to_path_buf()]);
+        let host::Resolution::Resolved { ledger, id, .. } =
+            fixed.resolve(&id.to_string()).await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+        let view = ledger.lock().await.project(&id).await.unwrap();
+        assert!(
+            view.party.iter().any(|m| m.email == "alice@example.com"),
+            "the override let Carol grant alice's enrollment"
+        );
+    }
+
+    /// Review round 2, concern 5: `--enroll` briefly lost the newly-
+    /// minted-vs-already-had distinction when the multi-channel engine's
+    /// return type stopped carrying `members::Minted`. Pins that
+    /// `member_code_line` (which both paths now share) still reads
+    /// differently for the two cases.
+    #[test]
+    fn member_code_line_reads_differently_for_newly_minted_vs_already_had() {
+        let newly = member_code_line("ABC123", true);
+        let already = member_code_line("ABC123", false);
+        assert_ne!(newly, already);
+        assert!(newly.contains("ABC123"), "{newly}");
+    }
+
+    /// `--channel` no longer exists on the `--enroll` path (Task 4): the
+    /// channel set comes straight from `invites::channels_for`, which
+    /// already stores the CANONICAL id `junto invite` resolved at issue
+    /// time (invites.rs's own `issue`/`consume` docs) — there is no
+    /// human-typed name left to resolve here. This pins that the store's
+    /// id is used VERBATIM: a token issued against the resolved id
+    /// redeems successfully with no separate `--channel` to reconcile
+    /// against it.
+    #[tokio::test]
+    async fn add_member_enroll_uses_the_stores_canonical_channel_id_verbatim() {
         let _home = crate::host::test_home::HomeGuard::new();
         let (_repo, id) = setup_channel("acme").await;
         let junto_home = host::junto_home().unwrap();
@@ -1683,15 +2600,13 @@ mod tests {
         let key = PublicKey::new(format!("ed25519:{}", "a".repeat(64))).unwrap();
         let url = build_enroll_url(&token, "alice@example.com", "Alice", &key, expires_at);
 
-        // `--channel acme` — the NAME, not the id `invites::issue` above was
-        // keyed against.
         add_member(
-            "acme".to_string(),
+            None,
             None,
             None,
             Some("human".to_string()),
-            Some("Dan".to_string()),
-            Some("dan@example.com".to_string()),
+            None,
+            None,
             None,
             Some(url),
         )
@@ -1718,6 +2633,11 @@ mod tests {
 
     /// `AlreadyUsed` end to end: redeeming the same enroll URL twice must
     /// surface a message telling the human what happened and what to do.
+    /// One channel, once fully redeemed, is gone from `channels_for`
+    /// entirely (Task 4) — so the second attempt hits `redeem_enrollment`'s
+    /// empty-channel-set refusal rather than a per-channel `AlreadyUsed`;
+    /// either way, the message must still say "already" so the operator
+    /// is not left guessing.
     #[tokio::test]
     async fn add_member_enroll_second_use_of_the_same_url_is_refused_as_already_used() {
         let _home = crate::host::test_home::HomeGuard::new();
@@ -1737,12 +2657,12 @@ mod tests {
         let url = build_enroll_url(&token, "alice@example.com", "Alice", &key, expires_at);
 
         add_member(
-            id.to_string(),
+            None,
             None,
             None,
             Some("human".to_string()),
-            Some("Dan".to_string()),
-            Some("dan@example.com".to_string()),
+            None,
+            None,
             None,
             Some(url.clone()),
         )
@@ -1750,12 +2670,12 @@ mod tests {
         .unwrap();
 
         let err = add_member(
-            id.to_string(),
+            None,
             None,
             None,
             Some("human".to_string()),
-            Some("Dan".to_string()),
-            Some("dan@example.com".to_string()),
+            None,
+            None,
             None,
             Some(url),
         )
@@ -1765,14 +2685,19 @@ mod tests {
     }
 
     /// Review finding 3: once `invites::consume` returns `Ok`, the token is
-    /// gone. A downstream failure (here, a bad `--author-*` pairing) must
-    /// say the token is already burned, so the operator does not retry the
-    /// identical URL and land on the `AlreadyUsed` dead end with no idea
-    /// why.
+    /// gone; every failure between there and the recorded `MemberAdded`
+    /// must say so, or the operator retries the identical URL and lands
+    /// on the `AlreadyUsed` dead end with no idea why. Task 4's
+    /// `redeem_enrollment` engine has no per-call author-override slot
+    /// (the HTTP redemption endpoint that reuses it has no CLI flags to
+    /// thread through), so a bad `--author-*` pairing can no longer be
+    /// the trigger — this pins the same "already burned" wrapping
+    /// directly around a `Host::add_member` failure (here, a non-founder
+    /// granter) that happens after a real `consume`.
     #[tokio::test]
     async fn add_member_enroll_failure_after_consume_names_the_spent_token() {
         let _home = crate::host::test_home::HomeGuard::new();
-        let (_repo, id) = setup_channel("acme").await;
+        let (repo, id) = setup_channel("acme").await;
         let junto_home = host::junto_home().unwrap();
         let token = enroll::mint_invite_token();
         let expires_at = Timestamp::now().as_millis() + enroll::MAX_INVITE_TTL_MS;
@@ -1784,23 +2709,24 @@ mod tests {
             expires_at,
         )
         .unwrap();
-        let key = PublicKey::new(format!("ed25519:{}", "d".repeat(64))).unwrap();
-        let url = build_enroll_url(&token, "alice@example.com", "Alice", &key, expires_at);
+        assert!(matches!(
+            invites::consume(&junto_home, &token, "alice@example.com", &id.to_string()).unwrap(),
+            invites::Consumed::Ok
+        ));
 
-        // Only --author-name, no --author-email: fails the "pass both, or
-        // neither" check AFTER consume already burned the token.
-        let err = add_member(
-            id.to_string(),
-            None,
-            None,
-            Some("human".to_string()),
-            Some("Dan".to_string()),
-            None,
-            None,
-            Some(url),
-        )
-        .await
-        .unwrap_err();
+        // A real `Host::add_member` failure — Carol never founded "acme"
+        // — occurring after the token above was genuinely burned.
+        let host = host::Host::fixed(vec![repo.path().to_path_buf()]);
+        let result = host
+            .add_member(
+                &id.to_string(),
+                &Member::human("Carol", "carol@example.com"),
+                Member::human("Alice", "alice@example.com"),
+                None,
+                None,
+            )
+            .await;
+        let err = spent_token_context(result, true).unwrap_err();
         assert!(err.to_string().contains("already burned"), "{err}");
     }
 
@@ -1812,7 +2738,7 @@ mod tests {
         let (_repo, id) = setup_channel("acme").await;
 
         add_member(
-            id.to_string(),
+            Some(id.to_string()),
             Some("worker@agents.junto".to_string()),
             Some("Worker".to_string()),
             Some("agent".to_string()),
@@ -1855,12 +2781,12 @@ mod tests {
         let url = build_enroll_url(&token, "worker@agents.junto", "Worker", &key, expires_at);
 
         add_member(
-            id.to_string(),
+            None,
             None,
             None,
             Some("agent".to_string()),
-            Some("Dan".to_string()),
-            Some("dan@example.com".to_string()),
+            None,
+            None,
             None,
             Some(url),
         )
@@ -1917,12 +2843,12 @@ mod tests {
         let url = build_enroll_url(&token, "alice@example.com", "Alice", &key, expires_at);
 
         add_member(
-            id.to_string(),
+            None,
             None,
             None,
             Some("human".to_string()),
-            Some("Dan".to_string()),
-            Some("dan@example.com".to_string()),
+            None,
+            None,
             None,
             Some(url),
         )
@@ -1965,93 +2891,6 @@ mod tests {
                     .success()
             );
         }
-    }
-
-    /// A minimal `ChannelView` carrying only `keyring` — every other field
-    /// defaulted, since `grants_to_park` reads nothing else.
-    fn channel_view_with_keyring(keyring: junto_kernel::Keyring) -> ChannelView {
-        ChannelView {
-            name: None,
-            entries: Vec::new(),
-            party: Vec::new(),
-            keyring,
-            unrecognized: std::collections::HashSet::new(),
-            unverified: std::collections::HashSet::new(),
-            standings: std::collections::HashMap::new(),
-            gate_status: std::collections::HashMap::new(),
-            gate_executions: std::collections::HashMap::new(),
-            sessions: std::collections::HashMap::new(),
-            closed: false,
-            channel_standing: junto_kernel::ChannelStanding::Scratch,
-            lineage: Vec::new(),
-            subjects: Vec::new(),
-        }
-    }
-
-    /// The only difference between the retired grant and the two active
-    /// ones is `retired_at` — same key, same email, distinct `granted_by`
-    /// ids — so a mutation that drops the filter (returns all three) or
-    /// inverts it (returns only the retired one) fails this exact
-    /// assertion. Two active grants, not one, so a mutation that narrows
-    /// to `.next()`/`.last()` of the filtered iterator (satisfying "active"
-    /// but not "every") also fails it.
-    #[test]
-    fn grants_to_park_returns_every_active_grant_when_the_email_has_a_mix() {
-        use junto_kernel::KeyGrant;
-        let key = PublicKey::new(format!("ed25519:{}", "a".repeat(64))).unwrap();
-        let active_a = EntryId::new();
-        let active_b = EntryId::new();
-        let retired_id = EntryId::new();
-        let mut keyring = junto_kernel::Keyring::new();
-        keyring.insert(
-            "alice@example.com".to_string(),
-            vec![
-                KeyGrant {
-                    key: key.clone(),
-                    granted_by: retired_id,
-                    retired_at: Some(Timestamp::from_millis(10)),
-                },
-                KeyGrant {
-                    key: key.clone(),
-                    granted_by: active_a,
-                    retired_at: None,
-                },
-                KeyGrant {
-                    key,
-                    granted_by: active_b,
-                    retired_at: None,
-                },
-            ],
-        );
-        let view = channel_view_with_keyring(keyring);
-        assert_eq!(
-            grants_to_park(&view, "alice@example.com"),
-            vec![active_a, active_b]
-        );
-    }
-
-    #[test]
-    fn grants_to_park_returns_empty_for_an_email_with_no_grants_at_all() {
-        let view = channel_view_with_keyring(junto_kernel::Keyring::new());
-        assert!(grants_to_park(&view, "nobody@example.com").is_empty());
-    }
-
-    /// Pinned to a literal expected string, not to calling `fingerprint`
-    /// again — proves the 16 chars come from *after* the 8-char
-    /// `ed25519:` prefix, not the prefix itself (which would wrongly read
-    /// `ed25519:01234567`).
-    #[test]
-    fn fingerprint_is_the_16_hex_chars_after_the_prefix_not_the_prefix_itself() {
-        let key =
-            PublicKey::new(format!("ed25519:{}{}", "0123456789abcdef", "0".repeat(48))).unwrap();
-        assert_eq!(fingerprint(&key), "0123456789abcdef");
-    }
-
-    #[test]
-    fn fingerprint_differs_between_distinct_keys() {
-        let key_a = PublicKey::new(format!("ed25519:{}", "1".repeat(64))).unwrap();
-        let key_b = PublicKey::new(format!("ed25519:{}", "2".repeat(64))).unwrap();
-        assert_ne!(fingerprint(&key_a), fingerprint(&key_b));
     }
 
     /// Append a founder-authored `MemberAdded` carrying `key` for `email`
@@ -2299,85 +3138,6 @@ mod tests {
             .unwrap();
     }
 
-    #[test]
-    fn keys_list_lines_prints_the_fingerprint_never_the_full_key() {
-        let key = PublicKey::new(format!("ed25519:{}", "7".repeat(64))).unwrap();
-        let grant_id = EntryId::new();
-        let mut keyring = junto_kernel::Keyring::new();
-        keyring.insert(
-            "alice@example.com".to_string(),
-            vec![junto_kernel::KeyGrant {
-                key,
-                granted_by: grant_id,
-                retired_at: None,
-            }],
-        );
-        let view = channel_view_with_keyring(keyring);
-        let lines = keys_list_lines(&view, None);
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("7777777777777777"), "{}", lines[0]);
-        assert!(!lines[0].contains(&"7".repeat(64)), "{}", lines[0]);
-        assert!(
-            lines[0].contains(&format!("granted_by={grant_id}")),
-            "{}",
-            lines[0]
-        );
-        assert!(lines[0].contains("active"), "{}", lines[0]);
-    }
-
-    /// Pinned to the literal expected date string, like `invite_line`'s own
-    /// test — not derived by calling `render::iso_utc` again.
-    #[test]
-    fn keys_list_lines_renders_the_retirement_timestamp_when_set() {
-        let key = PublicKey::new(format!("ed25519:{}", "8".repeat(64))).unwrap();
-        let grant_id = EntryId::new();
-        let mut keyring = junto_kernel::Keyring::new();
-        keyring.insert(
-            "bob@example.com".to_string(),
-            vec![junto_kernel::KeyGrant {
-                key,
-                granted_by: grant_id,
-                retired_at: Some(Timestamp::from_millis(1_700_000_000_000)),
-            }],
-        );
-        let view = channel_view_with_keyring(keyring);
-        let lines = keys_list_lines(&view, None);
-        assert_eq!(lines.len(), 1);
-        assert!(
-            lines[0].contains("retired 2023-11-14 22:13 UTC"),
-            "{}",
-            lines[0]
-        );
-        assert!(!lines[0].contains("active"), "{}", lines[0]);
-    }
-
-    #[test]
-    fn keys_list_lines_with_member_filters_to_exactly_that_email() {
-        let key_a = PublicKey::new(format!("ed25519:{}", "1".repeat(64))).unwrap();
-        let key_b = PublicKey::new(format!("ed25519:{}", "2".repeat(64))).unwrap();
-        let mut keyring = junto_kernel::Keyring::new();
-        keyring.insert(
-            "alice@example.com".to_string(),
-            vec![junto_kernel::KeyGrant {
-                key: key_a,
-                granted_by: EntryId::new(),
-                retired_at: None,
-            }],
-        );
-        keyring.insert(
-            "bob@example.com".to_string(),
-            vec![junto_kernel::KeyGrant {
-                key: key_b,
-                granted_by: EntryId::new(),
-                retired_at: None,
-            }],
-        );
-        let view = channel_view_with_keyring(keyring);
-        let lines = keys_list_lines(&view, Some("alice@example.com"));
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].starts_with("alice@example.com"), "{}", lines[0]);
-    }
-
     /// Finding 1 (final fix wave): `prune` fell between two task briefs
     /// and shipped wired to nothing. This exercises the REAL `invite()`
     /// path end to end — not `invites::prune` directly, which is
@@ -2415,9 +3175,12 @@ mod tests {
         )
         .unwrap();
 
-        invite(channel_id.to_string(), "someone@example.com".to_string())
-            .await
-            .unwrap();
+        invite(
+            vec![channel_id.to_string()],
+            "someone@example.com".to_string(),
+        )
+        .await
+        .unwrap();
 
         assert!(matches!(
             invites::consume(
@@ -2435,68 +3198,172 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn revocation_cutoff_warning_is_none_when_the_email_has_no_grants_at_all() {
-        let view = channel_view_with_keyring(junto_kernel::Keyring::new());
-        assert!(revocation_cutoff_warning(&view, "nobody@example.com", "acme").is_none());
+    /// Founder authority is checked for EVERY channel before a token
+    /// exists: a caller who founds one of two channels gets nothing
+    /// issued at all — `invites.toml` gains no record for either channel.
+    #[tokio::test]
+    async fn invite_issues_nothing_when_the_caller_does_not_found_every_channel() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (_repo_mine, _mine_id) = setup_channel("mine").await;
+        let (_repo_theirs, _theirs_id) =
+            setup_channel_with_founder("theirs", Member::human("Carol", "carol@example.com")).await;
+
+        let err = invite(
+            vec!["mine".to_string(), "theirs".to_string()],
+            "someone@example.com".to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("theirs"),
+            "error should name the channel the caller does not found: {err}"
+        );
+
+        let invites_path = host::junto_home().unwrap().join("invites.toml");
+        assert!(
+            !invites_path.exists(),
+            "a caller who does not found every channel must get nothing issued"
+        );
     }
 
-    /// The mixed fixture — one retired grant, one still active — is the
-    /// one that actually distinguishes "every grant retired" from "has A
-    /// retired grant": a wrong `.any()`/`.all()` swap, or dropping the
-    /// active-grant check entirely, would both still pass a fixture built
-    /// from only-retired or only-active grants but fails this one.
-    #[test]
-    fn revocation_cutoff_warning_is_none_while_any_grant_is_still_active() {
-        use junto_kernel::KeyGrant;
-        let key = PublicKey::new(format!("ed25519:{}", "b".repeat(64))).unwrap();
-        let mut keyring = junto_kernel::Keyring::new();
-        keyring.insert(
-            "alice@example.com".to_string(),
-            vec![
-                KeyGrant {
-                    key: key.clone(),
-                    granted_by: EntryId::new(),
-                    retired_at: Some(Timestamp::from_millis(10)),
-                },
-                KeyGrant {
-                    key,
-                    granted_by: EntryId::new(),
-                    retired_at: None,
-                },
-            ],
+    /// One token, one record per channel — the shape `channels_for` reads
+    /// back. `alpha` is named twice under two different spellings — once
+    /// by name, once by its canonical id — to pin the dedupe rule on the
+    /// RESOLVED id: a dedupe that instead compared raw strings would let
+    /// this pair through as two distinct channels.
+    #[tokio::test]
+    async fn invite_issues_one_record_per_channel_for_a_single_token() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (_repo_a, id_a) = setup_channel("alpha").await;
+        let (_repo_b, id_b) = setup_channel("beta").await;
+
+        invite(
+            vec!["alpha".to_string(), "beta".to_string(), id_a.to_string()],
+            "someone@example.com".to_string(),
+        )
+        .await
+        .unwrap();
+
+        // `invite()` only prints its token (never returns it), so read the
+        // store back directly rather than decoding the printed URL — the
+        // stored `token_sha256` is exactly the fact "one token, N records"
+        // rests on.
+        let junto_home = host::junto_home().unwrap();
+        let raw = std::fs::read_to_string(junto_home.join("invites.toml")).unwrap();
+        let doc: toml::Value = toml::from_str(&raw).unwrap();
+        let records = doc["invites"].as_array().unwrap();
+        assert_eq!(
+            records.len(),
+            2,
+            "'alpha' and its own id name the same channel and must collapse to one record: \
+             {records:?}"
         );
-        let view = channel_view_with_keyring(keyring);
-        assert!(revocation_cutoff_warning(&view, "alice@example.com", "acme").is_none());
+        let tokens: std::collections::HashSet<&str> = records
+            .iter()
+            .map(|r| r["token_sha256"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            tokens.len(),
+            1,
+            "one token must cover every channel: {records:?}"
+        );
+        let channels: std::collections::HashSet<String> = records
+            .iter()
+            .map(|r| r["channel"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            channels,
+            [id_a.to_string(), id_b.to_string()].into_iter().collect(),
+            "the store must name exactly the two canonical ids"
+        );
     }
 
-    #[test]
-    fn revocation_cutoff_warning_fires_and_names_the_email_and_channel_when_every_grant_is_retired()
-    {
-        use junto_kernel::KeyGrant;
-        let key = PublicKey::new(format!("ed25519:{}", "c".repeat(64))).unwrap();
-        let mut keyring = junto_kernel::Keyring::new();
-        keyring.insert(
-            "alice@example.com".to_string(),
-            vec![
-                KeyGrant {
-                    key: key.clone(),
-                    granted_by: EntryId::new(),
-                    retired_at: Some(Timestamp::from_millis(10)),
-                },
-                KeyGrant {
-                    key,
-                    granted_by: EntryId::new(),
-                    retired_at: Some(Timestamp::from_millis(20)),
-                },
-            ],
+    /// The line a founder reads before pasting it must show what they
+    /// actually typed, never the raw canonical id `resolve_channel`
+    /// resolves underneath — and when the same channel is named twice
+    /// under two spellings (its name, then its own id), only the FIRST
+    /// spelling survives as the display label.
+    #[tokio::test]
+    async fn mint_invite_displays_the_first_spelling_not_the_canonical_id() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (_repo, id) = setup_channel("acme").await;
+
+        let minted = mint_invite(
+            vec!["acme".to_string(), id.to_string()],
+            "someone@example.com".to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            minted.payload.channels,
+            vec![id.to_string()],
+            "one canonical id, deduped"
         );
-        let view = channel_view_with_keyring(keyring);
-        let warning = revocation_cutoff_warning(&view, "alice@example.com", "acme")
-            .expect("every grant retired must produce a warning");
-        assert!(warning.contains("alice@example.com"), "{warning}");
-        assert!(warning.contains("acme"), "{warning}");
-        assert!(warning.contains("cutoff"), "{warning}");
+        assert_eq!(
+            minted.display_channels,
+            vec!["acme".to_string()],
+            "the first spelling wins; the raw id must never be shown"
+        );
+    }
+
+    /// Finding 9c (final fix wave): the CLI must refuse a blank member,
+    /// exactly like `web.rs::post_invites_refuses_a_blank_member` — a
+    /// mutation that drops the emptiness check (or checks only the
+    /// untrimmed string) would mint a real, redeemable record for the
+    /// empty string (`invites::consume` compares `""` to `""`).
+    #[tokio::test]
+    async fn mint_invite_refuses_a_blank_member() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (_repo, _id) = setup_channel("acme").await;
+        let err = mint_invite(vec!["acme".to_string()], "   ".to_string())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("blank"), "{err}");
+
+        let junto_home = host::junto_home().unwrap();
+        assert!(
+            !junto_home.join("invites.toml").exists(),
+            "nothing issued for a blank member"
+        );
+    }
+
+    /// Task 4 walks `InvitePayload.channels` to produce one outcome per
+    /// channel; if that order ever diverged from what `channels_for`
+    /// reads back for the same token, the founder would be shown one
+    /// order in the minted code and granted in another once it is
+    /// redeemed.
+    #[tokio::test]
+    async fn invite_payload_channel_order_matches_channels_for() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (_repo_a, id_a) = setup_channel("alpha").await;
+        let (_repo_b, id_b) = setup_channel("beta").await;
+        let (_repo_c, id_c) = setup_channel("gamma").await;
+
+        let minted = mint_invite(
+            vec!["gamma".to_string(), "alpha".to_string(), "beta".to_string()],
+            "someone@example.com".to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            minted.payload.channels,
+            vec![id_c.to_string(), id_a.to_string(), id_b.to_string()],
+            "first-seen order, not sorted"
+        );
+
+        let junto_home = host::junto_home().unwrap();
+        let stored = invites::channels_for(
+            &junto_home,
+            &minted.payload.invite_token,
+            "someone@example.com",
+        )
+        .unwrap();
+        assert_eq!(
+            stored, minted.payload.channels,
+            "the store must read back channels in the same order the minted payload names them"
+        );
     }
 
     /// Finding 2, part 3 (final fix wave): the cutoff-warning check added
@@ -2546,12 +3413,12 @@ mod tests {
         let url = build_enroll_url(&token, "alice@example.com", "Alice", &new_key, expires_at);
 
         add_member(
-            channel_id.to_string(),
+            None,
             None,
             None,
             Some("human".to_string()),
-            Some("Dan".to_string()),
-            Some("dan@example.com".to_string()),
+            None,
+            None,
             None,
             Some(url),
         )
@@ -2576,6 +3443,163 @@ mod tests {
                 .iter()
                 .any(|g| g.key == new_key && g.retired_at.is_none()),
             "re-enrollment's new key must be ACTIVE: {grants:?}"
+        );
+    }
+
+    /// Finding 5 (final fix wave): the revocation-cutoff warning must be
+    /// DATA on `RedeemOutcome::Granted`, not merely a `println!` the HTTP
+    /// path could never see — pins that `redeem_enrollment`'s return
+    /// value itself carries it, killing a mutation that keeps the
+    /// message on stdout only (or drops it) instead of threading it onto
+    /// the outcome the caller actually receives.
+    #[tokio::test]
+    async fn redeem_enrollment_returns_the_cutoff_warning_as_data_on_granted() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (repo, channel_id) = setup_channel("acme").await;
+        let junto_home = host::junto_home().unwrap();
+        let setup_host = host::Host::fixed(vec![repo.path().to_path_buf()]);
+        let host::Resolution::Resolved { ledger, id, .. } =
+            setup_host.resolve(&channel_id.to_string()).await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+
+        let old_key = PublicKey::new(format!("ed25519:{}", "a".repeat(64))).unwrap();
+        let grant_id = grant_key(&ledger, id, "alice@example.com", &old_key).await;
+        let park = LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel: id,
+            author: Member::human("Dan", "dan@example.com"),
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::Park {
+                target: grant_id,
+                rationale: "lost device".into(),
+            },
+        };
+        ledger.lock().await.append(park).await.unwrap();
+
+        let expires_at = Timestamp::now().as_millis() + enroll::MAX_INVITE_TTL_MS;
+        let token = enroll::mint_invite_token();
+        invites::issue(
+            &junto_home,
+            &token,
+            "alice@example.com",
+            &channel_id.to_string(),
+            expires_at,
+        )
+        .unwrap();
+        let new_key = PublicKey::new(format!("ed25519:{}", "b".repeat(64))).unwrap();
+        let transport_key = PublicKey::new(format!("ed25519:{}", "c".repeat(64))).unwrap();
+        let payload = enroll::EnrollPayload {
+            v: enroll::PAYLOAD_VERSION,
+            invite_token: token,
+            email: "alice@example.com".to_string(),
+            display_name: "Alice".to_string(),
+            public_key: new_key,
+            transport_public_key: transport_key,
+            expires_at,
+        };
+
+        let host = host::Host::from_registry(junto_home);
+        let outcomes = redeem_enrollment(&host, &payload, MemberKind::Human, None)
+            .await
+            .unwrap();
+        assert_eq!(outcomes.len(), 1);
+        match &outcomes[0].1 {
+            RedeemOutcome::Granted { warning: Some(w) } => {
+                assert!(w.contains("cutoff"), "{w}");
+            }
+            other => panic!("expected Granted with a warning, got {other:?}"),
+        }
+    }
+
+    /// Task 4 finding 2 (review round 3): `already_a_member`'s
+    /// `&& grant.retired_at.is_none()` clause was undiscriminated — the
+    /// test above enrolls with a DIFFERENT key than the one it retires,
+    /// so no keyring grant matches the payload's key at all regardless
+    /// of that clause, and deleting it would still leave that test
+    /// green. This pins the realistic production case directly:
+    /// `keys::signing_key` mints a device's key only once, so a member
+    /// re-enrolling from the SAME device after `revoke-member` presents
+    /// the SAME public key against a RETIRED grant — that must still be
+    /// `Granted`, never read back as `AlreadyAMember`.
+    #[tokio::test]
+    async fn redeeming_with_a_retired_grant_for_the_same_key_still_grants() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (repo, channel_id) = setup_channel("acme").await;
+        let junto_home = host::junto_home().unwrap();
+        let setup_host = host::Host::fixed(vec![repo.path().to_path_buf()]);
+        let host::Resolution::Resolved { ledger, id, .. } =
+            setup_host.resolve(&channel_id.to_string()).await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+
+        let key = PublicKey::new(format!("ed25519:{}", "b".repeat(64))).unwrap();
+        let grant_id = grant_key(&ledger, id, "alice@example.com", &key).await;
+        let park = LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel: id,
+            author: Member::human("Dan", "dan@example.com"),
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::Park {
+                target: grant_id,
+                rationale: "lost device".into(),
+            },
+        };
+        ledger.lock().await.append(park).await.unwrap();
+
+        let token = enroll::mint_invite_token();
+        let expires_at = Timestamp::now().as_millis() + enroll::MAX_INVITE_TTL_MS;
+        invites::issue(
+            &junto_home,
+            &token,
+            "alice@example.com",
+            &channel_id.to_string(),
+            expires_at,
+        )
+        .unwrap();
+        let transport_key = PublicKey::new(format!("ed25519:{}", "c".repeat(64))).unwrap();
+        let payload = enroll::EnrollPayload {
+            v: enroll::PAYLOAD_VERSION,
+            invite_token: token,
+            email: "alice@example.com".to_string(),
+            display_name: "Alice".to_string(),
+            public_key: key.clone(),
+            transport_public_key: transport_key,
+            expires_at,
+        };
+
+        let host = host::Host::from_registry(junto_home);
+        let outcomes = redeem_enrollment(&host, &payload, MemberKind::Human, None)
+            .await
+            .unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].0, channel_id.to_string());
+        // Re-enrolling with the retired grant's own key also drops
+        // alice's revocation cutoff (finding 5, final fix wave) — this
+        // test's own re-enroll-after-retire setup is exactly that
+        // scenario, so `warning` is `Some`, not the ordinary-grant `None`.
+        assert!(
+            matches!(&outcomes[0].1, RedeemOutcome::Granted { warning: Some(_) }),
+            "a RETIRED grant for the same key must not read as AlreadyAMember: {:?}",
+            outcomes[0].1
+        );
+
+        let view = ledger.lock().await.project(&id).await.unwrap();
+        let grants = view.keyring.get("alice@example.com").unwrap();
+        assert_eq!(
+            grants.len(),
+            2,
+            "re-enrollment with the same key appends a second grant: {grants:?}"
+        );
+        assert!(
+            grants
+                .iter()
+                .any(|g| g.key == key && g.retired_at.is_none()),
+            "the same key must now have an ACTIVE grant: {grants:?}"
         );
     }
 
@@ -2620,14 +3644,16 @@ mod tests {
         );
     }
 
-    /// Finding 3 (final fix wave): the founder guard belongs on
+    /// Finding 3 (an earlier fix wave): the founder guard belongs on
     /// `revoke-member` only — `retire-device` parks one grant at a time,
     /// and the founder may legitimately need it to rotate a single
-    /// machine. Pins that `retire_device` is untouched by finding 3's fix
-    /// — an over-broad guard copied onto this function too would make
-    /// the `.unwrap()` below panic on an `Err`.
+    /// machine, so an over-broad "never touch the founder" guard must
+    /// not land here. Finding 8 (final fix wave, THIS one) narrows that:
+    /// retiring the founder's ONLY active grant is refused — the same
+    /// cutoff state `revoke-member` already refuses to hand the founder
+    /// — while retiring one of SEVERAL still works (the next test).
     #[tokio::test]
-    async fn retire_device_still_works_on_a_founder_grant() {
+    async fn retire_device_refuses_the_founders_only_grant() {
         let _home = crate::host::test_home::HomeGuard::new();
         let (repo, channel_id) = setup_channel("acme").await;
         let fixed = host::Host::fixed(vec![repo.path().to_path_buf()]);
@@ -2636,16 +3662,23 @@ mod tests {
         else {
             panic!("channel resolves");
         };
-        let key = PublicKey::new(format!("ed25519:{}", "4".repeat(64))).unwrap();
-        let grant_id = grant_key(&ledger, id, "dan@example.com", &key).await;
+        // `Host::open_channel` already grants the founder one key at
+        // genesis (`host.rs::open_channel`'s `self.keyed(opened_by,
+        // None)` — "the genesis carries the founder's public key, the
+        // first link in the channel keyring") — that IS the founder's
+        // only active grant here; no `grant_key` call needed.
+        let view = ledger.lock().await.project(&id).await.unwrap();
+        let grant_id = view.keyring["dan@example.com"][0].granted_by;
 
-        retire_device(
+        let err = retire_device(
             channel_id.to_string(),
             grant_id.to_string(),
             "rotating this one device".to_string(),
         )
         .await
-        .unwrap();
+        .unwrap_err();
+        assert!(err.to_string().contains("zero active"), "{err}");
+        assert!(err.to_string().contains("enroll"), "{err}");
 
         let view = ledger.lock().await.project(&id).await.unwrap();
         let grant = view.keyring["dan@example.com"]
@@ -2653,8 +3686,46 @@ mod tests {
             .find(|g| g.granted_by == grant_id)
             .unwrap();
         assert!(
-            grant.retired_at.is_some(),
-            "retire-device must still be able to park a founder's own single grant"
+            grant.retired_at.is_none(),
+            "a refused retire-device must not park anything"
+        );
+    }
+
+    /// Finding 8's other half: ordinary founder-grant rotation — retiring
+    /// one of SEVERAL active devices — must keep working, since the
+    /// founder is never left with zero active grants by it.
+    #[tokio::test]
+    async fn retire_device_still_rotates_a_founder_grant_when_another_remains() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (repo, channel_id) = setup_channel("acme").await;
+        let fixed = host::Host::fixed(vec![repo.path().to_path_buf()]);
+        let host::Resolution::Resolved { ledger, id, .. } =
+            fixed.resolve(&channel_id.to_string()).await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+        // The genesis grant is the founder's FIRST device; `grant_key`
+        // adds a second — retiring the first (an old laptop) must still
+        // work, since the second keeps the founder active.
+        let view = ledger.lock().await.project(&id).await.unwrap();
+        let old_grant = view.keyring["dan@example.com"][0].granted_by;
+        let new_key = PublicKey::new(format!("ed25519:{}", "6".repeat(64))).unwrap();
+        grant_key(&ledger, id, "dan@example.com", &new_key).await;
+
+        retire_device(
+            channel_id.to_string(),
+            old_grant.to_string(),
+            "old laptop retired".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let view = ledger.lock().await.project(&id).await.unwrap();
+        let grants = &view.keyring["dan@example.com"];
+        assert_eq!(
+            grants.iter().filter(|g| g.retired_at.is_none()).count(),
+            1,
+            "the new device's grant stays active: {grants:?}"
         );
     }
 }

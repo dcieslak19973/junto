@@ -40,6 +40,17 @@ pub struct Member {
     /// the canonical bytes when absent, so pre-0033 entries are unchanged.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub public_key: Option<PublicKey>,
+    /// The member's Ed25519 transport key (`docs/adr/0033`): the keypair a
+    /// federation transport (iroh) handshake authenticates with, kept
+    /// distinct from [`Self::public_key`] so entry signing and the
+    /// QUIC/TLS handshake never share a key. Carried on the same
+    /// membership-granting entries as `public_key`, where the party
+    /// projection reads it onto the matching [`crate::KeyGrant`]. Optional
+    /// for the same reasons `public_key` is — a device enrolled before this
+    /// field existed simply has none. Omitted from the canonical bytes when
+    /// absent, so pre-0033 entries are unchanged.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub transport_public_key: Option<PublicKey>,
 }
 
 impl Member {
@@ -51,6 +62,7 @@ impl Member {
             email: email.into(),
             kind: MemberKind::Human,
             public_key: None,
+            transport_public_key: None,
         }
     }
 
@@ -62,6 +74,7 @@ impl Member {
             email: email.into(),
             kind: MemberKind::Agent,
             public_key: None,
+            transport_public_key: None,
         }
     }
 
@@ -71,5 +84,49 @@ impl Member {
     pub fn with_key(mut self, key: PublicKey) -> Self {
         self.public_key = Some(key);
         self
+    }
+
+    /// This member with their transport key attached — used on the same
+    /// membership-granting entries as [`Self::with_key`], feeding the
+    /// matching [`crate::KeyGrant::transport_key`].
+    #[must_use]
+    pub fn with_transport_key(mut self, key: PublicKey) -> Self {
+        self.transport_public_key = Some(key);
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_public_key() -> PublicKey {
+        PublicKey::new(format!("ed25519:{}", "a".repeat(64))).unwrap()
+    }
+
+    fn other_public_key() -> PublicKey {
+        PublicKey::new(format!("ed25519:{}", "b".repeat(64))).unwrap()
+    }
+
+    #[test]
+    fn a_member_without_a_transport_key_serializes_exactly_as_before() {
+        // The byte-identity guard for every entry ever written. A Member carrying
+        // only a signing key must produce JSON with NO transport_public_key key at
+        // all — dropping skip_serializing_if would break every existing entry's
+        // canonical bytes and thus every existing signature.
+        let m = Member::human("Dan", "dan@x.com").with_key(sample_public_key());
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(!json.contains("transport"), "{json}");
+    }
+
+    #[test]
+    fn with_transport_key_carries_both_halves() {
+        let signing = sample_public_key();
+        let transport = other_public_key();
+        let m = Member::human("Dan", "dan@x.com")
+            .with_key(signing.clone())
+            .with_transport_key(transport.clone());
+        assert_eq!(m.public_key, Some(signing));
+        assert_eq!(m.transport_public_key, Some(transport));
     }
 }
