@@ -69,7 +69,7 @@ enum Command {
     /// ChannelOpened genesis entry binding the name, directly into the home
     /// substrate (no running host required).
     Open {
-        /// The channel's human-facing name (unique within the home substrate).
+        /// The channel's human-facing name (not required to be unique).
         name: String,
         /// The home substrate repo. Defaults to the current directory.
         #[arg(long, default_value = ".")]
@@ -613,10 +613,6 @@ async fn invite(channel: String, member: String) -> Result<()> {
         host::Resolution::NotFound => {
             bail!("no channel '{channel}' in any registered substrate")
         }
-        host::Resolution::Ambiguous(substrates) => bail!(
-            "channel name '{channel}' exists in several substrates ({substrates:?}); \
-             address it by id"
-        ),
     };
     let view = ledger.lock().await.project(&id).await?;
     let Some(founder) = view.party.first() else {
@@ -735,9 +731,6 @@ async fn diverge(from: String, child_name: String, at: Option<String>) -> Result
     let substrate = match host.resolve(&from).await? {
         host::Resolution::Resolved { substrate, .. } => substrate,
         host::Resolution::NotFound => bail!("no channel '{from}' in any registered substrate"),
-        host::Resolution::Ambiguous(substrates) => bail!(
-            "channel name '{from}' exists in several substrates ({substrates:?}); address it by id"
-        ),
     };
     let author = host::git_user(&substrate)?;
     let code = member_code_for(&author.email)?;
@@ -766,10 +759,6 @@ async fn converge(source: String, into: String, rationale: String) -> Result<()>
     let substrate = match host.resolve(&source).await? {
         host::Resolution::Resolved { substrate, .. } => substrate,
         host::Resolution::NotFound => bail!("no channel '{source}' in any registered substrate"),
-        host::Resolution::Ambiguous(substrates) => bail!(
-            "channel name '{source}' exists in several substrates ({substrates:?}); \
-             address it by id"
-        ),
     };
     let author = host::git_user(&substrate)?;
     let code = member_code_for(&author.email)?;
@@ -802,10 +791,6 @@ async fn resolve_channel(
         host::Resolution::NotFound => {
             bail!("no channel '{channel}' in any registered substrate")
         }
-        host::Resolution::Ambiguous(substrates) => bail!(
-            "channel name '{channel}' exists in several substrates ({substrates:?}); \
-             address it by id"
-        ),
     }
 }
 
@@ -1081,6 +1066,12 @@ async fn brief(dir: PathBuf) -> Result<()> {
             return Ok(());
         }
     };
+    // Fetched once, up front: a channel with nothing ratified stays out of
+    // the brief until something in it earns standing (spec §2's collapse —
+    // "a scratch thread is epistemically free: invisible to the brief
+    // until something in it is ratified"). Fails open (`None`) on a
+    // transient error rather than hiding every bound channel.
+    let recallable = host.channels_for_recall().await.ok();
     for channel in channels {
         match host.resolve(&channel).await {
             Ok(host::Resolution::Resolved { ledger, id, .. }) => {
@@ -1093,21 +1084,20 @@ async fn brief(dir: PathBuf) -> Result<()> {
                 let projected = ledger.lock().await.project(&id).await;
                 match projected {
                     Ok(view) => {
-                        let name = view.name.clone().unwrap_or_else(|| channel.clone());
                         let lineage = host.lineage_context(&view).await.unwrap_or_default();
-                        println!("{}", render::brief_markdown(&name, &id, &view, &lineage));
+                        let recall_eligible = recallable
+                            .as_ref()
+                            .is_none_or(|list| list.iter().any(|summary| summary.id == id));
+                        if recall_eligible {
+                            let name = view.name.clone().unwrap_or_else(|| channel.clone());
+                            println!("{}", render::brief_markdown(&name, &id, &view, &lineage));
+                        }
                     }
                     Err(err) => eprintln!("junto brief: projecting '{channel}': {err}"),
                 }
             }
             Ok(host::Resolution::NotFound) => {
                 eprintln!("junto brief: bound channel '{channel}' not found (not opened yet?)");
-            }
-            Ok(host::Resolution::Ambiguous(substrates)) => {
-                eprintln!(
-                    "junto brief: bound channel '{channel}' is ambiguous across {substrates:?}; \
-                     bind by id"
-                );
             }
             Err(err) => eprintln!("junto brief: resolving '{channel}': {err:#}"),
         }
@@ -1343,6 +1333,22 @@ mod tests {
              per-substrate ledger for the sibling channel and deadlocks"
         );
         outcome.unwrap().unwrap();
+    }
+
+    /// A bound channel with nothing ratified must not break session start —
+    /// it is simply skipped (spec §2's collapse: "invisible to the brief
+    /// until something in it is ratified").
+    #[tokio::test]
+    async fn brief_skips_a_scratch_bound_channel_without_erroring() {
+        let _home = crate::host::test_home::HomeGuard::new();
+        let (_repo, _id) = setup_channel("scratch-only").await;
+        let checkout = tempfile::tempdir().unwrap();
+        std::fs::write(
+            checkout.path().join(binding::PROJECT_BINDING),
+            "channels = [\"scratch-only\"]\n",
+        )
+        .unwrap();
+        brief(checkout.path().to_path_buf()).await.unwrap();
     }
 
     fn build_enroll_url(

@@ -485,17 +485,13 @@ impl JuntoMcp {
     }
 
     /// Resolve a channel reference to its home ledger + id, mapping the
-    /// not-found / ambiguous outcomes onto agent-actionable errors.
+    /// not-found outcome onto an agent-actionable error.
     async fn resolve(&self, channel: &str) -> Result<(SharedLedger, ChannelId), McpError> {
         match self.host.resolve(channel).await.map_err(internal)? {
             Resolution::Resolved { ledger, id, .. } => Ok((ledger, id)),
             Resolution::NotFound => Err(invalid(format!(
                 "no channel '{channel}' in any registered substrate — open it first \
                  (open_channel), or check list_channels"
-            ))),
-            Resolution::Ambiguous(substrates) => Err(invalid(format!(
-                "channel name '{channel}' exists in several substrates ({substrates:?}); \
-                 address it by id (see list_channels)"
             ))),
         }
     }
@@ -552,7 +548,7 @@ impl JuntoMcp {
     }
 
     #[tool(
-        description = "Open a channel: mint its globally unique id and write the ChannelOpened genesis entry binding the name (unique within its home substrate). A channel must be opened before anything can be recorded into it. `repo` picks the home substrate; omit it when the host serves exactly one."
+        description = "Open a channel: mint its globally unique id and write the ChannelOpened genesis entry binding the name. Names are not unique — two channels may share one, even in the same home substrate; a name lookup then resolves to whichever was opened most recently. A channel must be opened before anything can be recorded into it. `repo` picks the home substrate; omit it when the host serves exactly one."
     )]
     async fn open_channel(
         &self,
@@ -1411,18 +1407,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_enforces_name_uniqueness_per_substrate() {
+    async fn open_permits_a_duplicate_name_within_one_substrate() {
         let (dirs, mcp) = init_repo();
         open(&mcp, &dirs, "junto-dev").await;
-        let err = mcp
+        let second = mcp
             .open_channel(Parameters(OpenChannelRequest {
                 name: "junto-dev".into(),
                 author: dan(),
                 repo: None,
             }))
             .await
-            .unwrap_err();
-        assert!(err.message.contains("already exists"));
+            .expect("a duplicate name must be allowed after the collapse (spec §2)");
+        assert!(text_of(&second).contains("junto-dev"));
     }
 
     #[tokio::test]
@@ -1454,7 +1450,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ambiguous_names_across_substrates_ask_for_the_id() {
+    async fn duplicate_names_across_substrates_resolve_without_asking_for_the_id() {
         let (_dirs, mcp) = init_host(2);
         let repos = mcp.host.substrate_paths().unwrap();
         for repo in &repos {
@@ -1466,14 +1462,17 @@ mod tests {
             .await
             .unwrap();
         }
-        let err = mcp
-            .view_channel(Parameters(ViewRequest {
+        // After the collapse (spec §2), a name shared across substrates no
+        // longer refuses — it resolves to the most recently opened match.
+        let rendered = text_of(
+            &mcp.view_channel(Parameters(ViewRequest {
                 channel: "dev".into(),
                 full: true,
             }))
             .await
-            .unwrap_err();
-        assert!(err.message.contains("several substrates"));
+            .expect("a duplicate name across substrates resolves instead of asking for the id"),
+        );
+        assert!(rendered.contains("dev"), "{rendered}");
     }
 
     #[tokio::test]

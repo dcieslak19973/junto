@@ -105,9 +105,11 @@ pub enum EntryPayload {
         /// unnamed channel: opened by a human's first message, named later or
         /// never. Omitted from the canonical bytes when absent, so every
         /// entry written before the name became optional serializes
-        /// byte-identically. Still substrate-unique in practice —
-        /// `Host::open_channel` enforces it under the ledger lock; dropping
-        /// that uniqueness constraint is a separate, later change.
+        /// byte-identically. Not unique, anywhere (`docs/adr/0014`'s
+        /// amendment, spec §2's collapse): two channels may carry the same
+        /// name, even in the same home substrate — `Host::open_channel` no
+        /// longer scans for a same-named channel before appending the
+        /// genesis.
         #[serde(skip_serializing_if = "Option::is_none", default)]
         name: Option<String>,
     },

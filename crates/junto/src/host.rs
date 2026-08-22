@@ -8,9 +8,11 @@
 //!
 //! Channel addressing (`docs/adr/0014`/`0016`): a channel's id is minted at
 //! open time; its name is a label bound by the `ChannelOpened` genesis entry,
-//! unique only within its home substrate. The host resolves a bare name across
-//! all registered substrates — ambiguity is an error asking for
-//! qualification — and a raw id always resolves.
+//! not required to be unique anywhere (`docs/adr/0014`'s amendment, spec §2's
+//! collapse). The host resolves a bare name across all registered substrates
+//! by picking the most recently opened match — ties broken by `EntryId`, the
+//! same order `LedgerEntry::canonical_cmp` uses, so every replica resolves
+//! identically — and a raw id always resolves.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -18,8 +20,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use junto_kernel::{
-    ChannelId, ChannelView, EntryId, EntryPayload, GateStatus, Ledger, LedgerEntry, Member,
-    MemberKind, PublicKey, Standing, Subject, SubstrateProvider, Timestamp,
+    ChannelId, ChannelStanding, ChannelView, EntryId, EntryPayload, GateStatus, Ledger,
+    LedgerEntry, Member, MemberKind, PublicKey, Standing, Subject, SubstrateProvider, Timestamp,
 };
 use junto_substrate_git::GitRefsSubstrate;
 use serde::{Deserialize, Serialize};
@@ -167,6 +169,11 @@ pub struct ChannelSummary {
     /// The channel this one converged into (`docs/adr/0027`), if any — the
     /// strip draws the merge-back into that target's track.
     pub converged_into: Option<ChannelId>,
+    /// Recall's derived-standing filter (spec §2's collapse): `Scratch`
+    /// (nothing ratified yet) stays invisible to `Host::channels_for_recall`;
+    /// carried on every summary (not just the recall path) so any caller that
+    /// wants to badge or filter on it can, without a second projection sweep.
+    pub standing: ChannelStanding,
 }
 
 /// One notable event on a channel's track — a settled decision, an attached
@@ -249,8 +256,6 @@ pub enum Resolution {
     },
     /// No registered substrate has a channel by that name or id.
     NotFound,
-    /// The name exists in more than one substrate; the caller must qualify.
-    Ambiguous(Vec<PathBuf>),
 }
 
 /// The singleton host's shared state.
@@ -439,8 +444,31 @@ impl Host {
         Ok(self.overview().await?.0)
     }
 
+    /// Every channel across every served substrate whose derived standing
+    /// has earned recall — `Standing` (at least one ratified entry) or
+    /// `Settled` (closed or converged), never `Scratch` (nothing ratified
+    /// yet). A scratch channel is epistemically free (spec §2's collapse: "a
+    /// scratch thread is epistemically free: invisible to the brief until
+    /// something in it is ratified") — the brief/recall surfaces enumerate
+    /// this instead of [`Host::inventory`] so a junk thread never reaches an
+    /// agent's injected context. Same projection sweep as `inventory`, just
+    /// filtered.
+    pub async fn channels_for_recall(&self) -> Result<Vec<ChannelSummary>> {
+        Ok(self
+            .inventory()
+            .await?
+            .into_iter()
+            .filter(|summary| summary.standing != ChannelStanding::Scratch)
+            .collect())
+    }
+
     /// Resolve a channel reference — a name bound by a genesis entry, or a raw
-    /// channel id — to its home substrate and id (`docs/adr/0014`).
+    /// channel id — to its home substrate and id (`docs/adr/0014`). Names are
+    /// no longer unique (`docs/adr/0014`'s amendment, spec §2's collapse): a
+    /// name match picks the most recently **opened** channel, breaking a
+    /// timestamp tie by `EntryId` the same way [`LedgerEntry::canonical_cmp`]
+    /// does, so every replica resolves an ambiguous name identically without
+    /// asking anyone to qualify it.
     pub async fn resolve(&self, channel: &str) -> Result<Resolution> {
         // A raw id resolves directly: ids are globally unique, so the first
         // substrate containing it is *the* substrate.
@@ -459,34 +487,58 @@ impl Host {
             return Ok(Resolution::NotFound);
         }
 
-        let mut matches = Vec::new();
-        for summary in self.inventory().await? {
-            if summary.name.as_deref() == Some(channel) {
-                matches.push(summary);
+        // Every genesis whose *current* projected name matches, kept only as
+        // (substrate, id, genesis) — `canonical_cmp` needs the genesis entry
+        // itself, not just its timestamp, to break a same-millisecond tie.
+        let mut best: Option<(PathBuf, ChannelId, LedgerEntry)> = None;
+        for repo in self.substrate_paths()? {
+            let ledger = self.ledger_for(&repo).await?;
+            let guard = ledger.lock().await;
+            for id in guard.substrate().channels().await? {
+                let view = guard.project(&id).await?;
+                if view.name.as_deref() != Some(channel) {
+                    continue;
+                }
+                let Some(genesis) = view
+                    .entries
+                    .iter()
+                    .find(|entry| matches!(entry.payload, EntryPayload::ChannelOpened { .. }))
+                    .cloned()
+                else {
+                    continue;
+                };
+                let wins = match &best {
+                    Some((_, _, current)) => {
+                        genesis.canonical_cmp(current) == std::cmp::Ordering::Greater
+                    }
+                    None => true,
+                };
+                if wins {
+                    best = Some((repo.clone(), id, genesis));
+                }
             }
         }
-        match matches.len() {
-            0 => Ok(Resolution::NotFound),
-            1 => {
-                let hit = matches.remove(0);
-                let ledger = self.ledger_for(&hit.substrate).await?;
+        match best {
+            Some((substrate, id, _)) => {
+                let ledger = self.ledger_for(&substrate).await?;
                 Ok(Resolution::Resolved {
-                    substrate: hit.substrate,
+                    substrate,
                     ledger,
-                    id: hit.id,
+                    id,
                 })
             }
-            _ => Ok(Resolution::Ambiguous(
-                matches.into_iter().map(|hit| hit.substrate).collect(),
-            )),
+            None => Ok(Resolution::NotFound),
         }
     }
 
     /// Open a channel (`docs/adr/0014`/`0016`): mint its id (or accept a
-    /// declared one — the grandfathering path for pre-0014 records), enforce
-    /// name uniqueness within the home substrate, and append the
-    /// `ChannelOpened` genesis entry. The opener is the **founding member**
-    /// (`docs/adr/0017`), so their member code is minted alongside.
+    /// declared one — the grandfathering path for pre-0014 records) and
+    /// append the `ChannelOpened` genesis entry. Names are not unique
+    /// (`docs/adr/0014`'s amendment, spec §2's collapse) — two channels may
+    /// share a name in the same home substrate; [`Host::resolve`] picks the
+    /// most recently opened match deterministically. The opener is the
+    /// **founding member** (`docs/adr/0017`), so their member code is minted
+    /// alongside.
     ///
     /// `repo`: the home substrate; may be omitted when the host serves exactly
     /// one.
@@ -525,24 +577,21 @@ impl Host {
         };
 
         let ledger = self.ledger_for(&repo).await?;
-        // Hold the ledger lock across the uniqueness check *and* the append so
-        // two concurrent opens of the same name cannot both pass the check.
+        // Hold the ledger lock across the declared-id genesis check *and* the
+        // append, so two concurrent grandfathering opens of the same
+        // declared id cannot both pass the check.
         let mut guard = ledger.lock().await;
-        for id in guard.substrate().channels().await? {
-            let view = guard.project(&id).await?;
-            if view.name.as_deref() == Some(name) {
-                bail!(
-                    "channel '{name}' already exists in {} (id {id})",
-                    repo.display()
-                );
-            }
-            if declared_id == Some(id)
-                && view
-                    .entries
-                    .iter()
-                    .any(|e| matches!(e.payload, EntryPayload::ChannelOpened { .. }))
+        // The grandfathering path only: a declared pre-0014 id must not
+        // already carry a genesis (name-agnostic — an unnamed genesis is
+        // still a genesis, spec §2's collapse).
+        if let Some(declared) = declared_id {
+            let view = guard.project(&declared).await?;
+            if view
+                .entries
+                .iter()
+                .any(|entry| matches!(entry.payload, EntryPayload::ChannelOpened { .. }))
             {
-                bail!("channel {id} already has a genesis");
+                bail!("channel {declared} already has a genesis");
             }
         }
 
@@ -588,10 +637,6 @@ impl Host {
         let (ledger, id) = match resolution {
             Resolution::Resolved { ledger, id, .. } => (ledger, id),
             Resolution::NotFound => bail!("no channel '{channel}' in any registered substrate"),
-            Resolution::Ambiguous(substrates) => bail!(
-                "channel name '{channel}' exists in several substrates ({substrates:?}); \
-                 address it by id"
-            ),
         };
         let mut guard = ledger.lock().await;
         let view = guard.project(&id).await?;
@@ -919,10 +964,6 @@ impl Host {
     async fn resolve_target(&self, target: &str) -> Result<(ChannelId, Option<SharedLedger>)> {
         match self.resolve(target).await? {
             Resolution::Resolved { ledger, id, .. } => Ok((id, Some(ledger))),
-            Resolution::Ambiguous(substrates) => bail!(
-                "channel name '{target}' exists in several substrates ({substrates:?}); \
-                 address it by id"
-            ),
             Resolution::NotFound => match target.parse::<ChannelId>() {
                 Ok(id) => Ok((id, None)),
                 Err(_) => bail!(
@@ -1042,8 +1083,8 @@ impl Host {
         }
     }
 
-    /// Resolve a channel reference for a write op, turning the not-found /
-    /// ambiguous cases into clear errors (the shape diverge/converge share).
+    /// Resolve a channel reference for a write op, turning the not-found
+    /// case into a clear error (the shape diverge/converge share).
     async fn resolve_for_write(&self, channel: &str) -> Result<(PathBuf, SharedLedger, ChannelId)> {
         match self.resolve(channel).await? {
             Resolution::Resolved {
@@ -1052,10 +1093,6 @@ impl Host {
                 id,
             } => Ok((substrate, ledger, id)),
             Resolution::NotFound => bail!("no channel '{channel}' in any registered substrate"),
-            Resolution::Ambiguous(substrates) => bail!(
-                "channel name '{channel}' exists in several substrates ({substrates:?}); \
-                 address it by id"
-            ),
         }
     }
 
@@ -1312,6 +1349,7 @@ fn summarize(id: &ChannelId, view: &ChannelView, substrate: &Path) -> ChannelSum
                 && edge.direction == junto_kernel::LineageDirection::Outgoing)
                 .then_some(edge.other)
         }),
+        standing: view.channel_standing,
     }
 }
 
@@ -1460,6 +1498,196 @@ mod lineage_tests {
         };
         let view = ledger.lock().await.project(&id).await.unwrap();
         (id, view)
+    }
+
+    /// Two channels may share a name after the collapse (spec §2, ADR 0014's
+    /// amendment) — `open_channel`'s old substrate-wide uniqueness scan no
+    /// longer refuses the second open.
+    #[tokio::test]
+    async fn two_channels_may_share_a_name_and_both_open() {
+        let (_dirs, host) = lineage_host(1);
+        let first = host
+            .open_channel(None, "auth stuff", dan(), None)
+            .await
+            .expect("open");
+        let second = host
+            .open_channel(None, "auth stuff", dan(), None)
+            .await
+            .expect("a duplicate name must be allowed after the collapse (spec §2)");
+        assert_ne!(first.id, second.id);
+        // Both live on: a raw-id resolve finds each one.
+        assert!(matches!(
+            host.resolve(&first.id.to_string()).await.unwrap(),
+            Resolution::Resolved { id, .. } if id == first.id
+        ));
+        assert!(matches!(
+            host.resolve(&second.id.to_string()).await.unwrap(),
+            Resolution::Resolved { id, .. } if id == second.id
+        ));
+    }
+
+    /// Resolving a shared name picks the channel with the later genesis
+    /// timestamp — "most recently opened" — regardless of which one a
+    /// caller renamed most recently.
+    #[tokio::test]
+    async fn resolving_a_shared_name_prefers_the_later_genesis_timestamp() {
+        let (dirs, host) = lineage_host(1);
+        let substrate = host.substrate_paths().unwrap()[0].clone();
+        let ledger = host.ledger_for(&substrate).await.unwrap();
+        let older = ChannelId::default();
+        let newer = ChannelId::default();
+        ledger
+            .lock()
+            .await
+            .append(LedgerEntry {
+                signature: None,
+                id: EntryId::new(),
+                channel: older,
+                author: dan(),
+                timestamp: Timestamp::from_millis(1_000),
+                payload: EntryPayload::ChannelOpened {
+                    name: Some("auth stuff".into()),
+                },
+            })
+            .await
+            .unwrap();
+        ledger
+            .lock()
+            .await
+            .append(LedgerEntry {
+                signature: None,
+                id: EntryId::new(),
+                channel: newer,
+                author: dan(),
+                timestamp: Timestamp::from_millis(2_000),
+                payload: EntryPayload::ChannelOpened {
+                    name: Some("auth stuff".into()),
+                },
+            })
+            .await
+            .unwrap();
+        let _ = &dirs;
+
+        let Resolution::Resolved { id, .. } = host.resolve("auth stuff").await.unwrap() else {
+            panic!("'auth stuff' resolves");
+        };
+        assert_eq!(id, newer, "resolution prefers the later genesis");
+    }
+
+    /// When two genesis entries land in the same millisecond, resolution
+    /// still picks deterministically — by `EntryId`, the same tie-break
+    /// [`LedgerEntry::canonical_cmp`] uses — so every replica agrees.
+    #[tokio::test]
+    async fn resolving_a_shared_name_breaks_a_timestamp_tie_by_entry_id() {
+        let (dirs, host) = lineage_host(1);
+        let substrate = host.substrate_paths().unwrap()[0].clone();
+        let ledger = host.ledger_for(&substrate).await.unwrap();
+        let channel_a = ChannelId::default();
+        let channel_b = ChannelId::default();
+        let entry_a = LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel: channel_a,
+            author: dan(),
+            timestamp: Timestamp::from_millis(1_000),
+            payload: EntryPayload::ChannelOpened {
+                name: Some("auth stuff".into()),
+            },
+        };
+        let entry_b = LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel: channel_b,
+            author: dan(),
+            timestamp: Timestamp::from_millis(1_000),
+            payload: EntryPayload::ChannelOpened {
+                name: Some("auth stuff".into()),
+            },
+        };
+        let expected = if entry_a.canonical_cmp(&entry_b) == std::cmp::Ordering::Greater {
+            channel_a
+        } else {
+            channel_b
+        };
+        ledger.lock().await.append(entry_a).await.unwrap();
+        ledger.lock().await.append(entry_b).await.unwrap();
+        let _ = &dirs;
+
+        let Resolution::Resolved { id, .. } = host.resolve("auth stuff").await.unwrap() else {
+            panic!("'auth stuff' resolves");
+        };
+        assert_eq!(id, expected, "the greater canonical_cmp genesis wins");
+    }
+
+    /// A channel with nothing ratified (`ChannelStanding::Scratch`) must not
+    /// reach the brief/recall surfaces (spec §2's collapse).
+    #[tokio::test]
+    async fn channels_for_recall_omits_a_scratch_channel() {
+        let (_dirs, host) = lineage_host(1);
+        let scratch = host
+            .open_channel(None, "scratch thread", dan(), None)
+            .await
+            .expect("open");
+        let listed = host.channels_for_recall().await.expect("recall list");
+        assert!(
+            !listed.iter().any(|c| c.id == scratch.id),
+            "a channel with nothing ratified must not reach the brief"
+        );
+    }
+
+    /// Once a channel earns standing (at least one ratified entry), recall
+    /// carries it.
+    #[tokio::test]
+    async fn channels_for_recall_includes_a_channel_with_a_ratified_entry() {
+        let (dirs, host) = lineage_host(1);
+        let opened = host
+            .open_channel(None, "ratified thread", dan(), None)
+            .await
+            .expect("open");
+        let substrate = host.substrate_paths().unwrap()[0].clone();
+        let ledger = host.ledger_for(&substrate).await.unwrap();
+        let decision = EntryId::new();
+        ledger
+            .lock()
+            .await
+            .append(LedgerEntry {
+                signature: None,
+                id: decision,
+                channel: opened.id,
+                author: dan(),
+                timestamp: Timestamp::now(),
+                payload: EntryPayload::Assertion {
+                    statement: "use NDJSON for the pending queue".into(),
+                    rationale: "matches the substrate".into(),
+                    provenance: vec![],
+                    frame: None,
+                },
+            })
+            .await
+            .unwrap();
+        ledger
+            .lock()
+            .await
+            .append(LedgerEntry {
+                signature: None,
+                id: EntryId::new(),
+                channel: opened.id,
+                author: dan(),
+                timestamp: Timestamp::now(),
+                payload: EntryPayload::Ratification {
+                    target: decision,
+                    rationale: "agreed".into(),
+                },
+            })
+            .await
+            .unwrap();
+        let _ = &dirs;
+
+        let listed = host.channels_for_recall().await.expect("recall list");
+        assert!(
+            listed.iter().any(|c| c.id == opened.id),
+            "a channel with a ratified entry earns recall"
+        );
     }
 
     /// `docs/adr/0033` end to end through the host: opening a channel keys

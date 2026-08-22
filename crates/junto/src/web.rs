@@ -216,14 +216,6 @@ async fn resolve_for_projection(
             format!("no channel '{channel}' in any registered substrate"),
         )
             .into_response()),
-        Resolution::Ambiguous(substrates) => Err((
-            StatusCode::CONFLICT,
-            format!(
-                "channel name '{channel}' exists in several substrates ({substrates:?}); \
-                 address it by id"
-            ),
-        )
-            .into_response()),
     }
 }
 
@@ -512,8 +504,8 @@ async fn delete_agent(State(_host): State<Arc<Host>>, Path(slug): Path<String>) 
 /// The form body for opening a channel from the index page.
 #[derive(Debug, Deserialize)]
 struct OpenChannelForm {
-    /// The channel's name — a label, unique within its home substrate
-    /// (`docs/adr/0014`).
+    /// The channel's name — a label, not required to be unique
+    /// (`docs/adr/0014`'s amendment).
     name: String,
     /// The home substrate repo path; may be empty when the host serves
     /// exactly one.
@@ -566,7 +558,7 @@ async fn open_channel(
     match host.open_channel(Some(&repo), name, founder, None).await {
         // Id-addressed: ids are URL-safe, names may not be.
         Ok(opened) => Redirect::to(&format!("/channels/{}", opened.id)).into_response(),
-        // Name taken, unregistered substrate, … — the message says which.
+        // Unregistered substrate, empty/id-shaped name, … — the message says which.
         Err(err) => (StatusCode::CONFLICT, format!("{err:#}")).into_response(),
     }
 }
@@ -1333,8 +1325,8 @@ fn file_uri_to_path(uri: &str) -> Option<std::path::PathBuf> {
 /// The form body for renaming a channel.
 #[derive(Debug, Deserialize)]
 struct RenameForm {
-    /// The new name — a label, unique within the home substrate
-    /// (`docs/adr/0014`).
+    /// The new name — a label, not required to be unique
+    /// (`docs/adr/0014`'s amendment).
     name: String,
     /// Why the rename. A rationale, not a checkbox.
     rationale: String,
@@ -1374,18 +1366,6 @@ async fn rename_channel(
         Ok(projected) => projected,
         Err(response) => return response,
     };
-    // Name uniqueness within the home substrate, same rule open_channel
-    // enforces (docs/adr/0014: names are substrate-scoped labels).
-    let taken = host.inventory().await.unwrap_or_default().iter().any(|s| {
-        s.substrate == substrate && s.id != id && s.name.as_deref() == Some(new_name.as_str())
-    });
-    if taken {
-        return (
-            StatusCode::CONFLICT,
-            format!("a channel named '{new_name}' already exists in this substrate"),
-        )
-            .into_response();
-    }
     let author = match crate::host::git_user(&substrate) {
         Ok(author) => author,
         Err(err) => {
@@ -1719,13 +1699,6 @@ async fn verify(
         } => (substrate, ledger, id),
         Resolution::NotFound => {
             return (StatusCode::NOT_FOUND, format!("no channel '{channel}'")).into_response();
-        }
-        Resolution::Ambiguous(_) => {
-            return (
-                StatusCode::CONFLICT,
-                format!("channel name '{channel}' is ambiguous; use the id"),
-            )
-                .into_response();
         }
     };
 
@@ -4919,7 +4892,11 @@ mod tests {
             Resolution::NotFound
         ));
 
-        // Renaming onto a taken name is a conflict.
+        // Renaming onto a name already used elsewhere is now allowed (spec
+        // §2 drops uniqueness). Resolution prefers the channel opened more
+        // recently, not the one renamed most recently: "other" was opened
+        // after "web-test"/"better-name" was, so it still wins the name
+        // "other" even though the rename lands last.
         let response = open_channel(
             State(fx.host.clone()),
             Form(OpenChannelForm {
@@ -4938,7 +4915,16 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let Resolution::Resolved { id: other_id, .. } = fx.host.resolve("other").await.unwrap()
+        else {
+            panic!("'other' resolves");
+        };
+        assert_ne!(
+            other_id, fx.channel,
+            "resolution prefers the channel opened more recently over the one renamed more \
+             recently"
+        );
     }
 
     #[tokio::test]
@@ -4978,7 +4964,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_taken_name_is_a_conflict() {
+    async fn a_taken_name_is_allowed() {
         let fx = host_with_entry(assertion()).await;
         let response = open_channel(
             State(fx.host.clone()),
@@ -4988,9 +4974,18 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let page = body_text(response).await;
-        assert!(page.contains("web-test"), "{page}");
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .expect("redirect target")
+            .to_string();
+        assert_ne!(
+            location,
+            format!("/channels/{}", fx.channel),
+            "the duplicate open mints its own channel, distinct from the fixture's"
+        );
     }
 
     #[tokio::test]

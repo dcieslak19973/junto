@@ -22,3 +22,7 @@ This deliberately overrides the rule-of-three caution ("wait for the third proje
 ## Considered: one host per home substrate
 
 Simplest code, no registry file — rejected because the pain scales with project count (ports, processes, fragmented surface) and the repo-agnostic-channel case (work in A, record in R) makes the session→host binding non-deducible.
+
+## Amendment (2026-08-22): ambiguity resolves instead of erroring
+
+[`0014`'s amendment](0014-channel-identity-is-minted-names-are-substrate-scoped-labels.md#amendment-2026-08-22-names-stop-being-unique) drops per-substrate name uniqueness, which "Mechanics" above still assumes when it says a bare name "resolves when exactly one registered substrate has it; ambiguity is an error asking for substrate qualification." That is no longer how `Host::resolve` behaves: with names no longer unique, even a *single* substrate can hold two channels sharing a name, so substrate qualification stopped being able to disambiguate on its own. Resolution now spans every registered substrate and **picks the most recently opened match**, tie-broken deterministically by `EntryId` — the host never asks for qualification. ChannelIds are unaffected: still globally unique per 0014, still always resolve unqualified.
