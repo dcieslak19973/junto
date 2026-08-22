@@ -114,6 +114,10 @@ struct App {
     join_pending: bool,
     join_error: Option<String>,
     join_result: Option<EnrolledDto>,
+    /// This device's signing-key fingerprint for the current git identity,
+    /// if one is on file — computed once, on `SettingsLoaded`/`JoinDone`
+    /// (never from the view: `load_signing_key` is a blocking file read).
+    device_key_fingerprint: Option<String>,
 }
 
 /// The admin views behind the top-bar buttons.
@@ -718,6 +722,7 @@ impl App {
             join_pending: false,
             join_error: None,
             join_result: None,
+            device_key_fingerprint: None,
         };
         (
             app,
@@ -1600,6 +1605,14 @@ impl App {
                 Task::none()
             }
             Message::SettingsLoaded(settings) => {
+                // Read once here, not from the view — `load_signing_key`
+                // is a blocking file read + TOML parse, and views run
+                // every frame.
+                self.device_key_fingerprint = settings
+                    .as_ref()
+                    .and_then(|s| s.identity.as_ref())
+                    .and_then(|i| load_signing_key(&i.email))
+                    .map(|key| device_fingerprint(key.public_key().as_str()));
                 self.settings = settings;
                 Task::none()
             }
@@ -1614,12 +1627,27 @@ impl App {
                 }
                 self.join_pending = true;
                 self.join_error = None;
+                // Never leave a stale success block on screen behind a new
+                // attempt's error — the founder must never be handed a
+                // previous paste's enroll code as if it were this one's.
+                self.join_result = None;
                 post_device_enroll(HOST.to_string(), invite, None)
             }
             Message::JoinDone(result) => {
                 self.join_pending = false;
                 match result {
                     Ok(enrolled) => {
+                        // The mint may have been for this device's own git
+                        // identity (if it matches the invite's email) —
+                        // refresh the cached fingerprint so "this device"
+                        // doesn't keep reporting "no device key" after a
+                        // successful join.
+                        if let Some(identity) =
+                            self.settings.as_ref().and_then(|s| s.identity.as_ref())
+                        {
+                            self.device_key_fingerprint = load_signing_key(&identity.email)
+                                .map(|key| device_fingerprint(key.public_key().as_str()));
+                        }
                         self.join_result = Some(enrolled);
                         self.join_invite.clear();
                     }
@@ -2166,12 +2194,10 @@ fn settings_panel(app: &App) -> Element<'_, Message> {
                         .size(12)
                         .color(TEXT),
                 );
-                device = device.push(match load_signing_key(&i.email) {
-                    Some(key) => row![
+                device = device.push(match &app.device_key_fingerprint {
+                    Some(fp) => row![
                         badge("key on file", GREEN),
-                        text(device_fingerprint(key.public_key().as_str()))
-                            .size(11)
-                            .color(MUTED),
+                        text(fp.clone()).size(11).color(MUTED),
                     ]
                     .spacing(6)
                     .align_y(Center),
@@ -4170,39 +4196,43 @@ async fn simple_post_result(url: &str, form: &[(&str, String)], what: &str) -> R
 }
 
 /// Turn a failed response's status, content-type, and body into a short
-/// human string a panel can show directly — never the raw body. The
-/// host's JSON endpoints keep a JSON body on error (e.g. `POST /members`'s
-/// 409 `{"outcomes":[…]}`); this parses that body's `message` field,
-/// falling back to the trimmed body itself when the shape differs.
-/// Everything else — in particular the identity endpoints' plain-text
-/// refusals, which the host's router-wide `prettify_errors`
-/// (`crates/junto/src/web.rs`) rewrites into a styled HTML error page —
-/// collapses to the status code plus a fixed sentence, so a caller here
-/// never renders a raw `<html>` body in an error box.
+/// human string a panel can show directly — never the raw body. A JSON
+/// content-type body is parsed for a `message` field; anything else — an
+/// unrecognized JSON shape (with no `message` to extract — the caller
+/// wants that body's *own* fields, e.g. `POST /members`'s 409
+/// `{"outcomes":[…]}`, which belongs through `post_json_result_accepting`
+/// instead, never through here), an empty/unparseable body, or in
+/// particular the identity endpoints' plain-text refusals — which the
+/// host's router-wide `prettify_errors` (`crates/junto/src/web.rs`)
+/// rewrites into a styled HTML error page — all collapse to the same
+/// fixed, status-naming sentence, so a caller here never renders a raw
+/// body (HTML or otherwise) in an error box.
 fn describe_failed_response(status: u16, content_type: Option<&str>, body: &str) -> String {
     let is_json = content_type.is_some_and(|ct| ct.starts_with("application/json"));
-    if is_json {
-        let message = serde_json::from_str::<serde_json::Value>(body)
+    if is_json
+        && let Some(message) = serde_json::from_str::<serde_json::Value>(body)
             .ok()
-            .and_then(|value| value.get("message")?.as_str().map(str::to_string));
-        return message.unwrap_or_else(|| body.trim().to_string());
+            .and_then(|value| value.get("message")?.as_str().map(str::to_string))
+    {
+        return message;
     }
     format!("request failed ({status}); see the host log for details")
 }
 
-/// Shared POST → `Result<T, String>` helper: parses a JSON body into `T`
-/// on success; on failure, `describe_failed_response` turns the status,
-/// content-type, and body into a short human string — never the raw body.
-/// Beside `simple_post_result`, which returns `()` instead of a parsed
-/// body; `post_device_enroll` (Task 12) and the channel-pane members
-/// disclosure (Task 13) both reuse this.
-async fn post_json_result<T: DeserializeOwned>(
-    url: String,
-    form: Vec<(&'static str, String)>,
-    what: &'static str,
+/// Shared POST → `Result<T, String>` core behind `post_json_result` and
+/// `post_json_result_accepting`: parses `T` from the body when `accept`
+/// returns true for the response's status, else degrades through
+/// `describe_failed_response`. The two callers differ only in which
+/// statuses carry a `T` to parse — never in how a genuine failure is
+/// reported.
+async fn post_json<T: DeserializeOwned>(
+    url: &str,
+    form: &[(&str, String)],
+    what: &str,
+    accept: impl Fn(u16) -> bool,
 ) -> Result<T, String> {
-    match reqwest::Client::new().post(&url).form(&form).send().await {
-        Ok(resp) if resp.status().is_success() => resp
+    match reqwest::Client::new().post(url).form(form).send().await {
+        Ok(resp) if accept(resp.status().as_u16()) => resp
             .json::<T>()
             .await
             .map_err(|err| format!("{what}: couldn't parse the response: {err}")),
@@ -4222,6 +4252,45 @@ async fn post_json_result<T: DeserializeOwned>(
         }
         Err(err) => Err(format!("{what}: request failed: {err}")),
     }
+}
+
+/// Shared POST → `Result<T, String>` helper: parses a JSON body into `T`
+/// on 2xx; on failure, `describe_failed_response` turns the status,
+/// content-type, and body into a short human string — never the raw body.
+/// Beside `simple_post_result`, which returns `()` instead of a parsed
+/// body. `post_device_enroll` (Task 12) uses this; an endpoint that
+/// returns a structured body on a specific non-2xx status too (e.g.
+/// `POST /members`'s 409 outcomes) wants `post_json_result_accepting`
+/// instead.
+async fn post_json_result<T: DeserializeOwned>(
+    url: String,
+    form: Vec<(&'static str, String)>,
+    what: &'static str,
+) -> Result<T, String> {
+    post_json(&url, &form, what, |status| (200..300).contains(&status)).await
+}
+
+/// Like `post_json_result`, but also parses `T` from `extra_status` (e.g.
+/// `409`) instead of treating it as a failure. Some endpoints
+/// (`POST /members`) return their per-channel outcomes WITH a non-2xx
+/// status by contract; collapsing that into a bare error string would
+/// force the caller to string-scrape the JSON back out of
+/// `describe_failed_response`'s output, which never dumps a raw body
+/// anyway. No caller in this crate yet — the channel-pane members
+/// disclosure (Task 13) is this function's first real production caller,
+/// matching `crates/junto/src/keys.rs::has_transport_key`'s own precedent
+/// for kernel API landed ahead of its wiring.
+#[allow(dead_code)]
+async fn post_json_result_accepting<T: DeserializeOwned>(
+    url: String,
+    form: Vec<(&'static str, String)>,
+    what: &'static str,
+    extra_status: u16,
+) -> Result<T, String> {
+    post_json(&url, &form, what, move |status| {
+        (200..300).contains(&status) || status == extra_status
+    })
+    .await
 }
 
 /// Fetch a channel's curated brief (recall bridge) as Markdown text.
@@ -4995,16 +5064,25 @@ mod tests {
     }
 
     #[test]
-    fn describe_failed_response_prefers_a_json_message_over_an_html_body() {
+    fn describe_failed_response_prefers_a_json_message_and_never_dumps_a_raw_body() {
         assert_eq!(
             describe_failed_response(400, Some("application/json"), r#"{"message":"nope"}"#),
             "nope"
         );
-        // A JSON body without a "message" field falls back to the raw text.
+        // A JSON body with no recognized "message" field is never dumped
+        // into the panel raw — same fixed sentence as every other failure
+        // shape. A structured non-2xx body a caller actually wants (e.g.
+        // `POST /members`'s 409 `{"outcomes":[…]}`) belongs through
+        // `post_json_result_accepting`, never through this string.
         assert_eq!(
             describe_failed_response(409, Some("application/json"), r#"{"outcomes":[1,2]}"#),
-            r#"{"outcomes":[1,2]}"#
+            "request failed (409); see the host log for details"
         );
+        // An empty or unparseable JSON-content-type body still yields a
+        // non-empty, status-naming string — never a blank ⚠ box.
+        let empty = describe_failed_response(500, Some("application/json"), "");
+        assert!(!empty.is_empty(), "never a blank error string");
+        assert!(empty.contains("500"), "names the status: {empty}");
         // The identity endpoints' plain-text refusals arrive here as the
         // host's `prettify_errors` HTML error page — never rendered raw.
         let html = describe_failed_response(
