@@ -18,6 +18,20 @@ pub(crate) fn is_founder(view: &ChannelView, email: &str) -> bool {
         .is_some_and(|founder| founder.email == email)
 }
 
+/// Whether `email`'s membership is revoked as of `view`'s fold
+/// (`docs/adr/0035`): they hold at least one grant and **every** one of
+/// them is retired. A member with no grants at all is not revoked — they
+/// are merely unenrolled. The one place this rule is written down:
+/// `keys.json` (Task 6, `web.rs`), the live-WebSocket handshake
+/// (`live_ws::classify_auth_failure`), and [`revocation_cutoff_warning`]
+/// below all call this instead of re-deriving it, so a later amendment to
+/// the rule cannot drift between them.
+pub(crate) fn is_revoked(view: &ChannelView, email: &str) -> bool {
+    view.keyring.get(email).is_some_and(|grants| {
+        !grants.is_empty() && grants.iter().all(|grant| grant.retired_at.is_some())
+    })
+}
+
 /// Refuse unless `caller` is `view`'s founding member (device-key-
 /// enrollment plan, Task 9) — granting membership, revoking keys, and
 /// every other founder-only act share this one guard.
@@ -75,8 +89,7 @@ pub(crate) fn revocation_cutoff_warning(
     email: &str,
     channel: &str,
 ) -> Option<String> {
-    let grants = view.keyring.get(email)?;
-    if grants.is_empty() || grants.iter().any(|grant| grant.retired_at.is_none()) {
+    if !is_revoked(view, email) {
         return None;
     }
     Some(format!(

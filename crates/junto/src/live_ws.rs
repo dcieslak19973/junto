@@ -486,12 +486,10 @@ fn classify_auth_failure(view: &ChannelView, email: &str) -> AuthFailure {
     if !view.party.iter().any(|member| member.email == email) {
         return AuthFailure::NotAMember;
     }
-    match view.keyring.get(email) {
-        Some(grants) if !grants.is_empty() && grants.iter().all(|g| g.retired_at.is_some()) => {
-            AuthFailure::Revoked
-        }
-        _ => AuthFailure::Unenrolled,
+    if crate::identity::is_revoked(view, email) {
+        return AuthFailure::Revoked;
     }
+    AuthFailure::Unenrolled
 }
 
 /// Render an [`AuthFailure`] as the text a real human on the other end of

@@ -2202,18 +2202,16 @@ struct KeyMemberDto {
     /// Keyring order (canonical entry order) — stable across replicas.
     devices: Vec<KeyGrantDto>,
     /// Every grant retired: this email is revoked as of the latest
-    /// retirement (`docs/adr/0035`'s all-retired rule — the same predicate
-    /// `live_ws`'s handshake checks, never re-derived differently). `false`
-    /// for a member with no grants at all.
+    /// retirement (`docs/adr/0035`'s all-retired rule — see
+    /// [`crate::identity::is_revoked`], the one place it is written down).
+    /// `false` for a member with no grants at all.
     revoked: bool,
 }
 
 impl KeyMemberDto {
     fn from_member(member: &junto_kernel::Member, view: &ChannelView) -> Self {
         let grants = view.keyring.get(&member.email);
-        let revoked = grants.is_some_and(|grants| {
-            !grants.is_empty() && grants.iter().all(|g| g.retired_at.is_some())
-        });
+        let revoked = crate::identity::is_revoked(view, &member.email);
         KeyMemberDto {
             display_name: member.display_name.clone(),
             email: member.email.clone(),
@@ -3565,6 +3563,10 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&body).expect("valid json");
         assert_eq!(json["viewer_is_founder"], true);
         assert_eq!(json["viewer_email"], "web@example.com");
+        assert_eq!(
+            json["members"][0]["email"], json["founder_email"],
+            "party order — founder first — must not be re-sorted"
+        );
         let founder_dto = json["members"]
             .as_array()
             .expect("members array")
@@ -3573,6 +3575,30 @@ mod tests {
             .expect("founder present in members");
         let devices = founder_dto["devices"].as_array().expect("devices array");
         assert_eq!(devices.len(), 2);
+
+        // Keyring order (genesis grant, then the explicit device) must
+        // survive — not sorted by fingerprint or by retirement.
+        assert_eq!(devices[0]["fingerprint"], genesis_fingerprint);
+        assert!(
+            devices[0]["retired_at"].is_null(),
+            "the genesis grant is still active: {devices:?}"
+        );
+        assert_eq!(devices[1]["fingerprint"], device_fingerprint);
+        assert!(
+            !devices[1]["retired_at"].is_null(),
+            "the device grant was retired: {devices:?}"
+        );
+
+        // The genesis grant predates transport keys (Task 16): its
+        // transport_fingerprint is null — never a fallback to its own
+        // signing fingerprint, never "".
+        assert_eq!(devices[0]["transport_fingerprint"], serde_json::Value::Null);
+        assert_ne!(
+            devices[0]["transport_fingerprint"], devices[0]["fingerprint"],
+            "a null transport_fingerprint must never fall back to the signing fingerprint"
+        );
+        assert_eq!(devices[1]["transport_fingerprint"], transport_fingerprint);
+
         let retired_count = devices
             .iter()
             .filter(|d| !d["retired_at"].is_null())
@@ -3679,5 +3705,67 @@ mod tests {
             channel_view_json(State(fx.host.clone()), Path("no-such-channel".into())).await;
         assert_eq!(keys_response.status(), view_response.status());
         assert_eq!(keys_response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn keys_json_answers_200_with_no_viewer_identity_when_git_config_is_unset() {
+        // Env mutation (GIT_CONFIG_GLOBAL/SYSTEM below) is process-global —
+        // serialized by the same lock every other env-mutating test in this
+        // file holds.
+        let _home = crate::host::test_home::HomeGuard::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(dir.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        // Deliberately no local user.name/user.email — and the global and
+        // system config files are pointed at paths that do not exist, so
+        // this machine's own git identity cannot leak in and mask what this
+        // test means to exercise.
+        let nonexistent = dir.path().join("no-such-gitconfig");
+        unsafe {
+            std::env::set_var("GIT_CONFIG_GLOBAL", &nonexistent);
+            std::env::set_var("GIT_CONFIG_SYSTEM", &nonexistent);
+        }
+        let member_home = tempfile::tempdir().expect("member home");
+        let host = Host::fixed_with_member_home(
+            vec![dir.path().to_path_buf()],
+            Some(member_home.path().to_path_buf()),
+        );
+        host.open_channel(
+            None,
+            "no-identity-test",
+            Member::human("Nobody", "nobody@example.com"),
+            None,
+        )
+        .await
+        .expect("open channel");
+
+        // Confirm the isolation actually worked, or the rest of this test
+        // would exercise nothing.
+        assert!(
+            crate::host::git_user(dir.path()).is_err(),
+            "git config must be genuinely unreachable for this test to mean anything"
+        );
+
+        let response = keys_json(State(host.clone()), Path("no-identity-test".into())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_text(response).await;
+        let json: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert!(
+            json.get("viewer_email").is_some(),
+            "viewer_email must be present-and-null, not omitted: {body}"
+        );
+        assert_eq!(json["viewer_email"], serde_json::Value::Null);
+        assert_eq!(json["viewer_is_founder"], false);
+
+        unsafe {
+            std::env::remove_var("GIT_CONFIG_GLOBAL");
+            std::env::remove_var("GIT_CONFIG_SYSTEM");
+        }
     }
 }
