@@ -27,6 +27,7 @@ use junto_kernel::{
 };
 use junto_live::{Frame as WireFrame, LiveDoc, Presence};
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 
 const HOST: &str = "http://127.0.0.1:1727";
 
@@ -105,6 +106,14 @@ struct App {
     agent_mcp: Vec<(String, String)>,
     agent_skills: Vec<String>,
     agent_plugins: Vec<String>,
+    /// The join box (Settings → this device): a pasted invite that mints
+    /// this machine's key pair via `POST /devices/enroll`. The GUI never
+    /// mints a key itself — `join_result` only ever holds what the host
+    /// handed back.
+    join_invite: String,
+    join_pending: bool,
+    join_error: Option<String>,
+    join_result: Option<EnrolledDto>,
 }
 
 /// The admin views behind the top-bar buttons.
@@ -336,6 +345,21 @@ impl std::fmt::Display for HarnessRef {
 struct IdentityDto {
     name: String,
     email: String,
+}
+
+/// `POST /devices/enroll`'s response — mirrors
+/// `crates/junto/src/web.rs::EnrolledDto` exactly. A device enrolling under
+/// the current payload version always mints both keypairs in the same
+/// step, so neither fingerprint is ever optional here (contrast
+/// `keys.json`'s per-grant transport fingerprint, which IS optional for a
+/// grant made before transport keys existed — that DTO belongs to the
+/// members-disclosure task).
+#[derive(Debug, Clone, Deserialize)]
+struct EnrolledDto {
+    url: String,
+    email: String,
+    fingerprint: String,
+    transport_fingerprint: String,
 }
 
 impl std::fmt::Display for AgentDto {
@@ -620,6 +644,15 @@ enum Message {
     /// Open an admin view, or `None` to return to the channels workspace.
     OpenAdmin(Option<AdminView>),
     SettingsLoaded(Option<SettingsDto>),
+    /// The join box's pasted-invite text input changed (Settings → this device).
+    JoinInviteChanged(String),
+    /// Submit the join box: mint this device's key pair on the host from
+    /// the pasted invite (`POST /devices/enroll`).
+    JoinSubmit,
+    /// The result of a join POST — Ok carries the enrolled identity
+    /// (enroll code + both fingerprints) to show; the GUI never mints
+    /// anything itself.
+    JoinDone(Result<EnrolledDto, String>),
     RepoPathChanged(String),
     BrowseRepo,
     RepoPicked(Option<String>),
@@ -681,6 +714,10 @@ impl App {
             agent_mcp: Vec::new(),
             agent_skills: Vec::new(),
             agent_plugins: Vec::new(),
+            join_invite: String::new(),
+            join_pending: false,
+            join_error: None,
+            join_result: None,
         };
         (
             app,
@@ -1566,6 +1603,30 @@ impl App {
                 self.settings = settings;
                 Task::none()
             }
+            Message::JoinInviteChanged(value) => {
+                self.join_invite = value;
+                Task::none()
+            }
+            Message::JoinSubmit => {
+                let invite = self.join_invite.trim().to_string();
+                if invite.is_empty() || self.join_pending {
+                    return Task::none();
+                }
+                self.join_pending = true;
+                self.join_error = None;
+                post_device_enroll(HOST.to_string(), invite, None)
+            }
+            Message::JoinDone(result) => {
+                self.join_pending = false;
+                match result {
+                    Ok(enrolled) => {
+                        self.join_result = Some(enrolled);
+                        self.join_invite.clear();
+                    }
+                    Err(err) => self.join_error = Some(err),
+                }
+                Task::none()
+            }
             Message::RepoPathChanged(value) => {
                 self.repo_path = value;
                 Task::none()
@@ -2097,22 +2158,98 @@ fn settings_panel(app: &App) -> Element<'_, Message> {
             subs = subs.push(text(p.clone()).size(12).color(TEXT));
         }
         col = col.push(admin_card(subs));
-        let identity = s
-            .identity
-            .as_ref()
-            .map(|i| format!("{} <{}>", i.name, i.email))
-            .unwrap_or_else(|| "(no git identity)".into());
-        col = col.push(admin_card(
-            column![
-                text("acts authored as").size(13).color(TEAL),
-                text(identity).size(12).color(TEXT),
-            ]
-            .spacing(3),
-        ));
+        let mut device = column![text("this device").size(13).color(TEAL)].spacing(3);
+        match &s.identity {
+            Some(i) => {
+                device = device.push(
+                    text(format!("{} <{}>", i.name, i.email))
+                        .size(12)
+                        .color(TEXT),
+                );
+                device = device.push(match load_signing_key(&i.email) {
+                    Some(key) => row![
+                        badge("key on file", GREEN),
+                        text(device_fingerprint(key.public_key().as_str()))
+                            .size(11)
+                            .color(MUTED),
+                    ]
+                    .spacing(6)
+                    .align_y(Center),
+                    None => row![
+                        text("no device key on file — join a channel below to mint one")
+                            .size(12)
+                            .color(YELLOW)
+                    ],
+                });
+            }
+            None => {
+                device = device.push(text("(no git identity)").size(12).color(MUTED));
+            }
+        }
+        col = col.push(admin_card(device));
         col = col.push(text(format!("junto {}", s.version)).size(11).color(MUTED));
     } else {
         col = col.push(text("loading…").size(12).color(MUTED));
     }
+
+    // Join a channel: paste a founder's invite to mint this device's key
+    // pair (`POST /devices/enroll`) — the joiner half of pairing a second
+    // machine, replacing `junto enroll` in a terminal.
+    let mut join = column![text("join a channel").size(13).color(TEAL)].spacing(6);
+    join = join.push(
+        text_input("paste an invite (junto://enroll?code=…)…", &app.join_invite)
+            .on_input(Message::JoinInviteChanged)
+            .size(12)
+            .padding(6),
+    );
+    let can_join = !app.join_pending && !app.join_invite.trim().is_empty();
+    join = join.push(
+        button(text(if app.join_pending {
+            "joining…"
+        } else {
+            "join"
+        }))
+        .on_press_maybe(can_join.then_some(Message::JoinSubmit))
+        .padding(6),
+    );
+    if let Some(err) = &app.join_error {
+        join = join.push(text(format!("⚠ {err}")).size(11).color(RED));
+    }
+    if let Some(enrolled) = &app.join_result {
+        join = join.push(
+            column![
+                text(format!("joined as {}", enrolled.email))
+                    .size(12)
+                    .color(GREEN),
+                row![
+                    text("enroll code (hand this to the founder)")
+                        .size(12)
+                        .color(MUTED),
+                    copy_button(enrolled.url.clone()),
+                ]
+                .spacing(6)
+                .align_y(Center),
+                text(enrolled.url.clone()).size(10).color(TEXT),
+                text(format!(
+                    "fingerprint (read aloud): {}",
+                    enrolled.fingerprint
+                ))
+                .size(11)
+                .color(TEXT),
+                text(format!(
+                    "transport fingerprint: {}",
+                    enrolled.transport_fingerprint
+                ))
+                .size(11)
+                .color(TEXT),
+                text("your secret key never leaves this machine")
+                    .size(11)
+                    .color(MUTED),
+            ]
+            .spacing(4),
+        );
+    }
+    col = col.push(admin_card(join));
 
     // Register a repo as a home substrate — the GUI `junto init`.
     let mut repo = column![
@@ -3992,6 +4129,27 @@ fn post_delete_agent(slug: String) -> Task<Message> {
     )
 }
 
+/// POST an enroll (`/devices/enroll`) — mints this device's own signing
+/// and transport key pair on the host from a founder's pasted invite,
+/// modelled on `post_save_agent`/`simple_post_result` but, per that
+/// endpoint's JSON response, routed through `post_json_result` instead.
+/// `name` is the display name to enroll under; `None` lets the host fall
+/// back to this machine's git identity, then the invite email's local
+/// part.
+fn post_device_enroll(base: String, invite: String, name: Option<String>) -> Task<Message> {
+    let url = format!("{base}/devices/enroll");
+    Task::perform(
+        async move {
+            let mut form = vec![("invite", invite)];
+            if let Some(name) = name {
+                form.push(("name", name));
+            }
+            post_json_result::<EnrolledDto>(url, form, "join").await
+        },
+        Message::JoinDone,
+    )
+}
+
 /// Shared POST → `Result<(), String>` helper: success when the (redirect-
 /// followed) status is 2xx, else the status + body as an error.
 async fn simple_post_result(url: &str, form: &[(&str, String)], what: &str) -> Result<(), String> {
@@ -4008,6 +4166,61 @@ async fn simple_post_result(url: &str, form: &[(&str, String)], what: &str) -> R
             })
         }
         Err(err) => Err(format!("request failed: {err}")),
+    }
+}
+
+/// Turn a failed response's status, content-type, and body into a short
+/// human string a panel can show directly — never the raw body. The
+/// host's JSON endpoints keep a JSON body on error (e.g. `POST /members`'s
+/// 409 `{"outcomes":[…]}`); this parses that body's `message` field,
+/// falling back to the trimmed body itself when the shape differs.
+/// Everything else — in particular the identity endpoints' plain-text
+/// refusals, which the host's router-wide `prettify_errors`
+/// (`crates/junto/src/web.rs`) rewrites into a styled HTML error page —
+/// collapses to the status code plus a fixed sentence, so a caller here
+/// never renders a raw `<html>` body in an error box.
+fn describe_failed_response(status: u16, content_type: Option<&str>, body: &str) -> String {
+    let is_json = content_type.is_some_and(|ct| ct.starts_with("application/json"));
+    if is_json {
+        let message = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|value| value.get("message")?.as_str().map(str::to_string));
+        return message.unwrap_or_else(|| body.trim().to_string());
+    }
+    format!("request failed ({status}); see the host log for details")
+}
+
+/// Shared POST → `Result<T, String>` helper: parses a JSON body into `T`
+/// on success; on failure, `describe_failed_response` turns the status,
+/// content-type, and body into a short human string — never the raw body.
+/// Beside `simple_post_result`, which returns `()` instead of a parsed
+/// body; `post_device_enroll` (Task 12) and the channel-pane members
+/// disclosure (Task 13) both reuse this.
+async fn post_json_result<T: DeserializeOwned>(
+    url: String,
+    form: Vec<(&'static str, String)>,
+    what: &'static str,
+) -> Result<T, String> {
+    match reqwest::Client::new().post(&url).form(&form).send().await {
+        Ok(resp) if resp.status().is_success() => resp
+            .json::<T>()
+            .await
+            .map_err(|err| format!("{what}: couldn't parse the response: {err}")),
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let content_type = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let body = resp.text().await.unwrap_or_default();
+            Err(describe_failed_response(
+                status,
+                content_type.as_deref(),
+                &body,
+            ))
+        }
+        Err(err) => Err(format!("{what}: request failed: {err}")),
     }
 }
 
@@ -4181,6 +4394,21 @@ fn load_signing_key(email: &str) -> Option<SigningKey> {
     let file: KeysFile = toml::from_str(&text).ok()?;
     let record = file.keys.into_iter().find(|record| record.email == email)?;
     SigningKey::from_secret_hex(&record.secret).ok()
+}
+
+/// The 16-hex fingerprint the host derives from a public key
+/// (`crates/junto/src/identity.rs::fingerprint`): strip the `ed25519:`
+/// prefix, take the first 16 hex chars. Takes the key's raw string form
+/// (`SigningKey::public_key().as_str()`/`PublicKey::as_str()`) rather than
+/// a typed key, since the GUI derives this locally and must agree with the
+/// host's format byte-for-byte, or the two screens show different ids for
+/// one key.
+fn device_fingerprint(key: &str) -> String {
+    key.strip_prefix("ed25519:")
+        .unwrap_or(key)
+        .chars()
+        .take(16)
+        .collect()
 }
 
 /// Serialize and send one `WireFrame` over the live websocket's write half.
@@ -4756,6 +4984,42 @@ mod tests {
             "the derived public key matches the stored secret"
         );
         assert!(missing.is_none(), "no record on file for an unknown email");
+    }
+
+    #[test]
+    fn device_fingerprint_matches_the_hosts_sixteen_chars() {
+        // The GUI derives a fingerprint locally; it must agree with the host's
+        // identity::fingerprint, or the two screens show different ids for one key.
+        let key = "ed25519:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(device_fingerprint(key), "0123456789abcdef");
+    }
+
+    #[test]
+    fn describe_failed_response_prefers_a_json_message_over_an_html_body() {
+        assert_eq!(
+            describe_failed_response(400, Some("application/json"), r#"{"message":"nope"}"#),
+            "nope"
+        );
+        // A JSON body without a "message" field falls back to the raw text.
+        assert_eq!(
+            describe_failed_response(409, Some("application/json"), r#"{"outcomes":[1,2]}"#),
+            r#"{"outcomes":[1,2]}"#
+        );
+        // The identity endpoints' plain-text refusals arrive here as the
+        // host's `prettify_errors` HTML error page — never rendered raw.
+        let html = describe_failed_response(
+            400,
+            Some("text/html; charset=utf-8"),
+            "<html><body><h1>That needs a small fix</h1><p>this invite has expired</p></body></html>",
+        );
+        assert!(
+            !html.contains('<'),
+            "no raw markup leaks into the panel: {html}"
+        );
+        assert!(
+            !html.to_lowercase().contains("html"),
+            "no mention of the wrapper format: {html}"
+        );
     }
 
     #[test]
