@@ -888,7 +888,8 @@ impl JuntoMcp {
     ) -> Result<CallToolResult, McpError> {
         let author: Member = req.author.into();
         let (ledger, channel) = self.resolve(&req.channel).await?;
-        self.authorize(&ledger, &channel, &author, req.code.as_deref())
+        let view = self
+            .authorize(&ledger, &channel, &author, req.code.as_deref())
             .await?;
         let provenance = parse_provenance(req.provenance)?;
         let frame = parse_frame(req.frame, TargetKind::Assertion)?;
@@ -937,18 +938,14 @@ impl JuntoMcp {
         self.host.sign_entry(&mut entry);
         let id = entry.id;
         ledger.lock().await.append(entry).await.map_err(internal)?;
-        // The tail is a suggestion, never load-bearing: the write already
-        // landed, so a projection failure here must not surface as an error
-        // — that would invite a retry that appends a duplicate assertion to
-        // an append-only ledger.
-        let tail = ledger
-            .lock()
-            .await
-            .project(&channel)
-            .await
-            .ok()
-            .and_then(|view| crate::render::related_open_markdown(&view, &about, id))
-            .unwrap_or_default();
+        // The tail is a suggestion, built from the pre-append view
+        // `authorize` already produced: `related_open_markdown`'s `exclude`
+        // filters the new entry out (it isn't even present in this
+        // pre-append view), and its ranker corpus is built from the
+        // already-filtered candidate list either way, so the pre-append
+        // view is exactly equivalent to re-projecting after the append —
+        // without a second lock acquisition or a second full projection.
+        let tail = crate::render::related_open_markdown(&view, &about, id).unwrap_or_default();
         Ok(text(format!(
             "recorded {id} in channel '{}'{tail}",
             req.channel

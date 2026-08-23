@@ -1152,6 +1152,9 @@ impl Host {
     ) -> Result<crate::render::LineageContext> {
         /// How many of an ancestor's standing decisions to inherit.
         const INHERIT_MAX: usize = 8;
+        // One clock read for the whole call — `standing_decision_lines`
+        // otherwise reads it fresh per ancestor inside the loop below.
+        let now = Timestamp::now();
         let mut inherited = Vec::new();
         let mut references = Vec::new();
         for edge in &view.lineage {
@@ -1177,8 +1180,12 @@ impl Host {
                                 .map(|e| e.timestamp.as_millis())
                         });
                         entry.name = ancestor.name.clone();
-                        entry.decisions =
-                            crate::render::standing_decision_lines(&ancestor, cutoff, INHERIT_MAX);
+                        entry.decisions = crate::render::standing_decision_lines(
+                            &ancestor,
+                            cutoff,
+                            INHERIT_MAX,
+                            now,
+                        );
                         entry.resolved = true;
                     }
                     inherited.push(entry);
@@ -1380,11 +1387,10 @@ pub fn attention_for_view(id: &ChannelId, view: &ChannelView, now: Timestamp) ->
     // — a projection filter only (see its doc comment): the entry keeps its
     // `Standing`, this just stops asking. Gates are a separate vector and
     // are never touched here, so a pending gate never ages out.
-    let horizon_ms = VERIFICATION_HORIZON_DAYS * 24 * 60 * 60 * 1000;
     verifications.retain(|item| {
         now.as_millis()
             .saturating_sub(item.entry.timestamp.as_millis())
-            <= horizon_ms
+            <= VERIFICATION_HORIZON_MS
     });
     // Oldest first within each kind: the longest-waiting item leads. Gates
     // (blocked proposer) first, then stuck executions, then verification debt.
@@ -1416,6 +1422,12 @@ const MILESTONE_CAP: usize = 12;
 /// than dropping it, so it is still findable by id. Gates are exempt — a
 /// pending gate blocks its proposer, and time does not unblock them.
 pub(crate) const VERIFICATION_HORIZON_DAYS: i64 = 14;
+
+/// [`VERIFICATION_HORIZON_DAYS`] in milliseconds — the unit both aging sites
+/// (`attention_for_view` below, `crate::render::brief_shape`) compare
+/// against. Derived here, once, so a change to the constant's unit is one
+/// arithmetic site, not two independently-restated ones.
+pub(crate) const VERIFICATION_HORIZON_MS: i64 = VERIFICATION_HORIZON_DAYS * 24 * 60 * 60 * 1000;
 
 /// A short, single-line label for a milestone node's tooltip.
 fn milestone_label(text: &str) -> String {

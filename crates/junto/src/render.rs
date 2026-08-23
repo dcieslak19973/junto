@@ -152,7 +152,7 @@ fn brief_shape(view: &ChannelView, now: Timestamp) -> BriefShape<'_> {
         rejected: Vec::new(),
         superseded: 0,
     };
-    let horizon_ms = crate::host::VERIFICATION_HORIZON_DAYS * 24 * 60 * 60 * 1000;
+    let horizon_ms = crate::host::VERIFICATION_HORIZON_MS;
     for entry in &view.entries {
         match &entry.payload {
             EntryPayload::Assertion { kind, .. } => match view.standing(&entry.id) {
@@ -254,10 +254,17 @@ pub struct LineageRef {
 /// corrections), newest first, clamped, up to `max` — optionally only those
 /// recorded at or before `cutoff` epoch-millis (the divergence point, so a
 /// child inherits the parent *as of* the split). The summarizer the brief's
-/// inherited-context block (`docs/adr/0027`) reuses.
-pub fn standing_decision_lines(view: &ChannelView, cutoff: Option<i64>, max: usize) -> Vec<String> {
+/// inherited-context block (`docs/adr/0027`) reuses. `now` is threaded in
+/// (rather than read here) so a caller projecting many ancestors in a loop
+/// (`crate::host::HostState::lineage_context`) binds one clock read outside it.
+pub fn standing_decision_lines(
+    view: &ChannelView,
+    cutoff: Option<i64>,
+    max: usize,
+    now: Timestamp,
+) -> Vec<String> {
     let mut lines = Vec::new();
-    for entry in brief_shape(view, Timestamp::now()).ratified.iter().rev() {
+    for entry in brief_shape(view, now).ratified.iter().rev() {
         if let Some(cutoff) = cutoff
             && entry.timestamp.as_millis() > cutoff
         {
@@ -2481,6 +2488,7 @@ pub fn channel_html(
     // (state, not history), rendered as the page — with the full transcript
     // collapsed below instead of *being* the page.
     let shape = brief_shape(view, now);
+    let findings = findings_section(&shape, view, id);
     let notes = act_notes(view);
     let standing = standing_decisions_section(&shape, &notes);
     let recently = recently_section(view);
@@ -2602,7 +2610,7 @@ pub fn channel_html(
     let content = format!(
         "<h1>{name}</h1>\n\
          <p class=\"meta\">{count} entries</p>\n\
-         {rename}{lifecycle}{lineage_actions}{party}{strip}{start_work}{sessions}{standing}{recently}{footer}\
+         {rename}{lifecycle}{lineage_actions}{party}{strip}{findings}{start_work}{sessions}{standing}{recently}{footer}\
          <details class=\"ledger\"><summary class=\"board-head\">channel history \
          · {count} entries</summary>\n{body}</details>\n{open_here}",
         name = escape_html(name),
@@ -2695,6 +2703,40 @@ fn standing_decisions_section(
     format!(
         "<section class=\"board\"><h2 class=\"board-head\">standing decisions \
          (newest first)</h2>\n<div class=\"decisions\">{items}</div></section>\n"
+    )
+}
+
+/// The human rendering of the brief's quiet tier: provisional Findings and
+/// aged provisional Decisions — dropped off the act list but never off the
+/// record (`docs/adr/0039`). Mirrors [`brief_markdown`]'s "recorded,
+/// unverified" section (the same `shape.findings` bucket), styled like
+/// [`standing_decisions_section`] rather than the entry cards below. Unlike
+/// that tier these entries are still `Provisional`, so each keeps its id
+/// (`verification_form` addresses acts by id) and its ratify/park form —
+/// aging stops asking, it never stops the entry from being actable.
+fn findings_section(shape: &BriefShape<'_>, view: &ChannelView, channel: &ChannelId) -> String {
+    if shape.findings.is_empty() {
+        return String::new();
+    }
+    let mut items = String::new();
+    for entry in &shape.findings {
+        let text = match &entry.payload {
+            EntryPayload::Assertion { statement, .. } => statement.as_str(),
+            _ => continue,
+        };
+        let _ = writeln!(
+            items,
+            "<div class=\"decision\"><div class=\"dec-meta\">{who} · <code>{id}</code></div>\
+             <div class=\"dec-body\">{body}</div>{form}</div>",
+            who = escape_html(&entry.author.display_name),
+            id = entry.id,
+            body = escape_html(text),
+            form = verification_form(entry, view, channel),
+        );
+    }
+    format!(
+        "<section class=\"board\"><h2 class=\"board-head\">recorded, unverified</h2>\n\
+         <div class=\"decisions\">{items}</div></section>\n"
     )
 }
 
@@ -4957,6 +4999,52 @@ mod tests {
         assert!(
             quiet.contains(&id),
             "but it stays in the record — findable and ratifiable in the quieter tier: {quiet}"
+        );
+    }
+
+    /// Finding 1 (whole-branch review): `channel_html` must render the same
+    /// quiet tier `brief_markdown` does. Push the aged entry past
+    /// `HISTORY_CAP` with 30 newer entries so it can only be found in the
+    /// "recorded, unverified" section, never in the capped entry cards.
+    #[test]
+    fn an_aged_provisional_decision_renders_outside_the_entry_cards() {
+        const HORIZON_MS: i64 = 14 * 24 * 60 * 60 * 1000;
+        const MARKER: &str = "an old open decision, marker-2f9c";
+        let now = Timestamp::now();
+        let mut aged = assertion(Some(AssertionKind::Decision), MARKER);
+        aged.timestamp = Timestamp::from_millis(now.as_millis() - HORIZON_MS - 24 * 60 * 60 * 1000);
+
+        let mut entries = vec![aged];
+        for i in 0..30 {
+            let mut newer = assertion(Some(AssertionKind::Decision), "a newer decision");
+            newer.timestamp = Timestamp::from_millis(now.as_millis() - i * 1000);
+            entries.push(newer);
+        }
+        let view = view_with(entries);
+        let html = channel_html(
+            &[],
+            "t",
+            &ChannelId::new(),
+            &view,
+            std::path::Path::new("/repo"),
+            None,
+        );
+
+        let ledger_start = html
+            .find("<details class=\"ledger\"")
+            .expect("the collapsed ledger exists");
+        let (before_ledger, ledger_section) = html.split_at(ledger_start);
+        assert!(
+            !ledger_section.contains(MARKER),
+            "capped out of the entry cards by HISTORY_CAP: {ledger_section}"
+        );
+        assert!(
+            before_ledger.contains("recorded, unverified"),
+            "the quiet-tier section renders: {before_ledger}"
+        );
+        assert!(
+            before_ledger.contains(MARKER),
+            "but it still renders in the quiet tier, outside the entry cards: {before_ledger}"
         );
     }
 }
