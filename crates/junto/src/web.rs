@@ -2689,6 +2689,10 @@ impl EntryDto {
             EntryPayload::GateExecuted { note, .. } => ("act", format!("gate executed — {note}")),
             EntryPayload::SessionStarted { intent } => ("session", intent.clone()),
             EntryPayload::SessionUpdated { note, .. } => ("session", note.clone()),
+            EntryPayload::SessionCommitted { base, head, .. } => (
+                "session",
+                format!("work landed in {}..{}", base.short(), head.short()),
+            ),
             EntryPayload::ArtifactAttached {
                 kind, description, ..
             } => ("artifact", format!("{kind}: {description}")),

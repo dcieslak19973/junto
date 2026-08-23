@@ -112,6 +112,15 @@ impl CommitOid {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The oid abbreviated to its first 7 characters — the length git itself
+    /// prints — for surfaces that show a range rather than identify an
+    /// object. Never fails: [`CommitOid::new`] is the only constructor and it
+    /// admits exactly 40 characters.
+    #[must_use]
+    pub fn short(&self) -> &str {
+        &self.0[..7]
+    }
 }
 
 impl From<CommitOid> for String {

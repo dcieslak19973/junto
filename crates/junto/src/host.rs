@@ -1517,6 +1517,10 @@ fn preview(entry: &LedgerEntry) -> String {
         ),
         EntryPayload::SessionStarted { intent } => ("session started", intent.clone()),
         EntryPayload::SessionUpdated { note, .. } => ("session updated", note.clone()),
+        EntryPayload::SessionCommitted { base, head, .. } => (
+            "session committed",
+            format!("{}..{}", base.short(), head.short()),
+        ),
         EntryPayload::ArtifactAttached { description, .. } => ("artifact", description.clone()),
         // Provisional copy — the surface plan owns subject rendering.
         EntryPayload::SubjectAttached { subject } => (

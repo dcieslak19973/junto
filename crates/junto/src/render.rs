@@ -513,6 +513,9 @@ fn recent_line(entry: &LedgerEntry) -> String {
         EntryPayload::SessionUpdated { target, .. } => {
             format!("updated session `{}`", short(target))
         }
+        EntryPayload::SessionCommitted { base, head, .. } => {
+            format!("recorded work `{}..{}`", base.short(), head.short())
+        }
         EntryPayload::ArtifactAttached { description, .. } => {
             format!("attached artifact: {}", clamp(description, TAIL_CLAMP))
         }
@@ -803,6 +806,22 @@ fn describe_markdown(entry: &LedgerEntry, view: &ChannelView) -> String {
             format!(
                 "session update of `{target}` → {} — {note}",
                 session_state_label(*state)
+            )
+        }
+        EntryPayload::SessionCommitted {
+            target,
+            branch,
+            base,
+            head,
+        } => {
+            let where_ = branch
+                .as_deref()
+                .map(|branch| format!(" on `{branch}`"))
+                .unwrap_or_default();
+            format!(
+                "**session committed** — `{target}`'s work landed in `{}..{}`{where_}",
+                base.short(),
+                head.short()
             )
         }
         EntryPayload::ArtifactAttached {
@@ -2603,6 +2622,7 @@ fn entry_family(payload: &EntryPayload) -> &'static str {
         EntryPayload::Assertion { .. } | EntryPayload::Proposal { .. } => "fam-decision",
         EntryPayload::SessionStarted { .. }
         | EntryPayload::SessionUpdated { .. }
+        | EntryPayload::SessionCommitted { .. }
         | EntryPayload::ArtifactAttached { .. }
         // Provisional copy — the surface plan owns subject rendering.
         | EntryPayload::SubjectAttached { .. }
@@ -2767,6 +2787,22 @@ fn entry_card(entry: &LedgerEntry, view: &ChannelView, channel: &ChannelId) -> S
             Some(session_state_label(*state)),
             None,
             Some(note.as_str()),
+            None,
+            Some(*target),
+        ),
+        EntryPayload::SessionCommitted {
+            target,
+            branch,
+            base,
+            head,
+        } => (
+            "session committed",
+            None,
+            Some(match branch {
+                Some(branch) => format!("{}..{} on {branch}", base.short(), head.short()),
+                None => format!("{}..{}", base.short(), head.short()),
+            }),
+            None,
             None,
             Some(*target),
         ),
@@ -4012,6 +4048,7 @@ mod tests {
             junto_kernel::SessionView {
                 state: SessionState::Blocked,
                 artifacts: vec![artifact.id],
+                commits: None,
             },
         );
 
