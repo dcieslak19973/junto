@@ -19,8 +19,13 @@ Two layers, matching the kernel ↔ playbook seam (CLAUDE.md constraint #5):
    urgency order:
    - **pending gates** first: an agent proposed an action and is *blocked*
      on a human's approve/reject;
-   - **provisional assertions**: unverified record accumulating —
-     verification debt;
+   - **provisional Decisions, within the horizon**: unverified record
+     demanding a verdict — verification debt. `AssertionKind::Finding`
+     entries never enter this category (recorded and citable, asking
+     nobody to decide), and a Decision that has waited past
+     `VERIFICATION_HORIZON_DAYS` ages out of it too — both land in the
+     brief's quieter "recorded, unverified" tier instead, still findable
+     by id but no longer rendered as urgent (`adr/0039`);
    - **anomalies**: unrecognized authors (`adr/0017`), sync failures.
 2. **Playbook-contributed attention** (anticipated) — each workflow type
    creates its own things-needing-attention: a code-PR playbook says *a PR
@@ -422,6 +427,17 @@ Held openly so the next design round inherits the sharpened version:
    asymmetry. **This is junto's instance of the industry's central unsolved
    problem** — representable here (verification is a first-class, measurable
    act) in a way it is nowhere else, which is the position to work it from.
+   **Answered in part (`adr/0039`, 2026-08-23):** the "real debt vs.
+   tolerable" question turned out to conflate two different things —
+   `AssertionKind::Finding` narrows the board to only what actually asks for
+   a verdict (a Finding is recorded and citable but was never debt at all),
+   and `VERIFICATION_HORIZON_DAYS` stops a Decision nobody has needed to
+   verify in a while from continuing to render as urgent, without erasing
+   it — it moves to the brief's quieter "recorded, unverified" tier,
+   findable by id, reversible by ratifying whenever someone wants to. That
+   answers *rendering*: old debt does not drown the board. It does not
+   answer the deeper asymmetry — whether an agent can still out-produce a
+   human's ratify rate inside the horizon — which stays open.
 2. **Cleared states cut both ways.** Closure reduces residue *and* imports
    inbox-zero psychology — processing-for-clearance is the rubber-stamp
    gradient. Mitigation: decision frames + measuring override rates; watch

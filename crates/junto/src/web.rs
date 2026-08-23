@@ -2189,7 +2189,7 @@ async fn channel_brief(State(host): State<Arc<Host>>, Path(channel): Path<String
             let lineage = host.lineage_context(&view).await.unwrap_or_default();
             (
                 [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
-                render::brief_markdown(&name, &id, &view, &lineage),
+                render::brief_markdown(&name, &id, &view, &lineage, Timestamp::now()),
             )
                 .into_response()
         }
@@ -2236,11 +2236,15 @@ async fn focus_json(State(host): State<Arc<Host>>) -> Response {
     let clip = |s: &str| s.chars().take(140).collect::<String>();
     let inventory = host.inventory().await.unwrap_or_default();
     let mut items = Vec::new();
+    // One clock read for the whole board — every channel's attention group
+    // is judged against the same instant, not one that drifts as the loop
+    // crosses the inventory.
+    let now = Timestamp::now();
     for summary in &inventory {
         let Ok((id, view, _)) = project(&host, &summary.id.to_string()).await else {
             continue;
         };
-        let group = crate::host::attention_for_view(&id, &view);
+        let group = crate::host::attention_for_view(&id, &view, now);
         for item in &group.items {
             let kind = match item.kind {
                 crate::host::AttentionKind::Gate => "gate",
@@ -3609,6 +3613,9 @@ mod tests {
             rationale: "because".into(),
             provenance: vec![],
             frame: None,
+            session: None,
+            kind: None,
+            answers: None,
         }
     }
 

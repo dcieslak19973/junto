@@ -450,6 +450,10 @@ impl Host {
     pub async fn overview(&self) -> Result<(Vec<ChannelSummary>, Vec<AttentionGroup>)> {
         let mut summaries = Vec::new();
         let mut groups = Vec::new();
+        // One clock read for the whole sweep — every channel's attention
+        // group is judged against the same instant, not one that drifts as
+        // the sweep crosses substrates and channels.
+        let now = Timestamp::now();
         for repo in self.substrate_paths()? {
             let ledger = self.ledger_for(&repo).await?;
             let guard = ledger.lock().await;
@@ -458,7 +462,7 @@ impl Host {
                 // A closed channel demands no attention (docs/adr/0022) —
                 // its summary still lists, demoted, for the archive view.
                 if !view.closed {
-                    let group = attention_for_view(&id, &view);
+                    let group = attention_for_view(&id, &view, now);
                     if !group.items.is_empty() {
                         groups.push(group);
                     }
@@ -1148,6 +1152,9 @@ impl Host {
     ) -> Result<crate::render::LineageContext> {
         /// How many of an ancestor's standing decisions to inherit.
         const INHERIT_MAX: usize = 8;
+        // One clock read for the whole call — `standing_decision_lines`
+        // otherwise reads it fresh per ancestor inside the loop below.
+        let now = Timestamp::now();
         let mut inherited = Vec::new();
         let mut references = Vec::new();
         for edge in &view.lineage {
@@ -1173,8 +1180,12 @@ impl Host {
                                 .map(|e| e.timestamp.as_millis())
                         });
                         entry.name = ancestor.name.clone();
-                        entry.decisions =
-                            crate::render::standing_decision_lines(&ancestor, cutoff, INHERIT_MAX);
+                        entry.decisions = crate::render::standing_decision_lines(
+                            &ancestor,
+                            cutoff,
+                            INHERIT_MAX,
+                            now,
+                        );
                         entry.resolved = true;
                     }
                     inherited.push(entry);
@@ -1334,7 +1345,7 @@ pub struct OpenedChannel {
 /// One channel's attention items from an already-projected view — used by
 /// [`Host::attention`] and by the channel page's attention strip (which has
 /// the view in hand and must not re-project).
-pub fn attention_for_view(id: &ChannelId, view: &ChannelView) -> AttentionGroup {
+pub fn attention_for_view(id: &ChannelId, view: &ChannelView, now: Timestamp) -> AttentionGroup {
     let mut gates = Vec::new();
     let mut awaiting = Vec::new();
     let mut verifications = Vec::new();
@@ -1360,8 +1371,9 @@ pub fn attention_for_view(id: &ChannelId, view: &ChannelView) -> AttentionGroup 
                     entry: entry.clone(),
                 });
             }
-            EntryPayload::Assertion { .. }
-                if view.standing(&entry.id) == Some(junto_kernel::Standing::Provisional) =>
+            EntryPayload::Assertion { kind, .. }
+                if view.standing(&entry.id) == Some(junto_kernel::Standing::Provisional)
+                    && !matches!(kind, Some(junto_kernel::AssertionKind::Finding)) =>
             {
                 verifications.push(AttentionItem {
                     kind: AttentionKind::Verification,
@@ -1371,6 +1383,15 @@ pub fn attention_for_view(id: &ChannelId, view: &ChannelView) -> AttentionGroup 
             _ => {}
         }
     }
+    // Provisional assertions age off the board after `VERIFICATION_HORIZON_DAYS`
+    // — a projection filter only (see its doc comment): the entry keeps its
+    // `Standing`, this just stops asking. Gates are a separate vector and
+    // are never touched here, so a pending gate never ages out.
+    verifications.retain(|item| {
+        now.as_millis()
+            .saturating_sub(item.entry.timestamp.as_millis())
+            <= VERIFICATION_HORIZON_MS
+    });
     // Oldest first within each kind: the longest-waiting item leads. Gates
     // (blocked proposer) first, then stuck executions, then verification debt.
     gates.sort_by_key(|item| item.entry.timestamp);
@@ -1388,6 +1409,25 @@ pub fn attention_for_view(id: &ChannelId, view: &ChannelView) -> AttentionGroup 
 /// The most milestone nodes a channel's track carries — bounds clutter on a
 /// busy channel (the most recent win).
 const MILESTONE_CAP: usize = 12;
+
+/// How long a provisional assertion stays an attention item before it becomes
+/// recorded-but-unverified. A claim nobody has needed to verify in this long
+/// is not waiting on anyone, and `docs/attention.md:85` is explicit that the
+/// board is "not a queue".
+///
+/// This is a **projection filter only**: the entry keeps its `Provisional`
+/// standing and can still be ratified whenever someone wants to. It stays in
+/// the record — the scaled brief ([`crate::render::brief_markdown`]) moves it
+/// from the act list into its own quieter `recorded, unverified` tier rather
+/// than dropping it, so it is still findable by id. Gates are exempt — a
+/// pending gate blocks its proposer, and time does not unblock them.
+pub(crate) const VERIFICATION_HORIZON_DAYS: i64 = 14;
+
+/// [`VERIFICATION_HORIZON_DAYS`] in milliseconds — the unit both aging sites
+/// (`attention_for_view` below, `crate::render::brief_shape`) compare
+/// against. Derived here, once, so a change to the constant's unit is one
+/// arithmetic site, not two independently-restated ones.
+pub(crate) const VERIFICATION_HORIZON_MS: i64 = VERIFICATION_HORIZON_DAYS * 24 * 60 * 60 * 1000;
 
 /// A short, single-line label for a milestone node's tooltip.
 fn milestone_label(text: &str) -> String {
@@ -2773,7 +2813,7 @@ mod lineage_tests {
         }
 
         let view = ledger.lock().await.project(&id).await.unwrap();
-        let group = attention_for_view(&id, &view);
+        let group = attention_for_view(&id, &view, Timestamp::now());
         assert!(
             group
                 .items
@@ -2801,13 +2841,213 @@ mod lineage_tests {
             .await
             .unwrap();
         let view = ledger.lock().await.project(&id).await.unwrap();
-        let group = attention_for_view(&id, &view);
+        let group = attention_for_view(&id, &view, Timestamp::now());
         assert!(
             !group
                 .items
                 .iter()
                 .any(|i| i.kind == AttentionKind::AwaitingExecution),
             "a successful execution clears the signal"
+        );
+    }
+
+    fn assertion_of(
+        kind: Option<junto_kernel::AssertionKind>,
+        session: Option<EntryId>,
+    ) -> EntryPayload {
+        EntryPayload::Assertion {
+            statement: "s".into(),
+            rationale: "r".into(),
+            provenance: vec![],
+            frame: None,
+            session,
+            kind,
+            answers: None,
+        }
+    }
+
+    /// Wraps each payload in a fresh, unsigned entry and folds a standing
+    /// directly — no ledger append, no projection — mirroring `render.rs`'s
+    /// `view_with` test helper (`render.rs:3867`). Assertions land
+    /// `Provisional` (the standing `attention_for_view` checks); proposals
+    /// land a `Pending` gate. Corrections land `Provisional` too, but that
+    /// is test scaffolding only — the kernel's real projection never puts a
+    /// `Correction` in `standings` at all (a correction "does not itself
+    /// gain a Standing during projection"). Doing so here exists solely so
+    /// `a_correction_is_not_an_attention_item_today` can pin
+    /// `attention_for_view`'s behaviour even in that stronger-than-production
+    /// state.
+    fn view_with(payloads: Vec<EntryPayload>) -> ChannelView {
+        let channel = ChannelId::new();
+        let entries: Vec<LedgerEntry> = payloads
+            .into_iter()
+            .map(|payload| LedgerEntry {
+                signature: None,
+                id: EntryId::new(),
+                channel,
+                author: dan(),
+                timestamp: Timestamp::now(),
+                payload,
+            })
+            .collect();
+        let mut standings = HashMap::new();
+        let mut gate_status = HashMap::new();
+        for e in &entries {
+            match e.payload {
+                EntryPayload::Assertion { .. } | EntryPayload::Correction { .. } => {
+                    standings.insert(e.id, Standing::Provisional);
+                }
+                EntryPayload::Proposal { .. } => {
+                    gate_status.insert(e.id, GateStatus::Pending);
+                }
+                _ => {}
+            }
+        }
+        ChannelView {
+            name: None,
+            entries,
+            party: Vec::new(),
+            keyring: Default::default(),
+            unrecognized: std::collections::HashSet::new(),
+            unverified: Default::default(),
+            standings,
+            gate_status,
+            gate_executions: HashMap::new(),
+            sessions: HashMap::new(),
+            closed: false,
+            lineage: Vec::new(),
+            subjects: Vec::new(),
+            channel_standing: junto_kernel::ChannelStanding::Scratch,
+        }
+    }
+
+    /// A named convenience wrapper over `view_with` for the pending-gate
+    /// case: a single unapproved `Proposal`, which `view_with` already
+    /// folds to `GateStatus::Pending` for any `Proposal` payload. Exists so
+    /// call sites read as intent (`view_with_pending_gate()`) rather than
+    /// reconstructing the `Proposal` literal inline.
+    fn view_with_pending_gate() -> ChannelView {
+        view_with(vec![EntryPayload::Proposal {
+            action: "ship it".into(),
+            rationale: "because".into(),
+            provenance: vec![],
+            requirement: ApprovalRequirement::Count(1),
+            frame: None,
+            kind: None,
+        }])
+    }
+
+    #[tokio::test]
+    async fn a_finding_is_not_an_attention_item() {
+        let view = view_with(vec![
+            assertion_of(Some(junto_kernel::AssertionKind::Finding), None),
+            assertion_of(Some(junto_kernel::AssertionKind::Decision), None),
+        ]);
+        let group = attention_for_view(&ChannelId::new(), &view, Timestamp::now());
+        assert_eq!(
+            group.items.len(),
+            1,
+            "only the decision deserves a verdict: {:?}",
+            group.items
+        );
+        assert!(
+            matches!(
+                group.items[0].entry.payload,
+                EntryPayload::Assertion {
+                    kind: Some(junto_kernel::AssertionKind::Decision),
+                    ..
+                }
+            ),
+            "the surviving item must be the decision, not the finding: {:?}",
+            group.items[0].entry.payload
+        );
+    }
+    #[tokio::test]
+    async fn an_assertion_with_no_kind_still_asks_for_a_verdict() {
+        // Legacy entries must not be silently discharged.
+        let view = view_with(vec![assertion_of(None, None)]);
+        let group = attention_for_view(&ChannelId::new(), &view, Timestamp::now());
+        assert_eq!(group.items.len(), 1);
+    }
+
+    /// Pins CURRENT behaviour, not desired behaviour. `attention_for_view`
+    /// only matches `Proposal` and `Assertion` payloads, so a `Correction`
+    /// never becomes an attention item — even here, where its own standing
+    /// is `Provisional`. A corrected claim's text therefore stands
+    /// unverified forever; nobody is ever asked to look at it. That is a
+    /// real hole (a claim can in principle be laundered off the review
+    /// queue by correcting it), but closing it is out of scope for this
+    /// plan — it belongs to the surface/dialog plan that follows. This test
+    /// exists only so nobody changes the behaviour by accident before then.
+    #[tokio::test]
+    async fn a_correction_is_not_an_attention_item_today() {
+        let view = view_with(vec![EntryPayload::Correction {
+            target: EntryId::new(),
+            statement: "corrected".into(),
+            rationale: "typo".into(),
+        }]);
+        let group = attention_for_view(&ChannelId::new(), &view, Timestamp::now());
+        assert!(group.items.is_empty(), "{:?}", group.items);
+    }
+
+    #[tokio::test]
+    async fn a_provisional_decision_ages_off_the_board_but_keeps_its_standing() {
+        let view = view_with(vec![assertion_of(
+            Some(junto_kernel::AssertionKind::Decision),
+            None,
+        )]);
+        let entry_at = view.entries[0].timestamp.as_millis();
+        let inside = Timestamp::from_millis(entry_at + 13 * 24 * 60 * 60 * 1000);
+        let outside = Timestamp::from_millis(entry_at + 15 * 24 * 60 * 60 * 1000);
+
+        assert_eq!(
+            attention_for_view(&ChannelId::new(), &view, inside)
+                .items
+                .len(),
+            1,
+            "inside the horizon it still asks"
+        );
+        assert!(
+            attention_for_view(&ChannelId::new(), &view, outside)
+                .items
+                .is_empty(),
+            "outside the horizon it stops asking"
+        );
+        assert_eq!(
+            view.standing(&view.entries[0].id),
+            Some(junto_kernel::Standing::Provisional),
+            "aging is a projection filter, never a change of standing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pending_gate_never_ages_out() {
+        // A gate blocks its proposer; time does not unblock them.
+        let view = view_with_pending_gate();
+        let entry_at = view.entries[0].timestamp.as_millis();
+        let outside = Timestamp::from_millis(entry_at + 400 * 24 * 60 * 60 * 1000);
+        assert_eq!(
+            attention_for_view(&ChannelId::new(), &view, outside)
+                .items
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_far_past_entry_timestamp_ages_out_without_panicking() {
+        // A corrupt/hand-edited entry synced from another substrate could
+        // carry a near-`i64::MIN` timestamp; the horizon subtraction must
+        // saturate rather than overflow (debug-panic / release-wrap).
+        let mut view = view_with(vec![assertion_of(
+            Some(junto_kernel::AssertionKind::Decision),
+            None,
+        )]);
+        view.entries[0].timestamp = Timestamp::from_millis(i64::MIN + 1);
+        let group = attention_for_view(&ChannelId::new(), &view, Timestamp::now());
+        assert!(
+            group.items.is_empty(),
+            "a far-past timestamp does not panic and is treated as aged out"
         );
     }
 
@@ -2837,6 +3077,9 @@ mod lineage_tests {
                     rationale: "matches the substrate".into(),
                     provenance: vec![],
                     frame: None,
+                    session: None,
+                    kind: None,
+                    answers: None,
                 },
             })
             .await
@@ -2871,7 +3114,8 @@ mod lineage_tests {
             ledger.lock().await.project(&id).await.unwrap()
         };
         let ctx = host.lineage_context(&child_view).await.unwrap();
-        let brief = crate::render::brief_markdown("sq", &child.id, &child_view, &ctx);
+        let brief =
+            crate::render::brief_markdown("sq", &child.id, &child_view, &ctx, Timestamp::now());
         assert!(brief.contains("inherited context"), "{brief}");
         assert!(
             brief.contains("use NDJSON for the pending queue"),

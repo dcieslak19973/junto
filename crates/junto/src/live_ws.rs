@@ -2149,6 +2149,9 @@ mod tests {
                 rationale: "ran it twice".into(),
                 provenance: Vec::new(),
                 frame: None,
+                session: None,
+                kind: None,
+                answers: None,
             },
         };
         verified_entry
@@ -2297,6 +2300,9 @@ mod tests {
                 rationale: "device A is just lost, not me".into(),
                 provenance: Vec::new(),
                 frame: None,
+                session: None,
+                kind: None,
+                answers: None,
             },
         };
         mid_entry.sign(&key_b).expect("sign with device B");
@@ -2338,6 +2344,9 @@ mod tests {
                 rationale: "should not count".into(),
                 provenance: Vec::new(),
                 frame: None,
+                session: None,
+                kind: None,
+                answers: None,
             },
         };
         after_entry.sign(&key_b).expect("sign");

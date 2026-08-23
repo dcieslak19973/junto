@@ -643,6 +643,9 @@ mod tests {
                 rationale: "because".into(),
                 provenance: vec![],
                 frame: None,
+                session: None,
+                kind: None,
+                answers: None,
             },
         }
     }
@@ -840,6 +843,9 @@ mod tests {
                 rationale: "line one\r\nline two".into(),
                 provenance: vec![],
                 frame: None,
+                session: None,
+                kind: None,
+                answers: None,
             },
         };
         substrate.append(entry.clone()).await.unwrap();

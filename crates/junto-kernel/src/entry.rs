@@ -71,6 +71,26 @@ pub struct FrameOption {
     pub rationale: String,
 }
 
+/// What kind of claim an [`EntryPayload::Assertion`] is making.
+///
+/// The kernel stores this and folds nothing from it: what it *means* for a
+/// human's attention is an app-layer policy (`crates/junto`'s
+/// `attention_for_view`), because "does this deserve a verdict" is a product
+/// question and this crate is playbook-agnostic.
+///
+/// **Absent is read as [`Decision`](AssertionKind::Decision)** by every
+/// consumer, so entries written before this field existed keep asking for a
+/// verdict rather than silently ceasing to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssertionKind {
+    /// An observation, measurement, or discovered fact. Worth recording and
+    /// citing; it does not by itself ask anyone to decide anything.
+    Finding,
+    /// A choice, or a claim asserted for others to rely on. Wants a verdict.
+    Decision,
+}
+
 /// A decision frame (`docs/adr/0019`): the proposer articulates the
 /// verifier's decision space. Durable **including the options not chosen** —
 /// alternatives-considered as structure, the richer shape `docs/adr/0003`
@@ -189,6 +209,24 @@ pub enum EntryPayload {
         /// so every pre-frame entry's bytes are unchanged.
         #[serde(skip_serializing_if = "Option::is_none", default)]
         frame: Option<DecisionFrame>,
+        /// The Agent Session that recorded this, when one did — the
+        /// `SessionStarted` entry's id. Closes the `session -> decision` arrow
+        /// decision blame needs (ledger `b10ffdc6`): before this, only
+        /// `SessionUpdated`, `SessionCommitted` and `ArtifactAttached` named a
+        /// session, so an assertion floated free of the run that produced it.
+        /// Omitted from the canonical bytes when absent.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        session: Option<EntryId>,
+        /// Whether this is a finding or a decision. Absent reads as
+        /// [`AssertionKind::Decision`]. Omitted from the canonical bytes when
+        /// absent.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        kind: Option<AssertionKind>,
+        /// Open entries this one bears on — a *claim* to have answered them,
+        /// inert until this entry is itself verified. Omitted from the
+        /// canonical bytes when absent.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        answers: Option<Vec<EntryId>>,
     },
     /// Accepts a prior entry: moves its standing to ratified.
     Ratification {

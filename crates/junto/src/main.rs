@@ -1307,6 +1307,11 @@ async fn brief(dir: PathBuf, out: &mut impl std::io::Write) -> Result<()> {
             return Ok(());
         }
     };
+    // One clock read for the whole sweep — every bound channel must age
+    // against the same instant, not drift across per-channel git I/O
+    // (`Host::overview`/`focus_json` already do this; this was the one
+    // `brief_markdown` call site that read the clock per iteration).
+    let now = Timestamp::now();
     for channel in channels {
         match host.resolve(&channel).await {
             Ok(host::Resolution::Resolved { ledger, id, .. }) => {
@@ -1339,7 +1344,7 @@ async fn brief(dir: PathBuf, out: &mut impl std::io::Write) -> Result<()> {
                             if let Err(err) = writeln!(
                                 out,
                                 "{}",
-                                render::brief_markdown(&name, &id, &view, &lineage)
+                                render::brief_markdown(&name, &id, &view, &lineage, now)
                             ) {
                                 eprintln!("junto brief: writing '{channel}': {err}");
                             }
@@ -1730,6 +1735,9 @@ mod tests {
                     rationale: "matches the substrate".into(),
                     provenance: vec![],
                     frame: None,
+                    session: None,
+                    kind: None,
+                    answers: None,
                 },
             })
             .await
@@ -3051,6 +3059,9 @@ mod tests {
                 rationale: "just a claim".into(),
                 provenance: Vec::new(),
                 frame: None,
+                session: None,
+                kind: None,
+                answers: None,
             },
         };
         ledger.lock().await.append(entry).await.unwrap();
