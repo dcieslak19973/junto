@@ -4885,15 +4885,20 @@ mod tests {
         // match first — otherwise a long candidate could win on padding
         // alone, which is exactly what the length normalization exists to
         // prevent.
-        let short = "alpha bravo charlie".to_string();
+        // The long candidate is listed FIRST deliberately: `Vec::sort_by`
+        // is stable, so a dropped `.sqrt()` normalization would leave an
+        // exact score tie in input order and return the long candidate
+        // first — the assertion below only holds if the normalization is
+        // doing real work, not riding on stable-sort input order.
         let long = "alpha bravo charlie delta echo foxtrot golf hotel india juliet \
                      kilo lima mike november oscar papa quebec romeo sierra tango"
             .to_string();
-        let candidates = vec![(1u32, short), (2u32, long)];
+        let short = "alpha bravo charlie".to_string();
+        let candidates = vec![(1u32, long), (2u32, short)];
         let ranked = rank_by_overlap("alpha bravo charlie", &candidates, 2);
         assert_eq!(
             ranked,
-            vec![1, 2],
+            vec![2, 1],
             "the shorter, equally-matching candidate ranks first: {ranked:?}"
         );
     }
