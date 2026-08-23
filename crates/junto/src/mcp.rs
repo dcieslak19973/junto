@@ -1,4 +1,4 @@
-﻿//! The MCP write surface — how agents author ledger entries.
+//! The MCP write surface — how agents author ledger entries.
 //!
 //! `junto serve` exposes the kernel's ledger + gate operations as MCP tools
 //! over **streamable HTTP** (`docs/adr/0012`), so any MCP-capable agent
@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use junto_kernel::{
     ApprovalRequirement, ChannelId, ChannelView, ContentDigest, EntryId, EntryPayload, LedgerEntry,
-    Member, ProvenanceRef, SessionState, Timestamp, Uri,
+    Member, ProvenanceRef, SessionState, Subject, SubjectKind, Timestamp, Uri,
 };
 use rmcp::{
     ErrorData as McpError, ServerHandler,
@@ -127,10 +127,16 @@ fn parse_frame(
                          (approve or reject)"
                     )));
                 }
-                // Sessions carry no decision frame; no tool parses one for
-                // them, so this arm is unreachable in practice.
+                // Sessions and subject attachments carry no decision frame;
+                // no tool parses one for them, so these arms are
+                // unreachable in practice.
                 (TargetKind::Session, _) => {
                     return Err(invalid("an agent session does not carry a decision frame"));
+                }
+                (TargetKind::Subject, _) => {
+                    return Err(invalid(
+                        "a subject attachment does not carry a decision frame",
+                    ));
                 }
             };
             Ok(junto_kernel::FrameOption {
@@ -361,6 +367,38 @@ pub struct ConvergeRequest {
     pub code: Option<String>,
 }
 
+/// Attach a Document Subject — what a channel is *about* (`docs/adr/0037`).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AttachDocumentRequest {
+    /// Channel name (bound at open_channel) or raw channel id.
+    pub channel: String,
+    pub author: AuthorParam,
+    /// The author's member code (`docs/adr/0017`).
+    pub code: Option<String>,
+    /// Where the document lives, machine-independently — a uri with a
+    /// scheme, e.g. `https://…`, `file:///…`, or a wiki/page uri. A path on
+    /// your own machine is refused: this is recorded durably and must mean
+    /// the same thing to every member.
+    pub uri: String,
+    /// Optional content digest in `algorithm:value` form (e.g. "sha256:…"),
+    /// captured now so later drift of the document is detectable. Supply it
+    /// yourself; junto never computes one.
+    pub digest: Option<String>,
+}
+
+/// Withdraw an attached Subject (`docs/adr/0037`).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DetachSubjectRequest {
+    /// Channel name (bound at open_channel) or raw channel id.
+    pub channel: String,
+    pub author: AuthorParam,
+    /// The author's member code (`docs/adr/0017`).
+    pub code: Option<String>,
+    /// The attachment entry to withdraw — a full entry id or an unambiguous
+    /// prefix of 6+ characters, as shown by view_channel.
+    pub target: String,
+}
+
 /// The MCP handler: the singleton [`Host`] (`docs/adr/0015`), shared by every
 /// connected session and with the web read routes.
 #[derive(Clone)]
@@ -388,6 +426,16 @@ enum TargetKind {
     Proposal,
     /// update_session / attach_artifact act on Agent Sessions.
     Session,
+    /// detach_subject acts on subject attachments.
+    Subject,
+}
+
+/// Whether `id` names a `SubjectAttached` this channel carries in its log
+/// but no longer projects — i.e. an attachment that has been detached.
+fn detached_attachment(view: &ChannelView, id: &EntryId) -> bool {
+    view.entries.iter().any(|entry| {
+        &entry.id == id && matches!(entry.payload, EntryPayload::SubjectAttached { .. })
+    })
 }
 
 /// Resolve an act's target against the channel projection: a full id must
@@ -401,16 +449,30 @@ fn resolve_target(view: &ChannelView, raw: &str, kind: TargetKind) -> Result<Ent
         TargetKind::Assertion => "an assertion (ratify/park/correct targets)",
         TargetKind::Proposal => "a proposal (approve/reject targets)",
         TargetKind::Session => "an agent session (update_session/attach_artifact targets)",
+        TargetKind::Subject => "a subject attachment (detach_subject targets)",
     };
     let bears_kind = |id: &EntryId| match kind {
         TargetKind::Assertion => view.standing(id).is_some(),
         TargetKind::Proposal => view.gate_status(id).is_some(),
         TargetKind::Session => view.session(id).is_some(),
+        TargetKind::Subject => view.subjects.iter().any(|(sid, _)| sid == id),
     };
 
     if let Ok(id) = raw.parse::<EntryId>() {
         return if bears_kind(&id) {
             Ok(id)
+        } else if matches!(kind, TargetKind::Subject) && detached_attachment(view, &id) {
+            // The precise message matters here: `project_subjects` drops a
+            // detached attachment, so the generic "is not a subject
+            // attachment" would tell a caller retrying after a dropped
+            // connection that their attachment never existed. Mirrors
+            // `Host::detach_subject`'s own distinction, which this surface
+            // would otherwise shadow — it refuses before the host is
+            // reached.
+            Err(invalid(format!(
+                "subject attachment {id} is already detached — nothing to withdraw \
+                 (docs/adr/0037)"
+            )))
         } else {
             Err(invalid(format!(
                 "{id} is not {described} in this channel — check the id against view_channel"
@@ -456,6 +518,55 @@ fn parse_provenance(params: Option<Vec<ProvenanceParam>>) -> Result<Vec<Provenan
             })
         })
         .collect()
+}
+
+/// Validate a **Subject** uri: refuse what is provably machine-local, and
+/// nothing else.
+///
+/// A Subject's uri is its *identity*, compared as an exact string with no
+/// normalization (`docs/adr/0037`), and it enters an append-only record —
+/// so unlike a [`ProvenanceRef`]'s uri, which merely decorates an entry, a
+/// path that means something on only one machine is a permanent identity
+/// nobody else can resolve. [`Uri::new`] rejects only the empty string, so
+/// the check has to live here.
+///
+/// Three rules, and deliberately no fourth: a leading path separator (a
+/// POSIX absolute path or a UNC share), no `:` at all (a bare or relative
+/// path), or a single character before the first `:` (a Windows drive
+/// letter — note `D:/x` is otherwise a perfectly well-formed uri whose
+/// scheme is `d`, which is exactly why "require a scheme" does not work).
+/// Anything else passes, including an SCP-style git remote
+/// (`git@host:path`): the guard keeps unportable identities out, it does
+/// not police address formats, and `0037` explicitly leaves remote-URL
+/// normalization rejected.
+///
+/// # Errors
+/// [`McpError::invalid_params`] naming the rule and the fix, so an agent
+/// self-corrects without a round trip.
+fn subject_uri(raw: &str) -> Result<Uri, McpError> {
+    const WHY: &str = "a Subject's uri is recorded durably and compared as an exact string \
+                       (docs/adr/0037), so it must mean the same thing on every member's \
+                       machine";
+    let text = raw.trim();
+    if text.starts_with('/') || text.starts_with('\\') {
+        return Err(invalid(format!(
+            "'{text}' is a path on this machine, not a portable identity — {WHY}. Give a uri \
+             with a scheme, e.g. https://example.com/spec.md or file:///notes/spec.md"
+        )));
+    }
+    let Some((scheme, _)) = text.split_once(':') else {
+        return Err(invalid(format!(
+            "'{text}' has no scheme — {WHY}. Give a uri with a scheme, e.g. \
+             https://example.com/spec.md or file:///notes/spec.md"
+        )));
+    };
+    if scheme.chars().count() < 2 {
+        return Err(invalid(format!(
+            "'{text}' looks like a Windows drive path, not a portable identity — {WHY}. Give a \
+             uri with a scheme, e.g. file:///C:/notes/spec.md if you really mean a local file"
+        )));
+    }
+    Uri::new(text).map_err(|err| invalid(err.to_string()))
 }
 
 /// Parse a session-state string from the wire, mirroring the lowercase
@@ -661,6 +772,68 @@ impl JuntoMcp {
         Ok(text(format!(
             "converged '{}' into '{}' — the source is now closed. sync_channel to publish.",
             req.source, req.target
+        )))
+    }
+
+    #[tool(
+        description = "Attach a Document Subject — what this channel is about (docs/adr/0037): a spec, a design doc, a wiki page, a ticket. `uri` must carry a scheme and mean the same thing on every member's machine; a path on your own disk is refused, because a Subject's uri is recorded durably and compared as an exact string. `digest` is optional and yours to supply — junto never computes one. Returns the attachment id, which detach_subject targets. You must be a member; pass your `code`."
+    )]
+    async fn attach_document(
+        &self,
+        Parameters(req): Parameters<AttachDocumentRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let uri = subject_uri(&req.uri)?;
+        let subject = match req.digest {
+            Some(digest) => {
+                let digest = ContentDigest::new(digest).map_err(|e| invalid(e.to_string()))?;
+                Subject::with_digest(SubjectKind::Document, uri, digest)
+            }
+            None => Subject::new(SubjectKind::Document, uri),
+        };
+        let id = self
+            .host
+            .attach_subject(
+                &req.channel,
+                subject,
+                req.author.into(),
+                crate::host::WriteAuth::Agent(req.code.as_deref()),
+            )
+            .await
+            .map_err(|err| invalid(err.to_string()))?;
+        Ok(text(format!(
+            "attached document {} to channel '{}' (attachment {id}). \
+             detach_subject targets that id.",
+            req.uri.trim(),
+            req.channel
+        )))
+    }
+
+    #[tool(
+        description = "Withdraw an attached Subject (docs/adr/0037): record a detachment targeting its attachment entry, so the channel stops being about it. The attachment stays in the log — the record is append-only — but projections drop it. `target` is the attachment id or an unambiguous 6+ char prefix. You must be a member; pass your `code`."
+    )]
+    async fn detach_subject(
+        &self,
+        Parameters(req): Parameters<DetachSubjectRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let author: Member = req.author.into();
+        let (ledger, channel) = self.resolve(&req.channel).await?;
+        let view = self
+            .authorize(&ledger, &channel, &author, req.code.as_deref())
+            .await?;
+        let target = resolve_target(&view, &req.target, TargetKind::Subject)?;
+        let id = self
+            .host
+            .detach_subject(
+                &req.channel,
+                target,
+                author,
+                crate::host::WriteAuth::Agent(req.code.as_deref()),
+            )
+            .await
+            .map_err(|err| invalid(err.to_string()))?;
+        Ok(text(format!(
+            "detached subject attachment {target} from channel '{}' (detachment {id})",
+            req.channel
         )))
     }
 
@@ -1054,7 +1227,8 @@ impl ServerHandler for JuntoMcp {
             "junto's ledger: open channels (open_channel) and discover them (list_channels), \
              record decisions/findings (assertions), verify them (ratify/park/correct), gate \
              consequential actions (propose/approve/reject), track agent work as sessions \
-             (start_session/update_session) with verifiable outputs (attach_artifact), grant \
+             (start_session/update_session) with verifiable outputs (attach_artifact), say what \
+             a channel is about and stop saying it (attach_document/detach_subject), grant \
              membership (add_member, founder only), inspect a channel (view_channel), and \
              sync the durable record \
              through a git remote (sync_channel). Channels are addressed by name (bound when \
@@ -1181,6 +1355,201 @@ mod tests {
             .nth(1)
             .expect("entry id in confirmation")
             .to_string()
+    }
+
+    #[test]
+    fn subject_uri_refuses_machine_local_paths() {
+        // A Subject's uri enters the durable record and is compared as an
+        // exact string, so a path that only means something on one machine
+        // is a permanent, unportable identity. `Uri::new` alone rejects
+        // only the empty string, which is why this guard exists.
+        for raw in [
+            "/home/dan/spec.md",
+            "\\\\server\\share\\spec.md",
+            "\\spec.md",
+            "D:/git/junto/spec.md",
+            "D:\\git\\junto\\spec.md",
+            "c:/notes.md",
+            "spec.md",
+            "docs/spec.md",
+            "",
+        ] {
+            assert!(
+                subject_uri(raw).is_err(),
+                "'{raw}' is machine-local or has no scheme and must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn subject_uri_accepts_anything_with_a_real_scheme() {
+        // Deliberately permissive past the machine-path rules: the guard
+        // keeps unportable identities out, it does not police address
+        // formats. `git@host:path` is the case an earlier, stricter draft
+        // wrongly refused, and ADR 0037 names it as a legitimate spelling,
+        // so it is pinned here.
+        for raw in [
+            "https://example.com/spec.md",
+            "file:///notes/spec.md",
+            "git+https://github.com/owner/repo.git",
+            "git+ssh://git@github.com/owner/repo.git",
+            "git@github.com:owner/repo.git",
+            "urn:isbn:0451450523",
+            "notion://page/abc123",
+        ] {
+            assert!(subject_uri(raw).is_ok(), "'{raw}' must be accepted");
+        }
+    }
+
+    #[test]
+    fn subject_uri_trims_and_preserves_the_rest_verbatim() {
+        // No normalization (ADR 0037 keeps exact-string identity), so the
+        // accepted value differs from the input only by surrounding
+        // whitespace.
+        let uri = subject_uri("  https://example.com/A%20Spec.md  ").expect("accepted");
+        assert_eq!(uri.as_str(), "https://example.com/A%20Spec.md");
+    }
+
+    #[tokio::test]
+    async fn attach_document_makes_a_channel_be_about_a_document() {
+        // The case ADR 0037 shipped in the kernel and no surface could
+        // reach: PR #69's dogfood needed a temporary in-crate probe for it.
+        let (dirs, mcp) = init_repo();
+        open(&mcp, &dirs, "spec-work").await;
+
+        let attached = mcp
+            .attach_document(Parameters(AttachDocumentRequest {
+                channel: "spec-work".into(),
+                author: claude(),
+                code: code_of(&dirs, claude()),
+                uri: "https://example.com/design.md".into(),
+                digest: None,
+            }))
+            .await
+            .expect("attach a document");
+        assert!(
+            text_of(&attached).contains("attached document"),
+            "{}",
+            text_of(&attached)
+        );
+
+        let view = mcp
+            .view_channel(Parameters(ViewRequest {
+                channel: "spec-work".into(),
+                full: true,
+            }))
+            .await
+            .expect("view");
+        assert!(
+            text_of(&view).contains("design.md"),
+            "the attached document must show on the channel: {}",
+            text_of(&view)
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_document_refuses_a_machine_path() {
+        let (dirs, mcp) = init_repo();
+        open(&mcp, &dirs, "spec-work").await;
+
+        let err = mcp
+            .attach_document(Parameters(AttachDocumentRequest {
+                channel: "spec-work".into(),
+                author: claude(),
+                code: code_of(&dirs, claude()),
+                uri: "D:/git/junto/docs/design.md".into(),
+                digest: None,
+            }))
+            .await
+            .expect_err("a machine path must not enter the ledger");
+        assert!(
+            format!("{err:?}").contains("drive path"),
+            "the refusal must say why and how to fix it: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_document_keeps_a_caller_supplied_digest() {
+        let (dirs, mcp) = init_repo();
+        open(&mcp, &dirs, "spec-work").await;
+
+        mcp.attach_document(Parameters(AttachDocumentRequest {
+            channel: "spec-work".into(),
+            author: claude(),
+            code: code_of(&dirs, claude()),
+            uri: "https://example.com/design.md".into(),
+            digest: Some("sha256:deadbeef".into()),
+        }))
+        .await
+        .expect("attach with a digest");
+
+        let bad = mcp
+            .attach_document(Parameters(AttachDocumentRequest {
+                channel: "spec-work".into(),
+                author: claude(),
+                code: code_of(&dirs, claude()),
+                uri: "https://example.com/other.md".into(),
+                digest: Some("deadbeef".into()),
+            }))
+            .await
+            .expect_err("a digest with no algorithm prefix must be refused");
+        assert!(format!("{bad:?}").contains("algorithm"), "{bad:?}");
+    }
+
+    #[tokio::test]
+    async fn detach_subject_withdraws_by_id_prefix() {
+        let (dirs, mcp) = init_repo();
+        open(&mcp, &dirs, "spec-work").await;
+
+        let attached = mcp
+            .attach_document(Parameters(AttachDocumentRequest {
+                channel: "spec-work".into(),
+                author: claude(),
+                code: code_of(&dirs, claude()),
+                uri: "https://example.com/design.md".into(),
+                digest: None,
+            }))
+            .await
+            .expect("attach");
+        // "attached document <uri> to channel '<name>' (attachment <id>)."
+        let confirmation = text_of(&attached);
+        let id = confirmation
+            .rsplit_once("attachment ")
+            .and_then(|(_, tail)| tail.split(')').next())
+            .expect("attachment id in confirmation")
+            .to_string();
+
+        let detached = mcp
+            .detach_subject(Parameters(DetachSubjectRequest {
+                channel: "spec-work".into(),
+                author: claude(),
+                code: code_of(&dirs, claude()),
+                target: id[..8].to_string(),
+            }))
+            .await
+            .expect("detach by prefix");
+        assert!(
+            text_of(&detached).contains("detached"),
+            "{}",
+            text_of(&detached)
+        );
+
+        // A retry after a dropped connection must be told the attachment is
+        // gone, not that it never existed — `project_subjects` drops it, so
+        // the generic not-found message would be actively misleading.
+        let again = mcp
+            .detach_subject(Parameters(DetachSubjectRequest {
+                channel: "spec-work".into(),
+                author: claude(),
+                code: code_of(&dirs, claude()),
+                target: id,
+            }))
+            .await
+            .expect_err("a detached attachment is no longer a detach target");
+        assert!(
+            format!("{again:?}").contains("already detached"),
+            "{again:?}"
+        );
     }
 
     #[tokio::test]

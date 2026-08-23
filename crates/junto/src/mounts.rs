@@ -86,8 +86,11 @@ pub fn mounts_for(junto_home: &Path, subjects: &[Subject]) -> Result<Vec<Mount>>
 }
 
 /// Remember (or update) where this machine keeps a subject. The write half
-/// of the Mount store: `crate::web`'s `launch_session` calls this once
-/// `Host::attach_subject` has recorded the Subject a typed path implies.
+/// of the Mount store: `crate::web`'s `launch_session` calls this *before*
+/// `Host::attach_subject`, not after. `remember_mount` needs only the uri
+/// and the path, both already in hand, so it moves ahead of the append and
+/// the one irreversible step — the `SubjectAttached` entry — runs last among
+/// what can still fail (see the comment in `web.rs`'s `launch_session`).
 pub fn remember_mount(junto_home: &Path, uri: &Uri, path: &Path) -> Result<()> {
     let path = dunce::canonicalize(path)
         .with_context(|| format!("mount path {} not found", path.display()))?;

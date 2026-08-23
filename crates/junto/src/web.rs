@@ -1116,51 +1116,53 @@ async fn steer_session(
     {
         Ok(()) => Redirect::to(&format!("/channels/{id}")).into_response(),
         Err(crate::launch::NotLive) => {
-            // A channel with a mounted, `Execute`-capable subject resolves
-            // through it regardless of anything else the channel carries
-            // (the same rule `launch_session` follows —
-            // `a_mounted_repo_subject_still_launches_alongside_a_second_unmounted_one`).
-            // Refuse only when *nothing* is `Execute`-capable *and* a Repo
-            // subject this machine has no mount for exists (`mounts.toml`
-            // edited, or the entry removed after launch): that is a
-            // fixable gap, not a repo-free channel, and silently resuming
-            // into a fresh, empty `session_workdir` scratch directory
-            // would discard whatever work already exists in the mount the
-            // human just lost.
-            let executable = match crate::launch::executable_mount(&junto_home, &view) {
-                Ok(mount) => mount,
-                Err(err) => return internal(format!("reading mounts: {err}")),
-            };
-            if executable.is_none() {
-                match channel_has_unmounted_repo_subject(&junto_home, &view) {
-                    Ok(true) => {
-                        return (StatusCode::BAD_REQUEST, NO_MOUNTABLE_SUBJECT).into_response();
-                    }
-                    Ok(false) => {}
-                    Err(response) => return response,
-                }
-            }
             // The same id's workdir `launch_session` resolved when this
             // session started (`session_workdir`): a mounted subject's
-            // path, or the scratch directory Task 6 gives a repo-free
-            // channel — deterministic from `(junto_home, view, session)`,
-            // and therefore stable only while the mount store is: this
-            // re-resolves the *current* first Execute-capable mount, not
-            // necessarily the one this session launched in (ADR 0038's
-            // recorded limit). A session that already ran in scratch keeps
-            // running there: `<junto_home>/scratch/<session>` is created
-            // by `session_workdir` and never removed, so its existence is
+            // path, or the scratch directory a repo-free channel gets.
+            //
+            // A session that already ran in scratch keeps running there,
+            // and that decision comes FIRST — before any mount check.
+            // `<junto_home>/scratch/<session>` is created by
+            // `session_workdir` and never removed, so its existence is
             // already a durable, machine-local record that this session
-            // ran in scratch — re-resolving instead would silently move a
-            // resumed turn into a repo mounted after launch, running the
-            // agent in a checkout this session was never launched against,
-            // and recording that repo's uncommitted changes as this
-            // session's diff artifact (the likely instance of ADR 0038's
-            // limit).
+            // ran in scratch. Re-resolving would silently move a resumed
+            // turn into a repo mounted after launch, running the agent in
+            // a checkout this session was never launched against and
+            // recording that repo's uncommitted changes as this session's
+            // diff artifact (ADR 0038's recorded limit). Ordering the pin
+            // first also means an unmounted Repo subject arriving by sync
+            // — a teammate's `attach_subject`, needing no local action at
+            // all — cannot strand a scratch session that was never going
+            // to use a mount.
             let scratch = junto_home.join("scratch").join(session.to_string());
             let workspace = if scratch.is_dir() {
                 scratch
             } else {
+                // No scratch directory: this session ran in a mount. A
+                // channel with a mounted, `Execute`-capable subject
+                // resolves through it regardless of anything else the
+                // channel carries (the same rule `launch_session` follows —
+                // `a_mounted_repo_subject_still_launches_alongside_a_second_unmounted_one`).
+                // Refuse only when *nothing* is `Execute`-capable *and* a
+                // Repo subject this machine has no mount for exists
+                // (`mounts.toml` edited, or the entry removed after
+                // launch): that is a fixable gap, and silently resuming
+                // into a fresh, empty scratch directory would discard
+                // whatever work already exists in the mount the human just
+                // lost.
+                let executable = match crate::launch::executable_mount(&junto_home, &view) {
+                    Ok(mount) => mount,
+                    Err(err) => return internal(format!("reading mounts: {err}")),
+                };
+                if executable.is_none() {
+                    match channel_has_unmounted_repo_subject(&junto_home, &view) {
+                        Ok(true) => {
+                            return (StatusCode::BAD_REQUEST, NO_MOUNTABLE_SUBJECT).into_response();
+                        }
+                        Ok(false) => {}
+                        Err(response) => return response,
+                    }
+                }
                 match crate::launch::session_workdir(&junto_home, &view, session) {
                     Ok(workspace) => workspace,
                     Err(err) => return internal(format!("preparing a workdir: {err}")),
@@ -5234,16 +5236,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn steering_refuses_when_the_channel_now_carries_an_unmounted_repo_subject() {
-        // Fix round 2, finding 3: deleting `required_mount` in round 1
-        // dropped its refusal along with it. If a channel now carries a
-        // Repo subject this machine has no mount for (`mounts.toml`
-        // edited, or the entry removed after launch), `steer_session` must
-        // not silently resume the agent in a fresh, empty
-        // `session_workdir` scratch directory holding none of the
-        // session's real work — that is strictly worse than the old loud
-        // refusal, and inconsistent with `launch_session`, which keeps
-        // exactly this refusal for exactly this channel shape.
+    async fn steering_a_scratch_session_survives_a_teammates_unmounted_repo_subject() {
+        // A session that legitimately ran in `<junto_home>/scratch/<session>`
+        // must stay steerable when the channel later gains a Repo subject
+        // this machine has no mount for — which needs no local action at
+        // all, since a teammate's `attach_subject` arrives by sync.
+        //
+        // This test asserted the opposite until the scratch pin landed. Its
+        // original rationale (fix round 2, finding 3) was that resuming
+        // would drop the agent in "a fresh, empty `session_workdir` scratch
+        // directory holding none of the session's real work" — true then,
+        // false now: the pin resumes the session in the scratch directory
+        // it already ran in, which holds exactly its prior work. The
+        // refusal it was defending is still correct for a session that ran
+        // in a *mount* that has since vanished, which
+        // `steering_still_refuses_when_the_mount_it_ran_in_is_gone` covers.
         let home = crate::host::test_home::HomeGuard::new();
         let stub_dir = tempfile::tempdir().expect("stub dir");
         let stub = if cfg!(windows) {
@@ -5344,16 +5351,137 @@ mod tests {
         .await;
         assert_eq!(
             steered.status(),
+            StatusCode::SEE_OTHER,
+            "a session that already ran in scratch keeps running there"
+        );
+        // Clear the harness override BEFORE dropping `home`: dropping it
+        // releases the process-wide `HOME_LOCK`, and another test can grab
+        // the lock and set its own `JUNTO_HARNESS_CMD` in the window — which
+        // this `remove_var` would then delete out from under it, leaving its
+        // launch turn with no harness and never reaching `Done`.
+        unsafe { std::env::remove_var("JUNTO_HARNESS_CMD") };
+        drop(home);
+    }
+
+    #[tokio::test]
+    async fn steering_still_refuses_when_the_mount_it_ran_in_is_gone() {
+        // The case the NO_MOUNTABLE_SUBJECT refusal genuinely catches, and
+        // the only remaining one: this session ran in a real mount, so it
+        // has no scratch directory to be pinned to. If `mounts.toml` is
+        // edited (or the checkout removed) between turns, resuming would
+        // drop the agent into a fresh, empty scratch directory holding none
+        // of the work — so it must refuse loudly instead.
+        //
+        // Without this test, hoisting the scratch pin above the refusal
+        // would leave `steer_session`'s refusal arm with no coverage at all.
+        let home = crate::host::test_home::HomeGuard::new();
+        let stub_dir = tempfile::tempdir().expect("stub dir");
+        let stub = if cfg!(windows) {
+            let path = stub_dir.path().join("stub.cmd");
+            std::fs::write(
+                &path,
+                "@echo {\"type\":\"result\",\"subtype\":\"success\",\"result\":\"ok\",\
+                 \"session_id\":\"h-steer-mount-gone-1\",\"is_error\":false}\r\n",
+            )
+            .expect("write stub");
+            path
+        } else {
+            let path = stub_dir.path().join("stub.sh");
+            std::fs::write(
+                &path,
+                "#!/bin/sh\necho '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\
+                 \"ok\",\"session_id\":\"h-steer-mount-gone-1\",\"is_error\":false}'\n",
+            )
+            .expect("write stub");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod stub");
+            }
+            path
+        };
+        unsafe { std::env::set_var("JUNTO_HARNESS_CMD", &stub) };
+
+        let fx = host_with_entry(assertion()).await;
+        let workspace = tempfile::tempdir().expect("workspace");
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(workspace.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        attach_and_mount_repo(&fx, home.path(), workspace.path()).await;
+
+        let launched = launch_session(
+            State(fx.host.clone()),
+            Path("web-test".into()),
+            Form(LaunchForm {
+                intent: "do work in the repo".into(),
+                workspace: String::new(),
+                agent: String::new(),
+                mode: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(launched.status(), StatusCode::SEE_OTHER);
+
+        let Resolution::Resolved { ledger, id, .. } = fx.host.resolve("web-test").await.unwrap()
+        else {
+            panic!("channel resolves");
+        };
+        let mut session_id = None;
+        for _ in 0..100 {
+            let view = ledger.lock().await.project(&id).await.unwrap();
+            if let Some((sid, _)) = view
+                .sessions
+                .iter()
+                .find(|(_, s)| s.state == junto_kernel::SessionState::Done)
+            {
+                session_id = Some(*sid);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let session_id = session_id.expect("launch turn reached done");
+
+        // The session ran in the mount, so it has no scratch directory —
+        // which is exactly what makes the refusal below reachable.
+        assert!(
+            !home
+                .path()
+                .join("scratch")
+                .join(session_id.to_string())
+                .is_dir(),
+            "a session launched in a mount must not have a scratch directory"
+        );
+
+        // Now the mount goes away, leaving the Repo subject unmounted.
+        std::fs::remove_file(home.path().join("mounts.toml")).expect("drop the mount store");
+
+        let steered = steer_session(
+            State(fx.host.clone()),
+            Path(("web-test".into(), session_id.to_string())),
+            Form(SteerForm {
+                message: "keep going".into(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            steered.status(),
             StatusCode::BAD_REQUEST,
-            "steering must refuse rather than silently resume in a fresh, empty scratch dir"
+            "losing the mount a session ran in must refuse, not silently restart in scratch"
         );
         let bytes = axum::body::to_bytes(steered.into_body(), 64 * 1024)
             .await
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&bytes), NO_MOUNTABLE_SUBJECT);
-        let _ = home;
-
+        // Clear the harness override BEFORE dropping `home` — see the note
+        // in `steering_a_scratch_session_survives_a_teammates_unmounted_repo_subject`.
         unsafe { std::env::remove_var("JUNTO_HARNESS_CMD") };
+        drop((home, workspace));
     }
 
     #[tokio::test]
