@@ -188,6 +188,16 @@ pub struct RecordRequest {
     /// the verifier chooses between articulated positions instead of facing
     /// a blank box, and the frame is recorded durably.
     pub frame: Option<Vec<FrameOptionParam>>,
+    /// The Agent Session recording this, if one is (the id `start_session`
+    /// returned). Binds the claim to the run that produced it.
+    pub session: Option<String>,
+    /// `"finding"` (an observation — recorded and citable, asks nobody to
+    /// decide) or `"decision"` (a choice, or a claim for others to rely on —
+    /// wants a verdict). Omitted behaves as `"decision"`.
+    pub kind: Option<String>,
+    /// Ids of open entries this one bears on. A claim to have answered them,
+    /// inert until this entry is itself verified.
+    pub answers: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -870,7 +880,7 @@ impl JuntoMcp {
     }
 
     #[tool(
-        description = "Record an Assertion — a decision, finding, or claim — in a channel's ledger. It enters with Provisional standing; a member ratifies (or parks/corrects) it later. Give the real why in `rationale`, including alternatives considered, and bind evidence via `provenance`."
+        description = "Record an Assertion — a decision, finding, or claim — in a channel's ledger. It enters with Provisional standing; a member ratifies (or parks/corrects) it later. Give the real why in `rationale`, including alternatives considered, and bind evidence via `provenance`. `kind` says what you're asking for: \"finding\" is an observation — recorded and citable, asking nobody to decide; \"decision\" is a choice or a claim for others to rely on, and wants a verdict (omitted behaves as \"decision\"). `answers` links the ids of open entries this one bears on — a claim to have answered them, inert until this entry is itself verified."
     )]
     async fn record(
         &self,
@@ -878,11 +888,41 @@ impl JuntoMcp {
     ) -> Result<CallToolResult, McpError> {
         let author: Member = req.author.into();
         let (ledger, channel) = self.resolve(&req.channel).await?;
-        self.authorize(&ledger, &channel, &author, req.code.as_deref())
+        let view = self
+            .authorize(&ledger, &channel, &author, req.code.as_deref())
             .await?;
         let provenance = parse_provenance(req.provenance)?;
         let frame = parse_frame(req.frame, TargetKind::Assertion)?;
-        let entry = Self::entry(
+        let kind = match req.kind.as_deref() {
+            None => None,
+            Some("finding") => Some(junto_kernel::AssertionKind::Finding),
+            Some("decision") => Some(junto_kernel::AssertionKind::Decision),
+            Some(other) => {
+                return Err(invalid(format!(
+                    "unknown kind '{other}' — use \"finding\" or \"decision\""
+                )));
+            }
+        };
+        let session = match req.session.as_deref() {
+            None => None,
+            Some(raw) => Some(
+                raw.parse::<EntryId>()
+                    .map_err(|_| invalid(format!("session '{raw}' is not an entry id")))?,
+            ),
+        };
+        let answers = match req.answers {
+            None => None,
+            Some(raw) => Some(
+                raw.iter()
+                    .map(|id| {
+                        id.parse::<EntryId>()
+                            .map_err(|_| invalid(format!("answers '{id}' is not an entry id")))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+        };
+        let about = format!("{} {}", req.statement, req.rationale);
+        let mut entry = Self::entry(
             channel,
             author,
             EntryPayload::Assertion {
@@ -890,9 +930,26 @@ impl JuntoMcp {
                 rationale: req.rationale,
                 provenance,
                 frame,
+                session,
+                kind,
+                answers,
             },
         );
-        self.append(&req.channel, ledger, entry).await
+        self.host.sign_entry(&mut entry);
+        let id = entry.id;
+        ledger.lock().await.append(entry).await.map_err(internal)?;
+        // The tail is a suggestion, built from the pre-append view
+        // `authorize` already produced: `related_open_markdown`'s `exclude`
+        // filters the new entry out (it isn't even present in this
+        // pre-append view), and its ranker corpus is built from the
+        // already-filtered candidate list either way, so the pre-append
+        // view is exactly equivalent to re-projecting after the append —
+        // without a second lock acquisition or a second full projection.
+        let tail = crate::render::related_open_markdown(&view, &about, id).unwrap_or_default();
+        Ok(text(format!(
+            "recorded {id} in channel '{}'{tail}",
+            req.channel
+        )))
     }
 
     #[tool(
@@ -1162,7 +1219,7 @@ impl JuntoMcp {
             render::transcript_markdown(&name, &channel, &view)
         } else {
             let lineage = self.host.lineage_context(&view).await.unwrap_or_default();
-            render::brief_markdown(&name, &channel, &view, &lineage)
+            render::brief_markdown(&name, &channel, &view, &lineage, Timestamp::now())
         };
         Ok(text(rendered))
     }
@@ -1623,6 +1680,9 @@ mod tests {
                     uri: "https://example.com/sky".into(),
                     digest: Some("sha256:deadbeef".into()),
                 }]),
+                session: None,
+                kind: None,
+                answers: None,
             }))
             .await
             .unwrap();
@@ -1639,6 +1699,155 @@ mod tests {
         assert!(rendered.contains(&id), "view lists the entry id");
         assert!(rendered.contains("the sky is blue"));
         assert!(rendered.contains("[provisional]"));
+    }
+
+    #[tokio::test]
+    async fn record_names_a_related_open_entry_in_its_response() {
+        let (dirs, mcp) = init_repo();
+        open(&mcp, &dirs, "junto-dev").await;
+        let record = |statement: &str| {
+            mcp.record(Parameters(RecordRequest {
+                channel: "junto-dev".into(),
+                author: claude(),
+                code: code_of(&dirs, claude()),
+                statement: statement.into(),
+                rationale: "".into(),
+                frame: None,
+                provenance: None,
+                session: None,
+                kind: None,
+                answers: None,
+            }))
+        };
+        let first = record("the websocket handshake needs an ed25519 challenge")
+            .await
+            .unwrap();
+        let first_id = recorded_id(&first);
+
+        let second = record("stream the ed25519 websocket handshake to the client")
+            .await
+            .unwrap();
+        let response = text_of(&second);
+        assert!(
+            response.contains(&first_id),
+            "a second record over overlapping text names the first entry's id: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recorded_finding_carries_its_kind_and_session() {
+        let (dirs, mcp) = init_repo();
+        open(&mcp, &dirs, "junto-dev").await;
+
+        let started = mcp
+            .start_session(Parameters(StartSessionRequest {
+                channel: "junto-dev".into(),
+                author: claude(),
+                code: code_of(&dirs, claude()),
+                intent: "investigate ranker reuse".into(),
+            }))
+            .await
+            .unwrap();
+        let session = text_of(&started)
+            .split_whitespace()
+            .nth(2)
+            .expect("session id in confirmation")
+            .to_string();
+
+        let prior = mcp
+            .record(Parameters(RecordRequest {
+                channel: "junto-dev".into(),
+                author: claude(),
+                code: code_of(&dirs, claude()),
+                statement: "does the ranker need a rewrite?".into(),
+                rationale: "unclear before investigating".into(),
+                provenance: None,
+                frame: None,
+                session: None,
+                kind: None,
+                answers: None,
+            }))
+            .await
+            .expect("recorded the open question");
+        let question_id = recorded_id(&prior);
+
+        let recorded = mcp
+            .record(Parameters(RecordRequest {
+                channel: "junto-dev".into(),
+                author: claude(),
+                code: code_of(&dirs, claude()),
+                statement: "the ranker is reusable".into(),
+                rationale: "IDF overlap, no new deps".into(),
+                provenance: None,
+                frame: None,
+                session: Some(session.clone()),
+                kind: Some("finding".into()),
+                answers: Some(vec![question_id.clone()]),
+            }))
+            .await
+            .expect("recorded");
+        let id = recorded_id(&recorded);
+        let (ledger, channel) = mcp.resolve("junto-dev").await.expect("resolve");
+        let view = ledger
+            .lock()
+            .await
+            .project(&channel)
+            .await
+            .expect("project");
+        let entry = view
+            .entries
+            .iter()
+            .find(|e| e.id.to_string() == id)
+            .expect("the entry projects");
+        let EntryPayload::Assertion {
+            kind,
+            session: entry_session,
+            answers,
+            ..
+        } = &entry.payload
+        else {
+            panic!("expected an assertion");
+        };
+        assert_eq!(*kind, Some(junto_kernel::AssertionKind::Finding));
+        assert_eq!(
+            entry_session.as_ref().map(|s| s.to_string()),
+            Some(session),
+            "the session parsed from the request must reach the payload"
+        );
+        assert_eq!(
+            answers
+                .as_ref()
+                .map(|ids| ids.iter().map(EntryId::to_string).collect::<Vec<_>>()),
+            Some(vec![question_id]),
+            "the answers ids parsed from the request must reach the payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_assertion_kind_is_refused_rather_than_defaulted() {
+        // Silently coercing a typo to `decision` would put the entry in the
+        // attention queue the author was trying to stay out of.
+        let (dirs, mcp) = init_repo();
+        open(&mcp, &dirs, "junto-dev").await;
+        let err = mcp
+            .record(Parameters(RecordRequest {
+                channel: "junto-dev".into(),
+                author: claude(),
+                code: code_of(&dirs, claude()),
+                statement: "x".into(),
+                rationale: "y".into(),
+                provenance: None,
+                frame: None,
+                session: None,
+                kind: Some("observation".into()),
+                answers: None,
+            }))
+            .await
+            .expect_err("unknown kind must be refused");
+        assert!(
+            format!("{err:?}").contains("finding"),
+            "the refusal must name the accepted values: {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -1713,6 +1922,9 @@ mod tests {
                 rationale: "r".into(),
                 frame: None,
                 provenance: None,
+                session: None,
+                kind: None,
+                answers: None,
             }))
             .await
             .unwrap();
@@ -1771,6 +1983,9 @@ mod tests {
                 rationale: "r".into(),
                 frame: None,
                 provenance: None,
+                session: None,
+                kind: None,
+                answers: None,
             }))
             .await
             .unwrap_err();
@@ -1898,6 +2113,9 @@ mod tests {
                 rationale: "because".into(),
                 frame: None,
                 provenance: None,
+                session: None,
+                kind: None,
+                answers: None,
             }))
             .await
             .unwrap();
@@ -1937,6 +2155,9 @@ mod tests {
                 rationale: "simple".into(),
                 provenance: None,
                 frame: None,
+                session: None,
+                kind: None,
+                answers: None,
             }))
             .await
             .unwrap();
@@ -2076,6 +2297,9 @@ mod tests {
                     rationale: "r".into(),
                     provenance: None,
                     frame: None,
+                    session: None,
+                    kind: None,
+                    answers: None,
                 }))
                 .await
                 .unwrap();
@@ -2125,6 +2349,71 @@ mod tests {
         assert!(
             recent.contains("5 of 8 dead-ends, most recent first"),
             "{recent}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dead_ends_query_ranking_is_bounded_too_not_just_recency() {
+        // `dead_ends_are_ranked_and_bounded` only exercises the ranked path
+        // with a single matching dead-end, so its bound assertion runs
+        // through the `about: None` recency fallback instead of
+        // `rank_by_overlap` itself. Here seven of eight dead-ends share the
+        // query's tokens — more than `DEAD_ENDS_LIMIT` (5) — so the ranked
+        // path has to cut, proving the shared ranker's bound is live, not
+        // just the recency fallback's.
+        let (dirs, mcp) = init_repo();
+        open(&mcp, &dirs, "junto-dev").await;
+        let park = async |statement: &str, why: &str| {
+            let recorded = mcp
+                .record(Parameters(RecordRequest {
+                    channel: "junto-dev".into(),
+                    author: claude(),
+                    code: code_of(&dirs, claude()),
+                    statement: statement.into(),
+                    rationale: "r".into(),
+                    provenance: None,
+                    frame: None,
+                    session: None,
+                    kind: None,
+                    answers: None,
+                }))
+                .await
+                .unwrap();
+            mcp.park(Parameters(ActRequest {
+                channel: "junto-dev".into(),
+                author: dan(),
+                code: code_of(&dirs, dan()),
+                target: recorded_id(&recorded),
+                rationale: why.into(),
+            }))
+            .await
+            .unwrap();
+        };
+        for i in 0..7 {
+            park(
+                &format!("migration approach {i} moves the schema forward"),
+                "did not pan out",
+            )
+            .await;
+        }
+        park("caching layer was unrelated to this", "not needed").await;
+
+        let ranked = text_of(
+            &mcp.dead_ends(Parameters(DeadEndsRequest {
+                channel: "junto-dev".into(),
+                about: Some("schema migration".into()),
+            }))
+            .await
+            .unwrap(),
+        );
+        let items = ranked.lines().filter(|l| l.starts_with("- ")).count();
+        assert_eq!(
+            items, 5,
+            "seven candidates match; the ranked path is bounded too: {ranked}"
+        );
+        assert!(
+            !ranked.contains("caching layer"),
+            "the non-matching dead-end must not appear: {ranked}"
         );
     }
 
@@ -2192,6 +2481,9 @@ mod tests {
             rationale: "r".into(),
             frame: None,
             provenance: None,
+            session: None,
+            kind: None,
+            answers: None,
         }))
         .await
         .unwrap();
@@ -2254,6 +2546,9 @@ mod tests {
                     uri: "https://x".into(),
                     digest: Some("deadbeef".into()),
                 }]),
+                session: None,
+                kind: None,
+                answers: None,
             }))
             .await
             .unwrap_err();
@@ -2283,6 +2578,9 @@ mod tests {
                 rationale: "r".into(),
                 frame: None,
                 provenance: None,
+                session: None,
+                kind: None,
+                answers: None,
             }))
             .await
             .unwrap_err();
@@ -2303,6 +2601,9 @@ mod tests {
                 rationale: "r".into(),
                 frame: None,
                 provenance: None,
+                session: None,
+                kind: None,
+                answers: None,
             }))
             .await
             .unwrap_err();
@@ -2317,6 +2618,9 @@ mod tests {
                 rationale: "r".into(),
                 frame: None,
                 provenance: None,
+                session: None,
+                kind: None,
+                answers: None,
             }))
             .await
             .unwrap_err();
@@ -2412,6 +2716,9 @@ mod tests {
                     rationale: "evidence insufficient".into(),
                 },
             ]),
+            session: None,
+            kind: None,
+            answers: None,
         }))
         .await
         .unwrap();
@@ -2448,6 +2755,9 @@ mod tests {
                         rationale: "r".into(),
                     },
                 ]),
+                session: None,
+                kind: None,
+                answers: None,
             }))
             .await
             .unwrap_err();
@@ -2467,6 +2777,9 @@ mod tests {
                     act: "ratify".into(),
                     rationale: "r".into(),
                 }]),
+                session: None,
+                kind: None,
+                answers: None,
             }))
             .await
             .unwrap_err();
@@ -2488,6 +2801,9 @@ mod tests {
                 rationale: "because".into(),
                 frame: None,
                 provenance: None,
+                session: None,
+                kind: None,
+                answers: None,
             }))
             .await
             .unwrap();
