@@ -920,7 +920,8 @@ impl JuntoMcp {
                     .collect::<Result<Vec<_>, _>>()?,
             ),
         };
-        let entry = Self::entry(
+        let about = format!("{} {}", req.statement, req.rationale);
+        let mut entry = Self::entry(
             channel,
             author,
             EntryPayload::Assertion {
@@ -933,7 +934,20 @@ impl JuntoMcp {
                 answers,
             },
         );
-        self.append(&req.channel, ledger, entry).await
+        self.host.sign_entry(&mut entry);
+        let id = entry.id;
+        ledger.lock().await.append(entry).await.map_err(internal)?;
+        let view = ledger
+            .lock()
+            .await
+            .project(&channel)
+            .await
+            .map_err(internal)?;
+        let tail = crate::render::related_open_markdown(&view, &about, id).unwrap_or_default();
+        Ok(text(format!(
+            "recorded {id} in channel '{}'{tail}",
+            req.channel
+        )))
     }
 
     #[tool(
@@ -1683,6 +1697,39 @@ mod tests {
         assert!(rendered.contains(&id), "view lists the entry id");
         assert!(rendered.contains("the sky is blue"));
         assert!(rendered.contains("[provisional]"));
+    }
+
+    #[tokio::test]
+    async fn record_names_a_related_open_entry_in_its_response() {
+        let (dirs, mcp) = init_repo();
+        open(&mcp, &dirs, "junto-dev").await;
+        let record = |statement: &str| {
+            mcp.record(Parameters(RecordRequest {
+                channel: "junto-dev".into(),
+                author: claude(),
+                code: code_of(&dirs, claude()),
+                statement: statement.into(),
+                rationale: "".into(),
+                frame: None,
+                provenance: None,
+                session: None,
+                kind: None,
+                answers: None,
+            }))
+        };
+        let first = record("the websocket handshake needs an ed25519 challenge")
+            .await
+            .unwrap();
+        let first_id = recorded_id(&first);
+
+        let second = record("stream the ed25519 websocket handshake to the client")
+            .await
+            .unwrap();
+        let response = text_of(&second);
+        assert!(
+            response.contains(&first_id),
+            "a second record over overlapping text names the first entry's id: {response}"
+        );
     }
 
     #[tokio::test]
