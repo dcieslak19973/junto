@@ -450,6 +450,10 @@ impl Host {
     pub async fn overview(&self) -> Result<(Vec<ChannelSummary>, Vec<AttentionGroup>)> {
         let mut summaries = Vec::new();
         let mut groups = Vec::new();
+        // One clock read for the whole sweep — every channel's attention
+        // group is judged against the same instant, not one that drifts as
+        // the sweep crosses substrates and channels.
+        let now = Timestamp::now();
         for repo in self.substrate_paths()? {
             let ledger = self.ledger_for(&repo).await?;
             let guard = ledger.lock().await;
@@ -458,7 +462,7 @@ impl Host {
                 // A closed channel demands no attention (docs/adr/0022) —
                 // its summary still lists, demoted, for the archive view.
                 if !view.closed {
-                    let group = attention_for_view(&id, &view, Timestamp::now());
+                    let group = attention_for_view(&id, &view, now);
                     if !group.items.is_empty() {
                         groups.push(group);
                     }
@@ -2829,9 +2833,15 @@ mod lineage_tests {
 
     /// Wraps each payload in a fresh, unsigned entry and folds a standing
     /// directly — no ledger append, no projection — mirroring `render.rs`'s
-    /// `view_with` test helper (`render.rs:3867`). Assertions and
-    /// corrections land `Provisional` (the standing `attention_for_view`
-    /// checks); proposals land a `Pending` gate.
+    /// `view_with` test helper (`render.rs:3867`). Assertions land
+    /// `Provisional` (the standing `attention_for_view` checks); proposals
+    /// land a `Pending` gate. Corrections land `Provisional` too, but that
+    /// is test scaffolding only — the kernel's real projection never puts a
+    /// `Correction` in `standings` at all (a correction "does not itself
+    /// gain a Standing during projection"). Doing so here exists solely so
+    /// `a_correction_is_not_an_attention_item_today` can pin
+    /// `attention_for_view`'s behaviour even in that stronger-than-production
+    /// state.
     fn view_with(payloads: Vec<EntryPayload>) -> ChannelView {
         let channel = ChannelId::new();
         let entries: Vec<LedgerEntry> = payloads
@@ -2889,8 +2899,18 @@ mod lineage_tests {
             "only the decision deserves a verdict: {:?}",
             group.items
         );
+        assert!(
+            matches!(
+                group.items[0].entry.payload,
+                EntryPayload::Assertion {
+                    kind: Some(junto_kernel::AssertionKind::Decision),
+                    ..
+                }
+            ),
+            "the surviving item must be the decision, not the finding: {:?}",
+            group.items[0].entry.payload
+        );
     }
-
     #[tokio::test]
     async fn an_assertion_with_no_kind_still_asks_for_a_verdict() {
         // Legacy entries must not be silently discharged.

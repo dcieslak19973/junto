@@ -2236,11 +2236,15 @@ async fn focus_json(State(host): State<Arc<Host>>) -> Response {
     let clip = |s: &str| s.chars().take(140).collect::<String>();
     let inventory = host.inventory().await.unwrap_or_default();
     let mut items = Vec::new();
+    // One clock read for the whole board — every channel's attention group
+    // is judged against the same instant, not one that drifts as the loop
+    // crosses the inventory.
+    let now = Timestamp::now();
     for summary in &inventory {
         let Ok((id, view, _)) = project(&host, &summary.id.to_string()).await else {
             continue;
         };
-        let group = crate::host::attention_for_view(&id, &view, Timestamp::now());
+        let group = crate::host::attention_for_view(&id, &view, now);
         for item in &group.items {
             let kind = match item.kind {
                 crate::host::AttentionKind::Gate => "gate",
