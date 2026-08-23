@@ -1,4 +1,4 @@
-﻿//! The MCP write surface — how agents author ledger entries.
+//! The MCP write surface — how agents author ledger entries.
 //!
 //! `junto serve` exposes the kernel's ledger + gate operations as MCP tools
 //! over **streamable HTTP** (`docs/adr/0012`), so any MCP-capable agent
@@ -430,6 +430,14 @@ enum TargetKind {
     Subject,
 }
 
+/// Whether `id` names a `SubjectAttached` this channel carries in its log
+/// but no longer projects — i.e. an attachment that has been detached.
+fn detached_attachment(view: &ChannelView, id: &EntryId) -> bool {
+    view.entries.iter().any(|entry| {
+        &entry.id == id && matches!(entry.payload, EntryPayload::SubjectAttached { .. })
+    })
+}
+
 /// Resolve an act's target against the channel projection: a full id must
 /// *exist* and bear the right kind, and a git-style unambiguous id prefix is
 /// accepted — so agents stop reproducing full UUIDs from memory (a fabricated
@@ -453,6 +461,18 @@ fn resolve_target(view: &ChannelView, raw: &str, kind: TargetKind) -> Result<Ent
     if let Ok(id) = raw.parse::<EntryId>() {
         return if bears_kind(&id) {
             Ok(id)
+        } else if matches!(kind, TargetKind::Subject) && detached_attachment(view, &id) {
+            // The precise message matters here: `project_subjects` drops a
+            // detached attachment, so the generic "is not a subject
+            // attachment" would tell a caller retrying after a dropped
+            // connection that their attachment never existed. Mirrors
+            // `Host::detach_subject`'s own distinction, which this surface
+            // would otherwise shadow — it refuses before the host is
+            // reached.
+            Err(invalid(format!(
+                "subject attachment {id} is already detached — nothing to withdraw \
+                 (docs/adr/0037)"
+            )))
         } else {
             Err(invalid(format!(
                 "{id} is not {described} in this channel — check the id against view_channel"
@@ -1514,14 +1534,22 @@ mod tests {
             text_of(&detached)
         );
 
-        mcp.detach_subject(Parameters(DetachSubjectRequest {
-            channel: "spec-work".into(),
-            author: claude(),
-            code: code_of(&dirs, claude()),
-            target: id,
-        }))
-        .await
-        .expect_err("a detached attachment is no longer a detach target");
+        // A retry after a dropped connection must be told the attachment is
+        // gone, not that it never existed — `project_subjects` drops it, so
+        // the generic not-found message would be actively misleading.
+        let again = mcp
+            .detach_subject(Parameters(DetachSubjectRequest {
+                channel: "spec-work".into(),
+                author: claude(),
+                code: code_of(&dirs, claude()),
+                target: id,
+            }))
+            .await
+            .expect_err("a detached attachment is no longer a detach target");
+        assert!(
+            format!("{again:?}").contains("already detached"),
+            "{again:?}"
+        );
     }
 
     #[tokio::test]
