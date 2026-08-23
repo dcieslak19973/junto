@@ -28,7 +28,7 @@ What "inert" resolves into once a human *does* ratify the answering entry — of
 
 ## Terminology: `answers`, never `outcome`
 
-`0025` retired **`Outcome`** for *the target* (what done looks like, plus its Rubric) and introduced **`Deliverable`** for what a channel produced. Naming this field `outcome` would reopen exactly the drift `CLAUDE.md` forbids when it requires that *"names carry the ubiquitous language"* — the word is already spoken for, on the opposite side of the loop from what this field means.
+`0025` renamed junto's *old* `Outcome` — the produced thing (PR · memo · fix · parked) — to **`Deliverable`**, and reserved **`Outcome`** for *the target*: what done looks like, plus its Rubric. Naming this field `outcome` would reopen exactly the drift `CLAUDE.md` forbids when it requires that *"names carry the ubiquitous language"* — the word is already spoken for, on the opposite side of the loop from what this field means.
 
 ## Retrieval is a suggestion, never a link
 
