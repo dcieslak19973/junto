@@ -1381,7 +1381,11 @@ pub fn attention_for_view(id: &ChannelId, view: &ChannelView, now: Timestamp) ->
     // `Standing`, this just stops asking. Gates are a separate vector and
     // are never touched here, so a pending gate never ages out.
     let horizon_ms = VERIFICATION_HORIZON_DAYS * 24 * 60 * 60 * 1000;
-    verifications.retain(|item| now.as_millis() - item.entry.timestamp.as_millis() <= horizon_ms);
+    verifications.retain(|item| {
+        now.as_millis()
+            .saturating_sub(item.entry.timestamp.as_millis())
+            <= horizon_ms
+    });
     // Oldest first within each kind: the longest-waiting item leads. Gates
     // (blocked proposer) first, then stuck executions, then verification debt.
     gates.sort_by_key(|item| item.entry.timestamp);
@@ -2903,10 +2907,11 @@ mod lineage_tests {
         }
     }
 
-    /// A view with a single unapproved `Proposal` — a pending gate. Mirrors
-    /// `view_with`'s shape (fresh unsigned entry, folded standing/gate
-    /// status, no ledger append) for the one fixture `view_with` itself
-    /// cannot produce: gates land `GateStatus::Pending`, not a `Standing`.
+    /// A named convenience wrapper over `view_with` for the pending-gate
+    /// case: a single unapproved `Proposal`, which `view_with` already
+    /// folds to `GateStatus::Pending` for any `Proposal` payload. Exists so
+    /// call sites read as intent (`view_with_pending_gate()`) rather than
+    /// reconstructing the `Proposal` literal inline.
     fn view_with_pending_gate() -> ChannelView {
         view_with(vec![EntryPayload::Proposal {
             action: "ship it".into(),
@@ -3012,6 +3017,23 @@ mod lineage_tests {
                 .items
                 .len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_far_past_entry_timestamp_ages_out_without_panicking() {
+        // A corrupt/hand-edited entry synced from another substrate could
+        // carry a near-`i64::MIN` timestamp; the horizon subtraction must
+        // saturate rather than overflow (debug-panic / release-wrap).
+        let mut view = view_with(vec![assertion_of(
+            Some(junto_kernel::AssertionKind::Decision),
+            None,
+        )]);
+        view.entries[0].timestamp = Timestamp::from_millis(i64::MIN + 1);
+        let group = attention_for_view(&ChannelId::new(), &view, Timestamp::now());
+        assert!(
+            group.items.is_empty(),
+            "a far-past timestamp does not panic and is treated as aged out"
         );
     }
 
