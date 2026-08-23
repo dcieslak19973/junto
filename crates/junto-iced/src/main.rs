@@ -8,6 +8,7 @@
 //! whether native (Iced) beats the webview as the desktop power-surface.
 
 mod pointing;
+mod popover;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -31,7 +32,10 @@ use junto_live::{Frame as WireFrame, LiveDoc, Presence};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
-use pointing::{anchor_click, diff_row_targets, watcher_initials};
+use pointing::{
+    anchor_click, diff_row_targets, popup_anchor_line, watch_identity, watcher_initials,
+};
+use popover::Popover;
 
 const HOST: &str = "http://127.0.0.1:1727";
 
@@ -2382,9 +2386,25 @@ impl App {
     }
 
     fn subscription(&self) -> iced::Subscription<Message> {
-        // One live subscription per pane that is watching a session — SSE
-        // against the local `HOST`, or the authenticated websocket when the
-        // pane has a remote host configured (`Pane::remote`).
+        // One live subscription per pane that is watching a session. The
+        // authenticated websocket is preferred WHEREVER an identity to watch as
+        // can be resolved — including the local host, since `Pane::base()`
+        // already yields `HOST` when no remote is set. SSE remains the fallback
+        // for a machine with no identity on file at all.
+        //
+        // This is deliberate, and it is a fix rather than a tidy-up: the
+        // annotation composer only exists once a websocket reports
+        // `Message::LiveConnected` (that is the only source of
+        // `Pane::annotate_tx`), so gating the websocket on a NON-EMPTY `remote`
+        // meant a reviewer watching their own session on their own machine got
+        // no composer and therefore no clickable diff rows — the whole pointing
+        // gesture was unreachable unless they knew to type this host's own URL
+        // into a field labelled "remote". Ledger `02bded62`.
+        let identity_email = self
+            .settings
+            .as_ref()
+            .and_then(|s| s.identity.as_ref())
+            .map(|i| i.email.as_str());
         let streams: Vec<_> = self
             .panes
             .iter()
@@ -2396,16 +2416,21 @@ impl App {
                     .map(|session| {
                         // Id includes the nonce so a new turn restarts the stream.
                         let id = (session.clone(), state.stream_nonce);
-                        match &state.remote {
-                            Some(remote) => iced::Subscription::run_with_id(
+                        // The typed override, else this machine's own identity.
+                        let email = watch_identity(&state.watch_email, identity_email);
+                        match email {
+                            Some(email) => iced::Subscription::run_with_id(
                                 id,
                                 live_ws_stream(
-                                    remote.clone(),
+                                    state.base().to_string(),
                                     state.channel.clone(),
                                     session.clone(),
-                                    state.watch_email.clone(),
+                                    email,
                                 ),
                             ),
+                            // No identity anywhere: a websocket would only fail
+                            // its handshake, so keep the unauthenticated local
+                            // progress feed (and no composer, honestly).
                             None => iced::Subscription::run_with_id(
                                 id,
                                 session_stream(state.channel.clone(), session.clone()),
@@ -2597,10 +2622,15 @@ impl App {
             });
 
         // Shared-width columns, reflowing as channels open/close.
+        let machine_email = self
+            .settings
+            .as_ref()
+            .and_then(|s| s.identity.as_ref())
+            .map(|i| i.email.as_str());
         let mut body = row![].spacing(6);
         for id in &self.order {
             if let Some(pane) = self.panes.get(*id) {
-                body = body.push(column_pane(*id, pane, &self.agents));
+                body = body.push(column_pane(*id, pane, &self.agents, machine_email));
             }
         }
 
@@ -3015,7 +3045,21 @@ fn title_row(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
 /// live websocket as (`load_signing_key` reads that identity's key from
 /// this machine's `keys.toml`). Always visible, not just while watching a
 /// session — set before picking a session chip.
-fn remote_row(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
+///
+/// Both fields are OVERRIDES, not requirements: blank means this machine and
+/// this machine's identity (`pointing::watch_identity`). The email placeholder
+/// names the identity that will actually be used, because leaving it blank used
+/// to mean "no websocket, and therefore no annotation composer" with nothing on
+/// screen saying so (ledger `02bded62`).
+fn remote_row<'a>(
+    id: pane_grid::Pane,
+    pane: &'a Pane,
+    machine_email: Option<&'a str>,
+) -> Element<'a, Message> {
+    let watch_placeholder = match machine_email {
+        Some(email) => format!("watch as — default: {email}"),
+        None => "watch as (email) — no identity on this machine".to_string(),
+    };
     let inputs = row![
         text("remote ▸").size(11).color(MUTED),
         text_input("host (blank = local)", pane.remote.as_deref().unwrap_or(""))
@@ -3023,7 +3067,7 @@ fn remote_row(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
             .size(11)
             .padding(4)
             .width(Length::FillPortion(2)),
-        text_input("watch as (email)", &pane.watch_email)
+        text_input(&watch_placeholder, &pane.watch_email)
             .on_input(move |v| Message::WatchEmailChanged(id, v))
             .size(11)
             .padding(4)
@@ -3051,11 +3095,12 @@ fn column_pane<'a>(
     id: pane_grid::Pane,
     pane: &'a Pane,
     agents: &'a [AgentDto],
+    machine_email: Option<&'a str>,
 ) -> Element<'a, Message> {
     container(
         column![
             title_row(id, pane),
-            remote_row(id, pane),
+            remote_row(id, pane, machine_email),
             pane_body(id, pane, agents)
         ]
         .spacing(8),
@@ -3602,20 +3647,79 @@ fn annotate_composer(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
 /// One line naming where the composer is aimed, matching exactly what
 /// `AnnotateSubmit` will build: a code span, a pointed-at stream block, or the
 /// newest live event (the default when nothing has been pointed at).
+///
+/// Uses `●` and plain words only. `◆`/`▸`/`▾` do NOT render in this app's
+/// configured font (Segoe UI) and paint as tofu boxes — Dan could not find the
+/// feed gutter at all because of it (ledger `02ff24be`). `●` and `×` do render.
 fn aim_label(pane: &Pane) -> String {
     let path = pane.annotate_path.trim();
     if !path.is_empty() {
         return match pane.worktree_commit.as_deref() {
-            Some(commit) => format!("◆ {path}:{} @ {}", pane.annotate_lines, &commit[..7]),
+            Some(commit) => format!("● {path}:{} @ {}", pane.annotate_lines, &commit[..7]),
             // No commit has arrived, so `AnnotateSubmit` will refuse this
             // rather than fabricate one — say so before they type.
-            None => format!("⚠ {path} — no commit seen yet for this worktree"),
+            None => format!("no commit seen yet for this worktree — cannot anchor {path}"),
         };
     }
     match pane.annotate_op {
-        Some(op) => format!("◆ stream block #{op}"),
-        None => "▸ newest live event".to_string(),
+        Some(op) => format!("● stream block #{op}"),
+        None => "newest live event".to_string(),
     }
+}
+
+/// The floating comment panel: the same signed-annotation composer, anchored to
+/// the row it is about instead of pinned to the bottom of the pane.
+///
+/// Deliberately carries no `path`/`lines` inputs — the reviewer got here by
+/// clicking, so there is nothing to type. `×` clears the aim and hands the
+/// bottom composer back.
+fn annotate_popup(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
+    let head = row![
+        text(aim_label(pane)).size(11).color(TEAL),
+        Space::with_width(Fill),
+        button(text("×").size(12))
+            .on_press(Message::AnchorClear(id))
+            .padding([0, 6])
+            .style(|_t, _s| chip_style(MUTED, false)),
+    ]
+    .spacing(6)
+    .align_y(Center);
+    let body_input = text_input("comment on these lines…", &pane.annotate_body)
+        .on_input(move |v| Message::AnnotateBodyChanged(id, v))
+        .on_submit(Message::AnnotateSubmit(id))
+        .size(12)
+        .padding(6);
+    let urgent = checkbox("urgent", pane.annotate_urgent)
+        .on_toggle(move |on| Message::AnnotateUrgentToggled(id, on))
+        .size(14)
+        .text_size(11);
+    let submit = button(text("comment").size(11))
+        .on_press(Message::AnnotateSubmit(id))
+        .padding(6);
+    container(
+        column![
+            head,
+            body_input,
+            row![Space::with_width(Fill), urgent, submit]
+                .spacing(8)
+                .align_y(Center),
+        ]
+        .spacing(6),
+    )
+    .padding(10)
+    .style(|_theme| container::Style {
+        // Fully opaque: this floats over the diff, so anything translucent
+        // would leave code showing through the comment box.
+        background: Some(Background::Color(SURFACE)),
+        border: Border {
+            color: MAUVE,
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+        text_color: Some(TEXT),
+        ..container::Style::default()
+    })
+    .into()
 }
 
 fn pane_body<'a>(
@@ -3794,6 +3898,8 @@ fn pane_body<'a>(
         let aim = pane.annotate_tx.is_some().then(|| Aim {
             path: pane.annotate_path.as_str(),
             span: parse_span(&pane.annotate_lines),
+            popup_at: popup_anchor(pane),
+            pane,
         });
         // The session's persisted record: its SessionStarted entry plus every
         // entry targeting it (memos, artifacts), in timeline order.
@@ -3853,7 +3959,10 @@ fn pane_body<'a>(
             steer
         ]
         .spacing(8);
-        if pane.annotate_tx.is_some() {
+        // The bottom composer is the fallback surface. While a floating panel is
+        // anchored to the clicked row it IS the composer, so showing both would
+        // put two comment boxes on screen for one comment.
+        if pane.annotate_tx.is_some() && popup_anchor(pane).is_none() {
             session_col = session_col.push(annotate_composer(id, pane));
         }
         session_col.into()
@@ -3975,6 +4084,11 @@ const GUTTER: Length = Length::Fixed(14.0);
 /// The gutter is a sibling of the line, not a wrapper around it: an Iced
 /// `button` consumes its content's own interactions, so wrapping a Markdown
 /// block would silently kill its links.
+///
+/// It draws a filled BAR rather than a glyph. The first version used `▸`/`◆`,
+/// which do not exist in this app's font and painted as tofu boxes, so the only
+/// affordance for anchoring a stream block was invisible — Dan could not find it
+/// (ledger `02ff24be`). A coloured rectangle depends on no font at all.
 fn feed_block<'a>(
     id: pane_grid::Pane,
     item: &'a FeedItem,
@@ -3983,28 +4097,31 @@ fn feed_block<'a>(
     let gutter: Element<Message> = match item.op {
         Some(op) => {
             let lit = picked == Some(op);
-            button(
-                text(if lit { "◆" } else { "▸" })
-                    .size(9)
-                    .color(if lit { MAUVE } else { MUTED }),
-            )
-            .on_press(Message::AnchorStream(id, op))
-            .width(GUTTER)
-            .padding(0)
-            .style(move |_theme, status| {
-                let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
-                button::Style {
-                    background: (lit || hovered)
-                        .then_some(Background::Color(Color { a: 0.22, ..MAUVE })),
-                    text_color: if lit { MAUVE } else { MUTED },
-                    border: Border {
-                        radius: 3.0.into(),
-                        ..Border::default()
-                    },
-                    ..button::Style::default()
-                }
-            })
-            .into()
+            button(Space::new(Length::Fixed(3.0), Length::Fixed(14.0)))
+                .on_press(Message::AnchorStream(id, op))
+                .width(GUTTER)
+                .padding([0, 5])
+                .style(move |_theme, status| {
+                    let hovered =
+                        matches!(status, button::Status::Hovered | button::Status::Pressed);
+                    button::Style {
+                        background: Some(Background::Color(if lit {
+                            MAUVE
+                        } else if hovered {
+                            Color { a: 0.75, ..MAUVE }
+                        } else {
+                            // Dim but present: a reviewer has to be able to see
+                            // that the target exists before hovering it.
+                            Color { a: 0.30, ..MUTED }
+                        })),
+                        border: Border {
+                            radius: 2.0.into(),
+                            ..Border::default()
+                        },
+                        ..button::Style::default()
+                    }
+                })
+                .into()
         }
         // A line the app invented locally exists in no document, so there is
         // no op id to name and nothing to point at.
@@ -4579,6 +4696,39 @@ struct Aim<'a> {
     /// The composer's current `lines`, parsed — `None` while it is empty or
     /// malformed.
     span: Option<Span>,
+    /// The new-file line the floating comment panel hangs from — the span's
+    /// END, i.e. the row most recently clicked. `None` when no panel is shown.
+    /// Resolved by `popup_anchor`, which refuses a row that is not actually
+    /// rendered, so the panel can never be aimed at nothing.
+    popup_at: Option<u32>,
+    /// The pane, so the row owning the panel can build it in place.
+    pane: &'a Pane,
+}
+
+/// The most rows of a diff artifact that are ever rendered. `popup_anchor` uses
+/// the same bound, so it never promises a panel on a row past the cut-off.
+const MAX_DIFF_ROWS: usize = 500;
+
+/// The new-file line the floating comment panel should hang from: the aimed
+/// span's end, but only when an expanded diff artifact in this pane actually
+/// renders that row.
+///
+/// The "actually renders" check is what stops the reviewer being left with no
+/// composer at all: the bottom composer hides while the panel is up, so
+/// promising a panel that has no anchor would remove the only way to comment.
+fn popup_anchor(pane: &Pane) -> Option<u32> {
+    let diffs = pane.artifacts.values().filter_map(|content| match content {
+        ArtifactContent::Loaded { format, body, md } if format == "diff" && md.is_none() => {
+            Some(body.as_str())
+        }
+        _ => None,
+    });
+    popup_anchor_line(
+        &pane.annotate_path,
+        parse_span(&pane.annotate_lines),
+        diffs,
+        MAX_DIFF_ROWS,
+    )
 }
 
 /// Render an artifact's content inline: a diff gets per-line add/remove/hunk
@@ -4623,7 +4773,6 @@ fn artifact_body<'a>(
         })
         .into();
     }
-    const MAX_LINES: usize = 500;
     let lines: Vec<&str> = body.lines().collect();
     let is_diff = format == "diff";
     // One target per rendered row, in row order — indexed by the same `i` the
@@ -4634,15 +4783,24 @@ fn artifact_body<'a>(
         _ => Vec::new(),
     };
     let mut col = column![].spacing(1);
-    for (i, line) in lines.iter().enumerate().take(MAX_LINES) {
+    for (i, line) in lines.iter().enumerate().take(MAX_DIFF_ROWS) {
         let color = if is_diff { diff_line_color(line) } else { TEXT };
         match (aim, targets.get(i).copied().flatten()) {
             (Some(aim), Some((path, file_line))) => {
-                let lit = aim.path.trim() == path
+                let aimed_here = aim.path.trim() == path;
+                let lit = aimed_here
                     && aim
                         .span
                         .is_some_and(|s| s.start <= file_line && file_line <= s.end);
-                col = col.push(diff_row(id, line, color, path, file_line, lit));
+                let row = diff_row(id, line, color, path, file_line, lit);
+                // The comment surface hangs off the row it is about, rather than
+                // sitting 800px away at the bottom of the pane (ledger
+                // `02ff24be`). Exactly one row in the pane carries it.
+                if aimed_here && aim.popup_at == Some(file_line) {
+                    col = col.push(Popover::new(row, Some(annotate_popup(id, aim.pane))));
+                } else {
+                    col = col.push(row);
+                }
             }
             _ => {
                 col = col.push(
@@ -4654,11 +4812,11 @@ fn artifact_body<'a>(
             }
         }
     }
-    if lines.len() > MAX_LINES {
+    if lines.len() > MAX_DIFF_ROWS {
         col = col.push(
             text(format!(
                 "… ({} more lines — open in the web view for the full content)",
-                lines.len() - MAX_LINES
+                lines.len() - MAX_DIFF_ROWS
             ))
             .size(11)
             .color(MUTED),

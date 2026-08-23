@@ -20,6 +20,191 @@ use junto_kernel::Span;
 /// anything a reviewer cannot anchor to.
 pub type RowTarget<'a> = Option<(&'a str, u32)>;
 
+/// A plain rectangle, so the popover's placement maths stays renderer-neutral
+/// and testable without constructing an `iced::Rectangle`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+/// Where a floating panel of `panel` (width, height) should sit so that it hangs
+/// off `anchor` without leaving `viewport` (width, height).
+///
+/// Below the anchor by default; flipped ABOVE when there is no room below, so a
+/// row near the bottom of a pane still gets a usable panel. Horizontally
+/// left-aligned with the anchor, then pulled back inside the right edge.
+#[must_use]
+pub fn popover_position(
+    anchor: Rect,
+    panel: (f32, f32),
+    viewport: (f32, f32),
+    gap: f32,
+) -> (f32, f32) {
+    let (panel_w, panel_h) = panel;
+    let (viewport_w, viewport_h) = viewport;
+    let below = anchor.y + anchor.height + gap;
+    let y = if below + panel_h <= viewport_h {
+        below
+    } else {
+        (anchor.y - panel_h - gap).max(0.0)
+    };
+    let x = anchor.x.min((viewport_w - panel_w - 8.0).max(0.0)).max(8.0);
+    (x, y)
+}
+
+/// The new-file line a floating comment panel should hang from: the aimed
+/// span's END — the row most recently clicked — but only when one of `diffs`
+/// actually renders that row within its first `max_rows` lines.
+///
+/// The "actually renders" half is load-bearing: the caller hides its fallback
+/// composer whenever this returns `Some`, so promising a panel with no anchor
+/// would leave the reviewer no way to comment at all.
+#[must_use]
+pub fn popup_anchor_line<'a>(
+    path: &str,
+    span: Option<Span>,
+    diffs: impl Iterator<Item = &'a str>,
+    max_rows: usize,
+) -> Option<u32> {
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    let span = span?;
+    let mut diffs = diffs;
+    let rendered = diffs.any(|body| {
+        diff_row_targets(body)
+            .iter()
+            .take(max_rows)
+            .flatten()
+            .any(|(row_path, line)| *row_path == path && *line == span.end)
+    });
+    rendered.then_some(span.end)
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::{Rect, popover_position, popup_anchor_line};
+    use junto_kernel::Span;
+
+    const ANCHOR: Rect = Rect {
+        x: 40.0,
+        y: 100.0,
+        width: 300.0,
+        height: 16.0,
+    };
+
+    #[test]
+    fn a_panel_hangs_just_below_its_row() {
+        let (x, y) = popover_position(ANCHOR, (500.0, 120.0), (1000.0, 800.0), 4.0);
+        assert_eq!(x, 40.0, "left-aligned with the row");
+        assert_eq!(y, 120.0, "anchor bottom (116) plus the gap");
+    }
+
+    #[test]
+    fn a_panel_flips_above_when_there_is_no_room_below() {
+        // A row near the bottom of the pane must still get a usable panel
+        // rather than one clipped off the edge.
+        let anchor = Rect { y: 700.0, ..ANCHOR };
+        let (_, y) = popover_position(anchor, (500.0, 120.0), (1000.0, 800.0), 4.0);
+        assert_eq!(y, 576.0, "700 - 120 - 4");
+    }
+
+    #[test]
+    fn a_flipped_panel_taller_than_the_space_above_is_clamped_not_negative() {
+        let anchor = Rect { y: 30.0, ..ANCHOR };
+        let (_, y) = popover_position(anchor, (500.0, 400.0), (1000.0, 200.0), 4.0);
+        assert_eq!(y, 0.0, "never positioned off the top of the viewport");
+    }
+
+    #[test]
+    fn a_panel_is_pulled_back_inside_the_right_edge() {
+        let anchor = Rect { x: 900.0, ..ANCHOR };
+        let (x, _) = popover_position(anchor, (500.0, 120.0), (1000.0, 800.0), 4.0);
+        assert_eq!(x, 492.0, "1000 - 500 - 8");
+    }
+
+    #[test]
+    fn a_panel_wider_than_the_viewport_still_starts_on_screen() {
+        let (x, _) = popover_position(ANCHOR, (2000.0, 120.0), (600.0, 800.0), 4.0);
+        assert_eq!(x, 8.0, "clamped to the left margin, never negative");
+    }
+
+    const DIFF: &str = "\
+diff --git a/lib.rs b/lib.rs
++++ b/lib.rs
+@@ -1,3 +1,4 @@
+ fn one() {}
++fn two() {}
+ fn three() {}
+";
+
+    #[test]
+    fn the_anchor_is_the_span_end_when_that_row_is_rendered() {
+        let span = Span::new(1, 3).ok();
+        assert_eq!(
+            popup_anchor_line("lib.rs", span, [DIFF].into_iter(), 500),
+            Some(3),
+            "the panel hangs off the row most recently clicked"
+        );
+    }
+
+    #[test]
+    fn no_anchor_when_the_row_is_not_rendered_anywhere() {
+        // Hiding the fallback composer for a panel that cannot appear would
+        // leave no way to comment at all.
+        let span = Span::new(90, 99).ok();
+        assert_eq!(
+            popup_anchor_line("lib.rs", span, [DIFF].into_iter(), 500),
+            None
+        );
+        assert_eq!(
+            popup_anchor_line("other.rs", Span::new(1, 1).ok(), [DIFF].into_iter(), 500),
+            None,
+            "a path no rendered diff mentions anchors nothing"
+        );
+    }
+
+    #[test]
+    fn no_anchor_past_the_render_cut_off() {
+        // `max_rows` mirrors the renderer's own truncation, so a row the
+        // renderer drops can never be promised a panel.
+        assert_eq!(
+            popup_anchor_line("lib.rs", Span::new(1, 3).ok(), [DIFF].into_iter(), 4),
+            None
+        );
+    }
+
+    #[test]
+    fn no_anchor_without_a_path_or_a_parseable_span() {
+        assert_eq!(
+            popup_anchor_line("", Span::new(1, 3).ok(), [DIFF].into_iter(), 500),
+            None
+        );
+        assert_eq!(
+            popup_anchor_line("lib.rs", None, [DIFF].into_iter(), 500),
+            None
+        );
+    }
+
+    #[test]
+    fn the_anchor_is_found_across_several_expanded_diffs() {
+        let other = "+++ b/notes.md\n@@ -1,1 +7,1 @@\n+golf\n";
+        assert_eq!(
+            popup_anchor_line(
+                "notes.md",
+                Span::new(7, 7).ok(),
+                [DIFF, other].into_iter(),
+                500
+            ),
+            Some(7)
+        );
+    }
+}
+
 /// Map every rendered row of a unified diff to the new-file location it shows,
 /// one entry per [`str::lines`] row and in the same order — so a renderer that
 /// draws the diff row by row can zip the two and make exactly the anchorable
@@ -156,6 +341,69 @@ pub fn anchor_click(
         return (path.to_string(), format!("{}-{line}", span.start));
     }
     (path.to_string(), line.to_string())
+}
+
+/// The email a pane should authenticate its live websocket as: the reviewer's
+/// typed override if they gave one, else this machine's own identity.
+///
+/// `None` means no identity is known anywhere, which is the only case where an
+/// unauthenticated feed is still the right answer — a websocket would just fail
+/// its handshake.
+///
+/// Exists because the annotation composer only appears once a websocket
+/// connects, so "which identity do we watch as" silently decided whether the
+/// pointing gesture existed at all. Defaulting it is what makes the gesture
+/// reachable without the reviewer typing their own address into a form
+/// (ledger `02bded62`).
+#[must_use]
+pub fn watch_identity(typed: &str, machine: Option<&str>) -> Option<String> {
+    let typed = typed.trim();
+    if !typed.is_empty() {
+        return Some(typed.to_string());
+    }
+    machine
+        .map(str::trim)
+        .filter(|email| !email.is_empty())
+        .map(str::to_string)
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::watch_identity;
+
+    #[test]
+    fn an_empty_field_falls_back_to_this_machines_identity() {
+        // The reachability fix: a reviewer who types nothing still gets an
+        // authenticated websocket, and therefore a composer and clickable
+        // rows, on their own machine.
+        assert_eq!(
+            watch_identity("", Some("dan@example.com")).as_deref(),
+            Some("dan@example.com")
+        );
+        assert_eq!(
+            watch_identity("   ", Some("dan@example.com")).as_deref(),
+            Some("dan@example.com")
+        );
+    }
+
+    #[test]
+    fn a_typed_override_always_wins_and_is_trimmed() {
+        // Trimmed to match `Message::WatchEmailChanged`, so a pasted address
+        // with whitespace still resolves `load_signing_key`'s lookup.
+        assert_eq!(
+            watch_identity(" other@example.com ", Some("dan@example.com")).as_deref(),
+            Some("other@example.com")
+        );
+    }
+
+    #[test]
+    fn no_identity_anywhere_stays_unauthenticated() {
+        // The only case where the plain SSE feed is still right: a websocket
+        // would fail its handshake, and failing loudly buys nothing here.
+        assert_eq!(watch_identity("", None), None);
+        assert_eq!(watch_identity("", Some("")), None);
+        assert_eq!(watch_identity("  ", Some("   ")), None);
+    }
 }
 
 /// Up to two uppercase initials for a watcher's email, for the presence chip:
