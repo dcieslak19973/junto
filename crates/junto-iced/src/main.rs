@@ -7,6 +7,8 @@
 //! and `+ pane` to split a column; drag dividers to resize. The point is to feel
 //! whether native (Iced) beats the webview as the desktop power-surface.
 
+mod pointing;
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -15,7 +17,7 @@ use iced::widget::canvas::{self, Canvas, Frame, Geometry, Path, Stroke};
 use iced::widget::pane_grid;
 use iced::widget::{
     Space, button, checkbox, column, combo_box, container, markdown, pick_list, row, scrollable,
-    text, text_input,
+    text, text_input, tooltip,
 };
 use iced::{
     Background, Border, Center, Color, Element, Fill, Length, Padding, Point, Rectangle, Renderer,
@@ -28,6 +30,8 @@ use junto_kernel::{
 use junto_live::{Frame as WireFrame, LiveDoc, Presence};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
+
+use pointing::{anchor_click, diff_row_targets, watcher_initials};
 
 const HOST: &str = "http://127.0.0.1:1727";
 
@@ -163,15 +167,21 @@ struct Pane {
     /// rejects outright.
     annotate_email: Option<String>,
     /// The live doc's current `conversation` container length, mirrored
-    /// from the stream task (`Message::ConversationLen`). The composer's
-    /// `StreamAnchor` (an empty `path`) anchors at `conversation_len - 1`
-    /// — the most recent event's own CONTAINER index, which is not
-    /// necessarily `feed.len() - 1` (the feed also carries synthetic,
-    /// non-document error lines). An empty container (`conversation_len
-    /// == 0`, nothing has arrived yet) is refused outright rather than
-    /// saturating to a nonexistent index 0 — see the composer's
-    /// `AnnotateSubmit` handler.
+    /// from the stream task (`Message::ConversationLen`). A `StreamAnchor`
+    /// with no block picked falls back to `conversation_len - 1` — the most
+    /// recent event's own CONTAINER index, which is not necessarily
+    /// `feed.len() - 1` (the feed also carries synthetic, non-document
+    /// error lines). An empty container with nothing picked has no index to
+    /// anchor to and is refused outright rather than saturating to a
+    /// nonexistent index 0 — see the composer's `AnnotateSubmit` handler.
     conversation_len: usize,
+    /// The `conversation` container index the reviewer POINTED AT by
+    /// clicking a feed block's gutter (`Message::AnchorStream`), or `None`
+    /// to mean "the newest event" — the pre-pointing behaviour, kept as the
+    /// default so an un-aimed comment still lands somewhere real.
+    /// Mutually exclusive with `annotate_path`: pointing at a line clears
+    /// this, and pointing at a block clears the path.
+    annotate_op: Option<usize>,
     /// The most recent commit oid seen in a `{"kind":"diff","commit":…}`
     /// worktree event on this pane's live doc (`Message::WorktreeDiff`) —
     /// the ONLY source a `CodeAnchor`'s commit may come from. `None` means
@@ -437,6 +447,12 @@ struct LiveEvent {
 struct FeedItem {
     event: LiveEvent,
     md: Option<Vec<markdown::Item>>,
+    /// This item's own index in the live doc's `conversation` container — the
+    /// `op_id` a `StreamAnchor` on this block needs. `None` for a synthetic
+    /// line the app made up locally (`error_event`) or an SSE-streamed local
+    /// session, neither of which exists in the document, so neither can be
+    /// pointed at.
+    op: Option<usize>,
 }
 
 /// The raw Markdown to render for an event, if any: the host's `markdown`
@@ -748,7 +764,12 @@ enum Message {
     Watch(pane_grid::Pane, String),
     /// Close the session view, returning the pane to its timeline.
     CloseSession(pane_grid::Pane),
-    Live(String, LiveEvent),
+    /// A live event to append to a pane's feed (session, the event's own
+    /// `conversation` container index, the event). The index is `None` for a
+    /// line that exists only locally — a synthetic `error_event`, or anything
+    /// from the local SSE stream, which is not a live document — and those
+    /// lines are therefore not pointable (`FeedItem::op`).
+    Live(String, Option<usize>, LiveEvent),
     LiveEnded(String),
     /// The pane's remote-watch base URL text input changed (empty → local).
     RemoteChanged(pane_grid::Pane, String),
@@ -769,6 +790,19 @@ enum Message {
     /// commit oid) — mirrored into `Pane::worktree_commit`, the only source
     /// the composer's `CodeAnchor` may ever take a commit from.
     WorktreeDiff(String, String),
+    // --- pointing: click a rendered row/block to aim the composer ---
+    /// A rendered diff row was clicked (pane, new-file path, new-file line,
+    /// `pointing::diff_row_targets`) — prefills the composer's `path`/`lines`
+    /// instead of the reviewer typing them, extending the range on a second
+    /// click further down the same file (`pointing::anchor_click`).
+    AnchorRow(pane_grid::Pane, String, u32),
+    /// A rendered feed block's gutter was clicked (pane, the block's own
+    /// `conversation` container index) — aims the `StreamAnchor` there
+    /// instead of at the newest event.
+    AnchorStream(pane_grid::Pane, usize),
+    /// Drop the aimed anchor, returning the composer to commenting on the
+    /// newest live event.
+    AnchorClear(pane_grid::Pane),
     /// The annotation composer's `path` text input changed.
     AnnotatePathChanged(pane_grid::Pane, String),
     /// The annotation composer's `lines` text input changed.
@@ -1154,6 +1188,10 @@ impl App {
                     state.annotate_email = None;
                     state.conversation_len = 0;
                     state.worktree_commit = None;
+                    // A block index belongs to the document being left; the
+                    // feed is cleared here, so keeping it would aim at an op
+                    // from a different session.
+                    state.annotate_op = None;
                 }
                 Task::none()
             }
@@ -1167,16 +1205,18 @@ impl App {
                     state.annotate_email = None;
                     state.conversation_len = 0;
                     state.worktree_commit = None;
+                    state.annotate_op = None;
                 }
                 Task::none()
             }
-            Message::Live(session, event) => {
+            Message::Live(session, op, event) => {
                 let mut scroll = None;
                 for (_, state) in self.panes.iter_mut() {
                     if state.watched.as_deref() == Some(session.as_str()) {
                         let item = FeedItem {
                             md: feed_markdown(&event),
                             event,
+                            op,
                         };
                         // Coalesce streaming Markdown segments by seq.
                         match state.feed.last_mut() {
@@ -1209,6 +1249,10 @@ impl App {
                         state.annotate_email = None;
                         state.conversation_len = 0;
                         state.worktree_commit = None;
+                        // The picked block belonged to a document that is
+                        // gone; a stale index would anchor at the wrong op
+                        // on the next turn.
+                        state.annotate_op = None;
                         to_refresh = Some(*pane);
                         break;
                     }
@@ -1279,6 +1323,40 @@ impl App {
                 }
                 Task::none()
             }
+            Message::AnchorRow(pane, path, line) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    let (path, lines) = anchor_click(
+                        &state.annotate_path,
+                        parse_span(&state.annotate_lines),
+                        &path,
+                        line,
+                    );
+                    state.annotate_path = path;
+                    state.annotate_lines = lines;
+                    // A code anchor and a stream anchor are mutually
+                    // exclusive; pointing at a line drops any block picked.
+                    state.annotate_op = None;
+                }
+                Task::none()
+            }
+            Message::AnchorStream(pane, op) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    state.annotate_op = Some(op);
+                    // Clearing the path is what makes `AnnotateSubmit` build a
+                    // `StreamAnchor` rather than a `CodeAnchor`.
+                    state.annotate_path.clear();
+                    state.annotate_lines.clear();
+                }
+                Task::none()
+            }
+            Message::AnchorClear(pane) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    state.annotate_op = None;
+                    state.annotate_path.clear();
+                    state.annotate_lines.clear();
+                }
+                Task::none()
+            }
             Message::AnnotatePathChanged(pane, value) => {
                 if let Some(state) = self.panes.get_mut(pane) {
                     state.annotate_path = value;
@@ -1304,11 +1382,9 @@ impl App {
                 Task::none()
             }
             Message::AnnotateSubmit(pane) => {
-                let identity_name = self
-                    .settings
-                    .as_ref()
-                    .and_then(|s| s.identity.as_ref())
-                    .map(|i| i.name.clone());
+                // NOTE: the author is NOT taken from this machine's git
+                // identity. It is resolved below from the channel's own roster
+                // by the email the socket authenticated as — see `author_for`.
                 let Some(state) = self.panes.get_mut(pane) else {
                     return Task::none();
                 };
@@ -1316,6 +1392,8 @@ impl App {
                     state.feed.push(FeedItem {
                         md: None,
                         event: error_event(text),
+                        // Locally invented; it exists in no document.
+                        op: None,
                     });
                 };
                 let body = state.annotate_body.trim().to_string();
@@ -1356,19 +1434,27 @@ impl App {
                 // wire (`Pane::worktree_commit`, set only from a real
                 // `{"kind":"diff","commit":…}` worktree event) — never
                 // fabricated, never a placeholder. Anything else, including
-                // an empty path, is a `StreamAnchor` on the most recent
-                // conversation event instead.
+                // an empty path, is a `StreamAnchor` on a conversation event
+                // instead. Clicking a row only fills in the two inputs a
+                // reviewer used to type; it does not relax this rule.
                 let anchor = if path.is_empty() {
-                    if state.conversation_len == 0 {
+                    // The block the reviewer pointed at, else the newest
+                    // event. Nothing picked and an empty container means
+                    // there is no real index to name, which is refused
+                    // rather than saturated to a nonexistent index 0.
+                    let Some(op) = state
+                        .annotate_op
+                        .or_else(|| state.conversation_len.checked_sub(1))
+                    else {
                         push_error(
                             state,
                             "nothing to anchor to yet — wait for the first live event".to_string(),
                         );
                         return Task::none();
-                    }
+                    };
                     Anchor::Stream(StreamAnchor {
                         session,
-                        op_id: (state.conversation_len - 1).to_string(),
+                        op_id: op.to_string(),
                     })
                 } else {
                     let Some(commit_str) = state.worktree_commit.clone() else {
@@ -1408,10 +1494,9 @@ impl App {
                         span,
                     })
                 };
-                let author_name = identity_name.unwrap_or_else(|| email.clone());
                 let mut annotation = Annotation {
                     id: AnnotationId::new(),
-                    author: Member::human(author_name, email),
+                    author: author_for(state.keys.as_ref(), &email),
                     anchor,
                     body,
                     excerpt: None,
@@ -1586,6 +1671,9 @@ impl App {
                         markdown: None,
                     },
                     md: None,
+                    // A local echo of your own steer — the host's own copy
+                    // arrives separately, with a real index.
+                    op: None,
                 });
                 let scroll = state.scroll_id.clone();
                 Task::batch([
@@ -1615,6 +1703,7 @@ impl App {
                                 markdown: None,
                             },
                             md: None,
+                            op: None,
                         }),
                     }
                 }
@@ -3485,13 +3574,48 @@ fn annotate_composer(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
     let submit = button(text("comment").size(11))
         .on_press(Message::AnnotateSubmit(id))
         .padding(6);
+    // What this comment will actually be anchored to, stated plainly. The
+    // inputs alone can't say it: an empty path could mean the newest event or a
+    // block that was pointed at, and those land on different ops.
+    let mut aimed = row![text(aim_label(pane)).size(11).color(TEAL)]
+        .spacing(6)
+        .align_y(Center);
+    if pane.annotate_op.is_some() || !pane.annotate_path.trim().is_empty() {
+        aimed = aimed.push(
+            button(text("clear").size(10))
+                .on_press(Message::AnchorClear(id))
+                .padding([1, 6])
+                .style(|_t, _s| chip_style(MUTED, false)),
+        );
+    }
     column![
-        text("annotate ▸").size(11).color(MUTED),
+        row![text("annotate ▸").size(11).color(MUTED), aimed]
+            .spacing(8)
+            .align_y(Center),
         row![path_input, lines_input].spacing(6),
         row![body_input, urgent, submit].spacing(6).align_y(Center),
     ]
     .spacing(4)
     .into()
+}
+
+/// One line naming where the composer is aimed, matching exactly what
+/// `AnnotateSubmit` will build: a code span, a pointed-at stream block, or the
+/// newest live event (the default when nothing has been pointed at).
+fn aim_label(pane: &Pane) -> String {
+    let path = pane.annotate_path.trim();
+    if !path.is_empty() {
+        return match pane.worktree_commit.as_deref() {
+            Some(commit) => format!("◆ {path}:{} @ {}", pane.annotate_lines, &commit[..7]),
+            // No commit has arrived, so `AnnotateSubmit` will refuse this
+            // rather than fabricate one — say so before they type.
+            None => format!("⚠ {path} — no commit seen yet for this worktree"),
+        };
+    }
+    match pane.annotate_op {
+        Some(op) => format!("◆ stream block #{op}"),
+        None => "▸ newest live event".to_string(),
+    }
 }
 
 fn pane_body<'a>(
@@ -3651,6 +3775,11 @@ fn pane_body<'a>(
         if pane.streaming {
             header = header.push(text("● live").size(11).color(GREEN));
         }
+        // Presence, in the header rather than buried in the feed: who else is
+        // looking at this session right now (`Message::Watchers`).
+        if !pane.watchers.is_empty() {
+            header = header.push(watchers_chip(&pane.watchers));
+        }
         header = header.push(Space::with_width(Fill));
         header = header.push(
             button(text("× close").size(11))
@@ -3659,6 +3788,13 @@ fn pane_body<'a>(
                 .style(|_t, _s| chip_style(MUTED, false)),
         );
 
+        // Where the composer is aimed. `Some` exactly while the composer is on
+        // screen (`annotate_tx`), so diff rows and feed gutters become click
+        // targets and stop being them together with it.
+        let aim = pane.annotate_tx.is_some().then(|| Aim {
+            path: pane.annotate_path.as_str(),
+            span: parse_span(&pane.annotate_lines),
+        });
         // The session's persisted record: its SessionStarted entry plus every
         // entry targeting it (memos, artifacts), in timeline order.
         let mut record = column![].spacing(8);
@@ -3673,6 +3809,7 @@ fn pane_body<'a>(
                     false,
                     artifact_for(entry),
                     summary_md_for(entry),
+                    aim,
                 ));
             }
         }
@@ -3680,18 +3817,9 @@ fn pane_body<'a>(
         // visible after the turn lands until you leave the session.
         if pane.streaming || !pane.feed.is_empty() {
             record = record.push(text("— live turn —").size(11).color(MUTED));
-            // Remote-watch presence (the live websocket's `Ephemeral` frames) —
-            // absent for a local SSE-streamed session, which carries no presence.
-            if !pane.watchers.is_empty() {
-                record = record.push(
-                    text(format!("watching: {}", pane.watchers.join(", ")))
-                        .size(11)
-                        .color(TEAL),
-                );
-            }
             let mut feed = column![].spacing(6);
             for item in &pane.feed {
-                feed = feed.push(feed_line(item));
+                feed = feed.push(feed_block(id, item, pane.annotate_op));
             }
             if pane.streaming {
                 feed = feed.push(text("● working…").size(11).color(YELLOW));
@@ -3762,7 +3890,10 @@ fn pane_body<'a>(
                         error_for(entry),
                         pending_for(entry),
                         artifact_for(entry),
-                        summary_md_for(entry)
+                        summary_md_for(entry),
+                        // The composer only exists inside a watched
+                        // session, so nothing here is pointable.
+                        None
                     )
                 ]
                 .spacing(4)
@@ -3816,6 +3947,7 @@ fn pane_body<'a>(
                 pending_for(entry),
                 artifact_for(entry),
                 summary_md_for(entry),
+                None,
             ));
         }
         let scroll = scrollable(timeline).id(pane.scroll_id.clone()).height(Fill);
@@ -3828,6 +3960,59 @@ fn pane_body<'a>(
     column![header, launch, chips, main]
         .spacing(8)
         .padding([8.0_f32, 10.0])
+        .into()
+}
+
+/// The fixed width of the feed's pointing gutter, so pointable and
+/// unpointable blocks stay left-aligned with each other.
+const GUTTER: Length = Length::Fixed(14.0);
+
+/// One feed block plus its pointing gutter: a narrow click target left of the
+/// rendered line that aims the composer's `StreamAnchor` at THIS block
+/// (`Message::AnchorStream`) rather than at the newest event, which is what it
+/// always used to be.
+///
+/// The gutter is a sibling of the line, not a wrapper around it: an Iced
+/// `button` consumes its content's own interactions, so wrapping a Markdown
+/// block would silently kill its links.
+fn feed_block<'a>(
+    id: pane_grid::Pane,
+    item: &'a FeedItem,
+    picked: Option<usize>,
+) -> Element<'a, Message> {
+    let gutter: Element<Message> = match item.op {
+        Some(op) => {
+            let lit = picked == Some(op);
+            button(
+                text(if lit { "◆" } else { "▸" })
+                    .size(9)
+                    .color(if lit { MAUVE } else { MUTED }),
+            )
+            .on_press(Message::AnchorStream(id, op))
+            .width(GUTTER)
+            .padding(0)
+            .style(move |_theme, status| {
+                let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+                button::Style {
+                    background: (lit || hovered)
+                        .then_some(Background::Color(Color { a: 0.22, ..MAUVE })),
+                    text_color: if lit { MAUVE } else { MUTED },
+                    border: Border {
+                        radius: 3.0.into(),
+                        ..Border::default()
+                    },
+                    ..button::Style::default()
+                }
+            })
+            .into()
+        }
+        // A line the app invented locally exists in no document, so there is
+        // no op id to name and nothing to point at.
+        None => Space::with_width(GUTTER).into(),
+    };
+    row![gutter, feed_line(item)]
+        .spacing(4)
+        .align_y(iced::Top)
         .into()
 }
 
@@ -4066,6 +4251,32 @@ fn parse_span(s: &str) -> Option<Span> {
     Span::new(start, end).ok()
 }
 
+/// The [`Member`] to author an annotation as, resolved from the CHANNEL'S OWN
+/// ROSTER (`keys.json`) by the email the live socket actually authenticated as.
+///
+/// Neither the display name nor the kind may come from this machine's git
+/// identity. Dogfooding this composer produced an annotation reading
+/// `{"display_name":"Dan Cieslak","email":"omp@oh-my-pi.dev","kind":"Human"}`
+/// — the operator's name and the wrong kind stapled to the agent's address,
+/// because the name was read from `settings.identity` and the kind was
+/// hardcoded `human`. The record then misattributes a *signed* claim, which is
+/// the failure `b10ffdc6` is about: an agent must author as itself.
+///
+/// An email absent from the roster falls back to the email as its own display
+/// name and `agent` — the conservative choice, since a human is only ever
+/// asserted when the roster says so.
+fn author_for(keys: Option<&KeysDto>, email: &str) -> Member {
+    let member = keys
+        .into_iter()
+        .flat_map(|keys| keys.members.iter())
+        .find(|candidate| candidate.email == email);
+    match member {
+        Some(member) if member.kind == "human" => Member::human(member.display_name.clone(), email),
+        Some(member) => Member::agent(member.display_name.clone(), email),
+        None => Member::agent(email, email),
+    }
+}
+
 fn chip_style(color: Color, active: bool) -> button::Style {
     button::Style {
         background: Some(Background::Color(if active {
@@ -4100,6 +4311,7 @@ fn timeline_entry<'a>(
     pending: bool,
     artifact: Option<&'a ArtifactContent>,
     summary_md: Option<&'a [markdown::Item]>,
+    aim: Option<Aim<'a>>,
 ) -> Element<'a, Message> {
     row![
         rail(kind_color(&entry.kind)),
@@ -4111,7 +4323,8 @@ fn timeline_entry<'a>(
             error,
             pending,
             artifact,
-            summary_md
+            summary_md,
+            aim
         )
     ]
     .spacing(10)
@@ -4178,6 +4391,7 @@ fn entry_card<'a>(
     pending: bool,
     artifact: Option<&'a ArtifactContent>,
     summary_md: Option<&'a [markdown::Item]>,
+    aim: Option<Aim<'a>>,
 ) -> Element<'a, Message> {
     let accent = kind_color(&entry.kind);
     let mut head = row![
@@ -4327,7 +4541,7 @@ fn entry_card<'a>(
             Some(ArtifactContent::Loaded { format, body, md }) => {
                 card = card
                     .push(row![Space::with_width(Fill), copy_button(body.clone())].align_y(Center));
-                card = card.push(artifact_body(format, body, md.as_deref()));
+                card = card.push(artifact_body(id, format, body, md.as_deref(), aim));
             }
             None => {}
         }
@@ -4354,14 +4568,34 @@ fn entry_card<'a>(
         .into()
 }
 
-/// A small filled pill.
+/// Where the annotation composer is currently aimed, threaded down to the diff
+/// renderer. `Some` only while the composer is live (`Pane::annotate_tx`), which
+/// is the same condition that makes pointing meaningful at all: aiming inputs
+/// that are not on screen would be a click that appears to do nothing.
+#[derive(Clone, Copy)]
+struct Aim<'a> {
+    /// The composer's current `path`, untrimmed (as typed).
+    path: &'a str,
+    /// The composer's current `lines`, parsed — `None` while it is empty or
+    /// malformed.
+    span: Option<Span>,
+}
+
 /// Render an artifact's content inline: a diff gets per-line add/remove/hunk
 /// colour; anything else is shown verbatim. Monospace; long artifacts are
 /// truncated (the web view holds the full text).
+///
+/// With an `aim`, every diff row that occupies a line of the NEW file becomes a
+/// click target that aims the composer there (`pointing::diff_row_targets`);
+/// rows inside the aimed span are lit. Headers, hunk markers and removed rows
+/// stay plain text, which is also how a reviewer can see at a glance what is
+/// pointable.
 fn artifact_body<'a>(
+    id: pane_grid::Pane,
     format: &str,
     body: &'a str,
     md: Option<&'a [markdown::Item]>,
+    aim: Option<Aim<'a>>,
 ) -> Element<'a, Message> {
     // A memo renders as formatted Markdown.
     if let Some(items) = md {
@@ -4392,15 +4626,33 @@ fn artifact_body<'a>(
     const MAX_LINES: usize = 500;
     let lines: Vec<&str> = body.lines().collect();
     let is_diff = format == "diff";
+    // One target per rendered row, in row order — indexed by the same `i` the
+    // loop below draws with, so a click can never land on a different line than
+    // the one under the cursor. Skipped entirely when there is nothing to aim.
+    let targets = match aim {
+        Some(_) if is_diff => diff_row_targets(body),
+        _ => Vec::new(),
+    };
     let mut col = column![].spacing(1);
-    for line in lines.iter().take(MAX_LINES) {
+    for (i, line) in lines.iter().enumerate().take(MAX_LINES) {
         let color = if is_diff { diff_line_color(line) } else { TEXT };
-        col = col.push(
-            text((*line).to_string())
-                .font(iced::Font::MONOSPACE)
-                .size(12)
-                .color(color),
-        );
+        match (aim, targets.get(i).copied().flatten()) {
+            (Some(aim), Some((path, file_line))) => {
+                let lit = aim.path.trim() == path
+                    && aim
+                        .span
+                        .is_some_and(|s| s.start <= file_line && file_line <= s.end);
+                col = col.push(diff_row(id, line, color, path, file_line, lit));
+            }
+            _ => {
+                col = col.push(
+                    text((*line).to_string())
+                        .font(iced::Font::MONOSPACE)
+                        .size(12)
+                        .color(color),
+                );
+            }
+        }
     }
     if lines.len() > MAX_LINES {
         col = col.push(
@@ -4451,6 +4703,46 @@ fn diff_line_color(line: &str) -> Color {
     }
 }
 
+/// One anchorable diff row: a full-width click target that stays invisible
+/// until hovered, so a 500-row diff reads as a diff rather than as 500
+/// buttons. Clicking aims the composer at this row's new-file line
+/// (`Message::AnchorRow`); `lit` paints the rows already inside the aimed
+/// span, which is the only feedback that a range was picked at all.
+fn diff_row<'a>(
+    id: pane_grid::Pane,
+    body: &str,
+    color: Color,
+    path: &str,
+    line: u32,
+    lit: bool,
+) -> Element<'a, Message> {
+    button(
+        text(body.to_string())
+            .font(iced::Font::MONOSPACE)
+            .size(12)
+            .color(color),
+    )
+    .width(Fill)
+    .padding([0, 4])
+    .on_press(Message::AnchorRow(id, path.to_string(), line))
+    .style(move |_theme, status| {
+        let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        button::Style {
+            background: (lit || hovered).then_some(Background::Color(Color {
+                a: if lit { 0.28 } else { 0.14 },
+                ..MAUVE
+            })),
+            text_color: color,
+            border: Border {
+                radius: 3.0.into(),
+                ..Border::default()
+            },
+            ..button::Style::default()
+        }
+    })
+    .into()
+}
+
 /// A small "copy" button that writes `text` to the clipboard (Iced static text
 /// isn't mouse-selectable, so copy buttons are how you grab content).
 fn copy_button(text_to_copy: String) -> Element<'static, Message> {
@@ -4459,6 +4751,79 @@ fn copy_button(text_to_copy: String) -> Element<'static, Message> {
         .padding([1, 6])
         .style(|_t, _s| chip_style(MUTED, false))
         .into()
+}
+
+/// Watcher presence for the session header: an initials avatar per watcher
+/// (capped, with a `+N` overflow) plus the count, so "someone else is looking
+/// at this right now" is visible at a glance instead of being a line of emails
+/// buried in the feed. Fed by `Message::Watchers`, which the live websocket's
+/// `Ephemeral` presence frames already deliver.
+fn watchers_chip(watchers: &[String]) -> Element<'static, Message> {
+    const MAX_AVATARS: usize = 4;
+    let mut chip = row![].spacing(3).align_y(Center);
+    for email in watchers.iter().take(MAX_AVATARS) {
+        chip = chip.push(avatar(email));
+    }
+    if watchers.len() > MAX_AVATARS {
+        chip = chip.push(
+            text(format!("+{}", watchers.len() - MAX_AVATARS))
+                .size(10)
+                .color(MUTED),
+        );
+    }
+    chip.push(
+        text(format!("{} watching", watchers.len()))
+            .size(11)
+            .color(TEAL),
+    )
+    .into()
+}
+
+/// One watcher's initials in a filled pill, tinted deterministically from their
+/// email so two watchers are told apart at a glance. The initials are a cue,
+/// not an identity — hovering shows the full email, which is why moving
+/// presence into the header loses nothing.
+fn avatar(email: &str) -> Element<'static, Message> {
+    const TINTS: [Color; 5] = [BLUE, TEAL, MAUVE, GREEN, YELLOW];
+    let tint = TINTS[email_tint(email) as usize % TINTS.len()];
+    let pill = container(
+        text(watcher_initials(email))
+            .size(9)
+            .color(Color::from_rgb(0.12, 0.12, 0.18)),
+    )
+    .padding([1, 4])
+    .style(move |_theme| container::Style {
+        background: Some(Background::Color(tint)),
+        border: Border {
+            radius: 7.0.into(),
+            ..Border::default()
+        },
+        ..container::Style::default()
+    });
+    tooltip(
+        pill,
+        container(text(email.to_string()).size(11).color(TEXT))
+            .padding([2, 6])
+            .style(|_theme| container::Style {
+                background: Some(Background::Color(SURFACE)),
+                border: Border {
+                    color: BORDER,
+                    width: 1.0,
+                    radius: 4.0.into(),
+                },
+                ..container::Style::default()
+            }),
+        tooltip::Position::Bottom,
+    )
+    .into()
+}
+
+/// FNV-1a over an email, so a watcher keeps the same avatar tint across frames
+/// and across machines (a colour that shuffled every repaint would be noise).
+fn email_tint(email: &str) -> u32 {
+    email.bytes().fold(2_166_136_261_u32, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(16_777_619)
+    })
 }
 
 fn badge(label: &str, color: Color) -> Element<'static, Message> {
@@ -4513,6 +4878,7 @@ impl Pane {
             annotate_tx: None,
             annotate_email: None,
             conversation_len: 0,
+            annotate_op: None,
             worktree_commit: None,
             annotate_path: String::new(),
             annotate_lines: String::new(),
@@ -5401,7 +5767,12 @@ fn session_stream(channel: String, session: String) -> impl iced::futures::Strea
                 if let Some(data) = frame.lines().find_map(|l| l.strip_prefix("data:"))
                     && let Ok(event) = serde_json::from_str::<LiveEvent>(data.trim())
                 {
-                    let _ = output.send(Message::Live(session.clone(), event)).await;
+                    // The local SSE stream is not a live document, so it
+                    // exposes no container index and its lines are not
+                    // pointable — the composer is websocket-only anyway.
+                    let _ = output
+                        .send(Message::Live(session.clone(), None, event))
+                        .await;
                 }
             }
         }
@@ -5411,11 +5782,38 @@ fn session_stream(channel: String, session: String) -> impl iced::futures::Strea
 
 /// A session's live-websocket URL, derived from a pane's REST base URL
 /// (`Pane::base`) by swapping the scheme: `http` → `ws`, `https` → `wss`.
+///
+/// The channel and session are percent-encoded: a channel name is free text
+/// and may contain spaces (`febe66f2` keeps names human), and
+/// `tokio_tungstenite` refuses the resulting URL outright with "invalid uri
+/// character" — so an ordinary name silently broke live watching, while the
+/// REST calls beside it kept working because `reqwest` encodes for itself.
 fn ws_url(base: &str, channel: &str, session: &str) -> String {
     let base = base.trim_end_matches('/');
     let (scheme, rest) = base.split_once("://").unwrap_or(("http", base));
     let ws_scheme = if scheme == "https" { "wss" } else { "ws" };
+    let channel = encode_segment(channel);
+    let session = encode_segment(session);
     format!("{ws_scheme}://{rest}/channels/{channel}/sessions/{session}/live")
+}
+
+/// Percent-encode one URL path segment, keeping only the RFC 3986 unreserved
+/// set. Used by [`ws_url`], which builds its URL by string formatting and so
+/// has no library doing this for it.
+fn encode_segment(segment: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(segment.len());
+    for byte in segment.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char);
+            }
+            other => {
+                let _ = write!(out, "%{other:02X}");
+            }
+        }
+    }
+    out
 }
 
 /// A synthetic error line for the live feed — same shape `Message::Steered`'s
@@ -5536,6 +5934,7 @@ fn live_ws_stream(
             let _ = output
                 .send(Message::Live(
                     session.clone(),
+                    None,
                     error_event(format!("no signing key on file for '{email}'")),
                 ))
                 .await;
@@ -5549,6 +5948,7 @@ fn live_ws_stream(
                 let _ = output
                     .send(Message::Live(
                         session.clone(),
+                        None,
                         error_event(format!("connect failed: {err}")),
                     ))
                     .await;
@@ -5567,6 +5967,7 @@ fn live_ws_stream(
                         let _ = output
                             .send(Message::Live(
                                 session.clone(),
+                                None,
                                 error_event("handshake failed: expected a challenge".into()),
                             ))
                             .await;
@@ -5579,6 +5980,7 @@ fn live_ws_stream(
                 let _ = output
                     .send(Message::Live(
                         session.clone(),
+                        None,
                         error_event(
                             "handshake failed: connection closed before a challenge arrived".into(),
                         ),
@@ -5597,6 +5999,7 @@ fn live_ws_stream(
             let _ = output
                 .send(Message::Live(
                     session.clone(),
+                    None,
                     error_event(format!("failed to send auth: {err}")),
                 ))
                 .await;
@@ -5609,7 +6012,7 @@ fn live_ws_stream(
                     Ok(WireFrame::AuthOk) => {}
                     Ok(WireFrame::Rejected { reason }) => {
                         let _ = output
-                            .send(Message::Live(session.clone(), error_event(reason)))
+                            .send(Message::Live(session.clone(), None, error_event(reason)))
                             .await;
                         let _ = output.send(Message::LiveEnded(session)).await;
                         return;
@@ -5682,7 +6085,14 @@ fn live_ws_stream(
                                             serde_json::from_value::<LiveEvent>(current.clone())
                                         {
                                             let _ = output
-                                                .send(Message::Live(session.clone(), event))
+                                                .send(Message::Live(
+                                                    session.clone(),
+                                                    // Its own container index —
+                                                    // the block a StreamAnchor
+                                                    // on this row would name.
+                                                    Some(emitted - 1),
+                                                    event,
+                                                ))
                                                 .await;
                                         }
                                         last_seen = Some(current);
@@ -5695,7 +6105,11 @@ fn live_ws_stream(
                                             serde_json::from_value::<LiveEvent>(value.clone())
                                         {
                                             let _ = output
-                                                .send(Message::Live(session.clone(), event))
+                                                .send(Message::Live(
+                                                    session.clone(),
+                                                    Some(i),
+                                                    event,
+                                                ))
                                                 .await;
                                         }
                                         last_seen = Some(value);
@@ -5734,7 +6148,11 @@ fn live_ws_stream(
                                 }
                                 WireFrame::Rejected { reason } => {
                                     let _ = output
-                                        .send(Message::Live(session.clone(), error_event(reason)))
+                                        .send(Message::Live(
+                                            session.clone(),
+                                            None,
+                                            error_event(reason),
+                                        ))
                                         .await;
                                 }
                                 WireFrame::End => {
@@ -6014,6 +6432,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ws_url_percent_encodes_a_channel_name_with_spaces() {
+        // Found by dogfooding, not by reading: a channel literally named
+        // "pointing dogfood 20260823" made `tokio_tungstenite` refuse the URL
+        // ("invalid uri character"), so live watching failed for an ordinary
+        // human-readable name while every REST call in the same pane worked.
+        assert_eq!(
+            ws_url("http://127.0.0.1:1727", "pointing dogfood 20260823", "s"),
+            "ws://127.0.0.1:1727/channels/pointing%20dogfood%2020260823/sessions/s/live"
+        );
+        // Unreserved characters are left alone, so ids and slugs are unchanged.
+        assert_eq!(
+            ws_url("http://h", "a-b_c.d~e", "2dd175c6-0d6b"),
+            "ws://h/channels/a-b_c.d~e/sessions/2dd175c6-0d6b/live"
+        );
+        // A name that could otherwise inject extra path segments is encoded.
+        assert_eq!(
+            ws_url("http://h", "a/../b", "s"),
+            "ws://h/channels/a%2F..%2Fb/sessions/s/live"
+        );
+    }
+
     /// Same shape as `crates/junto/src/keys.rs`'s own tests: a tempdir
     /// `keys.toml` with a known secret, asserting the derived public key
     /// matches. `JUNTO_HOME` is process-global; this crate has no other test
@@ -6235,6 +6675,67 @@ mod tests {
             !summary.to_lowercase().contains("removed"),
             "never imply removal: {summary}"
         );
+    }
+
+    /// A roster shaped like `keys.json`, with the two kinds side by side.
+    fn roster() -> KeysDto {
+        let member = |display_name: &str, email: &str, kind: &str| KeyMemberDto {
+            display_name: display_name.into(),
+            email: email.into(),
+            kind: kind.into(),
+            devices: Vec::new(),
+            revoked: false,
+        };
+        KeysDto {
+            founder_email: "omp@oh-my-pi.dev".into(),
+            viewer_email: None,
+            viewer_is_founder: false,
+            members: vec![
+                member("Oh My Pi", "omp@oh-my-pi.dev", "agent"),
+                member(
+                    "Dan Cieslak",
+                    "dcieslak19973@users.noreply.github.com",
+                    "human",
+                ),
+            ],
+        }
+    }
+
+    #[test]
+    fn author_for_never_staples_the_machine_identity_to_another_email() {
+        // The exact misattribution dogfooding produced: an annotation signed
+        // by the agent but recorded as
+        // {"display_name":"Dan Cieslak","email":"omp@oh-my-pi.dev","kind":"Human"}
+        // because the name came from this machine's git identity and the kind
+        // was hardcoded. The roster is the only authority for both.
+        let author = author_for(Some(&roster()), "omp@oh-my-pi.dev");
+        assert_eq!(author.display_name, "Oh My Pi");
+        assert_eq!(author.email, "omp@oh-my-pi.dev");
+        assert_eq!(
+            author.kind,
+            junto_kernel::MemberKind::Agent,
+            "an agent must author as an agent, whoever owns the machine"
+        );
+    }
+
+    #[test]
+    fn author_for_reads_a_human_as_human() {
+        let author = author_for(Some(&roster()), "dcieslak19973@users.noreply.github.com");
+        assert_eq!(author.display_name, "Dan Cieslak");
+        assert_eq!(author.kind, junto_kernel::MemberKind::Human);
+    }
+
+    #[test]
+    fn author_for_falls_back_to_the_email_and_never_claims_to_be_a_human() {
+        // No roster yet (keys.json still in flight), or an email the channel
+        // does not list: assert as little as possible rather than inventing a
+        // human identity.
+        for keys in [None, Some(&roster())] {
+            let author = author_for(keys, "stranger@example.com");
+            assert_eq!(author.display_name, "stranger@example.com");
+            assert_eq!(author.email, "stranger@example.com");
+            assert_eq!(author.kind, junto_kernel::MemberKind::Agent);
+        }
     }
 
     #[test]
