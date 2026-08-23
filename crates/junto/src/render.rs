@@ -17,7 +17,7 @@
 
 use junto_kernel::{
     ChannelId, ChannelView, EntryId, EntryPayload, GateStatus, LedgerEntry, LineageRelation,
-    Member, MemberKind, ProvenanceRef, SessionState, Standing,
+    Member, MemberKind, ProvenanceRef, SessionState, Standing, Timestamp,
 };
 use std::fmt::Write as _;
 
@@ -2267,7 +2267,7 @@ pub fn channel_html(
     };
     // The channel's own attention strip: what here awaits the member, above
     // the full ledger (docs/attention.md).
-    let strip_group = crate::host::attention_for_view(id, view);
+    let strip_group = crate::host::attention_for_view(id, view, Timestamp::now());
     let strip = if strip_group.items.is_empty() {
         String::new()
     } else {

@@ -458,7 +458,7 @@ impl Host {
                 // A closed channel demands no attention (docs/adr/0022) —
                 // its summary still lists, demoted, for the archive view.
                 if !view.closed {
-                    let group = attention_for_view(&id, &view);
+                    let group = attention_for_view(&id, &view, Timestamp::now());
                     if !group.items.is_empty() {
                         groups.push(group);
                     }
@@ -1334,7 +1334,7 @@ pub struct OpenedChannel {
 /// One channel's attention items from an already-projected view — used by
 /// [`Host::attention`] and by the channel page's attention strip (which has
 /// the view in hand and must not re-project).
-pub fn attention_for_view(id: &ChannelId, view: &ChannelView) -> AttentionGroup {
+pub fn attention_for_view(id: &ChannelId, view: &ChannelView, now: Timestamp) -> AttentionGroup {
     let mut gates = Vec::new();
     let mut awaiting = Vec::new();
     let mut verifications = Vec::new();
@@ -1360,8 +1360,9 @@ pub fn attention_for_view(id: &ChannelId, view: &ChannelView) -> AttentionGroup 
                     entry: entry.clone(),
                 });
             }
-            EntryPayload::Assertion { .. }
-                if view.standing(&entry.id) == Some(junto_kernel::Standing::Provisional) =>
+            EntryPayload::Assertion { kind, .. }
+                if view.standing(&entry.id) == Some(junto_kernel::Standing::Provisional)
+                    && !matches!(kind, Some(junto_kernel::AssertionKind::Finding)) =>
             {
                 verifications.push(AttentionItem {
                     kind: AttentionKind::Verification,
@@ -2773,7 +2774,7 @@ mod lineage_tests {
         }
 
         let view = ledger.lock().await.project(&id).await.unwrap();
-        let group = attention_for_view(&id, &view);
+        let group = attention_for_view(&id, &view, Timestamp::now());
         assert!(
             group
                 .items
@@ -2801,7 +2802,7 @@ mod lineage_tests {
             .await
             .unwrap();
         let view = ledger.lock().await.project(&id).await.unwrap();
-        let group = attention_for_view(&id, &view);
+        let group = attention_for_view(&id, &view, Timestamp::now());
         assert!(
             !group
                 .items
@@ -2809,6 +2810,113 @@ mod lineage_tests {
                 .any(|i| i.kind == AttentionKind::AwaitingExecution),
             "a successful execution clears the signal"
         );
+    }
+
+    fn assertion_of(
+        kind: Option<junto_kernel::AssertionKind>,
+        session: Option<EntryId>,
+    ) -> EntryPayload {
+        EntryPayload::Assertion {
+            statement: "s".into(),
+            rationale: "r".into(),
+            provenance: vec![],
+            frame: None,
+            session,
+            kind,
+            answers: None,
+        }
+    }
+
+    /// Wraps each payload in a fresh, unsigned entry and folds a standing
+    /// directly — no ledger append, no projection — mirroring `render.rs`'s
+    /// `view_with` test helper (`render.rs:3867`). Assertions and
+    /// corrections land `Provisional` (the standing `attention_for_view`
+    /// checks); proposals land a `Pending` gate.
+    fn view_with(payloads: Vec<EntryPayload>) -> ChannelView {
+        let channel = ChannelId::new();
+        let entries: Vec<LedgerEntry> = payloads
+            .into_iter()
+            .map(|payload| LedgerEntry {
+                signature: None,
+                id: EntryId::new(),
+                channel,
+                author: dan(),
+                timestamp: Timestamp::now(),
+                payload,
+            })
+            .collect();
+        let mut standings = HashMap::new();
+        let mut gate_status = HashMap::new();
+        for e in &entries {
+            match e.payload {
+                EntryPayload::Assertion { .. } | EntryPayload::Correction { .. } => {
+                    standings.insert(e.id, Standing::Provisional);
+                }
+                EntryPayload::Proposal { .. } => {
+                    gate_status.insert(e.id, GateStatus::Pending);
+                }
+                _ => {}
+            }
+        }
+        ChannelView {
+            name: None,
+            entries,
+            party: Vec::new(),
+            keyring: Default::default(),
+            unrecognized: std::collections::HashSet::new(),
+            unverified: Default::default(),
+            standings,
+            gate_status,
+            gate_executions: HashMap::new(),
+            sessions: HashMap::new(),
+            closed: false,
+            lineage: Vec::new(),
+            subjects: Vec::new(),
+            channel_standing: junto_kernel::ChannelStanding::Scratch,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_finding_is_not_an_attention_item() {
+        let view = view_with(vec![
+            assertion_of(Some(junto_kernel::AssertionKind::Finding), None),
+            assertion_of(Some(junto_kernel::AssertionKind::Decision), None),
+        ]);
+        let group = attention_for_view(&ChannelId::new(), &view, Timestamp::now());
+        assert_eq!(
+            group.items.len(),
+            1,
+            "only the decision deserves a verdict: {:?}",
+            group.items
+        );
+    }
+
+    #[tokio::test]
+    async fn an_assertion_with_no_kind_still_asks_for_a_verdict() {
+        // Legacy entries must not be silently discharged.
+        let view = view_with(vec![assertion_of(None, None)]);
+        let group = attention_for_view(&ChannelId::new(), &view, Timestamp::now());
+        assert_eq!(group.items.len(), 1);
+    }
+
+    /// Pins CURRENT behaviour, not desired behaviour. `attention_for_view`
+    /// only matches `Proposal` and `Assertion` payloads, so a `Correction`
+    /// never becomes an attention item — even here, where its own standing
+    /// is `Provisional`. A corrected claim's text therefore stands
+    /// unverified forever; nobody is ever asked to look at it. That is a
+    /// real hole (a claim can in principle be laundered off the review
+    /// queue by correcting it), but closing it is out of scope for this
+    /// plan — it belongs to the surface/dialog plan that follows. This test
+    /// exists only so nobody changes the behaviour by accident before then.
+    #[tokio::test]
+    async fn a_correction_is_not_an_attention_item_today() {
+        let view = view_with(vec![EntryPayload::Correction {
+            target: EntryId::new(),
+            statement: "corrected".into(),
+            rationale: "typo".into(),
+        }]);
+        let group = attention_for_view(&ChannelId::new(), &view, Timestamp::now());
+        assert!(group.items.is_empty(), "{:?}", group.items);
     }
 
     #[tokio::test]

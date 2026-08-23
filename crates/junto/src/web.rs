@@ -2240,7 +2240,7 @@ async fn focus_json(State(host): State<Arc<Host>>) -> Response {
         let Ok((id, view, _)) = project(&host, &summary.id.to_string()).await else {
             continue;
         };
-        let group = crate::host::attention_for_view(&id, &view);
+        let group = crate::host::attention_for_view(&id, &view, Timestamp::now());
         for item in &group.items {
             let kind = match item.kind {
                 crate::host::AttentionKind::Gate => "gate",
