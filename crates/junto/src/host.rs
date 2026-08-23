@@ -1410,10 +1410,12 @@ const MILESTONE_CAP: usize = 12;
 /// board is "not a queue".
 ///
 /// This is a **projection filter only**: the entry keeps its `Provisional`
-/// standing, stays in the brief's record, and can still be ratified whenever
-/// someone wants to. Gates are exempt — a pending gate blocks its proposer,
-/// and time does not unblock them.
-const VERIFICATION_HORIZON_DAYS: i64 = 14;
+/// standing and can still be ratified whenever someone wants to. It stays in
+/// the record — the scaled brief ([`crate::render::brief_markdown`]) moves it
+/// from the act list into its own quieter `recorded, unverified` tier rather
+/// than dropping it, so it is still findable by id. Gates are exempt — a
+/// pending gate blocks its proposer, and time does not unblock them.
+pub(crate) const VERIFICATION_HORIZON_DAYS: i64 = 14;
 
 /// A short, single-line label for a milestone node's tooltip.
 fn milestone_label(text: &str) -> String {
@@ -3100,7 +3102,8 @@ mod lineage_tests {
             ledger.lock().await.project(&id).await.unwrap()
         };
         let ctx = host.lineage_context(&child_view).await.unwrap();
-        let brief = crate::render::brief_markdown("sq", &child.id, &child_view, &ctx);
+        let brief =
+            crate::render::brief_markdown("sq", &child.id, &child_view, &ctx, Timestamp::now());
         assert!(brief.contains("inherited context"), "{brief}");
         assert!(
             brief.contains("use NDJSON for the pending queue"),

@@ -1339,7 +1339,13 @@ async fn brief(dir: PathBuf, out: &mut impl std::io::Write) -> Result<()> {
                             if let Err(err) = writeln!(
                                 out,
                                 "{}",
-                                render::brief_markdown(&name, &id, &view, &lineage)
+                                render::brief_markdown(
+                                    &name,
+                                    &id,
+                                    &view,
+                                    &lineage,
+                                    Timestamp::now()
+                                )
                             ) {
                                 eprintln!("junto brief: writing '{channel}': {err}");
                             }

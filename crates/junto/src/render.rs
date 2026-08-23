@@ -111,10 +111,14 @@ fn last_act<'a>(
 /// ([`brief_markdown`]) and the human channel page ([`channel_html`]): one
 /// information design, two renderings (`docs/adr/0013`).
 struct BriefShape<'a> {
-    /// Provisional decisions and pending proposals — the act targets.
+    /// Provisional decisions (not yet past the verification horizon) and
+    /// pending proposals — the act targets.
     open: Vec<&'a LedgerEntry>,
-    /// Provisional findings — recorded and citable, asking nobody to
-    /// decide anything, so they do not rent an act-target line.
+    /// The quieter tier: provisional findings (recorded and citable, asking
+    /// nobody to decide anything) plus provisional decisions that have aged
+    /// past `VERIFICATION_HORIZON_DAYS` — dropped off the act list but never
+    /// off the record (`crate::host::attention_for_view` applies the same
+    /// horizon to the interactive board).
     findings: Vec<&'a LedgerEntry>,
     /// Ratified assertions plus corrections (the live text of settled
     /// territory), in canonical order.
@@ -132,7 +136,13 @@ struct BriefShape<'a> {
 /// Partition the live entries by what a newcomer needs them for. Genesis,
 /// membership, act, and session entries don't rent lines here: the party
 /// line, the folded notes, and the sessions board carry them.
-fn brief_shape(view: &ChannelView) -> BriefShape<'_> {
+///
+/// `now` ages provisional decisions off the act list past
+/// `crate::host::VERIFICATION_HORIZON_DAYS` — a projection filter only,
+/// mirroring `crate::host::attention_for_view`'s own horizon. Gates are
+/// exempt: a pending gate blocks its proposer, and time does not unblock
+/// them.
+fn brief_shape(view: &ChannelView, now: Timestamp) -> BriefShape<'_> {
     let mut shape = BriefShape {
         open: Vec::new(),
         findings: Vec::new(),
@@ -142,16 +152,23 @@ fn brief_shape(view: &ChannelView) -> BriefShape<'_> {
         rejected: Vec::new(),
         superseded: 0,
     };
+    let horizon_ms = crate::host::VERIFICATION_HORIZON_DAYS * 24 * 60 * 60 * 1000;
     for entry in &view.entries {
         match &entry.payload {
             EntryPayload::Assertion { kind, .. } => match view.standing(&entry.id) {
-                // Absent `kind` reads as a decision (`attention_for_view`
-                // applies the same rule) — only an explicit Finding diverts
-                // out of the act list.
-                Some(Standing::Provisional) if matches!(kind, Some(AssertionKind::Finding)) => {
-                    shape.findings.push(entry);
+                Some(Standing::Provisional) => {
+                    // Absent `kind` reads as a decision (`attention_for_view`
+                    // applies the same rule). A Finding, or a decision that
+                    // has waited past the horizon, is quieter than the act
+                    // list but stays in the record.
+                    let aged =
+                        now.as_millis().saturating_sub(entry.timestamp.as_millis()) > horizon_ms;
+                    if aged || matches!(kind, Some(AssertionKind::Finding)) {
+                        shape.findings.push(entry);
+                    } else {
+                        shape.open.push(entry);
+                    }
                 }
-                Some(Standing::Provisional) => shape.open.push(entry),
                 Some(Standing::Ratified) => shape.ratified.push(entry),
                 Some(Standing::Parked) => shape.parked.push(entry),
                 // Collapsed: the correction carries the live text.
@@ -240,7 +257,7 @@ pub struct LineageRef {
 /// inherited-context block (`docs/adr/0027`) reuses.
 pub fn standing_decision_lines(view: &ChannelView, cutoff: Option<i64>, max: usize) -> Vec<String> {
     let mut lines = Vec::new();
-    for entry in brief_shape(view).ratified.iter().rev() {
+    for entry in brief_shape(view, Timestamp::now()).ratified.iter().rev() {
         if let Some(cutoff) = cutoff
             && entry.timestamp.as_millis() > cutoff
         {
@@ -326,6 +343,7 @@ pub fn brief_markdown(
     id: &ChannelId,
     view: &ChannelView,
     lineage: &LineageContext,
+    now: Timestamp,
 ) -> String {
     let mut out = format!("# channel '{name}' ({id}) — brief\n\n");
     if !view.party.is_empty() {
@@ -363,7 +381,7 @@ pub fn brief_markdown(
         approved,
         rejected,
         superseded,
-    } = brief_shape(view);
+    } = brief_shape(view, now);
 
     // Needs attention — full ids and full detail: these are the act targets.
     out.push_str("## needs attention — act by id (ratify/park · approve/reject)\n\n");
@@ -587,7 +605,12 @@ fn tokens(text: &str) -> std::collections::HashSet<String> {
 /// Crude next to embeddings, but local, deterministic and dependency-free —
 /// `MemoryProvider` is the designed upgrade path (`docs/pluggability.md`).
 fn rank_by_overlap<T: Copy>(query: &str, candidates: &[(T, String)], limit: usize) -> Vec<T> {
-    let query = tokens(query);
+    // A `HashSet`'s iteration order is randomised per process (`RandomState`)
+    // and f64 addition is not associative, so summing in set order would let
+    // two replicas rank near-equal candidates differently. Sorting once here
+    // fixes the summation order everywhere below.
+    let mut query: Vec<String> = tokens(query).into_iter().collect();
+    query.sort_unstable();
     if query.is_empty() || candidates.is_empty() {
         return Vec::new();
     }
@@ -2320,6 +2343,10 @@ pub fn channel_html(
     substrate: &std::path::Path,
     workspace: Option<&std::path::Path>,
 ) -> String {
+    // One clock read for the whole render — the attention strip and the
+    // standing-decisions section (`docs/adr/0013` decay tiers) must age
+    // entries consistently within a single page.
+    let now = Timestamp::now();
     // The channel history shows the most recent entries (newest first); the
     // full record lives in the durable refs. Rendering all of them inline is a
     // heavy DOM (a 142-entry channel was ~240KB), so cap it.
@@ -2365,7 +2392,7 @@ pub fn channel_html(
     };
     // The channel's own attention strip: what here awaits the member, above
     // the full ledger (docs/attention.md).
-    let strip_group = crate::host::attention_for_view(id, view, Timestamp::now());
+    let strip_group = crate::host::attention_for_view(id, view, now);
     let strip = if strip_group.items.is_empty() {
         String::new()
     } else {
@@ -2453,7 +2480,7 @@ pub fn channel_html(
     // The human brief: the same scaled shape the agent brief carries
     // (state, not history), rendered as the page — with the full transcript
     // collapsed below instead of *being* the page.
-    let shape = brief_shape(view);
+    let shape = brief_shape(view, now);
     let notes = act_notes(view);
     let standing = standing_decisions_section(&shape, &notes);
     let recently = recently_section(view);
@@ -4529,7 +4556,13 @@ mod tests {
             subjects: Vec::new(),
             channel_standing: ChannelStanding::Standing,
         };
-        let brief = brief_markdown("t", &ChannelId::new(), &view, &Default::default());
+        let brief = brief_markdown(
+            "t",
+            &ChannelId::new(),
+            &view,
+            &Default::default(),
+            Timestamp::from_millis(1_781_046_734_154),
+        );
 
         // Acts fold into their targets instead of renting lines.
         assert!(brief.contains("ratified by Dan"), "{brief}");
@@ -4570,7 +4603,13 @@ mod tests {
             subjects: Vec::new(),
             channel_standing: ChannelStanding::Standing,
         };
-        let brief = brief_markdown("t", &ChannelId::new(), &view, &Default::default());
+        let brief = brief_markdown(
+            "t",
+            &ChannelId::new(),
+            &view,
+            &Default::default(),
+            Timestamp::from_millis(1_781_046_734_154),
+        );
 
         assert!(brief.contains("extra body 29"), "newest in full: {brief}");
         assert!(
@@ -4666,7 +4705,13 @@ mod tests {
         let entry = assertion(None, "claim");
         let id = entry.id.to_string();
         let view = view_with(vec![entry]);
-        let brief = brief_markdown("test", &ChannelId::new(), &view, &Default::default());
+        let brief = brief_markdown(
+            "test",
+            &ChannelId::new(),
+            &view,
+            &Default::default(),
+            Timestamp::from_millis(1_781_046_734_154),
+        );
         assert!(brief.contains(&id));
         assert!(brief.contains("[provisional]"));
     }
@@ -4675,7 +4720,16 @@ mod tests {
     fn empty_channel_renders_in_both_styles() {
         let view = view_with(vec![]);
         let id = ChannelId::new();
-        assert!(brief_markdown("empty", &id, &view, &Default::default()).contains("(no entries)"));
+        assert!(
+            brief_markdown(
+                "empty",
+                &id,
+                &view,
+                &Default::default(),
+                Timestamp::from_millis(1_781_046_734_154)
+            )
+            .contains("(no entries)")
+        );
         assert!(
             channel_html(
                 &[],
@@ -4766,7 +4820,13 @@ mod tests {
             assertion(Some(AssertionKind::Decision), "decide this"),
             assertion(Some(AssertionKind::Finding), "just noticed this"),
         ]);
-        let brief = brief_markdown("c", &ChannelId::new(), &view, &Default::default());
+        let brief = brief_markdown(
+            "c",
+            &ChannelId::new(),
+            &view,
+            &Default::default(),
+            Timestamp::from_millis(1_781_046_734_154),
+        );
         let needs = brief
             .split("## needs attention")
             .nth(1)
@@ -4787,25 +4847,54 @@ mod tests {
 
     #[test]
     fn related_open_items_are_ranked_and_bounded() {
-        // Eight open decisions; a query about websockets must rank the
-        // websocket one first and return no more than the bound.
+        // Four of eight open decisions share tokens with the query — more
+        // than `RELATED_OPEN_LIMIT` (3), so the bound actually has to cut
+        // something, not just pass through a single match. The top hit
+        // matches all three query tokens (plus a unique marker word); the
+        // other three matches only share two, so IDF-weighted scoring must
+        // still put the strongest match first.
         let view = view_with_open_decisions(&[
             "the websocket handshake needs an ed25519 challenge",
+            "the websocket proxy relays challenge frames to every peer",
+            "a challenge response header verifies the websocket client",
+            "clients replay the websocket challenge nonce during reconnect",
             "subject uris are compared exactly",
             "gates execute on approval",
             "names stop being unique",
             "the ledger is append-only",
-            "worktrees isolate a session",
-            "presence rides an ephemeral store",
-            "artifacts carry digests",
         ]);
         let out = related_open_markdown(&view, "websocket challenge handshake", EntryId::new())
             .expect("some open items are related");
-        let first = out.lines().find(|l| l.starts_with("- ")).unwrap();
-        assert!(first.contains("websocket"), "{out}");
+        let lines: Vec<&str> = out.lines().filter(|l| l.starts_with("- ")).collect();
+        assert_eq!(
+            lines.len(),
+            3,
+            "four candidates match; the bound must cut to the limit: {out}"
+        );
         assert!(
-            out.lines().filter(|l| l.starts_with("- ")).count() <= 3,
-            "{out}"
+            lines[0].contains("ed25519"),
+            "the three-token match outranks the two-token matches: {out}"
+        );
+    }
+
+    #[test]
+    fn rank_by_overlap_normalizes_by_document_length() {
+        // Two candidates share exactly the same matched tokens (equal raw
+        // IDF sum), but the second is padded with many unrelated tokens. The
+        // `sqrt(len)` normalization must still rank the tighter, shorter
+        // match first — otherwise a long candidate could win on padding
+        // alone, which is exactly what the length normalization exists to
+        // prevent.
+        let short = "alpha bravo charlie".to_string();
+        let long = "alpha bravo charlie delta echo foxtrot golf hotel india juliet \
+                     kilo lima mike november oscar papa quebec romeo sierra tango"
+            .to_string();
+        let candidates = vec![(1u32, short), (2u32, long)];
+        let ranked = rank_by_overlap("alpha bravo charlie", &candidates, 2);
+        assert_eq!(
+            ranked,
+            vec![1, 2],
+            "the shorter, equally-matching candidate ranks first: {ranked:?}"
         );
     }
 
@@ -4819,10 +4908,11 @@ mod tests {
     /// Aging is a projection filter (`VERIFICATION_HORIZON_DAYS`,
     /// `docs/attention.md`): a provisional decision that has waited past the
     /// horizon drops off the interactive "needs you" board
-    /// (`attention_for_view`), but it never leaves the record — the scaled
-    /// brief keeps listing it under `## needs attention`, ids included, so a
-    /// human can still find and ratify it. Aging removes an item from the
-    /// act list, never from the record.
+    /// (`attention_for_view`) *and* out of the brief's own act list — but it
+    /// never leaves the record. The brief moves it into the quieter
+    /// `## recorded, unverified` tier, ids included, so a human can still
+    /// find and ratify it. Aging removes an item from the act list, never
+    /// from the record.
     #[test]
     fn an_aged_out_decision_is_still_readable_in_the_brief() {
         const HORIZON_MS: i64 = 14 * 24 * 60 * 60 * 1000;
@@ -4830,7 +4920,7 @@ mod tests {
         let mut entry = assertion(Some(AssertionKind::Decision), "an old open decision");
         entry.timestamp =
             Timestamp::from_millis(now.as_millis() - HORIZON_MS - 24 * 60 * 60 * 1000);
-        let id = entry.id.to_string();
+        let id = short(&entry.id);
         let view = view_with(vec![entry]);
 
         let board = crate::host::attention_for_view(&ChannelId::new(), &view, now);
@@ -4840,7 +4930,7 @@ mod tests {
             board.items
         );
 
-        let brief = brief_markdown("t", &ChannelId::new(), &view, &Default::default());
+        let brief = brief_markdown("t", &ChannelId::new(), &view, &Default::default(), now);
         let needs = brief
             .split("## needs attention")
             .nth(1)
@@ -4849,8 +4939,19 @@ mod tests {
             .next()
             .unwrap();
         assert!(
-            needs.contains(&id),
-            "the brief keeps listing it — aging never removes it from the record: {needs}"
+            !needs.contains(&id),
+            "aged past the horizon, it must also drop off the brief's own act list: {needs}"
+        );
+        let quiet = brief
+            .split("## recorded, unverified")
+            .nth(1)
+            .expect("the quieter tier exists")
+            .split("\n## ")
+            .next()
+            .unwrap();
+        assert!(
+            quiet.contains(&id),
+            "but it stays in the record — findable and ratifiable in the quieter tier: {quiet}"
         );
     }
 }

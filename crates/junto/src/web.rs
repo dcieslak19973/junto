@@ -2189,7 +2189,7 @@ async fn channel_brief(State(host): State<Arc<Host>>, Path(channel): Path<String
             let lineage = host.lineage_context(&view).await.unwrap_or_default();
             (
                 [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
-                render::brief_markdown(&name, &id, &view, &lineage),
+                render::brief_markdown(&name, &id, &view, &lineage, Timestamp::now()),
             )
                 .into_response()
         }

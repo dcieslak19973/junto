@@ -937,13 +937,18 @@ impl JuntoMcp {
         self.host.sign_entry(&mut entry);
         let id = entry.id;
         ledger.lock().await.append(entry).await.map_err(internal)?;
-        let view = ledger
+        // The tail is a suggestion, never load-bearing: the write already
+        // landed, so a projection failure here must not surface as an error
+        // — that would invite a retry that appends a duplicate assertion to
+        // an append-only ledger.
+        let tail = ledger
             .lock()
             .await
             .project(&channel)
             .await
-            .map_err(internal)?;
-        let tail = crate::render::related_open_markdown(&view, &about, id).unwrap_or_default();
+            .ok()
+            .and_then(|view| crate::render::related_open_markdown(&view, &about, id))
+            .unwrap_or_default();
         Ok(text(format!(
             "recorded {id} in channel '{}'{tail}",
             req.channel
@@ -1217,7 +1222,7 @@ impl JuntoMcp {
             render::transcript_markdown(&name, &channel, &view)
         } else {
             let lineage = self.host.lineage_context(&view).await.unwrap_or_default();
-            render::brief_markdown(&name, &channel, &view, &lineage)
+            render::brief_markdown(&name, &channel, &view, &lineage, Timestamp::now())
         };
         Ok(text(rendered))
     }
@@ -2347,6 +2352,71 @@ mod tests {
         assert!(
             recent.contains("5 of 8 dead-ends, most recent first"),
             "{recent}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dead_ends_query_ranking_is_bounded_too_not_just_recency() {
+        // `dead_ends_are_ranked_and_bounded` only exercises the ranked path
+        // with a single matching dead-end, so its bound assertion runs
+        // through the `about: None` recency fallback instead of
+        // `rank_by_overlap` itself. Here seven of eight dead-ends share the
+        // query's tokens — more than `DEAD_ENDS_LIMIT` (5) — so the ranked
+        // path has to cut, proving the shared ranker's bound is live, not
+        // just the recency fallback's.
+        let (dirs, mcp) = init_repo();
+        open(&mcp, &dirs, "junto-dev").await;
+        let park = async |statement: &str, why: &str| {
+            let recorded = mcp
+                .record(Parameters(RecordRequest {
+                    channel: "junto-dev".into(),
+                    author: claude(),
+                    code: code_of(&dirs, claude()),
+                    statement: statement.into(),
+                    rationale: "r".into(),
+                    provenance: None,
+                    frame: None,
+                    session: None,
+                    kind: None,
+                    answers: None,
+                }))
+                .await
+                .unwrap();
+            mcp.park(Parameters(ActRequest {
+                channel: "junto-dev".into(),
+                author: dan(),
+                code: code_of(&dirs, dan()),
+                target: recorded_id(&recorded),
+                rationale: why.into(),
+            }))
+            .await
+            .unwrap();
+        };
+        for i in 0..7 {
+            park(
+                &format!("migration approach {i} moves the schema forward"),
+                "did not pan out",
+            )
+            .await;
+        }
+        park("caching layer was unrelated to this", "not needed").await;
+
+        let ranked = text_of(
+            &mcp.dead_ends(Parameters(DeadEndsRequest {
+                channel: "junto-dev".into(),
+                about: Some("schema migration".into()),
+            }))
+            .await
+            .unwrap(),
+        );
+        let items = ranked.lines().filter(|l| l.starts_with("- ")).count();
+        assert_eq!(
+            items, 5,
+            "seven candidates match; the ranked path is bounded too: {ranked}"
+        );
+        assert!(
+            !ranked.contains("caching layer"),
+            "the non-matching dead-end must not appear: {ranked}"
         );
     }
 
