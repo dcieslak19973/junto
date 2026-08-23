@@ -1689,6 +1689,39 @@ mod tests {
     async fn a_recorded_finding_carries_its_kind_and_session() {
         let (dirs, mcp) = init_repo();
         open(&mcp, &dirs, "junto-dev").await;
+
+        let started = mcp
+            .start_session(Parameters(StartSessionRequest {
+                channel: "junto-dev".into(),
+                author: claude(),
+                code: code_of(&dirs, claude()),
+                intent: "investigate ranker reuse".into(),
+            }))
+            .await
+            .unwrap();
+        let session = text_of(&started)
+            .split_whitespace()
+            .nth(2)
+            .expect("session id in confirmation")
+            .to_string();
+
+        let prior = mcp
+            .record(Parameters(RecordRequest {
+                channel: "junto-dev".into(),
+                author: claude(),
+                code: code_of(&dirs, claude()),
+                statement: "does the ranker need a rewrite?".into(),
+                rationale: "unclear before investigating".into(),
+                provenance: None,
+                frame: None,
+                session: None,
+                kind: None,
+                answers: None,
+            }))
+            .await
+            .expect("recorded the open question");
+        let question_id = recorded_id(&prior);
+
         let recorded = mcp
             .record(Parameters(RecordRequest {
                 channel: "junto-dev".into(),
@@ -1698,9 +1731,9 @@ mod tests {
                 rationale: "IDF overlap, no new deps".into(),
                 provenance: None,
                 frame: None,
-                session: None,
+                session: Some(session.clone()),
                 kind: Some("finding".into()),
-                answers: None,
+                answers: Some(vec![question_id.clone()]),
             }))
             .await
             .expect("recorded");
@@ -1717,10 +1750,28 @@ mod tests {
             .iter()
             .find(|e| e.id.to_string() == id)
             .expect("the entry projects");
-        let EntryPayload::Assertion { kind, .. } = &entry.payload else {
+        let EntryPayload::Assertion {
+            kind,
+            session: entry_session,
+            answers,
+            ..
+        } = &entry.payload
+        else {
             panic!("expected an assertion");
         };
         assert_eq!(*kind, Some(junto_kernel::AssertionKind::Finding));
+        assert_eq!(
+            entry_session.as_ref().map(|s| s.to_string()),
+            Some(session),
+            "the session parsed from the request must reach the payload"
+        );
+        assert_eq!(
+            answers
+                .as_ref()
+                .map(|ids| ids.iter().map(EntryId::to_string).collect::<Vec<_>>()),
+            Some(vec![question_id]),
+            "the answers ids parsed from the request must reach the payload"
+        );
     }
 
     #[tokio::test]
