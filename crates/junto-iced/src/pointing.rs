@@ -254,6 +254,86 @@ index 8728563..794d911 100644
         assert_eq!(targets[17], Some(("notes.md", 8)));
     }
 
+    /// A second verbatim junto artifact, captured from a working tree staged to
+    /// exercise every branch at once: an added file, a deleted file, a
+    /// modification mixing removals and additions, pure appends, and the
+    /// untracked trailer.
+    const FOUR_FILES: &str = "\
+diff --git a/added.rs b/added.rs
+new file mode 100644
+index 0000000..e14fae5
+--- /dev/null
++++ b/added.rs
+@@ -0,0 +1,3 @@
++fn brand_new() {
++    todo!()
++}
+diff --git a/legacy.rs b/legacy.rs
+deleted file mode 100644
+index 69bd7f3..0000000
+--- a/legacy.rs
++++ /dev/null
+@@ -1,2 +0,0 @@
+-fn old_one() {}
+-fn old_two() {}
+diff --git a/lib.rs b/lib.rs
+index 324a3b2..a4762a7 100644
+--- a/lib.rs
++++ b/lib.rs
+@@ -1,4 +1,5 @@
+ fn one() {}
+ fn two() { println!(\"two\"); }
+-fn three() {}
++fn three() { println!(\"three\"); }
+ fn four() {}
++fn five() {}
+diff --git a/notes.md b/notes.md
+index 382f027..bd0395c 100644
+--- a/notes.md
++++ b/notes.md
+@@ -7,3 +7,5 @@ delta
+ echo
+ foxtrot
+ golf
++hotel
++india
+
+# untracked files:
+?? scratch.tmp
+";
+
+    #[test]
+    fn a_four_file_artifact_anchors_exactly_the_new_side_of_every_hunk() {
+        let targets = diff_row_targets(FOUR_FILES);
+        assert_eq!(targets.len(), FOUR_FILES.lines().count());
+        let anchorable: Vec<_> = targets.iter().flatten().copied().collect();
+        assert_eq!(
+            anchorable,
+            vec![
+                // An added file: its rows ARE the whole new file.
+                ("added.rs", 1),
+                ("added.rs", 2),
+                ("added.rs", 3),
+                // legacy.rs is deleted — `+++ /dev/null` leaves no path and
+                // `+0,0` no line, so NOTHING in that hunk is anchorable.
+                // A modification: context and `+` count, the `-` row does not,
+                // so the added `fn three()` is line 3 rather than line 4.
+                ("lib.rs", 1),
+                ("lib.rs", 2),
+                ("lib.rs", 3),
+                ("lib.rs", 4),
+                ("lib.rs", 5),
+                // Pure appends land after the context they follow.
+                ("notes.md", 7),
+                ("notes.md", 8),
+                ("notes.md", 9),
+                ("notes.md", 10),
+                ("notes.md", 11),
+                // The untracked trailer contributes nothing.
+            ]
+        );
+    }
+
     #[test]
     fn a_trailer_after_the_last_hunk_is_never_numbered_as_code() {
         // The bug this pins, found by running the mapper over a real artifact
