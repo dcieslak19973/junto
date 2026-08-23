@@ -188,6 +188,16 @@ pub struct RecordRequest {
     /// the verifier chooses between articulated positions instead of facing
     /// a blank box, and the frame is recorded durably.
     pub frame: Option<Vec<FrameOptionParam>>,
+    /// The Agent Session recording this, if one is (the id `start_session`
+    /// returned). Binds the claim to the run that produced it.
+    pub session: Option<String>,
+    /// `"finding"` (an observation — recorded and citable, asks nobody to
+    /// decide) or `"decision"` (a choice, or a claim for others to rely on —
+    /// wants a verdict). Omitted behaves as `"decision"`.
+    pub kind: Option<String>,
+    /// Ids of open entries this one bears on. A claim to have answered them,
+    /// inert until this entry is itself verified.
+    pub answers: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -870,7 +880,7 @@ impl JuntoMcp {
     }
 
     #[tool(
-        description = "Record an Assertion — a decision, finding, or claim — in a channel's ledger. It enters with Provisional standing; a member ratifies (or parks/corrects) it later. Give the real why in `rationale`, including alternatives considered, and bind evidence via `provenance`."
+        description = "Record an Assertion — a decision, finding, or claim — in a channel's ledger. It enters with Provisional standing; a member ratifies (or parks/corrects) it later. Give the real why in `rationale`, including alternatives considered, and bind evidence via `provenance`. `kind` says what you're asking for: \"finding\" is an observation — recorded and citable, asking nobody to decide; \"decision\" is a choice or a claim for others to rely on, and wants a verdict (omitted behaves as \"decision\"). `answers` links the ids of open entries this one bears on — a claim to have answered them, inert until this entry is itself verified."
     )]
     async fn record(
         &self,
@@ -882,6 +892,34 @@ impl JuntoMcp {
             .await?;
         let provenance = parse_provenance(req.provenance)?;
         let frame = parse_frame(req.frame, TargetKind::Assertion)?;
+        let kind = match req.kind.as_deref() {
+            None => None,
+            Some("finding") => Some(junto_kernel::AssertionKind::Finding),
+            Some("decision") => Some(junto_kernel::AssertionKind::Decision),
+            Some(other) => {
+                return Err(invalid(format!(
+                    "unknown kind '{other}' — use \"finding\" or \"decision\""
+                )));
+            }
+        };
+        let session = match req.session.as_deref() {
+            None => None,
+            Some(raw) => Some(
+                raw.parse::<EntryId>()
+                    .map_err(|_| invalid(format!("session '{raw}' is not an entry id")))?,
+            ),
+        };
+        let answers = match req.answers {
+            None => None,
+            Some(raw) => Some(
+                raw.iter()
+                    .map(|id| {
+                        id.parse::<EntryId>()
+                            .map_err(|_| invalid(format!("answers '{id}' is not an entry id")))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+        };
         let entry = Self::entry(
             channel,
             author,
@@ -890,9 +928,9 @@ impl JuntoMcp {
                 rationale: req.rationale,
                 provenance,
                 frame,
-                session: None,
-                kind: None,
-                answers: None,
+                session,
+                kind,
+                answers,
             },
         );
         self.append(&req.channel, ledger, entry).await
@@ -1626,6 +1664,9 @@ mod tests {
                     uri: "https://example.com/sky".into(),
                     digest: Some("sha256:deadbeef".into()),
                 }]),
+                session: None,
+                kind: None,
+                answers: None,
             }))
             .await
             .unwrap();
@@ -1642,6 +1683,71 @@ mod tests {
         assert!(rendered.contains(&id), "view lists the entry id");
         assert!(rendered.contains("the sky is blue"));
         assert!(rendered.contains("[provisional]"));
+    }
+
+    #[tokio::test]
+    async fn a_recorded_finding_carries_its_kind_and_session() {
+        let (dirs, mcp) = init_repo();
+        open(&mcp, &dirs, "junto-dev").await;
+        let recorded = mcp
+            .record(Parameters(RecordRequest {
+                channel: "junto-dev".into(),
+                author: claude(),
+                code: code_of(&dirs, claude()),
+                statement: "the ranker is reusable".into(),
+                rationale: "IDF overlap, no new deps".into(),
+                provenance: None,
+                frame: None,
+                session: None,
+                kind: Some("finding".into()),
+                answers: None,
+            }))
+            .await
+            .expect("recorded");
+        let id = recorded_id(&recorded);
+        let (ledger, channel) = mcp.resolve("junto-dev").await.expect("resolve");
+        let view = ledger
+            .lock()
+            .await
+            .project(&channel)
+            .await
+            .expect("project");
+        let entry = view
+            .entries
+            .iter()
+            .find(|e| e.id.to_string() == id)
+            .expect("the entry projects");
+        let EntryPayload::Assertion { kind, .. } = &entry.payload else {
+            panic!("expected an assertion");
+        };
+        assert_eq!(*kind, Some(junto_kernel::AssertionKind::Finding));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_assertion_kind_is_refused_rather_than_defaulted() {
+        // Silently coercing a typo to `decision` would put the entry in the
+        // attention queue the author was trying to stay out of.
+        let (dirs, mcp) = init_repo();
+        open(&mcp, &dirs, "junto-dev").await;
+        let err = mcp
+            .record(Parameters(RecordRequest {
+                channel: "junto-dev".into(),
+                author: claude(),
+                code: code_of(&dirs, claude()),
+                statement: "x".into(),
+                rationale: "y".into(),
+                provenance: None,
+                frame: None,
+                session: None,
+                kind: Some("observation".into()),
+                answers: None,
+            }))
+            .await
+            .expect_err("unknown kind must be refused");
+        assert!(
+            format!("{err:?}").contains("finding"),
+            "the refusal must name the accepted values: {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -1716,6 +1822,9 @@ mod tests {
                 rationale: "r".into(),
                 frame: None,
                 provenance: None,
+                session: None,
+                kind: None,
+                answers: None,
             }))
             .await
             .unwrap();
@@ -1774,6 +1883,9 @@ mod tests {
                 rationale: "r".into(),
                 frame: None,
                 provenance: None,
+                session: None,
+                kind: None,
+                answers: None,
             }))
             .await
             .unwrap_err();
@@ -1901,6 +2013,9 @@ mod tests {
                 rationale: "because".into(),
                 frame: None,
                 provenance: None,
+                session: None,
+                kind: None,
+                answers: None,
             }))
             .await
             .unwrap();
@@ -1940,6 +2055,9 @@ mod tests {
                 rationale: "simple".into(),
                 provenance: None,
                 frame: None,
+                session: None,
+                kind: None,
+                answers: None,
             }))
             .await
             .unwrap();
@@ -2079,6 +2197,9 @@ mod tests {
                     rationale: "r".into(),
                     provenance: None,
                     frame: None,
+                    session: None,
+                    kind: None,
+                    answers: None,
                 }))
                 .await
                 .unwrap();
@@ -2195,6 +2316,9 @@ mod tests {
             rationale: "r".into(),
             frame: None,
             provenance: None,
+            session: None,
+            kind: None,
+            answers: None,
         }))
         .await
         .unwrap();
@@ -2257,6 +2381,9 @@ mod tests {
                     uri: "https://x".into(),
                     digest: Some("deadbeef".into()),
                 }]),
+                session: None,
+                kind: None,
+                answers: None,
             }))
             .await
             .unwrap_err();
@@ -2286,6 +2413,9 @@ mod tests {
                 rationale: "r".into(),
                 frame: None,
                 provenance: None,
+                session: None,
+                kind: None,
+                answers: None,
             }))
             .await
             .unwrap_err();
@@ -2306,6 +2436,9 @@ mod tests {
                 rationale: "r".into(),
                 frame: None,
                 provenance: None,
+                session: None,
+                kind: None,
+                answers: None,
             }))
             .await
             .unwrap_err();
@@ -2320,6 +2453,9 @@ mod tests {
                 rationale: "r".into(),
                 frame: None,
                 provenance: None,
+                session: None,
+                kind: None,
+                answers: None,
             }))
             .await
             .unwrap_err();
@@ -2415,6 +2551,9 @@ mod tests {
                     rationale: "evidence insufficient".into(),
                 },
             ]),
+            session: None,
+            kind: None,
+            answers: None,
         }))
         .await
         .unwrap();
@@ -2451,6 +2590,9 @@ mod tests {
                         rationale: "r".into(),
                     },
                 ]),
+                session: None,
+                kind: None,
+                answers: None,
             }))
             .await
             .unwrap_err();
@@ -2470,6 +2612,9 @@ mod tests {
                     act: "ratify".into(),
                     rationale: "r".into(),
                 }]),
+                session: None,
+                kind: None,
+                answers: None,
             }))
             .await
             .unwrap_err();
@@ -2491,6 +2636,9 @@ mod tests {
                 rationale: "because".into(),
                 frame: None,
                 provenance: None,
+                session: None,
+                kind: None,
+                answers: None,
             }))
             .await
             .unwrap();
