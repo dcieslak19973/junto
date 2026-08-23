@@ -1376,6 +1376,12 @@ pub fn attention_for_view(id: &ChannelId, view: &ChannelView, now: Timestamp) ->
             _ => {}
         }
     }
+    // Provisional assertions age off the board after `VERIFICATION_HORIZON_DAYS`
+    // — a projection filter only (see its doc comment): the entry keeps its
+    // `Standing`, this just stops asking. Gates are a separate vector and
+    // are never touched here, so a pending gate never ages out.
+    let horizon_ms = VERIFICATION_HORIZON_DAYS * 24 * 60 * 60 * 1000;
+    verifications.retain(|item| now.as_millis() - item.entry.timestamp.as_millis() <= horizon_ms);
     // Oldest first within each kind: the longest-waiting item leads. Gates
     // (blocked proposer) first, then stuck executions, then verification debt.
     gates.sort_by_key(|item| item.entry.timestamp);
@@ -1393,6 +1399,17 @@ pub fn attention_for_view(id: &ChannelId, view: &ChannelView, now: Timestamp) ->
 /// The most milestone nodes a channel's track carries — bounds clutter on a
 /// busy channel (the most recent win).
 const MILESTONE_CAP: usize = 12;
+
+/// How long a provisional assertion stays an attention item before it becomes
+/// recorded-but-unverified. A claim nobody has needed to verify in this long
+/// is not waiting on anyone, and `docs/attention.md:85` is explicit that the
+/// board is "not a queue".
+///
+/// This is a **projection filter only**: the entry keeps its `Provisional`
+/// standing, stays in the brief's record, and can still be ratified whenever
+/// someone wants to. Gates are exempt — a pending gate blocks its proposer,
+/// and time does not unblock them.
+const VERIFICATION_HORIZON_DAYS: i64 = 14;
 
 /// A short, single-line label for a milestone node's tooltip.
 fn milestone_label(text: &str) -> String {
@@ -2886,6 +2903,21 @@ mod lineage_tests {
         }
     }
 
+    /// A view with a single unapproved `Proposal` — a pending gate. Mirrors
+    /// `view_with`'s shape (fresh unsigned entry, folded standing/gate
+    /// status, no ledger append) for the one fixture `view_with` itself
+    /// cannot produce: gates land `GateStatus::Pending`, not a `Standing`.
+    fn view_with_pending_gate() -> ChannelView {
+        view_with(vec![EntryPayload::Proposal {
+            action: "ship it".into(),
+            rationale: "because".into(),
+            provenance: vec![],
+            requirement: ApprovalRequirement::Count(1),
+            frame: None,
+            kind: None,
+        }])
+    }
+
     #[tokio::test]
     async fn a_finding_is_not_an_attention_item() {
         let view = view_with(vec![
@@ -2937,6 +2969,50 @@ mod lineage_tests {
         }]);
         let group = attention_for_view(&ChannelId::new(), &view, Timestamp::now());
         assert!(group.items.is_empty(), "{:?}", group.items);
+    }
+
+    #[tokio::test]
+    async fn a_provisional_decision_ages_off_the_board_but_keeps_its_standing() {
+        let view = view_with(vec![assertion_of(
+            Some(junto_kernel::AssertionKind::Decision),
+            None,
+        )]);
+        let entry_at = view.entries[0].timestamp.as_millis();
+        let inside = Timestamp::from_millis(entry_at + 13 * 24 * 60 * 60 * 1000);
+        let outside = Timestamp::from_millis(entry_at + 15 * 24 * 60 * 60 * 1000);
+
+        assert_eq!(
+            attention_for_view(&ChannelId::new(), &view, inside)
+                .items
+                .len(),
+            1,
+            "inside the horizon it still asks"
+        );
+        assert!(
+            attention_for_view(&ChannelId::new(), &view, outside)
+                .items
+                .is_empty(),
+            "outside the horizon it stops asking"
+        );
+        assert_eq!(
+            view.standing(&view.entries[0].id),
+            Some(junto_kernel::Standing::Provisional),
+            "aging is a projection filter, never a change of standing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pending_gate_never_ages_out() {
+        // A gate blocks its proposer; time does not unblock them.
+        let view = view_with_pending_gate();
+        let entry_at = view.entries[0].timestamp.as_millis();
+        let outside = Timestamp::from_millis(entry_at + 400 * 24 * 60 * 60 * 1000);
+        assert_eq!(
+            attention_for_view(&ChannelId::new(), &view, outside)
+                .items
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
