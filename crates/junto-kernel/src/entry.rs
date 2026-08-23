@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::subject::Subject;
 use crate::{
-    EntryId, Member, ProvenanceRef, Timestamp, gate::ApprovalRequirement, ids::ChannelId,
-    session::SessionState, sign::Signature,
+    EntryId, Member, ProvenanceRef, Timestamp, anchor::CommitOid, gate::ApprovalRequirement,
+    ids::ChannelId, session::SessionState, sign::Signature,
 };
 
 /// One immutable record in a Channel's Ledger.
@@ -304,6 +304,32 @@ pub enum EntryPayload {
         /// What changed, or why — e.g. what the agent is blocked on.
         note: String,
     },
+    /// Records the commit range one Agent Session's work landed in — the
+    /// durable counterpart to [`CodeAnchor`](crate::CodeAnchor)'s vocabulary,
+    /// and the join key that lets a line of code be traced back to the
+    /// decisions that produced it. An act targeting a
+    /// [`SessionStarted`](EntryPayload::SessionStarted) entry.
+    ///
+    /// Appended at a turn boundary **only when a real range resolves**, so a
+    /// recorded range always denotes work that exists: `base` is the commit
+    /// the session's work starts from (exclusive), `head` the commit it
+    /// reached (inclusive), and neither is ever fabricated. A session that
+    /// committed nothing carries no such entry at all, which is why the
+    /// range is not an `Option` inside it.
+    SessionCommitted {
+        /// The session whose work this range belongs to (a `SessionStarted`
+        /// entry id).
+        target: EntryId,
+        /// The branch the work landed on, when git can say — a human-facing
+        /// label, never identity (`docs/adr/0014`'s rule for names). Omitted
+        /// from the canonical bytes when absent.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        branch: Option<String>,
+        /// The commit the session's work starts from, exclusive.
+        base: CommitOid,
+        /// The commit the session's work reached, inclusive.
+        head: CommitOid,
+    },
     /// Binds a verifiable **Artifact** (a diff, log, test result, memo…) to
     /// the Agent Session that produced it. The artifact's *content* lives
     /// wherever `provenance` points — URI + digest, never blobs in the ledger
@@ -393,6 +419,7 @@ impl EntryPayload {
             | EntryPayload::Rejection { target, .. }
             | EntryPayload::GateExecuted { target, .. }
             | EntryPayload::SessionUpdated { target, .. }
+            | EntryPayload::SessionCommitted { target, .. }
             | EntryPayload::ArtifactAttached { target, .. }
             | EntryPayload::SubjectDetached { target } => Some(*target),
         }

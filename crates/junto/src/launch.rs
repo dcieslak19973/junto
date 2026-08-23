@@ -28,7 +28,7 @@ use sha2::Digest as _;
 use tokio::sync::{broadcast, mpsc};
 
 use junto_kernel::{
-    ChannelId, ChannelView, ContentDigest, EntryId, EntryPayload, LedgerEntry, Member,
+    ChannelId, ChannelView, CommitOid, ContentDigest, EntryId, EntryPayload, LedgerEntry, Member,
     ProvenanceRef, SessionState, Timestamp, Uri,
 };
 
@@ -2058,6 +2058,7 @@ async fn record_outcome(
         )
         .await?;
     }
+    record_commit_range(host, channel_ref, channel, session, agent, workspace).await?;
 
     let (state, note) = outcome_state(outcome.end, turn, &outcome.result);
     append(
@@ -2078,6 +2079,71 @@ async fn record_outcome(
     )
     .await?;
     Ok(turn)
+}
+
+/// Record the commit range this session's work landed in, when one resolves.
+///
+/// This is the join key decision blame needs: `git blame` on a line yields a
+/// commit oid, and this entry is what ties that oid back to a session — and
+/// so to the intent, artifacts, decisions and gates around it. The live
+/// plane's [`CodeAnchor`](junto_kernel::CodeAnchor) already carries a commit,
+/// but it is ephemeral and only exists where somebody commented; unannotated
+/// code is exactly the case blame is for.
+///
+/// **Appends nothing rather than guessing.** A range needs a *base* junto
+/// itself recorded (`branch.<branch>.juntoBaseSha`, read by
+/// [`pr_branch_base`]), so a session working outside a `junto/<session>`
+/// branch records no range at all: where its work began is not knowable after
+/// the fact, and a fabricated base is worse than an absent one — the same
+/// rule the live plane's worktree tap already follows for its own oid. A base
+/// equal to `HEAD` means the turn committed nothing, which is likewise
+/// nothing to record.
+async fn record_commit_range(
+    host: &Host,
+    channel_ref: &str,
+    channel: ChannelId,
+    session: EntryId,
+    agent: &crate::agent::Agent,
+    workspace: &Path,
+) -> Result<()> {
+    let Some((branch, base, head)) = commit_range(workspace) else {
+        return Ok(());
+    };
+    append(
+        host,
+        channel_ref,
+        LedgerEntry {
+            signature: None,
+            id: EntryId::new(),
+            channel,
+            author: agent.member(),
+            timestamp: Timestamp::now(),
+            payload: EntryPayload::SessionCommitted {
+                target: session,
+                branch,
+                base,
+                head,
+            },
+        },
+    )
+    .await
+}
+
+/// Resolve the commit range a session's work landed in, or `None` when there
+/// is nothing honest to record. Split out from [`record_commit_range`] so the
+/// three refusals are testable without a host: no recorded base (the
+/// workspace is not on a `junto/<session>` branch, so where the work began is
+/// unknowable), base equal to head (the turn committed nothing), and an oid
+/// git reported in a shape [`CommitOid`] refuses.
+fn commit_range(workspace: &Path) -> Option<(Option<String>, CommitOid, CommitOid)> {
+    let base = pr_branch_base(workspace)?;
+    let head = workspace_head_commit(workspace)?;
+    if base == head {
+        return None;
+    }
+    let base = CommitOid::new(base).ok()?;
+    let head = CommitOid::new(head).ok()?;
+    Some((current_branch(workspace), base, head))
 }
 
 // ---- the Outcome loop: the code-PR push-gate (docs/adr/0025) ----
@@ -2495,6 +2561,7 @@ async fn capture_turn(
         )
         .await?;
     }
+    record_commit_range(host, channel_ref, channel, session, agent, workspace).await?;
     append(
         host,
         channel_ref,
@@ -3039,6 +3106,75 @@ mod tests {
         dir
     }
 
+    #[test]
+    fn commit_range_is_none_without_a_recorded_base() {
+        // The ordinary case for a session working on someone's own branch:
+        // junto never wrote a `juntoBaseSha`, so where the work began is not
+        // knowable after the fact and nothing is recorded. A fabricated base
+        // would be worse than an absent one.
+        let repo = git_repo_with_commit();
+        assert!(commit_range(repo.path()).is_none());
+    }
+
+    #[test]
+    fn commit_range_is_none_when_the_turn_committed_nothing() {
+        // Base recorded, but HEAD has not moved past it: there is no work to
+        // blame, so there is no range to record.
+        let repo = git_repo_with_commit();
+        let head = workspace_head_commit(repo.path()).expect("HEAD resolves");
+        set_base_sha(repo.path(), &head);
+        assert!(commit_range(repo.path()).is_none());
+    }
+
+    #[test]
+    fn commit_range_spans_the_base_and_the_new_head() {
+        let repo = git_repo_with_commit();
+        let base = workspace_head_commit(repo.path()).expect("HEAD resolves");
+        set_base_sha(repo.path(), &base);
+        // One more commit, so HEAD moves past the recorded base.
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(repo.path())
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        std::fs::write(repo.path().join("fix.txt"), "y").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "the fix"]);
+        let head = workspace_head_commit(repo.path()).expect("HEAD resolves");
+
+        let (branch, recorded_base, recorded_head) =
+            commit_range(repo.path()).expect("a real range resolves");
+        assert_eq!(recorded_base.as_str(), base, "base is the recorded one");
+        assert_eq!(
+            recorded_head.as_str(),
+            head,
+            "head is the real oid, never fabricated"
+        );
+        assert_eq!(branch.as_deref(), Some("main"));
+    }
+
+    /// Record a junto base sha for the repo's current branch, the way the
+    /// Outcome loop's branch setup does.
+    fn set_base_sha(repo: &Path, sha: &str) {
+        let branch = current_branch(repo).expect("a branch");
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["config", &format!("branch.{branch}.juntoBaseSha"), sha,])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
     #[tokio::test]
     async fn pr_gate_executor_ignores_an_ordinary_approval() {
         let repo = git_repo();
@@ -3112,6 +3248,130 @@ mod tests {
             .entries
             .len();
         assert_eq!(before, after, "an ordinary approval triggers no PR-open");
+    }
+
+    #[tokio::test]
+    async fn recording_a_commit_range_appends_it_to_the_real_ledger() {
+        // The writer through the production path — `record_commit_range` ->
+        // `append` -> the substrate — then read back by projecting the
+        // channel, so this covers the append, the fold, and the projection
+        // together rather than the range arithmetic alone.
+        let repo = git_repo_with_commit();
+        let home = tempfile::tempdir().unwrap();
+        let host = crate::host::Host::fixed_with_member_home(
+            vec![repo.path().to_path_buf()],
+            Some(home.path().to_path_buf()),
+        );
+        let dan = Member::human("Dan", "dan@example.com");
+        let channel = host
+            .open_channel(None, "c", dan.clone(), None)
+            .await
+            .unwrap()
+            .id;
+        let session = EntryId::new();
+        let agent = crate::agent::Agent {
+            slug: "claude".into(),
+            name: "Claude".into(),
+            harness: "claude".into(),
+            email: "claude@junto.local".into(),
+            role: None,
+            model: None,
+            mcp_servers: Vec::new(),
+            skills: Vec::new(),
+            plugins: Vec::new(),
+        };
+
+        // The agent must be in the Party or its entries project as
+        // unrecognized (`docs/adr/0017`) and no session folds out of them —
+        // which is exactly how the first version of this test failed.
+        host.add_member("c", &dan, agent.member(), None, None)
+            .await
+            .unwrap();
+        // The session the range will hang off — a range for a session the
+        // ledger has never seen is skipped by design, so the fixture has to
+        // be a real one.
+        append(
+            &host,
+            "c",
+            LedgerEntry {
+                signature: None,
+                id: session,
+                channel,
+                author: agent.member(),
+                timestamp: Timestamp::now(),
+                payload: EntryPayload::SessionStarted {
+                    intent: "land the fix".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+        // A clean workspace with no recorded base records nothing at all —
+        // asserted through the same path, so "nothing to record" cannot be
+        // confused with "the writer is broken".
+        record_commit_range(&host, "c", channel, session, &agent, repo.path())
+            .await
+            .unwrap();
+        let ledger = host.ledger_for(repo.path()).await.unwrap();
+        let view = ledger.lock().await.project(&channel).await.unwrap();
+        assert!(
+            !view
+                .entries
+                .iter()
+                .any(|e| matches!(e.payload, EntryPayload::SessionCommitted { .. })),
+            "a workspace with no recorded base must append nothing"
+        );
+
+        // Now a real range: record the base, then move HEAD past it.
+        let base = workspace_head_commit(repo.path()).expect("HEAD resolves");
+        set_base_sha(repo.path(), &base);
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(repo.path())
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        std::fs::write(repo.path().join("fix.txt"), "y").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "the fix"]);
+        let head = workspace_head_commit(repo.path()).expect("HEAD resolves");
+
+        record_commit_range(&host, "c", channel, session, &agent, repo.path())
+            .await
+            .unwrap();
+
+        let view = ledger.lock().await.project_fresh(&channel).await.unwrap();
+        let recorded = view
+            .entries
+            .iter()
+            .find_map(|e| match &e.payload {
+                EntryPayload::SessionCommitted {
+                    target,
+                    branch,
+                    base,
+                    head,
+                } => Some((*target, branch.clone(), base.clone(), head.clone())),
+                _ => None,
+            })
+            .expect("the range was appended");
+        assert_eq!(recorded.0, session, "it targets the session");
+        assert_eq!(recorded.1.as_deref(), Some("main"));
+        assert_eq!(recorded.2.as_str(), base);
+        assert_eq!(recorded.3.as_str(), head);
+        // And the projection hands it back on the session, which is what a
+        // blame query will read.
+        let commits = view
+            .session(&session)
+            .and_then(|s| s.commits.clone())
+            .expect("the range projects onto the session");
+        assert_eq!(commits.head.as_str(), head);
     }
 
     #[tokio::test]

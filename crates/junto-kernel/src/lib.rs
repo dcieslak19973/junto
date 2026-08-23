@@ -47,7 +47,7 @@ pub use ledger::{
 };
 pub use member::{Member, MemberKind};
 pub use provenance::{ContentDigest, ProvenanceRef, Uri};
-pub use session::{SessionState, SessionView};
+pub use session::{CommitRange, SessionState, SessionView};
 pub use sign::{PublicKey, Signature, SigningKey};
 pub use subject::{Subject, SubjectKind};
 pub use substrate::{InMemorySubstrate, SubstrateProvider};

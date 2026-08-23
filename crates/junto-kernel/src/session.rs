@@ -20,6 +20,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::EntryId;
+use crate::anchor::CommitOid;
 
 /// The live state of an Agent Session (`docs/domain-model.md`).
 ///
@@ -43,10 +44,27 @@ pub enum SessionState {
     Error,
 }
 
+/// The commit range one Agent Session's work landed in — `base` exclusive,
+/// `head` inclusive, as
+/// [`SessionCommitted`](crate::EntryPayload::SessionCommitted) recorded it.
+///
+/// The two oids travel together so "a base without a head" cannot be
+/// represented: a range either exists in full or not at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitRange {
+    /// The commit the work starts from, exclusive.
+    pub base: CommitOid,
+    /// The commit the work reached, inclusive.
+    pub head: CommitOid,
+    /// The branch it landed on, when git could say.
+    pub branch: Option<String>,
+}
+
 /// A point-in-time view of one Agent Session, derived during projection:
-/// its current [`SessionState`] plus the ids of the
+/// its current [`SessionState`], the ids of the
 /// [`ArtifactAttached`](crate::EntryPayload::ArtifactAttached) entries that
-/// bound outputs to it, in canonical order.
+/// bound outputs to it, in canonical order, and the commit range its work
+/// landed in if one was recorded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionView {
     /// The session's current state after folding its updates.
@@ -55,4 +73,12 @@ pub struct SessionView {
     /// order. The artifact content lives wherever its provenance points —
     /// never in the ledger.
     pub artifacts: Vec<EntryId>,
+    /// The commit range this session's work landed in, folded
+    /// last-applicable-wins from its
+    /// [`SessionCommitted`](crate::EntryPayload::SessionCommitted) acts.
+    ///
+    /// `None` is the honest reading rather than a gap: the session has
+    /// recorded no commits, either because it produced none or because it
+    /// ran before the range was recorded at all.
+    pub commits: Option<CommitRange>,
 }

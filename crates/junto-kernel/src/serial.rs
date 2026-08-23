@@ -221,6 +221,19 @@ mod tests {
                 note: "progress".into(),
             }));
         }
+        // A recorded commit range, with and without the optional branch: the
+        // absent case must round-trip through the `skip_serializing_if` path
+        // that keeps it out of the canonical bytes entirely.
+        for branch in [Some("junto/9f2".to_string()), None] {
+            assert_round_trips(&entry(EntryPayload::SessionCommitted {
+                target,
+                branch,
+                base: crate::CommitOid::new("0f1e2d3c4b5a69788796a5b4c3d2e1f009182736")
+                    .expect("valid oid"),
+                head: crate::CommitOid::new("1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d")
+                    .expect("valid oid"),
+            }));
+        }
         assert_round_trips(&entry(EntryPayload::ArtifactAttached {
             target,
             kind: "diff".into(),
@@ -299,6 +312,30 @@ mod tests {
         });
         let json = String::from_utf8(e.to_canonical_bytes().expect("serialize")).expect("utf8");
         assert!(!json.contains("\"frame\""), "{json}");
+    }
+
+    #[test]
+    fn an_absent_commit_range_branch_is_omitted_from_the_canonical_bytes() {
+        // Same additive rule as `signature`, `DivergedFrom::at`,
+        // `Assertion::frame` and `ChannelOpened::name`: the branch is a
+        // convenience label, so when git could not name one the key is absent
+        // rather than null, and the range's bytes stay minimal.
+        let e = entry(EntryPayload::SessionCommitted {
+            target: EntryId::new(),
+            branch: None,
+            base: crate::CommitOid::new("0f1e2d3c4b5a69788796a5b4c3d2e1f009182736")
+                .expect("valid oid"),
+            head: crate::CommitOid::new("1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d")
+                .expect("valid oid"),
+        });
+        let json = String::from_utf8(e.to_canonical_bytes().expect("serialize")).expect("utf8");
+        assert!(!json.contains("\"branch\""), "{json}");
+        // The oids themselves must be present and unabbreviated: `short()` is
+        // for surfaces, never for the record.
+        assert!(
+            json.contains("0f1e2d3c4b5a69788796a5b4c3d2e1f009182736"),
+            "{json}"
+        );
     }
 
     #[test]

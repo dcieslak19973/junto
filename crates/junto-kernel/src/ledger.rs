@@ -832,6 +832,7 @@ impl<S: SubstrateProvider> Ledger<S> {
                 | EntryPayload::GateExecuted { .. }
                 | EntryPayload::SessionStarted { .. }
                 | EntryPayload::SessionUpdated { .. }
+                | EntryPayload::SessionCommitted { .. }
                 | EntryPayload::ArtifactAttached { .. }
                 | EntryPayload::SubjectAttached { .. }
                 | EntryPayload::SubjectDetached { .. } => continue,
@@ -946,6 +947,7 @@ impl<S: SubstrateProvider> Ledger<S> {
                     SessionView {
                         state: SessionState::Working,
                         artifacts: Vec::new(),
+                        commits: None,
                     },
                 );
             }
@@ -956,6 +958,20 @@ impl<S: SubstrateProvider> Ledger<S> {
                 EntryPayload::SessionUpdated { target, state, .. } => {
                     if let Some(session) = sessions.get_mut(target) {
                         session.state = *state;
+                    }
+                }
+                EntryPayload::SessionCommitted {
+                    target,
+                    branch,
+                    base,
+                    head,
+                } => {
+                    if let Some(session) = sessions.get_mut(target) {
+                        session.commits = Some(crate::session::CommitRange {
+                            base: base.clone(),
+                            head: head.clone(),
+                            branch: branch.clone(),
+                        });
                     }
                 }
                 EntryPayload::ArtifactAttached { target, .. } => {
@@ -3453,6 +3469,146 @@ mod tests {
 
         let view = ledger.project(&channel).await.unwrap();
         assert_eq!(view.session(&session).unwrap().state, SessionState::Done);
+    }
+
+    fn oid(seed: char) -> crate::CommitOid {
+        crate::CommitOid::new(std::iter::repeat_n(seed, 40).collect::<String>())
+            .expect("40 hex chars")
+    }
+
+    #[tokio::test]
+    async fn a_recorded_commit_range_projects_onto_its_session() {
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let agent = Member::agent("Coder", "coder@junto.local");
+        let session = EntryId::new();
+        ledger
+            .append(entry(
+                session,
+                channel,
+                agent.clone(),
+                1,
+                session_started("work"),
+            ))
+            .await
+            .unwrap();
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                agent,
+                2,
+                EntryPayload::SessionCommitted {
+                    target: session,
+                    branch: Some("junto/9f2".into()),
+                    base: oid('a'),
+                    head: oid('b'),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let view = ledger.project(&channel).await.unwrap();
+        let commits = view
+            .session(&session)
+            .expect("session projected")
+            .commits
+            .clone()
+            .expect("range projected");
+        assert_eq!(commits.base, oid('a'));
+        assert_eq!(commits.head, oid('b'));
+        assert_eq!(commits.branch.as_deref(), Some("junto/9f2"));
+        // A range is a fact about work, not a verification act: it must not
+        // give the session a standing.
+        assert_eq!(view.standing(&session), None);
+    }
+
+    #[tokio::test]
+    async fn a_session_with_no_recorded_range_has_none() {
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let agent = Member::agent("Coder", "coder@junto.local");
+        let session = EntryId::new();
+        ledger
+            .append(entry(session, channel, agent, 1, session_started("work")))
+            .await
+            .unwrap();
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert!(view.session(&session).unwrap().commits.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_later_commit_range_supersedes_an_earlier_one() {
+        // Last-applicable-wins, like every other folded session fact: a turn
+        // that commits more moves the head rather than adding a second range.
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let agent = Member::agent("Coder", "coder@junto.local");
+        let session = EntryId::new();
+        ledger
+            .append(entry(
+                session,
+                channel,
+                agent.clone(),
+                1,
+                session_started("work"),
+            ))
+            .await
+            .unwrap();
+        for (millis, head) in [(2, oid('b')), (3, oid('c'))] {
+            ledger
+                .append(entry(
+                    EntryId::new(),
+                    channel,
+                    agent.clone(),
+                    millis,
+                    EntryPayload::SessionCommitted {
+                        target: session,
+                        branch: None,
+                        base: oid('a'),
+                        head,
+                    },
+                ))
+                .await
+                .unwrap();
+        }
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert_eq!(
+            view.session(&session)
+                .unwrap()
+                .commits
+                .clone()
+                .unwrap()
+                .head,
+            oid('c')
+        );
+    }
+
+    #[tokio::test]
+    async fn a_commit_range_for_an_unknown_session_is_skipped_leniently() {
+        let mut ledger = Ledger::new(InMemorySubstrate::new());
+        let channel = ChannelId::new();
+        let agent = Member::agent("Coder", "coder@junto.local");
+        ledger
+            .append(entry(
+                EntryId::new(),
+                channel,
+                agent,
+                1,
+                EntryPayload::SessionCommitted {
+                    target: EntryId::new(),
+                    branch: None,
+                    base: oid('a'),
+                    head: oid('b'),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let view = ledger.project(&channel).await.unwrap();
+        assert!(view.sessions.is_empty());
     }
 
     #[tokio::test]
