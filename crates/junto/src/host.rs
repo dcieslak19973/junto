@@ -2837,6 +2837,9 @@ mod lineage_tests {
                     rationale: "matches the substrate".into(),
                     provenance: vec![],
                     frame: None,
+                    session: None,
+                    kind: None,
+                    answers: None,
                 },
             })
             .await

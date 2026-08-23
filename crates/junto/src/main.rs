@@ -1730,6 +1730,9 @@ mod tests {
                     rationale: "matches the substrate".into(),
                     provenance: vec![],
                     frame: None,
+                    session: None,
+                    kind: None,
+                    answers: None,
                 },
             })
             .await
@@ -3051,6 +3054,9 @@ mod tests {
                 rationale: "just a claim".into(),
                 provenance: Vec::new(),
                 frame: None,
+                session: None,
+                kind: None,
+                answers: None,
             },
         };
         ledger.lock().await.append(entry).await.unwrap();

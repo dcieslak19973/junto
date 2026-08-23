@@ -3963,6 +3963,9 @@ mod tests {
                 rationale: "r".into(),
                 provenance: vec![],
                 frame: None,
+                session: None,
+                kind: None,
+                answers: None,
             },
         }
     }
@@ -4532,6 +4535,9 @@ mod tests {
                     junto_kernel::Uri::new("https://example.com/pr/1").expect("uri"),
                 )],
                 frame: None,
+                session: None,
+                kind: None,
+                answers: None,
             },
         };
         let view = view_with(vec![entry]);
@@ -4604,6 +4610,9 @@ mod tests {
                         },
                     ],
                 }),
+                session: None,
+                kind: None,
+                answers: None,
             },
         };
         let id = entry.id;

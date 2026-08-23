@@ -890,6 +890,9 @@ impl JuntoMcp {
                 rationale: req.rationale,
                 provenance,
                 frame,
+                session: None,
+                kind: None,
+                answers: None,
             },
         );
         self.append(&req.channel, ledger, entry).await

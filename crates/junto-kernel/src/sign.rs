@@ -290,6 +290,9 @@ mod tests {
                 rationale: "adr 0033".into(),
                 provenance: vec![],
                 frame: None,
+                session: None,
+                kind: None,
+                answers: None,
             },
         }
     }

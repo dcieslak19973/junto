@@ -1047,6 +1047,9 @@ mod tests {
             rationale: "because".into(),
             provenance: Vec::new(),
             frame: None,
+            session: None,
+            kind: None,
+            answers: None,
         }
     }
 

@@ -3609,6 +3609,9 @@ mod tests {
             rationale: "because".into(),
             provenance: vec![],
             frame: None,
+            session: None,
+            kind: None,
+            answers: None,
         }
     }
 

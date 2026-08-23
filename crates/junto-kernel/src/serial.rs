@@ -119,6 +119,9 @@ mod tests {
             rationale: "observed at noon".into(),
             provenance: vec![provenance_with_digest()],
             frame: None,
+            session: None,
+            kind: None,
+            answers: None,
         }));
         // Assertion with a digest-less provenance ref (exercises the omitted field).
         assert_round_trips(&entry(EntryPayload::Assertion {
@@ -128,6 +131,9 @@ mod tests {
                 Uri::new("file://notes.md").expect("uri"),
             )],
             frame: None,
+            session: None,
+            kind: None,
+            answers: None,
         }));
         // Assertion carrying a decision frame (docs/adr/0019) — the frame
         // round-trips, unchosen options included.
@@ -149,6 +155,30 @@ mod tests {
                     },
                 ],
             }),
+            session: None,
+            kind: None,
+            answers: None,
+        }));
+        // The new assertion facts: a finding that names its session and the
+        // open entry it answers, and the all-absent case that must keep
+        // pre-change bytes.
+        assert_round_trips(&entry(EntryPayload::Assertion {
+            statement: "the ranker is reusable".into(),
+            rationale: "IDF overlap, no deps".into(),
+            provenance: vec![],
+            frame: None,
+            session: Some(target),
+            kind: Some(crate::AssertionKind::Finding),
+            answers: Some(vec![target]),
+        }));
+        assert_round_trips(&entry(EntryPayload::Assertion {
+            statement: "no new facts".into(),
+            rationale: "legacy shape".into(),
+            provenance: vec![],
+            frame: None,
+            session: None,
+            kind: None,
+            answers: None,
         }));
         assert_round_trips(&entry(EntryPayload::Ratification {
             target,
@@ -309,9 +339,54 @@ mod tests {
             rationale: "plain".into(),
             provenance: vec![],
             frame: None,
+            session: None,
+            kind: None,
+            answers: None,
         });
         let json = String::from_utf8(e.to_canonical_bytes().expect("serialize")).expect("utf8");
         assert!(!json.contains("\"frame\""), "{json}");
+    }
+
+    #[test]
+    fn absent_assertion_facts_leave_canonical_bytes_unchanged() {
+        // Same additive rule as `frame` and `ChannelOpened::name`: an entry
+        // that carries none of the new facts must serialise exactly as it did
+        // before they existed, or every pre-change signature breaks.
+        let e = entry(EntryPayload::Assertion {
+            statement: "plain".into(),
+            rationale: "plain".into(),
+            provenance: vec![],
+            frame: None,
+            session: None,
+            kind: None,
+            answers: None,
+        });
+        let json = String::from_utf8(e.to_canonical_bytes().expect("serialize")).expect("utf8");
+        // `author.kind` ("Human"/"Agent") always appears in the envelope, so
+        // the bare-substring check for the new assertion `kind` field must
+        // scope to the payload — same collision the `name` test above notes
+        // for `author.display_name`.
+        let payload = &json[json.find("\"payload\"").expect("payload key")..];
+        assert!(!payload.contains("\"session\""), "{json}");
+        assert!(!payload.contains("\"kind\""), "{json}");
+        assert!(!payload.contains("\"answers\""), "{json}");
+    }
+
+    #[test]
+    fn assertion_kind_is_snake_case_on_the_wire() {
+        // The record is read by humans and by other tools; "finding" is the
+        // wire form, not "Finding".
+        let e = entry(EntryPayload::Assertion {
+            statement: "x".into(),
+            rationale: "y".into(),
+            provenance: vec![],
+            frame: None,
+            session: None,
+            kind: Some(crate::AssertionKind::Finding),
+            answers: None,
+        });
+        let json = String::from_utf8(e.to_canonical_bytes().expect("serialize")).expect("utf8");
+        assert!(json.contains("\"kind\":\"finding\""), "{json}");
     }
 
     #[test]
@@ -345,6 +420,9 @@ mod tests {
             rationale: "twice".into(),
             provenance: vec![provenance_with_digest()],
             frame: None,
+            session: None,
+            kind: None,
+            answers: None,
         });
         assert_eq!(
             e.to_canonical_bytes().expect("first"),
@@ -359,6 +437,9 @@ mod tests {
             rationale: "y".into(),
             provenance: vec![],
             frame: None,
+            session: None,
+            kind: None,
+            answers: None,
         });
         let json = String::from_utf8(e.to_canonical_bytes().expect("serialize")).expect("utf8");
         // JCS sorts object keys; the envelope keys must appear alphabetically,
@@ -380,6 +461,9 @@ mod tests {
             rationale: "line one\r\nline two".into(),
             provenance: vec![],
             frame: None,
+            session: None,
+            kind: None,
+            answers: None,
         });
         let bytes = e.to_canonical_bytes().expect("serialize");
         assert!(
