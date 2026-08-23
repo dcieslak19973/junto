@@ -2488,7 +2488,7 @@ pub fn channel_html(
     // (state, not history), rendered as the page — with the full transcript
     // collapsed below instead of *being* the page.
     let shape = brief_shape(view, now);
-    let findings = findings_section(&shape, view, id);
+    let findings = findings_section(&shape);
     let notes = act_notes(view);
     let standing = standing_decisions_section(&shape, &notes);
     let recently = recently_section(view);
@@ -2709,34 +2709,41 @@ fn standing_decisions_section(
 /// The human rendering of the brief's quiet tier: provisional Findings and
 /// aged provisional Decisions — dropped off the act list but never off the
 /// record (`docs/adr/0039`). Mirrors [`brief_markdown`]'s "recorded,
-/// unverified" section (the same `shape.findings` bucket), styled like
-/// [`standing_decisions_section`] rather than the entry cards below. Unlike
-/// that tier these entries are still `Provisional`, so each keeps its id
-/// (`verification_form` addresses acts by id) and its ratify/park form —
-/// aging stops asking, it never stops the entry from being actable.
-fn findings_section(shape: &BriefShape<'_>, view: &ChannelView, channel: &ChannelId) -> String {
+/// unverified" section exactly: one clamped line per entry, id included so
+/// it stays findable — no act form. The point of this tier is that these
+/// entries stop *asking*; a human who still wants to act on one can, via
+/// the entry cards below (`entry_card`'s `verification_form` offers
+/// ratify/park on any provisional assertion regardless of kind or age,
+/// `adr/0039`'s documented escape hatch). Bounded the way
+/// [`standing_decisions_section`] is bounded, so a busy channel's quiet
+/// tier cannot regrow the unbounded DOM `HISTORY_CAP` exists to cap.
+fn findings_section(shape: &BriefShape<'_>) -> String {
     if shape.findings.is_empty() {
         return String::new();
     }
+    // Same cap `standing_decisions_section` uses — no new constant needed.
+    const CAP: usize = BRIEF_RECENT_FULL + BRIEF_OLDER_CLAMPED;
     let mut items = String::new();
-    for entry in &shape.findings {
-        let text = match &entry.payload {
-            EntryPayload::Assertion { statement, .. } => statement.as_str(),
-            _ => continue,
-        };
+    for (index, entry) in shape.findings.iter().rev().enumerate() {
+        if index >= CAP {
+            let _ = writeln!(
+                items,
+                "<li class=\"older\">…and {} older recorded-but-unverified entries \
+                 (in the full ledger below)</li>",
+                shape.findings.len() - index
+            );
+            break;
+        }
         let _ = writeln!(
             items,
-            "<div class=\"decision\"><div class=\"dec-meta\">{who} · <code>{id}</code></div>\
-             <div class=\"dec-body\">{body}</div>{form}</div>",
-            who = escape_html(&entry.author.display_name),
-            id = entry.id,
-            body = escape_html(text),
-            form = verification_form(entry, view, channel),
+            "<li><code>{id}</code> {line}</li>",
+            id = short(&entry.id),
+            line = backticks_to_code(&recent_line(entry)),
         );
     }
     format!(
         "<section class=\"board\"><h2 class=\"board-head\">recorded, unverified</h2>\n\
-         <div class=\"decisions\">{items}</div></section>\n"
+         <ul class=\"standing\">{items}</ul></section>\n"
     )
 }
 
@@ -5038,13 +5045,59 @@ mod tests {
             !ledger_section.contains(MARKER),
             "capped out of the entry cards by HISTORY_CAP: {ledger_section}"
         );
+        let quiet_tier = before_ledger
+            .split("<h2 class=\"board-head\">recorded, unverified</h2>")
+            .nth(1)
+            .expect("the quiet-tier section renders")
+            .split("</section>")
+            .next()
+            .unwrap();
         assert!(
-            before_ledger.contains("recorded, unverified"),
-            "the quiet-tier section renders: {before_ledger}"
+            quiet_tier.contains(MARKER),
+            "still findable in the quiet tier, outside the entry cards: {quiet_tier}"
         );
         assert!(
-            before_ledger.contains(MARKER),
-            "but it still renders in the quiet tier, outside the entry cards: {before_ledger}"
+            !quiet_tier.contains("<form"),
+            "the quiet tier carries no act form — aging stops asking, acting stays in \
+             the entry cards below: {quiet_tier}"
+        );
+    }
+
+    /// Finding review (the residual on the finding-1 fix): the quiet tier
+    /// must not regrow the unbounded DOM `HISTORY_CAP` exists to cap — it
+    /// is bounded the same way `standing_decisions_section` is, with an
+    /// "…and N older" tail past the cap.
+    #[test]
+    fn findings_section_is_bounded_with_an_older_tail() {
+        // 27 Findings — past the 25-item cap (`BRIEF_RECENT_FULL` +
+        // `BRIEF_OLDER_CLAMPED`).
+        let entries: Vec<LedgerEntry> = (0..27)
+            .map(|i| assertion(Some(AssertionKind::Finding), &format!("finding {i}")))
+            .collect();
+        let view = view_with(entries);
+        let html = channel_html(
+            &[],
+            "t",
+            &ChannelId::new(),
+            &view,
+            std::path::Path::new("/repo"),
+            None,
+        );
+        let quiet_tier = html
+            .split("<h2 class=\"board-head\">recorded, unverified</h2>")
+            .nth(1)
+            .expect("the quiet-tier section renders")
+            .split("</section>")
+            .next()
+            .unwrap();
+        assert!(
+            quiet_tier.contains("…and 2 older recorded-but-unverified entries"),
+            "bounded, with a count of the elided rest: {quiet_tier}"
+        );
+        assert_eq!(
+            quiet_tier.matches("<li>").count(),
+            25,
+            "no more than the cap renders in full: {quiet_tier}"
         );
     }
 }
