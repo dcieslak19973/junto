@@ -2803,7 +2803,9 @@ impl App {
             bottom: 0.0,
             left: 10.0,
         });
-        let center: Element<Message> = column![grid].spacing(10).padding(10).into();
+        let center: Element<Message> = container(column![grid].spacing(10).padding(10))
+            .id(iced::widget::Id::new("center-grid-column"))
+            .into();
 
         // The three-pane shell: collapsible blades either side of the channel
         // workspace. Each blade collapses to a stub rather than to zero so the
@@ -3100,6 +3102,21 @@ fn right_blade(app: &App) -> Element<'_, Message> {
 /// The whole lineage DAG, relocated from the always-visible top ribbon into
 /// the right blade. Freed from the top band it no longer needs the 150px
 /// scroll cap the ribbon imposed — it gets the blade's full height.
+///
+/// The scrollable here is deliberately vertical-only, NOT both-axis. A
+/// `scrollable::Direction::Both` arms width-compression on the canvas's own
+/// `Limits` (`Scrollable::layout`, `iced_widget-0.14.2/src/scrollable.rs:
+/// 447-462`), which makes `Canvas::layout`'s `Length::Fill` width resolve to
+/// its zero intrinsic size instead of the blade's real width
+/// (`Limits::resolve`, `iced_core-0.14.0/src/layout/limits.rs:167-171`) —
+/// `Canvas::draw` then bails out on `bounds.width < 1.0`
+/// (`canvas.rs:290-294`) and the whole graph goes blank at every blade
+/// width, not just `BladeWidth::MIN`. `LineageCanvas` only carries a
+/// `height` field and derives its horizontal `right` edge from the ACTUAL
+/// bounds at draw time, so there is no fixed content width to hand a
+/// horizontal scrollbar either. The narrow-blade clip this leaves
+/// unresolved is a known limitation of the graph's provisional placement in
+/// a blade rather than its original full-window-width ribbon.
 fn lineage_view(app: &App) -> Element<'_, Message> {
     match &app.lineage {
         Some(graph) => {
@@ -3115,10 +3132,6 @@ fn lineage_view(app: &App) -> Element<'_, Message> {
                     .width(Fill)
                     .height(Length::Fixed(content_h)),
             )
-            .direction(scrollable::Direction::Both {
-                vertical: scrollable::Scrollbar::default(),
-                horizontal: scrollable::Scrollbar::default(),
-            })
             .height(Fill)
             .into()
         }
@@ -8269,12 +8282,16 @@ diff --git a/lib.rs b/lib.rs
     /// `iced_test::simulator` performs REAL layout of the actual root
     /// `App::view()`, so it can answer this directly.
     ///
-    /// EMPIRICAL VERDICT: it does not collapse. The proxy is the
-    /// `container(center)` wrapper the grid sits in, tagged
-    /// `"center-pane-grid"` in `view()` for exactly this test, whose
-    /// `Target::bounds()` reports the real cross-axis height the row
-    /// actually handed it — in the default 768px-tall simulator window this
-    /// measures ~733px, not zero and not a tab-bar sliver.
+    /// EMPIRICAL VERDICT: it does not collapse. The proxies are two tagged
+    /// containers: `"center-grid-column"`, wrapping `column![grid]`
+    /// directly (the innermost point compression could bite), and
+    /// `"center-pane-grid"`, one level further out — both `Target::bounds()`
+    /// report real height in the default 768px-tall simulator window
+    /// (~733px), not zero and not a tab-bar sliver. Asserting on both means
+    /// this guard survives a later edit that gives the outer container an
+    /// explicit `.height(...)` independent of its content (which would let
+    /// the outer alone report a healthy height even if the grid itself had
+    /// collapsed).
     ///
     /// `"loading…"` text (`pane_body`'s `Content::Loading` arm) is NOT a
     /// valid proxy for this, despite living deep inside the grid: a plain
@@ -8282,27 +8299,36 @@ diff --git a/lib.rs b/lib.rs
     /// of how much space its ancestors were given, so an assertion on it
     /// passes or fails identically whether the collapse is real or not —
     /// verified directly: its bounds (height 20.8) were bit-for-bit
-    /// identical whether or not the surrounding chain carried
-    /// `.height(Fill)`, which proves that proxy measures the text, never
-    /// the grid.
+    /// identical whether or not the surrounding chain carried an explicit
+    /// `.height(Fill)` chain, which proves that proxy measures the text,
+    /// never the grid.
     ///
-    /// The reviewer's derivation conflates the two flex axes:
-    /// `iced_core::layout::flex::resolve` only zeroes a `Fill` child's
-    /// *cross*-axis size when the parent's cross axis is compressed
-    /// (`cross = if cross_compress { 0.0 } else { max_cross }`,
-    /// `flex.rs:93`) — a Fill child's *main*-axis size instead comes from
-    /// `available = axis.main(limits.max()) - total_spacing`, computed
-    /// unconditionally, compression or not (`flex.rs:94`). The shell's
-    /// `column![grid]` is a `Column`, whose main axis IS height — so the
-    /// grid's `.height(Fill)` is a main-axis fill in its immediate parent,
-    /// never zeroed by compression at all. Compression only ever zeroes a
-    /// widget's *cross* axis, which for this chain is width, and every
-    /// width in this chain is either `Fill` (never re-compressed, since
-    /// `Limits::width`/`height` only sets `compression = true` for
-    /// `Shrink`, and only clears it for `Fixed` — never for `Fill`,
-    /// `limits.rs:55-88`) or the blades' own `Length::Fixed` (which clears
-    /// compression for itself directly). Nowhere in the actual chain does a
-    /// Fill *cross*-axis child sit under a compressed cross axis.
+    /// WHY it does not collapse: NOT because a main-axis `Fill` is somehow
+    /// immune to compression — it is not. `flex::resolve` genuinely does
+    /// propagate main-axis compression to children (`flex.rs:85-88`) and
+    /// gates the pass that distributes remaining space to main-axis fills on
+    /// `!main_compress` (`flex.rs:186`); a `Fill` child's main-axis size
+    /// really would collapse to its intrinsic size under a genuinely
+    /// `Shrink` parent (`Limits::resolve`, `limits.rs:167-186`). The reason
+    /// is that none of this chain's `column!`/`row!`/`container(...)` calls
+    /// stay `Shrink` long enough to arm compression in the first place.
+    /// `Column`/`Row::push` (their `column!`/`row!` macros' constructor)
+    /// runs `self.height = self.height.enclose(child_size.height)` for
+    /// every child (`column.rs:148-149`, `row.rs:139-140`), and
+    /// `Length::enclose` promotes a still-`Shrink` parent straight to
+    /// whatever `Fill`/`FillPortion` a child asks for
+    /// (`iced_core-0.14.0/src/length.rs:61-66`) — so `column![grid]`
+    /// (`grid` itself is `.width(Fill).height(Fill)`) is never actually
+    /// `Shrink` by the time it reaches layout; it silently becomes `Fill`
+    /// the moment `grid` is pushed. `Container::new` does the same thing one
+    /// level up: it takes its OWN width/height from its content's
+    /// `size_hint().fluid()` (`container.rs:87-97`), so `container(center)`
+    /// inherits `Fill` from `center`'s already-promoted height without ever
+    /// declaring it explicitly. The shell row promotes the same way from the
+    /// blades' explicit `.height(Fill)` containers. `Limits::width`/`height`
+    /// only ever arms compression for a length that is STILL `Shrink` when
+    /// it reaches them (`limits.rs:55-88`) — and by construction, nothing on
+    /// this path ever is.
     #[test]
     fn the_center_pane_grid_gets_real_height_not_a_zero_height_sliver() {
         let (mut app, _) = App::new();
@@ -8312,35 +8338,42 @@ diff --git a/lib.rs b/lib.rs
         app.shell = shell::ShellState::default();
 
         let mut ui = iced_test::simulator(app.view());
-        let target = ui
+        let inner = ui
+            .find(iced::widget::Id::new("center-grid-column"))
+            .expect("the column wrapping the grid must be laid out")
+            .bounds();
+        let outer = ui
             .find(iced::widget::Id::new("center-pane-grid"))
-            .expect("the center container must be laid out");
+            .expect("the center container must be laid out")
+            .bounds();
 
         assert!(
-            target.bounds().height > 100.0,
-            "expected the center pane grid's container to receive real \
-             height in a 768px-tall window, got a laid-out height of {:?} — \
-             the predicted zero-height/sliver collapse",
-            target.bounds()
+            inner.height > 100.0 && outer.height > 100.0,
+            "expected the center pane grid to receive real height in a \
+             768px-tall window, got inner (wraps column![grid] directly) \
+             {inner:?} and outer (one level further out) {outer:?} — the \
+             predicted zero-height/sliver collapse",
         );
     }
 
     /// Settles whether `left_blade`'s `FillPortion`-split nav/body columns
     /// actually observe the persisted `NavSplit` ratio, or whether — per the
-    /// review finding — the enclosing `column![...]` being Shrink in both
+    /// review finding — the enclosing `column![...]` being `Shrink` in both
     /// axes leaves `FillPortion` inert. Same method as the Fix-1 test:
     /// `iced_test` real layout, read back through tagged container ids
     /// rather than trusted from source.
     ///
     /// EMPIRICAL VERDICT: it is not inert. Measured ratio is exactly 0.55 —
-    /// `NavSplit::DEFAULT` — with the enclosing column left untouched
-    /// (still Shrink in both axes, no code change). Consistent with the
-    /// Fix-1 finding: height is this column's MAIN axis, and a `Fill`/
-    /// `FillPortion` child's main-axis size comes from the ordinary
-    /// available-space budget regardless of the parent's own compression
-    /// (`flex.rs:94`) — only a Fill child's CROSS axis (here, width) would
-    /// be zeroed by a compressed parent, and neither child asks for Fill
-    /// width.
+    /// `NavSplit::DEFAULT` — with the enclosing column left untouched. It is
+    /// NOT actually `Shrink` in both axes by the time it reaches layout,
+    /// though: by the same `Length::enclose` promotion the Fix-1 test's doc
+    /// comment traces (`column.rs:148-149`, `length.rs:61-66`), pushing a
+    /// `Length::FillPortion(55)` child promotes this column's declared
+    /// `Shrink` height straight to `FillPortion(55)`, and pushing the
+    /// `Fill`-width `switcher`/nav row promotes its width to `Fill` too. A
+    /// `FillPortion` main-axis child (height, for this `Column`) draws from
+    /// the ordinary `available` budget once compression is never armed —
+    /// which it is not here, for the same reason as Fix 1.
     #[test]
     fn the_left_blades_nav_and_body_observe_the_persisted_split() {
         let (mut app, _) = App::new();
