@@ -161,6 +161,34 @@ impl ShellState {
     }
 }
 
+use std::path::Path;
+
+/// Read shell state from `path`.
+///
+/// Total by construction: a missing file, an unreadable file, an unparseable
+/// file, or a partial one all yield defaults. Layout state is a convenience,
+/// never a reason the application will not start — so there is deliberately
+/// no error to surface and no `Result` for a caller to mishandle.
+pub fn load(path: &Path) -> ShellState {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| toml::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+/// Write shell state to `path`, creating the parent directory if needed.
+///
+/// Returns the io error rather than swallowing it so a caller can log it, but
+/// callers are expected to treat a failed save as non-fatal.
+pub fn save(path: &Path, state: &ShellState) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let text = toml::to_string_pretty(state)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    std::fs::write(path, text)
+}
+
 #[cfg(test)]
 mod clamp_tests {
     use super::{BladeWidth, NavSplit, ShellState};
@@ -217,5 +245,80 @@ mod clamp_tests {
         let state = ShellState::default();
         assert!(!state.left_collapsed);
         assert!(!state.right_collapsed);
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::{BladeWidth, LeftView, NavSplit, RightView, ShellState, load, save};
+
+    /// A unique temp path per test — these run in parallel, so a shared
+    /// filename would make them flaky.
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("junto-iced-shell-{name}.toml"))
+    }
+
+    #[test]
+    fn state_survives_a_save_and_load_round_trip() {
+        let path = temp_path("round-trip");
+        let written = ShellState {
+            left_collapsed: true,
+            left_view: LeftView::Sessions,
+            right_view: RightView::Lineage,
+            right_width: BladeWidth::new(400.0),
+            ..Default::default()
+        };
+
+        save(&path, &written).expect("save should succeed to a temp dir");
+        assert_eq!(load(&path), written);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_absent_file_yields_defaults_rather_than_an_error() {
+        // First run on a new machine: no file exists yet.
+        let path = temp_path("absent-file-that-is-never-created");
+        assert_eq!(load(&path), ShellState::default());
+    }
+
+    #[test]
+    fn a_corrupt_file_yields_defaults_so_the_app_still_starts() {
+        // Layout state is a convenience; it must never be a reason the
+        // application refuses to launch.
+        let path = temp_path("corrupt");
+        std::fs::write(&path, "this is not toml {{{").expect("write temp file");
+        assert_eq!(load(&path), ShellState::default());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_partial_file_fills_only_its_missing_fields() {
+        // A file written by an older build must not lose the fields it does
+        // carry, nor fail on the ones it lacks.
+        let path = temp_path("partial");
+        std::fs::write(&path, "left_collapsed = true\n").expect("write temp file");
+        let loaded = load(&path);
+        assert!(loaded.left_collapsed);
+        assert_eq!(loaded.right_width, BladeWidth::default());
+        assert_eq!(loaded.left_view, LeftView::default());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_out_of_range_width_on_disk_is_clamped_on_load() {
+        // Hand-edited or corrupt values must not strand a blade at 2px.
+        let path = temp_path("out-of-range");
+        std::fs::write(&path, "left_width = 2.0\n").expect("write temp file");
+        assert_eq!(load(&path).left_width.get(), BladeWidth::MIN);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_out_of_range_nav_split_on_disk_is_clamped_on_load() {
+        let path = temp_path("split-out-of-range");
+        std::fs::write(&path, "left_split = 0.99\n").expect("write temp file");
+        assert_eq!(load(&path).left_split.get(), NavSplit::MAX);
+        let _ = std::fs::remove_file(&path);
     }
 }
