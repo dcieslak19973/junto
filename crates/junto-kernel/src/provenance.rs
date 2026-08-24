@@ -92,6 +92,21 @@ impl ContentDigest {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The digest of `bytes` under SHA-256, in this type's `algorithm:value`
+    /// shape.
+    ///
+    /// Lives here because a digest is only useful when two parties compute it
+    /// identically: the host digests an artifact's bytes as it stores them
+    /// (`store_artifact`), and a reviewer annotating that artifact digests the
+    /// bytes it fetched back. Those two must agree for a [`crate::RecordAnchor`]
+    /// to be checkable at all, so the formula is stated once rather than
+    /// spelled out at each call site.
+    #[must_use]
+    pub fn sha256_of(bytes: &[u8]) -> Self {
+        use sha2::Digest as _;
+        Self(format!("sha256:{:x}", sha2::Sha256::digest(bytes)))
+    }
 }
 
 impl From<ContentDigest> for String {
@@ -154,5 +169,19 @@ mod tests {
         assert!(ContentDigest::new("sha256:").is_err());
         assert!(ContentDigest::new(":deadbeef").is_err());
         assert!(ContentDigest::new("sha256:deadbeef").is_ok());
+    }
+
+    #[test]
+    fn sha256_of_matches_the_published_vector() {
+        // A known-answer vector, not a round-trip: the host and a reviewing
+        // client digest the same bytes independently, so the exact string -
+        // lowercase hex, `sha256:` prefix, no truncation - is the contract.
+        assert_eq!(
+            ContentDigest::sha256_of(b"abc").as_str(),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        // Its own shape invariant holds, so it round-trips through `new`.
+        let d = ContentDigest::sha256_of(b"");
+        assert!(ContentDigest::new(d.as_str().to_string()).is_ok());
     }
 }

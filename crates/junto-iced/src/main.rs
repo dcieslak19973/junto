@@ -17,8 +17,8 @@ use iced::futures::channel::mpsc;
 use iced::widget::canvas::{self, Canvas, Frame, Geometry, Path, Stroke};
 use iced::widget::pane_grid;
 use iced::widget::{
-    Space, button, checkbox, column, combo_box, container, markdown, pick_list, row, scrollable,
-    text, text_input, tooltip,
+    Space, button, checkbox, column, combo_box, container, markdown, mouse_area, pick_list, row,
+    scrollable, text, text_input, tooltip,
 };
 use iced::{
     Background, Border, Center, Color, Element, Fill, Length, Padding, Point, Rectangle, Renderer,
@@ -26,15 +26,13 @@ use iced::{
 };
 use junto_kernel::{
     Anchor, Annotation, AnnotationId, CodeAnchor, CommitOid, ContentDigest, EntryId, Member,
-    SigningKey, Span, StreamAnchor, Timestamp,
+    RecordAnchor, SigningKey, Span, StreamAnchor, Timestamp,
 };
 use junto_live::{Frame as WireFrame, LiveDoc, Presence};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
-use pointing::{
-    anchor_click, diff_row_targets, popup_anchor_line, watch_identity, watcher_initials,
-};
+use pointing::{diff_row_targets, drag_lines, popup_anchor_line, watch_identity, watcher_initials};
 use popover::Popover;
 
 const HOST: &str = "http://127.0.0.1:1727";
@@ -194,6 +192,26 @@ struct Pane {
     /// Mutually exclusive with `annotate_path`: pointing at a line clears
     /// this, and pointing at a block clears the path.
     annotate_op: Option<usize>,
+    /// The record content the composer is aimed at: `(entry id, content
+    /// digest)`, set by clicking a line of any artifact that is not a diff row
+    /// with a known commit.
+    ///
+    /// This is the third anchor kind (`junto_kernel::RecordAnchor`, Dan's call
+    /// 2026-08-23): content already IN the record — a memo, a log, a snapshot,
+    /// an uncommitted diff's text — which is immutable and digest-addressable,
+    /// so it needs none of the re-anchoring machinery a file span does.
+    /// Mutually exclusive with both `annotate_path` and `annotate_op`.
+    annotate_record: Option<(String, String)>,
+    /// The row a press-drag started on, in the units of whatever is aimed
+    /// (`Some` only between press and release). A drag extends the selection to
+    /// each row entered while this is set; releasing, or leaving the artifact,
+    /// clears it.
+    drag_from: Option<u32>,
+    /// The row under the cursor, keyed by its target so two artifacts sharing a
+    /// line number cannot both light up. Tracked by hand because these rows are
+    /// `mouse_area`s, not `button`s: a button reports no drag state, which is
+    /// why the first version of this gesture had to be directional clicking.
+    hover: Option<(String, u32)>,
     /// The most recent commit oid seen in a `{"kind":"diff","commit":…}`
     /// worktree event on this pane's live doc (`Message::WorktreeDiff`) —
     /// the ONLY source a `CodeAnchor`'s commit may come from. `None` means
@@ -595,6 +613,11 @@ enum ArtifactContent {
         body: String,
         /// Parsed Markdown, for memo-format artifacts (parsed once on load).
         md: Option<Vec<markdown::Item>>,
+        /// The digest of `body`, computed once on arrival rather than per frame,
+        /// and by the same formula the host used when it stored these bytes
+        /// (`ContentDigest::sha256_of`) so a `RecordAnchor` built here matches
+        /// the artifact's recorded provenance.
+        digest: String,
     },
     Error(String),
 }
@@ -748,6 +771,34 @@ enum IdentityResult {
     Parked(usize),
 }
 
+/// What a rendered row points at — the two anchor kinds a row can make.
+///
+/// Carried by the pointing messages so one row widget serves both, and so the
+/// `update` handler never has to guess which claim a click meant from the state
+/// it happens to find lying around.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AnchorTarget {
+    /// A line of a file at the session's commit (`CodeAnchor`): the new-file
+    /// path. The stronger claim, available only where a diff row occupies a real
+    /// new-file line.
+    Code(String),
+    /// A line of content already in the record (`RecordAnchor`): the entry that
+    /// attached it, and that content's digest.
+    Record(String, String),
+}
+
+impl AnchorTarget {
+    /// The identity a hover or a drag is scoped to, so a drag can never jump
+    /// between two files (or two artifacts) mid-gesture and produce a span whose
+    /// halves came from different content.
+    fn key(&self) -> &str {
+        match self {
+            Self::Code(path) => path,
+            Self::Record(entry, _) => entry,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum Message {
     ChannelsLoaded(Vec<String>),
@@ -805,12 +856,17 @@ enum Message {
     /// commit oid) — mirrored into `Pane::worktree_commit`, the only source
     /// the composer's `CodeAnchor` may ever take a commit from.
     WorktreeDiff(String, String),
-    // --- pointing: click a rendered row/block to aim the composer ---
-    /// A rendered diff row was clicked (pane, new-file path, new-file line,
-    /// `pointing::diff_row_targets`) — prefills the composer's `path`/`lines`
-    /// instead of the reviewer typing them, extending the range on a second
-    /// click further down the same file (`pointing::anchor_click`).
-    AnchorRow(pane_grid::Pane, String, u32),
+    // --- pointing: press-drag-release across rendered rows to aim the composer ---
+    /// The mouse went down on a rendered row (pane, what that row points at,
+    /// the row's line in that target's own units) — aims the composer at a
+    /// single line and begins a drag.
+    AnchorPress(pane_grid::Pane, AnchorTarget, u32),
+    /// The cursor entered a rendered row. Always updates the hover paint; while
+    /// a drag is in progress on the SAME target it also extends the selection
+    /// (`pointing::drag_lines`).
+    AnchorOver(pane_grid::Pane, AnchorTarget, u32),
+    /// The mouse came up, or left the artifact entirely — ends any drag.
+    AnchorRelease(pane_grid::Pane),
     /// A rendered feed block's gutter was clicked (pane, the block's own
     /// `conversation` container index) — aims the `StreamAnchor` there
     /// instead of at the newest event.
@@ -1357,21 +1413,31 @@ impl App {
                 }
                 Task::none()
             }
-            Message::AnchorRow(pane, path, line) => {
+            Message::AnchorPress(pane, target, line) => {
                 if let Some(state) = self.panes.get_mut(pane) {
-                    let (path, lines) = anchor_click(
-                        &state.annotate_path,
-                        parse_span(&state.annotate_lines),
-                        &path,
-                        line,
-                    );
-                    state.annotate_path = path;
-                    state.annotate_lines = lines;
-                    // A code anchor and a stream anchor are mutually
-                    // exclusive; pointing at a line drops any block picked.
-                    state.annotate_op = None;
-                    // A different session has a different newest diff.
-                    state.auto_expanded = false;
+                    state.aim_at(&target, drag_lines(line, line));
+                    state.drag_from = Some(line);
+                }
+                Task::none()
+            }
+            Message::AnchorOver(pane, target, line) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    state.hover = Some((target.key().to_string(), line));
+                    // Extend only within the target the drag started on: a span
+                    // whose ends came from two different files would be a signed
+                    // claim about code that never existed.
+                    if let Some(from) = state.drag_from
+                        && state.aimed_key() == Some(target.key())
+                    {
+                        state.aim_at(&target, drag_lines(from, line));
+                    }
+                }
+                Task::none()
+            }
+            Message::AnchorRelease(pane) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    state.drag_from = None;
+                    state.hover = None;
                 }
                 Task::none()
             }
@@ -1382,12 +1448,14 @@ impl App {
                     // `StreamAnchor` rather than a `CodeAnchor`.
                     state.annotate_path.clear();
                     state.annotate_lines.clear();
+                    state.annotate_record = None;
                 }
                 Task::none()
             }
             Message::AnchorClear(pane) => {
                 if let Some(state) = self.panes.get_mut(pane) {
                     state.annotate_op = None;
+                    state.annotate_record = None;
                     // A different session has a different newest diff.
                     state.auto_expanded = false;
                     state.annotate_path.clear();
@@ -1467,15 +1535,51 @@ impl App {
                     return Task::none();
                 };
                 let path = state.annotate_path.trim().to_string();
-                // Anchor-sourcing rule: a `CodeAnchor` may only be built from
-                // a commit oid this pane has actually seen arrive over the
-                // wire (`Pane::worktree_commit`, set only from a real
+                // Anchor-sourcing rule, now three-way. A `RecordAnchor` is
+                // preferred when the reviewer clicked record content, because
+                // its claim is exactly true by construction: the entry id and
+                // the digest name bytes that an append-only log can never
+                // change, so there is nothing to fabricate and nothing to
+                // re-anchor. A `CodeAnchor` is the stronger claim where it is
+                // available, but it may only be built from a commit oid this
+                // pane has actually SEEN arrive over the wire
+                // (`Pane::worktree_commit`, set only from a real
                 // `{"kind":"diff","commit":…}` worktree event) — never
-                // fabricated, never a placeholder. Anything else, including
-                // an empty path, is a `StreamAnchor` on a conversation event
-                // instead. Clicking a row only fills in the two inputs a
-                // reviewer used to type; it does not relax this rule.
-                let anchor = if path.is_empty() {
+                // fabricated, never a placeholder. Anything else, including an
+                // empty path, is a `StreamAnchor` on a conversation event.
+                // Clicking a row only fills in what a reviewer used to type; it
+                // does not relax any of this.
+                let anchor = if let Some((entry, digest)) = state.annotate_record.clone() {
+                    let Ok(entry) = entry.parse::<EntryId>() else {
+                        push_error(
+                            state,
+                            "malformed entry id for the clicked content".to_string(),
+                        );
+                        return Task::none();
+                    };
+                    let Ok(digest) = ContentDigest::new(digest) else {
+                        push_error(
+                            state,
+                            "malformed digest for the clicked content".to_string(),
+                        );
+                        return Task::none();
+                    };
+                    let Some(span) = parse_span(&state.annotate_lines) else {
+                        push_error(
+                            state,
+                            format!(
+                                "invalid line range '{}' — use \"12\" or \"12-14\"",
+                                state.annotate_lines
+                            ),
+                        );
+                        return Task::none();
+                    };
+                    Anchor::Record(RecordAnchor {
+                        entry,
+                        digest,
+                        span,
+                    })
+                } else if path.is_empty() {
                     // The block the reviewer pointed at, else the newest
                     // event. Nothing picked and an empty container means
                     // there is no real index to name, which is refused
@@ -1666,10 +1770,17 @@ impl App {
                         Ok(dto) => {
                             let md = (dto.format == "markdown")
                                 .then(|| markdown::parse(&dto.content).collect::<Vec<_>>());
+                            // Digested here, from the bytes actually received,
+                            // so a `RecordAnchor` names exactly what the
+                            // reviewer was looking at.
+                            let digest = ContentDigest::sha256_of(dto.content.as_bytes())
+                                .as_str()
+                                .to_string();
                             ArtifactContent::Loaded {
                                 format: dto.format,
                                 body: dto.content,
                                 md,
+                                digest,
                             }
                         }
                         Err(err) => ArtifactContent::Error(err),
@@ -3743,6 +3854,15 @@ fn annotate_composer(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
 /// configured font (Segoe UI) and paint as tofu boxes — Dan could not find the
 /// feed gutter at all because of it (ledger `02ff24be`). `●` and `×` do render.
 fn aim_label(pane: &Pane) -> String {
+    // Checked first because it is the only aim that can never be refused: the
+    // bytes are already in the record, so there is no commit to wait for.
+    if let Some((entry, _)) = &pane.annotate_record {
+        return format!(
+            "● line {} of entry {}",
+            pane.annotate_lines,
+            &entry[..8.min(entry.len())]
+        );
+    }
     let path = pane.annotate_path.trim();
     if !path.is_empty() {
         return match pane.worktree_commit.as_deref() {
@@ -3991,8 +4111,13 @@ fn pane_body<'a>(
         // targets and stop being them together with it.
         let aim = pane.annotate_tx.is_some().then(|| Aim {
             path: pane.annotate_path.as_str(),
+            record: pane
+                .annotate_record
+                .as_ref()
+                .map(|(entry, _)| entry.as_str()),
             span: parse_span(&pane.annotate_lines),
             popup_at: popup_anchor(pane),
+            hover: pane.hover.as_ref().map(|(key, line)| (key.as_str(), *line)),
             pane,
         });
         // REVIEW-FIRST ARRANGEMENT (ledger `532826c2`). The session's newest
@@ -4584,9 +4709,12 @@ fn code_panel<'a>(
     .spacing(8)
     .align_y(Center);
     let body: Element<Message> = match pane.artifacts.get(&artifact.id) {
-        Some(ArtifactContent::Loaded { format, body, md }) => {
-            artifact_body(id, format, body, md.as_deref(), aim)
-        }
+        Some(ArtifactContent::Loaded {
+            format,
+            body,
+            md,
+            digest,
+        }) => artifact_body(id, &artifact.id, digest, format, body, md.as_deref(), aim),
         Some(ArtifactContent::Loading) => text("loading the diff…").size(11).color(MUTED).into(),
         Some(ArtifactContent::Error(err)) => text(format!("⚠ {err}")).size(11).color(RED).into(),
         None => button(text("show the diff").size(11))
@@ -4863,11 +4991,24 @@ fn entry_card<'a>(
             Some(ArtifactContent::Error(err)) => {
                 card = card.push(text(format!("⚠ {err}")).size(11).color(RED));
             }
-            Some(ArtifactContent::Loaded { format, body, md }) => {
+            Some(ArtifactContent::Loaded {
+                format,
+                body,
+                md,
+                digest,
+            }) => {
                 card = card.push(
                     row![Space::new().width(Fill), copy_button(body.clone())].align_y(Center),
                 );
-                card = card.push(artifact_body(id, format, body, md.as_deref(), aim));
+                card = card.push(artifact_body(
+                    id,
+                    &entry.id,
+                    digest,
+                    format,
+                    body,
+                    md.as_deref(),
+                    aim,
+                ));
             }
             None => {}
         }
@@ -4900,8 +5041,13 @@ fn entry_card<'a>(
 /// that are not on screen would be a click that appears to do nothing.
 #[derive(Clone, Copy)]
 struct Aim<'a> {
-    /// The composer's current `path`, untrimmed (as typed).
+    /// The composer's current `path`, untrimmed (as typed). Empty when the aim
+    /// is at record content or the live stream rather than at a file.
     path: &'a str,
+    /// The record entry the composer is aimed at, when pointing at content
+    /// already in the record (`Pane::annotate_record`). Mutually exclusive with
+    /// a non-empty `path`.
+    record: Option<&'a str>,
     /// The composer's current `lines`, parsed — `None` while it is empty or
     /// malformed.
     span: Option<Span>,
@@ -4910,6 +5056,10 @@ struct Aim<'a> {
     /// Resolved by `popup_anchor`, which refuses a row that is not actually
     /// rendered, so the panel can never be aimed at nothing.
     popup_at: Option<u32>,
+    /// The row under the cursor as `(target key, line)`, so exactly one row
+    /// paints its hover. Tracked in state because these rows are `mouse_area`s,
+    /// which report no hover status of their own.
+    hover: Option<(&'a str, u32)>,
     /// The pane, so the row owning the panel can build it in place.
     pane: &'a Pane,
 }
@@ -4926,10 +5076,16 @@ const MAX_DIFF_ROWS: usize = 500;
 /// composer at all: the bottom composer hides while the panel is up, so
 /// promising a panel that has no anchor would remove the only way to comment.
 fn popup_anchor(pane: &Pane) -> Option<u32> {
+    // A record aim needs no rendering check: the aimed entry IS the artifact
+    // being rendered, and the row was clicked to set the span in the first
+    // place, so the line necessarily exists in what is on screen.
+    if pane.annotate_record.is_some() {
+        return parse_span(&pane.annotate_lines).map(|span| span.end);
+    }
     let diffs = pane.artifacts.values().filter_map(|content| match content {
-        ArtifactContent::Loaded { format, body, md } if format == "diff" && md.is_none() => {
-            Some(body.as_str())
-        }
+        ArtifactContent::Loaded {
+            format, body, md, ..
+        } if format == "diff" && md.is_none() => Some(body.as_str()),
         _ => None,
     });
     popup_anchor_line(
@@ -4940,72 +5096,51 @@ fn popup_anchor(pane: &Pane) -> Option<u32> {
     )
 }
 
-/// A hint telling the reviewer what to click on a diff, shown only while they
-/// are actually in commenting mode (`aim`).
-///
-/// Deliberately says nothing on a non-diff artifact. An earlier version
-/// advertised "not pointable: comments anchor to diff lines and live feed
-/// blocks only", and Dan's answer was that he does not want the limitation
-/// explained, he wants it gone — everything should be pointable. Advertising a
-/// restriction we intend to remove is worse than saying nothing, so the
-/// negative case is left silent until the anchor vocabulary covers it.
-fn pointability_note(is_diff: bool, commenting: bool) -> Option<Element<'static, Message>> {
-    (is_diff && commenting).then(|| {
-        text(
-            "click an added or context line to comment on it — removed lines have no line \
-             number in the new file",
-        )
-        .size(10)
-        .color(MUTED)
-        .into()
-    })
-}
-
 /// Render an artifact's content inline: a diff gets per-line add/remove/hunk
 /// colour; anything else is shown verbatim. Monospace; long artifacts are
 /// truncated (the web view holds the full text).
 ///
-/// With an `aim`, every diff row that occupies a line of the NEW file becomes a
-/// click target that aims the composer there (`pointing::diff_row_targets`);
-/// rows inside the aimed span are lit. Headers, hunk markers and removed rows
-/// stay plain text, which is also how a reviewer can see at a glance what is
-/// pointable.
+/// With an `aim`, EVERY rendered line is a click target (ledger `9d0ea0b6`:
+/// pointing that works only on the added lines of a committed diff violates
+/// least surprise). A diff row occupying a line of the new file aims a
+/// `CodeAnchor` at that file line (`pointing::diff_row_targets`); every other
+/// line — a header, a hunk marker, a removed row, a whole memo or log — aims a
+/// `RecordAnchor` at that line of this artifact's stored content, which is
+/// immutable and digest-addressable. Rows inside the aimed span are lit.
+///
+/// A Markdown artifact renders formatted while READING and as pointable
+/// monospace lines while commenting, because a line is what an anchor can name:
+/// rendered Markdown has no stable line to point at, and refusing to point at
+/// memos at all is the defect this replaces.
 fn artifact_body<'a>(
     id: pane_grid::Pane,
+    entry: &'a str,
+    digest: &'a str,
     format: &str,
     body: &'a str,
     md: Option<&'a [markdown::Item]>,
     aim: Option<Aim<'a>>,
 ) -> Element<'a, Message> {
-    // A memo renders as formatted Markdown. It takes an early return, so the
-    // pointability note has to be emitted HERE as well as at the end of the
-    // plain-text path below — adding it only there is why memos silently had
-    // no label at all.
-    if let Some(items) = md {
-        let mut col = column![
+    if let Some(items) = md.filter(|_| aim.is_none()) {
+        return container(
             markdown::view(items, Theme::CatppuccinMocha)
-                .map(|url| Message::OpenUrl(url.to_string()))
-        ]
-        .spacing(6);
-        if let Some(note) = pointability_note(false, aim.is_some()) {
-            col = col.push(note);
-        }
-        return container(col)
-            .padding(8)
-            .width(Fill)
-            .style(|_theme| container::Style {
-                background: Some(Background::Color(Color {
-                    a: 0.6,
-                    ..Color::from_rgb(0.067, 0.067, 0.106)
-                })),
-                border: Border {
-                    color: BORDER,
-                    width: 1.0,
-                    radius: 4.0.into(),
-                },
-                ..container::Style::default()
-            })
-            .into();
+                .map(|url| Message::OpenUrl(url.to_string())),
+        )
+        .padding(8)
+        .width(Fill)
+        .style(|_theme| container::Style {
+            background: Some(Background::Color(Color {
+                a: 0.6,
+                ..Color::from_rgb(0.067, 0.067, 0.106)
+            })),
+            border: Border {
+                color: BORDER,
+                width: 1.0,
+                radius: 4.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into();
     }
     let lines: Vec<&str> = body.lines().collect();
     let is_diff = format == "diff";
@@ -5019,31 +5154,53 @@ fn artifact_body<'a>(
     let mut col = column![].spacing(1);
     for (i, line) in lines.iter().enumerate().take(MAX_DIFF_ROWS) {
         let color = if is_diff { diff_line_color(line) } else { TEXT };
-        match (aim, targets.get(i).copied().flatten()) {
-            (Some(aim), Some((path, file_line))) => {
-                let aimed_here = aim.path.trim() == path;
-                let lit = aimed_here
-                    && aim
-                        .span
-                        .is_some_and(|s| s.start <= file_line && file_line <= s.end);
-                let row = diff_row(id, line, color, path, file_line, lit);
-                // The comment surface hangs off the row it is about, rather than
-                // sitting 800px away at the bottom of the pane (ledger
-                // `02ff24be`). Exactly one row in the pane carries it.
-                if aimed_here && aim.popup_at == Some(file_line) {
-                    col = col.push(Popover::new(row, Some(annotate_popup(id, aim.pane))));
-                } else {
-                    col = col.push(row);
-                }
-            }
-            _ => {
-                col = col.push(
-                    text((*line).to_string())
-                        .font(iced::Font::MONOSPACE)
-                        .size(12)
-                        .color(color),
-                );
-            }
+        let Some(aim) = aim else {
+            col = col.push(
+                text((*line).to_string())
+                    .font(iced::Font::MONOSPACE)
+                    .size(12)
+                    .color(color),
+            );
+            continue;
+        };
+        // `line_no` is this row's own 1-indexed position in the stored content,
+        // which is what a `RecordAnchor` names; `file_line` is the position in
+        // the NEW file, which is what a `CodeAnchor` names. They are different
+        // numbers and must never be swapped.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "capped at MAX_DIFF_ROWS, far below u32::MAX"
+        )]
+        let line_no = (i + 1) as u32;
+        // A diff row that occupies a real new-file line makes the stronger
+        // claim; everything else points at this artifact's stored text.
+        let (target, row_line) = match targets.get(i).copied().flatten() {
+            Some((path, file_line)) => (AnchorTarget::Code(path.to_string()), file_line),
+            None => (
+                AnchorTarget::Record(entry.to_string(), digest.to_string()),
+                line_no,
+            ),
+        };
+        // Aimed HERE means the composer is pointed at this row's own target, so
+        // `lit` and the panel can never appear on a row belonging to a different
+        // file or artifact.
+        let aimed_here = match &target {
+            AnchorTarget::Code(path) => aim.record.is_none() && aim.path.trim() == path,
+            AnchorTarget::Record(record, _) => aim.record == Some(record.as_str()),
+        };
+        let lit = aimed_here
+            && aim
+                .span
+                .is_some_and(|s| s.start <= row_line && row_line <= s.end);
+        let hovered = aim.hover == Some((target.key(), row_line));
+        let row = anchor_row(id, line, color, target, row_line, lit, hovered);
+        // The comment surface hangs off the row it is about, rather than sitting
+        // 800px away at the bottom of the pane (ledger `02ff24be`). Exactly one
+        // row in the pane carries it: the aimed span's end.
+        if aimed_here && aim.popup_at == Some(row_line) {
+            col = col.push(Popover::new(row, Some(annotate_popup(id, aim.pane))));
+        } else {
+            col = col.push(row);
         }
     }
     if lines.len() > MAX_DIFF_ROWS {
@@ -5056,10 +5213,19 @@ fn artifact_body<'a>(
             .color(MUTED),
         );
     }
-    if let Some(note) = pointability_note(is_diff, aim.is_some()) {
-        col = col.push(note);
-    }
-    container(col)
+    // A release outside any row would otherwise leave `drag_from` set, and the
+    // next hover — with no button down — would silently extend the selection.
+    // Leaving the artifact ends the gesture, which bounds that to the one case
+    // a `mouse_area` cannot observe.
+    let body: Element<Message> = if aim.is_some() {
+        mouse_area(col)
+            .on_release(Message::AnchorRelease(id))
+            .on_exit(Message::AnchorRelease(id))
+            .into()
+    } else {
+        col.into()
+    };
+    container(body)
         .padding(8)
         .width(Fill)
         .style(|_theme| container::Style {
@@ -5098,20 +5264,34 @@ fn diff_line_color(line: &str) -> Color {
     }
 }
 
-/// One anchorable diff row: a full-width click target that stays invisible
-/// until hovered, so a 500-row diff reads as a diff rather than as 500
-/// buttons. Clicking aims the composer at this row's new-file line
-/// (`Message::AnchorRow`); `lit` paints the rows already inside the aimed
-/// span, which is the only feedback that a range was picked at all.
-fn diff_row<'a>(
+/// One anchorable row: a full-width target that stays invisible until hovered,
+/// so a 500-row diff reads as a diff and a memo reads as prose rather than as
+/// hundreds of buttons.
+///
+/// A `mouse_area`, deliberately not a `button`. A button reports no drag state
+/// at all, which is why the first version of this gesture was "click a line,
+/// then click a lower line" — directional, undiscoverable, and Dan's complaint
+/// (2026-08-23). `on_press`/`on_enter`/`on_release` give press-drag-release
+/// selection instead, at the cost of painting hover by hand (`hovered`).
+///
+/// `lit` paints rows already inside the aimed span, which is the only feedback
+/// that a range was picked. Colour distinguishes the claim: mauve for a
+/// `CodeAnchor` at a file line, teal for a `RecordAnchor` at stored content, so
+/// a reviewer can tell which one a drag is making without reading the composer.
+fn anchor_row<'a>(
     id: pane_grid::Pane,
     body: &str,
     color: Color,
-    path: &str,
+    target: AnchorTarget,
     line: u32,
     lit: bool,
+    hovered: bool,
 ) -> Element<'a, Message> {
-    button(
+    let paint = match target {
+        AnchorTarget::Code(_) => MAUVE,
+        AnchorTarget::Record(..) => TEAL,
+    };
+    let row = container(
         text(body.to_string())
             .font(iced::Font::MONOSPACE)
             .size(12)
@@ -5119,23 +5299,23 @@ fn diff_row<'a>(
     )
     .width(Fill)
     .padding([0, 4])
-    .on_press(Message::AnchorRow(id, path.to_string(), line))
-    .style(move |_theme, status| {
-        let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
-        button::Style {
-            background: (lit || hovered).then_some(Background::Color(Color {
-                a: if lit { 0.28 } else { 0.14 },
-                ..MAUVE
-            })),
-            text_color: color,
-            border: Border {
-                radius: 3.0.into(),
-                ..Border::default()
-            },
-            ..button::Style::default()
-        }
-    })
-    .into()
+    .style(move |_theme| container::Style {
+        background: (lit || hovered).then_some(Background::Color(Color {
+            a: if lit { 0.28 } else { 0.14 },
+            ..paint
+        })),
+        text_color: Some(color),
+        border: Border {
+            radius: 3.0.into(),
+            ..Border::default()
+        },
+        ..container::Style::default()
+    });
+    mouse_area(row)
+        .on_press(Message::AnchorPress(id, target.clone(), line))
+        .on_enter(Message::AnchorOver(id, target, line))
+        .on_release(Message::AnchorRelease(id))
+        .into()
 }
 
 /// A small "copy" button that writes `text` to the clipboard (Iced static text
@@ -5260,6 +5440,39 @@ fn status_color(status: &str) -> Color {
 }
 
 impl Pane {
+    /// Aim the composer at `target` over `lines`, keeping the three anchor kinds
+    /// mutually exclusive.
+    ///
+    /// Every pointing gesture goes through here so the exclusivity is stated
+    /// once: an aim left half-set — a stale `annotate_path` beside a fresh
+    /// `annotate_record`, say — would make `AnnotateSubmit` sign the wrong kind
+    /// of claim, and that is a corrupt record rather than a cosmetic bug.
+    fn aim_at(&mut self, target: &AnchorTarget, lines: String) {
+        self.annotate_lines = lines;
+        self.annotate_op = None;
+        match target {
+            AnchorTarget::Code(path) => {
+                self.annotate_path = path.clone();
+                self.annotate_record = None;
+            }
+            AnchorTarget::Record(entry, digest) => {
+                // Record content is not a file: the empty path is what tells
+                // `AnnotateSubmit` this is not a `CodeAnchor`.
+                self.annotate_path.clear();
+                self.annotate_record = Some((entry.clone(), digest.clone()));
+            }
+        }
+    }
+
+    /// The key of whatever the composer is currently aimed at, or `None` when it
+    /// is aimed at the live stream (which has no rows to drag across).
+    fn aimed_key(&self) -> Option<&str> {
+        if let Some((entry, _)) = &self.annotate_record {
+            return Some(entry.as_str());
+        }
+        Some(self.annotate_path.trim()).filter(|path| !path.is_empty())
+    }
+
     fn loading(channel: &str) -> Self {
         Pane {
             channel: channel.to_string(),
@@ -5274,6 +5487,9 @@ impl Pane {
             annotate_email: None,
             conversation_len: 0,
             annotate_op: None,
+            annotate_record: None,
+            drag_from: None,
+            hover: None,
             worktree_commit: None,
             annotate_path: String::new(),
             annotate_lines: String::new(),
@@ -6861,12 +7077,22 @@ diff --git a/lib.rs b/lib.rs
         let pane = panes.get(id).expect("the pane just created");
         let aim = Aim {
             path: "",
+            record: None,
             span: None,
             popup_at: None,
+            hover: None,
             pane,
         };
 
-        let mut ui = iced_test::simulator(artifact_body(id, "diff", diff, None, Some(aim)));
+        let mut ui = iced_test::simulator(artifact_body(
+            id,
+            "a1",
+            "sha256:x",
+            "diff",
+            diff,
+            None,
+            Some(aim),
+        ));
 
         // The added line is row 5 of the diff and line 2 of the NEW file: the
         // removed row above it consumes no new-file line.
@@ -6874,12 +7100,14 @@ diff --git a/lib.rs b/lib.rs
             .expect("the added row is a click target");
         let messages: Vec<Message> = ui.into_messages().collect();
 
+        // A click is now a press AND a release (`mouse_area`), so the assertion
+        // names the press rather than demanding the whole list be one message.
         assert!(
-            matches!(
-                messages.as_slice(),
-                [Message::AnchorRow(_, path, 2)] if path == "lib.rs"
-            ),
-            "expected one AnchorRow at lib.rs:2, got {messages:?}"
+            messages.iter().any(|m| matches!(
+                m,
+                Message::AnchorPress(_, AnchorTarget::Code(path), 2) if path == "lib.rs"
+            )),
+            "expected a code anchor press at lib.rs:2, got {messages:?}"
         );
     }
 
@@ -6926,6 +7154,9 @@ diff --git a/lib.rs b/lib.rs
                 format: "diff".into(),
                 body: DIFF.into(),
                 md: None,
+                digest: ContentDigest::sha256_of(DIFF.as_bytes())
+                    .as_str()
+                    .to_string(),
             },
         );
         (panes, id, DIFF)
@@ -6970,27 +7201,68 @@ diff --git a/lib.rs b/lib.rs
     }
 
     #[test]
-    fn clicking_a_removed_diff_row_emits_nothing() {
-        // A removed line has no new-file number, so it must not be a target —
-        // the same claim as `diff_row_targets`' unit tests, asserted here
-        // through the rendered widget tree instead of the mapper.
+    fn clicking_a_removed_diff_row_anchors_the_record_not_the_file() {
+        // CONTRACT DELIBERATELY INVERTED (Dan, 2026-08-23: "EVERYTHING should be
+        // pointable"). This test previously asserted a removed row emitted
+        // NOTHING, which was correct while `CodeAnchor` was the only anchor a
+        // diff row could make: a deleted line has no line in the new file, so
+        // there was nothing truthful to point at. `Anchor::Record` gives it
+        // something — the line still exists in the stored artifact's TEXT, at
+        // row 3 — so the row is now a target for that claim instead, and the
+        // old silence is the bug rather than the guarantee.
         let diff = "+++ b/lib.rs\n@@ -1,2 +1,1 @@\n-fn gone() {}\n fn stays() {}\n";
         let (panes, id) = pane_grid::State::new(Pane::loading("c"));
         let pane = panes.get(id).expect("the pane just created");
         let aim = Aim {
             path: "",
+            record: None,
             span: None,
             popup_at: None,
+            hover: None,
             pane,
         };
 
-        let mut ui = iced_test::simulator(artifact_body(id, "diff", diff, None, Some(aim)));
-        let _ = ui.click("-fn gone() {}");
+        let mut ui = iced_test::simulator(artifact_body(
+            id,
+            "a1",
+            "sha256:x",
+            "diff",
+            diff,
+            None,
+            Some(aim),
+        ));
+        ui.click("-fn gone() {}")
+            .expect("a removed row is a record target");
         let messages: Vec<Message> = ui.into_messages().collect();
 
         assert!(
-            messages.is_empty(),
-            "a removed row must not anchor, got {messages:?}"
+            messages.iter().any(|m| matches!(
+                m,
+                Message::AnchorPress(_, AnchorTarget::Record(entry, digest), 3)
+                    if entry == "a1" && digest == "sha256:x"
+            )),
+            "expected a record anchor at line 3 of a1, got {messages:?}"
+        );
+        // The surviving context line keeps its stronger claim: it has a real
+        // new-file line, so it still anchors the FILE, not the artifact text.
+        let mut ui = iced_test::simulator(artifact_body(
+            id,
+            "a1",
+            "sha256:x",
+            "diff",
+            diff,
+            None,
+            Some(aim),
+        ));
+        ui.click(" fn stays() {}")
+            .expect("a context row is a target");
+        let messages: Vec<Message> = ui.into_messages().collect();
+        assert!(
+            messages.iter().any(|m| matches!(
+                m,
+                Message::AnchorPress(_, AnchorTarget::Code(path), 1) if path == "lib.rs"
+            )),
+            "expected a code anchor at lib.rs:1, got {messages:?}"
         );
     }
 
@@ -7488,26 +7760,116 @@ diff --git a/lib.rs b/lib.rs
     }
 
     #[test]
-    fn the_diff_hint_appears_only_on_a_diff_and_only_while_commenting() {
-        // A diff gets a hint about what to click. A non-diff gets NOTHING —
-        // deliberately, since advertising "not pointable" advertises a
-        // restriction that is on its way out (Dan: everything should be
-        // pointable), and saying nothing is better than saying that.
+    fn a_memo_renders_formatted_while_reading_and_pointable_while_commenting() {
+        // The restriction the deleted `pointability_note` used to explain is
+        // gone rather than better worded. A memo is prose, so it renders as
+        // Markdown when nobody is commenting; a line is the only thing an anchor
+        // can name, so the same memo becomes clickable monospace lines the
+        // moment the composer is aimed at anything.
+        let memo = "# Findings\n\nThe handshake was mine.\n";
+        let md: Vec<markdown::Item> = markdown::parse(memo).collect();
+        let (panes, id) = pane_grid::State::new(Pane::loading("c"));
+        let pane = panes.get(id).expect("the pane just created");
+
+        let mut reading = iced_test::simulator(artifact_body(
+            id,
+            "m1",
+            "sha256:x",
+            "markdown",
+            memo,
+            Some(&md),
+            None,
+        ));
+        // Rendered Markdown drops the literal "# " of the heading; the raw line
+        // is therefore absent exactly while it is unpointable.
         assert!(
-            pointability_note(true, true).is_some(),
-            "a diff says what to click"
+            reading.click("# Findings").is_err(),
+            "a memo being read is prose, not click targets"
         );
+
+        let aim = Aim {
+            path: "",
+            record: None,
+            span: None,
+            popup_at: None,
+            hover: None,
+            pane,
+        };
+        let mut commenting = iced_test::simulator(artifact_body(
+            id,
+            "m1",
+            "sha256:x",
+            "markdown",
+            memo,
+            Some(&md),
+            Some(aim),
+        ));
+        commenting
+            .click("The handshake was mine.")
+            .expect("a memo's lines are pointable while commenting");
+        let messages: Vec<Message> = commenting.into_messages().collect();
         assert!(
-            pointability_note(false, true).is_none(),
-            "a memo or log stays silent rather than advertising a limitation"
+            messages.iter().any(|m| matches!(
+                m,
+                Message::AnchorPress(_, AnchorTarget::Record(entry, _), 3) if entry == "m1"
+            )),
+            "expected a record anchor at line 3 of the memo, got {messages:?}"
         );
     }
 
     #[test]
-    fn the_pointability_note_only_appears_while_commenting() {
-        // Reading, not commenting: a note about anchoring would be noise on
-        // every artifact in the record.
-        assert!(pointability_note(true, false).is_none());
-        assert!(pointability_note(false, false).is_none());
+    fn aiming_at_one_anchor_kind_clears_the_others() {
+        // The corruption risk this guards: an aim left half-set — a stale
+        // `annotate_path` beside a fresh `annotate_record` — makes
+        // `AnnotateSubmit` sign the WRONG KIND of claim, which is a bad entry in
+        // an append-only record rather than a cosmetic bug.
+        let mut pane = Pane::loading("c");
+        pane.annotate_op = Some(4);
+
+        pane.aim_at(&AnchorTarget::Code("lib.rs".into()), drag_lines(2, 4));
+        assert_eq!(pane.annotate_path, "lib.rs");
+        assert_eq!(pane.annotate_lines, "2-4");
+        assert!(
+            pane.annotate_record.is_none(),
+            "a code aim clears the record"
+        );
+        assert!(pane.annotate_op.is_none(), "a code aim clears the stream");
+
+        pane.aim_at(
+            &AnchorTarget::Record("a1".into(), "sha256:x".into()),
+            drag_lines(7, 7),
+        );
+        assert_eq!(pane.annotate_record, Some(("a1".into(), "sha256:x".into())));
+        assert!(
+            pane.annotate_path.is_empty(),
+            "a record aim must clear the path, or submit builds a CodeAnchor"
+        );
+    }
+
+    #[test]
+    fn a_drag_is_scoped_to_the_target_it_started_on() {
+        // `aimed_key` is what stops a drag crossing from one file (or artifact)
+        // into another: a span whose two ends came from different content would
+        // be a signed claim about code that never existed.
+        let mut pane = Pane::loading("c");
+        assert_eq!(pane.aimed_key(), None, "the live stream has no rows");
+
+        pane.aim_at(&AnchorTarget::Code(" lib.rs ".into()), drag_lines(1, 1));
+        assert_eq!(
+            pane.aimed_key(),
+            Some("lib.rs"),
+            "the key is trimmed, since the path is also a free text input"
+        );
+
+        pane.aim_at(
+            &AnchorTarget::Record("a1".into(), "sha256:x".into()),
+            drag_lines(1, 1),
+        );
+        assert_eq!(pane.aimed_key(), Some("a1"));
+        assert_ne!(
+            pane.aimed_key(),
+            Some(AnchorTarget::Code("lib.rs".into()).key()),
+            "a drag started in a diff cannot extend into an artifact's text"
+        );
     }
 }
