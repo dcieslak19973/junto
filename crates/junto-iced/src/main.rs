@@ -1323,8 +1323,18 @@ impl App {
                 let Some(focus) = self.focus else {
                     return Task::none();
                 };
-                if let Some((new_pane, _)) = self.panes.split(axis, focus, Pane::loading("")) {
+                // A split shows what the pane being split showed — duplicate
+                // the focused pane's channel rather than opening a pane on
+                // the empty string, which is unfetchable (no channel to ask
+                // the host for) and, worse, becomes the very next
+                // `open_or_focus`'s split target, silently orphaning it.
+                let Some(channel) = self.panes.get(focus).map(|state| state.channel.clone()) else {
+                    return Task::none();
+                };
+                if let Some((new_pane, _)) = self.panes.split(axis, focus, Pane::loading(&channel))
+                {
                     self.focus = Some(new_pane);
+                    return fetch(new_pane, HOST.to_string(), &channel);
                 }
                 Task::none()
             }
@@ -2734,11 +2744,19 @@ impl App {
         // arbitrary 2D nesting — split any pane on either axis, at any depth.
         let grid = pane_grid::PaneGrid::new(&self.panes, |id, pane, _maximized| {
             pane_grid::Content::new(channel_pane(self, id, pane)).title_bar(
-                pane_grid::TitleBar::new(text(pane.channel.as_str()).size(13))
+                pane_grid::TitleBar::new(text(pane.channel.as_str()).size(15))
                     .controls(Element::from(
                         row![
                             button("↻").on_press(Message::Refresh(id)).padding(4),
-                            button("×").on_press(Message::Close(id)).padding(4),
+                            // `State::close` removes nothing and returns `None`
+                            // when `pane` has no sibling (the single-pane case,
+                            // which is also the app's startup state) — disable
+                            // rather than publish a click that does nothing.
+                            button("×")
+                                .on_press_maybe(
+                                    (self.panes.len() > 1).then_some(Message::Close(id))
+                                )
+                                .padding(4),
                         ]
                         .spacing(6),
                     ))
