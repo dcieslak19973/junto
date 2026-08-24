@@ -9,6 +9,7 @@
 
 mod pointing;
 mod popover;
+mod shell;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
