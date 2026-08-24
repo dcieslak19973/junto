@@ -2843,7 +2843,12 @@ impl App {
             }
         }
 
-        let top_bar = admin_toolbar(self.admin);
+        let top_bar = container(admin_toolbar(self.admin)).padding(Padding {
+            top: 10.0,
+            right: 10.0,
+            bottom: 0.0,
+            left: 10.0,
+        });
         let center: Element<Message> = column![focus_board, adder, ribbon, body.height(Fill)]
             .spacing(10)
             .padding(10)
@@ -2858,6 +2863,7 @@ impl App {
         } else {
             container(left_blade(self))
                 .width(Length::Fixed(self.shell.left_width.get()))
+                .height(Fill)
                 .into()
         };
         let right: Element<Message> = if self.shell.right_collapsed {
@@ -2865,6 +2871,7 @@ impl App {
         } else {
             container(right_blade(self))
                 .width(Length::Fixed(self.shell.right_width.get()))
+                .height(Fill)
                 .into()
         };
 
@@ -6611,9 +6618,9 @@ fn junto_home() -> Option<PathBuf> {
 /// Where the shell's layout state lives — `<junto-home>/ui.toml`, alongside
 /// the host's `keys.toml`. Falls back to a relative path when the home cannot
 /// be resolved; `shell::load` treats an unreadable path as "use defaults".
-fn shell_state_path() -> std::path::PathBuf {
+fn shell_state_path() -> PathBuf {
     junto_home()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .unwrap_or_else(|| PathBuf::from("."))
         .join("ui.toml")
 }
 
