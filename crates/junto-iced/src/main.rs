@@ -76,6 +76,9 @@ struct App {
     /// the custom shared-width Columns layout, not a PaneGrid.
     panes: pane_grid::State<Pane>,
     focus: Option<pane_grid::Pane>,
+    /// Three-pane shell layout — collapse, widths, active blade views.
+    /// Loaded at startup and written back on every change (`shell::save`).
+    shell: shell::ShellState,
     /// Left-to-right pane order (pane_grid's own iteration isn't ordered).
     order: Vec<pane_grid::Pane>,
     /// Available channel names for the type-ahead picker.
@@ -808,6 +811,14 @@ enum Message {
     FocusChipPicked(String, String),
     /// Dismiss the pinned attention card in a pane.
     ClearHighlight(pane_grid::Pane),
+    /// Collapse or expand the left blade.
+    ToggleLeftBlade,
+    /// Collapse or expand the right blade.
+    ToggleRightBlade,
+    /// Switch the left blade's view beneath the pinned nav.
+    LeftViewPicked(shell::LeftView),
+    /// Switch the right blade's view.
+    RightViewPicked(shell::RightView),
     /// Edit the rationale draft for an inline verification act (pane, entry, text).
     ActRationaleChanged(pane_grid::Pane, String, String),
     /// Submit a verification act on an entry (pane, entry, act route, rationale).
@@ -1039,6 +1050,7 @@ impl App {
             join_error: None,
             join_result: None,
             device_key_fingerprint: None,
+            shell: shell::load(&shell_state_path()),
         };
         (
             app,
@@ -1124,6 +1136,26 @@ impl App {
                 if let Some(state) = self.panes.get_mut(pane) {
                     state.highlight_entry = None;
                 }
+                Task::none()
+            }
+            Message::ToggleLeftBlade => {
+                self.shell.toggle_left();
+                self.persist_shell();
+                Task::none()
+            }
+            Message::ToggleRightBlade => {
+                self.shell.toggle_right();
+                self.persist_shell();
+                Task::none()
+            }
+            Message::LeftViewPicked(view) => {
+                self.shell.left_view = view;
+                self.persist_shell();
+                Task::none()
+            }
+            Message::RightViewPicked(view) => {
+                self.shell.right_view = view;
+                self.persist_shell();
                 Task::none()
             }
             Message::ActRationaleChanged(pane, entry_id, value) => {
@@ -2531,6 +2563,12 @@ impl App {
         }
     }
 
+    /// Write shell state to disk, ignoring failure. A layout preference that
+    /// cannot be saved is a lost preference, not an error worth a surface.
+    fn persist_shell(&self) {
+        let _ = shell::save(&shell_state_path(), &self.shell);
+    }
+
     fn subscription(&self) -> iced::Subscription<Message> {
         // One live subscription per pane that is watching a session. The
         // authenticated websocket is preferred WHEREVER an identity to watch as
@@ -2805,15 +2843,35 @@ impl App {
             }
         }
 
+        let top_bar = admin_toolbar(self.admin);
+        let center: Element<Message> = column![focus_board, adder, ribbon, body.height(Fill)]
+            .spacing(10)
+            .padding(10)
+            .into();
+
+        // The three-pane shell: collapsible blades either side of the channel
+        // workspace. Each blade collapses to a stub rather than to zero so the
+        // attention badge stays legible even when the blade is put away
+        // (docs/attention.md — attention is the spine).
+        let left: Element<Message> = if self.shell.left_collapsed {
+            blade_stub(Side::Left, Some(self.focus_items.len()))
+        } else {
+            container(left_blade(self))
+                .width(Length::Fixed(self.shell.left_width.get()))
+                .into()
+        };
+        let right: Element<Message> = if self.shell.right_collapsed {
+            blade_stub(Side::Right, None)
+        } else {
+            container(right_blade(self))
+                .width(Length::Fixed(self.shell.right_width.get()))
+                .into()
+        };
+
         column![
-            admin_toolbar(self.admin),
-            focus_board,
-            adder,
-            ribbon,
-            body.height(Fill)
+            top_bar,
+            row![left, container(center).width(Fill), right].spacing(0),
         ]
-        .spacing(10)
-        .padding(10)
         .into()
     }
 }
@@ -2841,6 +2899,105 @@ fn admin_toolbar(current: Option<AdminView>) -> Element<'static, Message> {
     ]
     .spacing(4)
     .align_y(Center)
+    .into()
+}
+
+/// Which side of the shell a blade sits on — used only to point its stub's
+/// chevron outward and to route the stub's click to the right message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Left,
+    Right,
+}
+
+/// The collapsed form of a blade: a narrow rail carrying a chevron to reopen
+/// it and, on the left, the count of items wanting attention. Collapsing must
+/// not be able to hide that count entirely.
+fn blade_stub<'a>(side: Side, badge: Option<usize>) -> Element<'a, Message> {
+    let (glyph, message) = match side {
+        Side::Left => ("›", Message::ToggleLeftBlade),
+        Side::Right => ("‹", Message::ToggleRightBlade),
+    };
+    let mut rail = column![button(text(glyph).size(13)).on_press(message).padding(4)]
+        .spacing(6)
+        .align_x(Center);
+    if let Some(count) = badge.filter(|count| *count > 0) {
+        rail = rail.push(text(count.to_string()).size(11).color(RED));
+    }
+    container(rail)
+        .width(Length::Fixed(24.0))
+        .height(Fill)
+        .into()
+}
+
+/// The left blade: pinned channel navigation above a switchable
+/// Attention/Sessions view. Nav is pinned rather than switchable so changing
+/// channels never costs a round trip through a view switcher.
+fn left_blade(app: &App) -> Element<'_, Message> {
+    let switcher = row![
+        button(text("attention").size(12))
+            .on_press(Message::LeftViewPicked(shell::LeftView::Attention))
+            .padding(4),
+        button(text("sessions").size(12))
+            .on_press(Message::LeftViewPicked(shell::LeftView::Sessions))
+            .padding(4),
+    ]
+    .spacing(4);
+
+    // Filled in by Task 4 (attention) and Task 5 (sessions).
+    let body: Element<Message> = match app.shell.left_view {
+        shell::LeftView::Attention => text("attention").size(12).into(),
+        shell::LeftView::Sessions => text("sessions").size(12).into(),
+    };
+
+    column![
+        // Pinned nav — replaced with the real channel list in Task 4.
+        container(text("channels").size(12)).height(Length::FillPortion(
+            (app.shell.left_split.get() * 100.0) as u16
+        )),
+        button(text("‹").size(13))
+            .on_press(Message::ToggleLeftBlade)
+            .padding(4),
+        switcher,
+        container(body).height(Length::FillPortion(
+            ((1.0 - app.shell.left_split.get()) * 100.0) as u16
+        )),
+    ]
+    .spacing(6)
+    .padding(8)
+    .into()
+}
+
+/// The right blade: a switchable Artifacts/Lineage view.
+fn right_blade(app: &App) -> Element<'_, Message> {
+    let switcher = row![
+        button(text("artifacts").size(12))
+            .on_press(Message::RightViewPicked(shell::RightView::Artifacts))
+            .padding(4),
+        button(text("lineage").size(12))
+            .on_press(Message::RightViewPicked(shell::RightView::Lineage))
+            .padding(4),
+    ]
+    .spacing(4);
+
+    // Filled in by Task 5.
+    let body: Element<Message> = match app.shell.right_view {
+        shell::RightView::Artifacts => text("artifacts").size(12).into(),
+        shell::RightView::Lineage => text("lineage").size(12).into(),
+    };
+
+    column![
+        row![
+            switcher,
+            button(text("›").size(13))
+                .on_press(Message::ToggleRightBlade)
+                .padding(4)
+        ]
+        .spacing(6),
+        body,
+    ]
+    .spacing(6)
+    .padding(8)
     .into()
 }
 
@@ -6449,6 +6606,15 @@ fn junto_home() -> Option<PathBuf> {
         return Some(PathBuf::from(home));
     }
     std::env::home_dir().map(|home| home.join(".junto"))
+}
+
+/// Where the shell's layout state lives — `<junto-home>/ui.toml`, alongside
+/// the host's `keys.toml`. Falls back to a relative path when the home cannot
+/// be resolved; `shell::load` treats an unreadable path as "use defaults".
+fn shell_state_path() -> std::path::PathBuf {
+    junto_home()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("ui.toml")
 }
 
 /// One record in `<junto-home>/keys.toml` — mirrors `crates/junto/src/keys.rs`'s
