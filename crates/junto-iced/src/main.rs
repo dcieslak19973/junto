@@ -6117,6 +6117,49 @@ where
         .await
 }
 
+/// What the FIRST frame on a freshly opened live socket means.
+enum FirstFrame {
+    /// The handshake is on: sign this nonce.
+    Challenge(String),
+    /// The session has no live document, so there is nothing to watch. The host
+    /// answers that with `End` BEFORE challenging and calls it "graceful, not a
+    /// failure" (`crates/junto/src/live_ws.rs`) — watching a landed session is
+    /// the ordinary case and must close quietly.
+    QuietEnd,
+    /// A real failure, with something worth showing the reviewer.
+    Failed(String),
+}
+
+/// Classify the first frame of a live-socket handshake.
+///
+/// Split out because getting this wrong is user-visible, and was: treating the
+/// pre-challenge `End` as "expected a challenge" put a "handshake failed" line
+/// in the feed every time anyone watched a session that was not currently
+/// running a turn — which became every local watch once the websocket stopped
+/// being remote-only.
+fn classify_first_frame(
+    incoming: Option<
+        Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>,
+    >,
+) -> FirstFrame {
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+    match incoming {
+        Some(Ok(WsMessage::Text(text))) => match serde_json::from_str::<WireFrame>(text.as_str()) {
+            Ok(WireFrame::Challenge { nonce }) => FirstFrame::Challenge(nonce),
+            Ok(WireFrame::End) => FirstFrame::QuietEnd,
+            // The host also refuses before challenging when the session is not
+            // watchable at all; that reason IS worth showing, unlike `End`.
+            Ok(WireFrame::Rejected { reason }) => FirstFrame::Failed(reason),
+            _ => FirstFrame::Failed("handshake failed: expected a challenge".into()),
+        },
+        // A clean close carrying no frame means the same as `End`: nothing to
+        // watch. Only a transport error or a non-text frame is a failure.
+        Some(Ok(WsMessage::Close(_))) | None => FirstFrame::QuietEnd,
+        Some(Ok(_)) => FirstFrame::Failed("handshake failed: expected a challenge".into()),
+        Some(Err(err)) => FirstFrame::Failed(format!("handshake failed: {err}")),
+    }
+}
+
 /// A long-lived subscription streaming a session's live feed from a REMOTE
 /// host's authenticated live websocket (`/channels/{channel}/sessions/{session}/live`)
 /// into `Message::Live`/`Message::Watchers` — the websocket counterpart of
@@ -6172,33 +6215,18 @@ fn live_ws_stream(
         };
         let (mut write, mut read) = socket.split();
 
-        // Handshake: Challenge → Auth → AuthOk (or Rejected/anything else).
-        let nonce = match read.next().await {
-            Some(Ok(WsMessage::Text(text))) => {
-                match serde_json::from_str::<WireFrame>(text.as_str()) {
-                    Ok(WireFrame::Challenge { nonce }) => nonce,
-                    _ => {
-                        let _ = output
-                            .send(Message::Live(
-                                session.clone(),
-                                None,
-                                error_event("handshake failed: expected a challenge".into()),
-                            ))
-                            .await;
-                        let _ = output.send(Message::LiveEnded(session)).await;
-                        return;
-                    }
-                }
+        // Handshake: Challenge → Auth → AuthOk. What the FIRST frame means is
+        // classified by `classify_first_frame`, so the distinction that matters
+        // — a graceful `End` versus a real failure — is unit-tested.
+        let nonce = match classify_first_frame(read.next().await) {
+            FirstFrame::Challenge(nonce) => nonce,
+            FirstFrame::QuietEnd => {
+                let _ = output.send(Message::LiveEnded(session)).await;
+                return;
             }
-            _ => {
+            FirstFrame::Failed(reason) => {
                 let _ = output
-                    .send(Message::Live(
-                        session.clone(),
-                        None,
-                        error_event(
-                            "handshake failed: connection closed before a challenge arrived".into(),
-                        ),
-                    ))
+                    .send(Message::Live(session.clone(), None, error_event(reason)))
                     .await;
                 let _ = output.send(Message::LiveEnded(session)).await;
                 return;
@@ -7047,5 +7075,75 @@ diff --git a/lib.rs b/lib.rs
             invite_countdown_live(true, Some(60_000), 0),
             "an open form with an unexpired code ticks"
         );
+    }
+
+    /// Build the text frame the host would actually send.
+    fn ws_text(
+        frame: &WireFrame,
+    ) -> Option<
+        Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>,
+    > {
+        Some(Ok(tokio_tungstenite::tungstenite::Message::text(
+            serde_json::to_string(frame).expect("WireFrame always serializes"),
+        )))
+    }
+
+    #[test]
+    fn a_pre_challenge_end_closes_quietly_rather_than_failing() {
+        // THE BUG, reported from the running app: the host answers a session
+        // with no live document by sending `End` before any challenge — its own
+        // code calls that "graceful, not a failure" — and the client reported
+        // "handshake failed: expected a challenge". Confirmed against the real
+        // host: the first and only frame for a landed session is {"t":"end"}.
+        // It became visible on every watch once the websocket stopped being
+        // remote-only.
+        assert!(matches!(
+            classify_first_frame(ws_text(&WireFrame::End)),
+            FirstFrame::QuietEnd
+        ));
+    }
+
+    #[test]
+    fn a_challenge_starts_the_handshake() {
+        let framed = ws_text(&WireFrame::Challenge {
+            nonce: "abc123".into(),
+        });
+        match classify_first_frame(framed) {
+            FirstFrame::Challenge(nonce) => assert_eq!(nonce, "abc123"),
+            _ => panic!("expected a challenge"),
+        }
+    }
+
+    #[test]
+    fn a_refusal_surfaces_its_reason_but_end_never_does() {
+        // A `Rejected` reason is actionable ("not a member", "no such
+        // session"); `End` is not, which is the whole distinction.
+        match classify_first_frame(ws_text(&WireFrame::Rejected {
+            reason: "not a member of this channel".into(),
+        })) {
+            FirstFrame::Failed(reason) => assert_eq!(reason, "not a member of this channel"),
+            _ => panic!("expected a failure"),
+        }
+    }
+
+    #[test]
+    fn a_silent_close_is_nothing_to_watch_not_a_failure() {
+        assert!(matches!(classify_first_frame(None), FirstFrame::QuietEnd));
+        assert!(matches!(
+            classify_first_frame(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(
+                None
+            )))),
+            FirstFrame::QuietEnd
+        ));
+    }
+
+    #[test]
+    fn an_unexpected_frame_is_still_a_handshake_failure() {
+        // `AuthOk` before a challenge is genuinely wrong, and must not be
+        // swallowed quietly along with `End`.
+        match classify_first_frame(ws_text(&WireFrame::AuthOk)) {
+            FirstFrame::Failed(reason) => assert!(reason.contains("expected a challenge")),
+            _ => panic!("expected a failure"),
+        }
     }
 }
