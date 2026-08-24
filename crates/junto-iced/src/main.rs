@@ -3995,11 +3995,24 @@ fn pane_body<'a>(
             popup_at: popup_anchor(pane),
             pane,
         });
+        // REVIEW-FIRST ARRANGEMENT (ledger `532826c2`). The session's newest
+        // diff is the pane's PRIMARY object and the entry record becomes a side
+        // panel, because a reviewer arrives wanting to look at code and used to
+        // get a filing cabinet in which code was a collapsed row. Falls back to
+        // the record-only column when the session has no diff at all, rather
+        // than showing an empty code panel.
+        let primary = newest_diff_artifact(&dto.entries, &session_id);
+
         // The session's persisted record: its SessionStarted entry plus every
-        // entry targeting it (memos, artifacts), in timeline order.
+        // entry targeting it (memos, artifacts), in timeline order. The primary
+        // diff is omitted — it is already the main panel, and showing it twice
+        // is how the record got long enough to hide things in.
         let mut record = column![].spacing(8);
         for entry in &dto.entries {
-            if entry.id == session_id || entry.target.as_deref() == Some(session_id.as_str()) {
+            let is_primary = primary.is_some_and(|p| p.id == entry.id);
+            if !is_primary
+                && (entry.id == session_id || entry.target.as_deref() == Some(session_id.as_str()))
+            {
                 record = record.push(timeline_entry(
                     id,
                     entry,
@@ -4026,6 +4039,7 @@ fn pane_body<'a>(
             }
             record = record.push(feed);
         }
+        let record_scroll = scrollable(record).id(pane.scroll_id.clone()).height(Fill);
 
         // Steer (resumes a landed turn, or steers a live one) + interrupt.
         let placeholder = if pane.streaming {
@@ -4047,12 +4061,17 @@ fn pane_body<'a>(
             interrupt_btn,
         ]
         .spacing(6);
-        let mut session_col = column![
-            header,
-            scrollable(record).id(pane.scroll_id.clone()).height(Fill),
-            steer
-        ]
-        .spacing(8);
+        let main_area: Element<Message> = match primary {
+            Some(artifact) => row![
+                container(code_panel(id, pane, artifact, aim)).width(Length::FillPortion(3)),
+                container(record_scroll).width(Length::FillPortion(2)),
+            ]
+            .spacing(10)
+            .height(Fill)
+            .into(),
+            None => record_scroll.into(),
+        };
+        let mut session_col = column![header, main_area, steer].spacing(8);
         // The bottom composer is the fallback surface. While a floating panel is
         // anchored to the clicked row it IS the composer, so showing both would
         // put two comment boxes on screen for one comment.
@@ -4541,6 +4560,43 @@ fn newest_diff_artifact<'a>(entries: &'a [EntryDto], session: &str) -> Option<&'
             && entry.target.as_deref() == Some(session)
             && artifact_label(&entry.summary) == "diff"
     })
+}
+
+/// The session's newest diff, rendered as the pane's primary object rather than
+/// as one collapsed card among many (`532826c2`: "the gesture is fine; reaching
+/// the code is the problem").
+///
+/// It carries no collapse control, and its card is omitted from the side record
+/// so the same diff is never on screen twice. Content normally arrives via the
+/// load-time auto-expand; when it has not (a refresh that raced it, or a
+/// collapse performed before this arrangement put the diff here) the panel
+/// offers a button rather than a stuck spinner, so it can never be dead.
+fn code_panel<'a>(
+    id: pane_grid::Pane,
+    pane: &'a Pane,
+    artifact: &'a EntryDto,
+    aim: Option<Aim<'a>>,
+) -> Element<'a, Message> {
+    let head = row![
+        badge("diff", kind_color("artifact")),
+        text(artifact.summary.clone()).size(12).color(MUTED),
+    ]
+    .spacing(8)
+    .align_y(Center);
+    let body: Element<Message> = match pane.artifacts.get(&artifact.id) {
+        Some(ArtifactContent::Loaded { format, body, md }) => {
+            artifact_body(id, format, body, md.as_deref(), aim)
+        }
+        Some(ArtifactContent::Loading) => text("loading the diff…").size(11).color(MUTED).into(),
+        Some(ArtifactContent::Error(err)) => text(format!("⚠ {err}")).size(11).color(RED).into(),
+        None => button(text("show the diff").size(11))
+            .on_press(Message::ToggleArtifact(id, artifact.id.clone()))
+            .padding(6)
+            .into(),
+    };
+    column![head, scrollable(body).height(Fill)]
+        .spacing(6)
+        .into()
 }
 
 fn chip_style(color: Color, active: bool) -> button::Style {
@@ -6824,6 +6880,92 @@ diff --git a/lib.rs b/lib.rs
                 [Message::AnchorRow(_, path, 2)] if path == "lib.rs"
             ),
             "expected one AnchorRow at lib.rs:2, got {messages:?}"
+        );
+    }
+
+    /// Builds a pane watching session `s1`, whose record holds one diff
+    /// artifact with its content already fetched.
+    fn reviewing_pane() -> (pane_grid::State<Pane>, pane_grid::Pane, &'static str) {
+        const DIFF: &str = "\
+diff --git a/lib.rs b/lib.rs
++++ b/lib.rs
+@@ -1,3 +1,4 @@
+ fn one() {}
++fn two() { println!(\"two\"); }
+";
+        let entry = |id: &str, kind: &str, summary: &str| EntryDto {
+            id: id.into(),
+            author: "omp@oh-my-pi.dev".into(),
+            kind: kind.into(),
+            summary: summary.into(),
+            status: None,
+            unrecognized: false,
+            unverified: false,
+            target: Some("s1".into()),
+            frame: Vec::new(),
+        };
+        let (mut panes, id) = pane_grid::State::new(Pane::loading("c"));
+        let pane = panes.get_mut(id).expect("the pane just created");
+        pane.watched = Some("s1".into());
+        pane.content = Content::Loaded(ChannelDto {
+            id: "c".into(),
+            name: Some("c".into()),
+            closed: false,
+            party: Vec::new(),
+            workspace: None,
+            sessions: Vec::new(),
+            entries: vec![
+                entry("s1", "session", "did a thing"),
+                entry("m1", "memo", "memo: some prose"),
+                entry("a1", "artifact", "diff: lib.rs"),
+            ],
+        });
+        pane.artifacts.insert(
+            "a1".into(),
+            ArtifactContent::Loaded {
+                format: "diff".into(),
+                body: DIFF.into(),
+                md: None,
+            },
+        );
+        (panes, id, DIFF)
+    }
+
+    #[test]
+    fn watching_a_session_puts_its_diff_on_screen_with_no_clicks() {
+        // The review-first arrangement's whole claim (ledger `532826c2`): a
+        // reviewer who opens a session is looking AT the code, having clicked
+        // nothing. Simulating `pane_body` rather than `artifact_body` is the
+        // point — it is the layout, not the diff renderer, that is on trial.
+        let (panes, id, _) = reviewing_pane();
+        let pane = panes.get(id).expect("the pane just built");
+        let mut ui = iced_test::simulator(pane_body(id, pane, &[], &[]));
+
+        ui.find("+fn two() { println!(\"two\"); }")
+            .expect("the diff's added line must be on screen before any click");
+    }
+
+    #[test]
+    fn the_primary_diff_is_not_also_a_card_in_the_side_record() {
+        // Showing it twice is how the record got long enough to hide things in,
+        // so the artifact's own card must be gone - while the memo beside it,
+        // which has no primary panel, stays.
+        let (panes, id, _) = reviewing_pane();
+        let pane = panes.get(id).expect("the pane just built");
+        let mut ui = iced_test::simulator(pane_body(id, pane, &[], &[]));
+
+        ui.find("memo: some prose")
+            .expect("a non-diff entry still belongs in the side record");
+        assert!(
+            ui.find("diff: lib.rs").is_ok(),
+            "the primary panel labels itself with the artifact's summary"
+        );
+        // An artifact card carries a toggle; the primary panel never does, so
+        // with the primary excluded no toggle exists in the pane at all. The
+        // label reads "hide" here because this artifact's content is loaded.
+        assert!(
+            ui.find("hide content ▾").is_err(),
+            "the primary diff must not also appear as a card in the record"
         );
     }
 

@@ -201,13 +201,28 @@ pub struct StreamAnchor {
 ///
 /// Preferring `CodeAnchor` whenever the commit is genuinely known keeps the
 /// stronger claim available without ever fabricating one.
+///
+/// # Entries as well as artifacts
+///
+/// `entry` is any [`EntryId`], not only an `ArtifactAttached` one: a line of an
+/// assertion's rationale is annotatable too (Dan's call, 2026-08-23). An
+/// annotation on an entry is a **remark**, not a **verdict** — a verification
+/// act (`Ratification`/`Park`/`Correction`) changes an entry's *standing*,
+/// while an annotation says something about a line of its *text*, so the two
+/// instruments overlap without conflicting.
+///
+/// The digest is well defined either way: an artifact's comes from its
+/// provenance, and an entry's is the digest of its own canonical bytes
+/// (`docs/adr/0008`), which an append-only log can never change.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RecordAnchor {
-    /// The entry whose content is annotated — for an artifact, the
-    /// `ArtifactAttached` entry, whose id *is* the artifact's id.
+    /// The entry whose content is annotated: an `ArtifactAttached` entry —
+    /// whose id *is* the artifact's id — or any other entry, to annotate its
+    /// own text.
     pub entry: EntryId,
-    /// Digest of the annotated content, taken from that entry's provenance, so
-    /// an anchor and the bytes it was taken against can always be matched.
+    /// Digest of the annotated content, so an anchor and the bytes it was taken
+    /// against can always be matched: an artifact's provenance digest, or the
+    /// entry's own canonical-bytes digest.
     pub digest: ContentDigest,
     /// The annotated line span within the content.
     pub span: Span,
