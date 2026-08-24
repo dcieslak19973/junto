@@ -53,9 +53,12 @@ const BLUE: Color = Color::from_rgb(0.537, 0.706, 0.980); // --accent #89b4fa
 
 fn main() -> iced::Result {
     let icon = iced::window::icon::from_file_data(include_bytes!("../icon.png"), None).ok();
-    iced::application("junto — native spike", App::update, App::view)
+    // 0.14 takes the boot function FIRST and sets the title separately; the
+    // old `application(title, ..).run_with(boot)` shape is gone.
+    iced::application(App::new, App::update, App::view)
+        .title("junto — native spike")
         .subscription(App::subscription)
-        .theme(|_| Theme::CatppuccinMocha)
+        .theme(|_: &App| Theme::CatppuccinMocha)
         // The web uses `Inter, system-ui, sans-serif`; on Windows system-ui is
         // Segoe UI (used by name at runtime — not bundled, so no redistribution).
         // Cross-platform parity later = bundle Inter (OFL, MIT-compatible).
@@ -66,7 +69,7 @@ fn main() -> iced::Result {
             size: Size::new(1400.0, 1040.0),
             ..Default::default()
         })
-        .run_with(App::new)
+        .run()
 }
 
 struct App {
@@ -234,7 +237,7 @@ struct Pane {
     /// feedback and disables the buttons until the host responds.
     act_pending: HashSet<String>,
     /// The timeline scrollable's id, so we can snap it to the newest entry.
-    scroll_id: scrollable::Id,
+    scroll_id: iced::widget::Id,
     /// Expanded artifacts' inline content, keyed by artifact entry id. Absent =
     /// collapsed; present = expanded (loading / loaded / error).
     artifacts: HashMap<String, ArtifactContent>,
@@ -1158,10 +1161,7 @@ impl App {
                         // Task 13) — every view.json load keeps keys.json
                         // in step.
                         Task::batch([
-                            scrollable::snap_to(
-                                state.scroll_id.clone(),
-                                scrollable::RelativeOffset::END,
-                            ),
+                            iced::widget::operation::snap_to_end(state.scroll_id.clone()),
                             fetch_brief(pane, base.clone(), channel.clone()),
                             fetch_keys(pane, base, &channel),
                         ])
@@ -1243,9 +1243,7 @@ impl App {
                     }
                 }
                 // Keep the newest live output in view.
-                scroll.map_or_else(Task::none, |id| {
-                    scrollable::snap_to(id, scrollable::RelativeOffset::END)
-                })
+                scroll.map_or_else(Task::none, iced::widget::operation::snap_to_end)
             }
             Message::LiveEnded(session) => {
                 let mut to_refresh = None;
@@ -1689,7 +1687,7 @@ impl App {
                 let scroll = state.scroll_id.clone();
                 Task::batch([
                     post_steer(pane, base, channel, session, text),
-                    scrollable::snap_to(scroll, scrollable::RelativeOffset::END),
+                    iced::widget::operation::snap_to_end(scroll),
                 ])
             }
             Message::Steered(pane, result) => {
@@ -2421,26 +2419,45 @@ impl App {
                     .as_ref()
                     .filter(|_| state.streaming)
                     .map(|session| {
-                        // Id includes the nonce so a new turn restarts the stream.
-                        let id = (session.clone(), state.stream_nonce);
                         // The typed override, else this machine's own identity.
                         let email = watch_identity(&state.watch_email, identity_email);
+                        // 0.14 replaced `run_with_id(id, stream)` with
+                        // `run_with(data, builder)`, where `builder` is a plain
+                        // fn pointer and `data` is BOTH the stream's input and
+                        // its identity — so the nonce rides in the data, which
+                        // is what makes a new turn restart the subscription.
                         match email {
-                            Some(email) => iced::Subscription::run_with_id(
-                                id,
-                                live_ws_stream(
+                            Some(email) => iced::Subscription::run_with(
+                                (
                                     state.base().to_string(),
                                     state.channel.clone(),
                                     session.clone(),
                                     email,
+                                    state.stream_nonce,
                                 ),
+                                |(base, channel, session, email, _nonce): &(
+                                    String,
+                                    String,
+                                    String,
+                                    String,
+                                    u64,
+                                )| {
+                                    live_ws_stream(
+                                        base.clone(),
+                                        channel.clone(),
+                                        session.clone(),
+                                        email.clone(),
+                                    )
+                                },
                             ),
                             // No identity anywhere: a websocket would only fail
                             // its handshake, so keep the unauthenticated local
                             // progress feed (and no composer, honestly).
-                            None => iced::Subscription::run_with_id(
-                                id,
-                                session_stream(state.channel.clone(), session.clone()),
+                            None => iced::Subscription::run_with(
+                                (state.channel.clone(), session.clone(), state.stream_nonce),
+                                |(channel, session, _nonce): &(String, String, u64)| {
+                                    session_stream(channel.clone(), session.clone())
+                                },
                             ),
                         }
                     })
@@ -2671,11 +2688,11 @@ fn admin_toolbar(current: Option<AdminView>) -> Element<'static, Message> {
     };
     row![
         text("junto").size(15),
-        Space::with_width(16),
+        Space::new().width(16),
         tab("channels", None),
         tab("settings", Some(AdminView::Settings)),
         tab("agents", Some(AdminView::Agents)),
-        Space::with_width(Fill),
+        Space::new().width(Fill),
         button(text("↻ refresh").size(12))
             .on_press(Message::RefreshAll)
             .padding([4, 12])
@@ -2894,7 +2911,7 @@ fn agents_panel(app: &App) -> Element<'_, Message> {
                 text(truncate(&role, 70)).size(11).color(MUTED),
             ]
             .spacing(2),
-            Space::with_width(Fill),
+            Space::new().width(Fill),
             button(text("edit").size(11))
                 .on_press(Message::AgentEdit(a.clone()))
                 .padding([2, 8])
@@ -3045,7 +3062,7 @@ fn agents_panel(app: &App) -> Element<'_, Message> {
 fn title_row(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
     row![
         text(pane.channel.clone()).size(15),
-        Space::with_width(Fill),
+        Space::new().width(Fill),
         button("↻").on_press(Message::Refresh(id)).padding(4),
         button("×").on_press(Message::Close(id)).padding(4),
     ]
@@ -3137,15 +3154,11 @@ fn column_pane<'a>(
 /// The curated brief (recall bridge) rendered as Markdown in a card at the top
 /// of a pane — standing decisions + what needs attention.
 fn brief_panel<'a>(items: &'a [markdown::Item], raw: &str) -> Element<'a, Message> {
-    let body = markdown::view(
-        items,
-        markdown::Settings::default(),
-        markdown::Style::from_palette(Theme::CatppuccinMocha.palette()),
-    )
-    .map(|url| Message::OpenUrl(url.to_string()));
+    let body =
+        markdown::view(items, Theme::CatppuccinMocha).map(|url| Message::OpenUrl(url.to_string()));
     let head = row![
         text("brief").size(11).color(TEAL),
-        Space::with_width(Fill),
+        Space::new().width(Fill),
         copy_button(raw.to_string()),
     ]
     .align_y(Center);
@@ -3449,7 +3462,8 @@ fn identity_form<'a>(
                 .align_y(Center);
             for (idx, (name, ticked)) in pane.identity_channels.iter().enumerate() {
                 channels = channels.push(
-                    checkbox(name.clone(), *ticked)
+                    checkbox(*ticked)
+                        .label(name.clone())
                         .on_toggle(move |_| Message::IdentityChannelToggle(id, idx))
                         .size(13)
                         .text_size(11),
@@ -3659,7 +3673,8 @@ fn annotate_composer(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
         .on_submit(Message::AnnotateSubmit(id))
         .size(12)
         .padding(6);
-    let urgent = checkbox("urgent", pane.annotate_urgent)
+    let urgent = checkbox(pane.annotate_urgent)
+        .label("urgent")
         .on_toggle(move |on| Message::AnnotateUrgentToggled(id, on))
         .size(14)
         .text_size(11);
@@ -3723,7 +3738,7 @@ fn aim_label(pane: &Pane) -> String {
 fn annotate_popup(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
     let head = row![
         text(aim_label(pane)).size(11).color(TEAL),
-        Space::with_width(Fill),
+        Space::new().width(Fill),
         button(text("×").size(12))
             .on_press(Message::AnchorClear(id))
             .padding([0, 6])
@@ -3736,7 +3751,8 @@ fn annotate_popup(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
         .on_submit(Message::AnnotateSubmit(id))
         .size(12)
         .padding(6);
-    let urgent = checkbox("urgent", pane.annotate_urgent)
+    let urgent = checkbox(pane.annotate_urgent)
+        .label("urgent")
         .on_toggle(move |on| Message::AnnotateUrgentToggled(id, on))
         .size(14)
         .text_size(11);
@@ -3747,7 +3763,7 @@ fn annotate_popup(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
         column![
             head,
             body_input,
-            row![Space::with_width(Fill), urgent, submit]
+            row![Space::new().width(Fill), urgent, submit]
                 .spacing(8)
                 .align_y(Center),
         ]
@@ -3872,7 +3888,8 @@ fn pane_body<'a>(
     };
     // Mode as a checkbox (matches the web): unchecked = a single turn (default);
     // checked = the code-PR push-gate verify/Grader loop (docs/adr/0025).
-    let mode_checkbox = checkbox("code-PR push-gate (verify loop)", pane.launch_outcome)
+    let mode_checkbox = checkbox(pane.launch_outcome)
+        .label("code-PR push-gate (verify loop)")
         .on_toggle(move |on| Message::LaunchModeChanged(id, on))
         .size(16)
         .text_size(12);
@@ -3932,7 +3949,7 @@ fn pane_body<'a>(
         if !pane.watchers.is_empty() {
             header = header.push(watchers_chip(&pane.watchers));
         }
-        header = header.push(Space::with_width(Fill));
+        header = header.push(Space::new().width(Fill));
         header = header.push(
             button(text("× close").size(11))
                 .on_press(Message::CloseSession(id))
@@ -4030,7 +4047,7 @@ fn pane_body<'a>(
             dto.entries.iter().find(|e| e.id == hid).map(|entry| {
                 let header = row![
                     text("▾ needs you").size(11).color(YELLOW),
-                    Space::with_width(Fill),
+                    Space::new().width(Fill),
                     button(text("dismiss").size(11).color(MUTED))
                         .on_press(Message::ClearHighlight(id))
                         .padding([2, 8])
@@ -4145,35 +4162,38 @@ fn feed_block<'a>(
     let gutter: Element<Message> = match item.op {
         Some(op) => {
             let lit = picked == Some(op);
-            button(Space::new(Length::Fixed(3.0), Length::Fixed(14.0)))
-                .on_press(Message::AnchorStream(id, op))
-                .width(GUTTER)
-                .padding([0, 5])
-                .style(move |_theme, status| {
-                    let hovered =
-                        matches!(status, button::Status::Hovered | button::Status::Pressed);
-                    button::Style {
-                        background: Some(Background::Color(if lit {
-                            MAUVE
-                        } else if hovered {
-                            Color { a: 0.75, ..MAUVE }
-                        } else {
-                            // Dim but present: a reviewer has to be able to see
-                            // that the target exists before hovering it.
-                            Color { a: 0.30, ..MUTED }
-                        })),
-                        border: Border {
-                            radius: 2.0.into(),
-                            ..Border::default()
-                        },
-                        ..button::Style::default()
-                    }
-                })
-                .into()
+            button(
+                Space::new()
+                    .width(Length::Fixed(3.0))
+                    .height(Length::Fixed(14.0)),
+            )
+            .on_press(Message::AnchorStream(id, op))
+            .width(GUTTER)
+            .padding([0, 5])
+            .style(move |_theme, status| {
+                let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+                button::Style {
+                    background: Some(Background::Color(if lit {
+                        MAUVE
+                    } else if hovered {
+                        Color { a: 0.75, ..MAUVE }
+                    } else {
+                        // Dim but present: a reviewer has to be able to see
+                        // that the target exists before hovering it.
+                        Color { a: 0.30, ..MUTED }
+                    })),
+                    border: Border {
+                        radius: 2.0.into(),
+                        ..Border::default()
+                    },
+                    ..button::Style::default()
+                }
+            })
+            .into()
         }
         // A line the app invented locally exists in no document, so there is
         // no op id to name and nothing to point at.
-        None => Space::with_width(GUTTER).into(),
+        None => Space::new().width(GUTTER).into(),
     };
     row![gutter, feed_line(item)]
         .spacing(4)
@@ -4205,12 +4225,8 @@ fn feed_line(item: &FeedItem) -> Element<'_, Message> {
     }
     // Model prose renders as Markdown; status/tool/error lines stay plain.
     if let Some(md) = &item.md {
-        return markdown::view(
-            md,
-            markdown::Settings::default(),
-            markdown::Style::from_palette(Theme::CatppuccinMocha.palette()),
-        )
-        .map(|url| Message::OpenUrl(url.to_string()));
+        return markdown::view(md, Theme::CatppuccinMocha)
+            .map(|url| Message::OpenUrl(url.to_string()));
     }
     let event = &item.event;
     let body = if event.html {
@@ -4511,7 +4527,7 @@ fn entry_acts(entry: &EntryDto) -> Option<(&'static str, &'static str)> {
 /// continuous connecting line needs a `Fill` height, which Iced forbids inside
 /// a scrollable — dots-only still reads as a node history.)
 fn rail(color: Color) -> Element<'static, Message> {
-    column![Space::with_height(6), dot(color)]
+    column![Space::new().height(6), dot(color)]
         .align_x(Center)
         .width(Length::Fixed(18.0))
         .into()
@@ -4519,7 +4535,7 @@ fn rail(color: Color) -> Element<'static, Message> {
 
 /// A small filled circle (a history node).
 fn dot(color: Color) -> Element<'static, Message> {
-    container(Space::new(0.0, 0.0))
+    container(Space::new())
         .width(Length::Fixed(11.0))
         .height(Length::Fixed(11.0))
         .style(move |_theme| container::Style {
@@ -4574,17 +4590,12 @@ fn entry_card<'a>(
     if show_unverified {
         head = head.push(badge("unverified", YELLOW));
     }
-    head = head.push(Space::with_width(Fill));
+    head = head.push(Space::new().width(Fill));
     head = head.push(copy_button(entry.summary.clone()));
 
     // The body: a session memo renders as Markdown; everything else is plain.
     let body: Element<Message> = if let Some(items) = summary_md {
-        markdown::view(
-            items,
-            markdown::Settings::default(),
-            markdown::Style::from_palette(Theme::CatppuccinMocha.palette()),
-        )
-        .map(|url| Message::OpenUrl(url.to_string()))
+        markdown::view(items, Theme::CatppuccinMocha).map(|url| Message::OpenUrl(url.to_string()))
     } else {
         text(entry.summary.clone()).size(13).color(TEXT).into()
     };
@@ -4613,7 +4624,7 @@ fn entry_card<'a>(
             let color = if affirmative { GREEN } else { RED };
             let inner = row![
                 text(opt.label.clone()).size(11),
-                Space::with_width(Fill),
+                Space::new().width(Fill),
                 text(opt.act.clone()).size(10),
             ]
             .spacing(8)
@@ -4704,8 +4715,9 @@ fn entry_card<'a>(
                 card = card.push(text(format!("⚠ {err}")).size(11).color(RED));
             }
             Some(ArtifactContent::Loaded { format, body, md }) => {
-                card = card
-                    .push(row![Space::with_width(Fill), copy_button(body.clone())].align_y(Center));
+                card = card.push(
+                    row![Space::new().width(Fill), copy_button(body.clone())].align_y(Center),
+                );
                 card = card.push(artifact_body(id, format, body, md.as_deref(), aim));
             }
             None => {}
@@ -4798,12 +4810,8 @@ fn artifact_body<'a>(
     // A memo renders as formatted Markdown.
     if let Some(items) = md {
         return container(
-            markdown::view(
-                items,
-                markdown::Settings::default(),
-                markdown::Style::from_palette(Theme::CatppuccinMocha.palette()),
-            )
-            .map(|url| Message::OpenUrl(url.to_string())),
+            markdown::view(items, Theme::CatppuccinMocha)
+                .map(|url| Message::OpenUrl(url.to_string())),
         )
         .padding(8)
         .width(Fill)
@@ -5101,7 +5109,7 @@ impl Pane {
             act_drafts: HashMap::new(),
             act_errors: HashMap::new(),
             act_pending: HashSet::new(),
-            scroll_id: scrollable::Id::unique(),
+            scroll_id: iced::widget::Id::unique(),
             artifacts: HashMap::new(),
             launch_expanded: false,
             show_full_history: false,
@@ -5953,7 +5961,7 @@ fn fetch_channels() -> Task<Message> {
 /// (`/channels/{channel}/sessions/{session}/stream`) into `Message::Live`.
 fn session_stream(channel: String, session: String) -> impl iced::futures::Stream<Item = Message> {
     use iced::futures::{SinkExt, StreamExt};
-    iced::stream::channel(64, move |mut output| async move {
+    iced::stream::channel::<Message>(64, move |mut output: mpsc::Sender<Message>| async move {
         let url = format!("{HOST}/channels/{channel}/sessions/{session}/stream");
         let Ok(response) = reqwest::get(&url).await else {
             let _ = output.send(Message::LiveEnded(session)).await;
@@ -6135,7 +6143,7 @@ fn live_ws_stream(
     use iced::futures::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-    iced::stream::channel(64, move |mut output| async move {
+    iced::stream::channel::<Message>(64, move |mut output: mpsc::Sender<Message>| async move {
         let Some(signing_key) = load_signing_key(&email) else {
             let _ = output
                 .send(Message::Live(
