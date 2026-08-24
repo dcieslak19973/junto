@@ -172,9 +172,56 @@ pub struct StreamAnchor {
     pub op_id: String,
 }
 
-/// What an [`Annotation`] is pinned to: a span of code at a commit, or a
-/// position in a live stream. Tagged so the two shapes are distinguishable
-/// on the wire without a separate discriminant field.
+/// An anchor into content that is **already in the record**: a line span inside
+/// a stored artifact, identified by the entry that attached it and pinned by
+/// that content's digest.
+///
+/// Unlike [`CodeAnchor`] this needs no commit and no re-anchoring pass. An
+/// `ArtifactAttached` entry's own id *is* the artifact's id, its provenance
+/// carries a [`ContentDigest`], and the ledger is append-only — so the content
+/// under this anchor can never change and the anchor is **exact forever by
+/// construction**. That is what distinguishes it from the `DocAnchor` still
+/// owed for *mutable, external* documents, whose whole difficulty is detecting
+/// that a quote has moved or been deleted.
+///
+/// # Choosing between this and [`CodeAnchor`] for a diff
+///
+/// A diff artifact can be pointed at either way, and which is correct depends
+/// on whether the diff's **new side exists at a commit**:
+///
+/// - **Committed** — the new side is some commit's content, so
+///   [`CodeAnchor`] is right: it names the file and lines *in the code*, which
+///   survives the artifact and can be re-read from the repository.
+/// - **Uncommitted** — the usual per-turn "uncommitted changes in …" artifact.
+///   Its added lines exist at *no* commit, and the oid such a diff is captured
+///   against is its **base**, so a `CodeAnchor` built from it would number
+///   lines against a file that does not contain them. `RecordAnchor` is the
+///   honest choice: it anchors the artifact's text, which is exactly what the
+///   reviewer was looking at.
+///
+/// Preferring `CodeAnchor` whenever the commit is genuinely known keeps the
+/// stronger claim available without ever fabricating one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RecordAnchor {
+    /// The entry whose content is annotated — for an artifact, the
+    /// `ArtifactAttached` entry, whose id *is* the artifact's id.
+    pub entry: EntryId,
+    /// Digest of the annotated content, taken from that entry's provenance, so
+    /// an anchor and the bytes it was taken against can always be matched.
+    pub digest: ContentDigest,
+    /// The annotated line span within the content.
+    pub span: Span,
+}
+
+/// What an [`Annotation`] is pinned to: a span of code at a commit, a position
+/// in a live stream, or a span of content already in the record. Tagged so the
+/// shapes are distinguishable on the wire without a separate discriminant
+/// field.
+///
+/// The tag is **internal** (`kind`), so adding a variant is additive: existing
+/// `{"kind":"code",…}` and `{"kind":"stream",…}` values gain no field and move
+/// no byte, leaving their canonical bytes — and therefore their signatures
+/// (`docs/adr/0033`) — untouched.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Anchor {
@@ -182,6 +229,8 @@ pub enum Anchor {
     Code(CodeAnchor),
     /// Pinned to a position in a live collaborative stream.
     Stream(StreamAnchor),
+    /// Pinned to a line span of content already in the record.
+    Record(RecordAnchor),
 }
 
 /// Identifies a single [`Annotation`] — the same transparent-UUID pattern as
@@ -439,5 +488,65 @@ mod tests {
         assert!(Annotation::from_canonical_bytes(&annotation_bytes_with_span(7, 3)).is_err());
         // A valid span still deserializes.
         assert!(Annotation::from_canonical_bytes(&annotation_bytes_with_span(3, 3)).is_ok());
+    }
+
+    #[test]
+    fn record_anchor_round_trips() {
+        let a = Anchor::Record(RecordAnchor {
+            entry: crate::EntryId::new(),
+            digest: ContentDigest::new("sha256:deadbeef").unwrap(),
+            span: Span::new(2, 4).unwrap(),
+        });
+        let json = serde_json::to_string(&a).unwrap();
+        assert!(json.contains("\"kind\":\"record\""), "{json}");
+        assert_eq!(a, serde_json::from_str::<Anchor>(&json).unwrap());
+    }
+
+    #[test]
+    fn adding_the_record_variant_moved_no_existing_anchor_bytes() {
+        // THE PERMANENCE CLAIM the `Anchor::Record` proposal rests on, asserted
+        // rather than argued: `Anchor` is internally tagged, so an existing
+        // value gains no field and moves no byte when a third variant exists
+        // beside it. If this ever fails, every annotation signed before the
+        // variant landed stops verifying (`docs/adr/0033`).
+        //
+        // The literal below is the wire form of an annotation actually archived
+        // by a live session on 2026-08-23, copied verbatim from its live-plane
+        // snapshot rather than reconstructed.
+        let archived = r#"{"blob":"sha256:unpinned","commit":"eccb1dad8bce59205d2e57896680d00433d4edb8","kind":"code","path":"lib.rs","span":{"end":4,"start":2}}"#;
+        let anchor: Anchor = serde_json::from_str(archived).expect("still deserializes");
+        match &anchor {
+            Anchor::Code(code) => {
+                assert_eq!(code.path, "lib.rs");
+                assert_eq!((code.span.start, code.span.end), (2, 4));
+            }
+            other => panic!("expected a code anchor, got {other:?}"),
+        }
+        // Re-serializing yields the same field set — no new key, no `record`
+        // discriminant leaking into a code anchor.
+        let again: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&anchor).unwrap()).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(archived).unwrap();
+        assert_eq!(again, expected, "an existing anchor's bytes must not move");
+    }
+
+    #[test]
+    fn a_record_anchor_needs_no_commit_and_a_code_anchor_still_does() {
+        // The distinction Dan drew: a committed diff should be pinned to the
+        // code at its commit, while an UNCOMMITTED diff's added lines exist at
+        // no commit at all and must be anchored as record content instead. The
+        // types enforce it — `RecordAnchor` has no commit field to fabricate.
+        let record = RecordAnchor {
+            entry: crate::EntryId::new(),
+            digest: ContentDigest::new("sha256:abc").unwrap(),
+            span: Span::new(1, 1).unwrap(),
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&Anchor::Record(record)).unwrap()).unwrap();
+        assert!(
+            json.get("commit").is_none(),
+            "a record anchor must never carry a commit: {json}"
+        );
+        assert_eq!(json["kind"], "record");
     }
 }
