@@ -2660,7 +2660,30 @@ impl App {
         });
         let countdown_tick = counting_down
             .then(|| iced::time::every(std::time::Duration::from_secs(1)).map(|_| Message::Tick));
-        iced::Subscription::batch(streams.into_iter().chain([tick]).chain(countdown_tick))
+        // Zed's dock bindings, since that is the reference point. These add no
+        // state: they fire the same messages the chevrons do. The
+        // command/control guard is load-bearing — without it a bare "b" or
+        // "r" typed into the new-channel field or the composer would steal
+        // the keystroke and toggle a blade instead of inserting the letter.
+        let keys = iced::keyboard::listen().filter_map(|event| {
+            let iced::keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
+                return None;
+            };
+            if !(modifiers.command() || modifiers.control()) {
+                return None;
+            }
+            match key.as_ref() {
+                iced::keyboard::Key::Character("b") => Some(Message::ToggleLeftBlade),
+                iced::keyboard::Key::Character("r") => Some(Message::ToggleRightBlade),
+                _ => None,
+            }
+        });
+        iced::Subscription::batch(
+            streams
+                .into_iter()
+                .chain([tick, keys])
+                .chain(countdown_tick),
+        )
     }
 
     fn view(&self) -> Element<'_, Message> {
