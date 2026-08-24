@@ -4027,8 +4027,26 @@ fn pane_body<'a>(
         // The bottom composer is the fallback surface. While a floating panel is
         // anchored to the clicked row it IS the composer, so showing both would
         // put two comment boxes on screen for one comment.
-        if pane.annotate_tx.is_some() && popup_anchor(pane).is_none() {
-            session_col = session_col.push(annotate_composer(id, pane));
+        if pane.annotate_tx.is_some() {
+            if popup_anchor(pane).is_none() {
+                session_col = session_col.push(annotate_composer(id, pane));
+            }
+        } else {
+            // Say why there is nothing to click. Pointing needs a live,
+            // authenticated socket, because a `CodeAnchor`'s commit may only
+            // come from a `Message::WorktreeDiff` that actually arrived on the
+            // wire — so on a landed session the diff rows are deliberately
+            // inert. They look identical either way, and the host closes a
+            // finished session's socket silently, so without this line the
+            // reviewer just finds that clicking does nothing.
+            session_col = session_col.push(
+                text(
+                    "commenting needs a live turn — steer above to resume this \
+                     session, then click a diff line",
+                )
+                .size(11)
+                .color(MUTED),
+            );
         }
         session_col.into()
     } else {
