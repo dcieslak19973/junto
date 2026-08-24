@@ -6629,6 +6629,75 @@ fn post_steer(
 mod tests {
     use super::*;
 
+    /// Headless UI test, which is the reason for the 0.14 upgrade. Verifying
+    /// that clicking a diff row emits the right anchor used to mean driving the
+    /// real window through Win32 — stolen focus, DPI-scaled coordinates, and
+    /// dropped keystrokes. `iced_test` selects a widget BY ITS TEXT and clicks
+    /// it in memory, so the same claim is now an ordinary assertion.
+    #[test]
+    fn clicking_a_rendered_diff_row_emits_that_rows_anchor() {
+        let diff = "\
+diff --git a/lib.rs b/lib.rs
++++ b/lib.rs
+@@ -1,3 +1,4 @@
+ fn one() {}
+-fn two() {}
++fn two() { println!(\"two\"); }
+ fn three() {}
+";
+        // A pane is only needed so the aimed row can build its panel; nothing
+        // is aimed here, so the rows are plain click targets.
+        let (panes, id) = pane_grid::State::new(Pane::loading("c"));
+        let pane = panes.get(id).expect("the pane just created");
+        let aim = Aim {
+            path: "",
+            span: None,
+            popup_at: None,
+            pane,
+        };
+
+        let mut ui = iced_test::simulator(artifact_body(id, "diff", diff, None, Some(aim)));
+
+        // The added line is row 5 of the diff and line 2 of the NEW file: the
+        // removed row above it consumes no new-file line.
+        ui.click("+fn two() { println!(\"two\"); }")
+            .expect("the added row is a click target");
+        let messages: Vec<Message> = ui.into_messages().collect();
+
+        assert!(
+            matches!(
+                messages.as_slice(),
+                [Message::AnchorRow(_, path, 2)] if path == "lib.rs"
+            ),
+            "expected one AnchorRow at lib.rs:2, got {messages:?}"
+        );
+    }
+
+    #[test]
+    fn clicking_a_removed_diff_row_emits_nothing() {
+        // A removed line has no new-file number, so it must not be a target —
+        // the same claim as `diff_row_targets`' unit tests, asserted here
+        // through the rendered widget tree instead of the mapper.
+        let diff = "+++ b/lib.rs\n@@ -1,2 +1,1 @@\n-fn gone() {}\n fn stays() {}\n";
+        let (panes, id) = pane_grid::State::new(Pane::loading("c"));
+        let pane = panes.get(id).expect("the pane just created");
+        let aim = Aim {
+            path: "",
+            span: None,
+            popup_at: None,
+            pane,
+        };
+
+        let mut ui = iced_test::simulator(artifact_body(id, "diff", diff, None, Some(aim)));
+        let _ = ui.click("-fn gone() {}");
+        let messages: Vec<Message> = ui.into_messages().collect();
+
+        assert!(
+            messages.is_empty(),
+            "a removed row must not anchor, got {messages:?}"
+        );
+    }
+
     #[test]
     fn ws_url_swaps_http_and_https_schemes() {
         assert_eq!(

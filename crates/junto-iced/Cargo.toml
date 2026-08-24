@@ -42,4 +42,7 @@ junto-live = { path = "../junto-live" }
 toml = "0.9"
 
 [workspace]
+
+[dev-dependencies]
+iced_test = "0.14"
 # standalone — see the header comment
