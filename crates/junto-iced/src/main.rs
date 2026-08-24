@@ -2840,7 +2840,7 @@ fn blade_stub<'a>(side: Side, badge: Option<usize>) -> Element<'a, Message> {
 /// channels plus a name field, substrate picker, and error display for a
 /// new one.
 fn adder(app: &App) -> Element<'_, Message> {
-    let adder_row = row![
+    let open_row = row![
         text("open ▸").size(13).color(MUTED),
         combo_box(
             &app.channels,
@@ -2848,19 +2848,25 @@ fn adder(app: &App) -> Element<'_, Message> {
             None,
             Message::ChannelPicked,
         )
-        .width(260),
+        .width(Fill),
+    ]
+    .spacing(8)
+    .align_y(Center);
+    let new_row = row![
         text("· new ▸").size(13).color(MUTED),
         text_input("new channel name…", &app.new_channel)
             .on_input(Message::NewChannelChanged)
             .on_submit(Message::CreateChannel)
-            .width(200)
+            .width(Fill)
             .padding(6),
+        button("create").on_press(Message::CreateChannel).padding(6),
     ]
     .spacing(8)
     .align_y(Center);
+    let mut adder_col = column![open_row, new_row].spacing(6);
     // When several substrates are registered, the host needs to know which.
-    let adder_row = if app.substrates.len() > 1 {
-        adder_row.push(
+    if app.substrates.len() > 1 {
+        adder_col = adder_col.push(
             pick_list(
                 app.substrates.clone(),
                 app.new_channel_repo.clone(),
@@ -2868,16 +2874,13 @@ fn adder(app: &App) -> Element<'_, Message> {
             )
             .text_size(12)
             .padding(6),
-        )
-    } else {
-        adder_row
-    };
-    let adder_row = adder_row.push(button("create").on_press(Message::CreateChannel).padding(6));
+        );
+    }
     match &app.new_channel_error {
-        Some(err) => column![adder_row, text(format!("⚠ {err}")).size(11).color(RED)]
-            .spacing(4)
+        Some(err) => adder_col
+            .push(text(format!("⚠ {err}")).size(11).color(RED))
             .into(),
-        None => adder_row.into(),
+        None => adder_col.into(),
     }
 }
 
@@ -2933,7 +2936,12 @@ fn attention_view(app: &App) -> Element<'_, Message> {
     if app.focus_items.is_empty() {
         return text("focus · all clear").size(13).color(GREEN).into();
     }
-    let mut items = column![].spacing(4);
+    let mut items = column![
+        text(format!("needs you ({}) ▸", app.focus_items.len()))
+            .size(13)
+            .color(YELLOW)
+    ]
+    .spacing(4);
     for item in &app.focus_items {
         items = items.push(focus_chip(item));
     }
@@ -2956,20 +2964,18 @@ fn left_blade(app: &App) -> Element<'_, Message> {
 
     let body: Element<Message> = match app.shell.left_view {
         shell::LeftView::Attention => attention_view(app),
+        // Filled in by Task 5.
         shell::LeftView::Sessions => text("sessions").size(12).into(),
     };
 
     column![
-        row![
-            button(text("‹").size(13))
-                .on_press(Message::ToggleLeftBlade)
-                .padding(4),
-            switcher,
-        ]
-        .spacing(6),
+        button(text("‹").size(13))
+            .on_press(Message::ToggleLeftBlade)
+            .padding(4),
         container(channel_nav(app)).height(Length::FillPortion(
             (app.shell.left_split.get() * 100.0) as u16
         )),
+        switcher,
         container(body).height(Length::FillPortion(
             ((1.0 - app.shell.left_split.get()) * 100.0) as u16
         )),
