@@ -280,6 +280,9 @@ struct Pane {
     /// disclosure instead of silently reading as "no members" (a fetch
     /// failure and a genuinely empty roster must never look the same).
     keys_error: Option<String>,
+    /// Whether this pane has already auto-expanded a session's newest diff.
+    /// Set once so a manual collapse is not undone by the next refetch.
+    auto_expanded: bool,
     /// Whether the members disclosure is expanded.
     members_open: bool,
     /// The founder identity act currently open in this pane, if any — the
@@ -1152,6 +1155,20 @@ impl App {
                                 state.worktree_commit = None;
                             }
                         }
+                        // Put the code on screen without hunting for it: a
+                        // watched session's newest diff artifact is expanded
+                        // once, automatically (ledger `532826c2`). Once only,
+                        // so collapsing it by hand is not undone by the next
+                        // refetch.
+                        let auto_expand = state
+                            .watched
+                            .as_deref()
+                            .filter(|_| !state.auto_expanded)
+                            .and_then(|session| newest_diff_artifact(&dto.entries, session))
+                            .map(|entry| entry.id.clone());
+                        if auto_expand.is_some() {
+                            state.auto_expanded = true;
+                        }
                         state.content = Content::Loaded(dto);
                         let base = state.base().to_string();
                         let channel = state.channel.clone();
@@ -1160,11 +1177,15 @@ impl App {
                         // disclosure reads (device-key-enrollment plan,
                         // Task 13) — every view.json load keeps keys.json
                         // in step.
-                        Task::batch([
+                        let mut tasks = vec![
                             iced::widget::operation::snap_to_end(state.scroll_id.clone()),
                             fetch_brief(pane, base.clone(), channel.clone()),
                             fetch_keys(pane, base, &channel),
-                        ])
+                        ];
+                        if let Some(artifact) = auto_expand {
+                            tasks.push(Task::done(Message::ToggleArtifact(pane, artifact)));
+                        }
+                        Task::batch(tasks)
                     }
                     Err(err) => {
                         state.content = Content::Error(err);
@@ -1203,6 +1224,8 @@ impl App {
                     // feed is cleared here, so keeping it would aim at an op
                     // from a different session.
                     state.annotate_op = None;
+                    // A different session has a different newest diff.
+                    state.auto_expanded = false;
                 }
                 Task::none()
             }
@@ -1217,6 +1240,8 @@ impl App {
                     state.conversation_len = 0;
                     state.worktree_commit = None;
                     state.annotate_op = None;
+                    // A different session has a different newest diff.
+                    state.auto_expanded = false;
                 }
                 Task::none()
             }
@@ -1345,6 +1370,8 @@ impl App {
                     // A code anchor and a stream anchor are mutually
                     // exclusive; pointing at a line drops any block picked.
                     state.annotate_op = None;
+                    // A different session has a different newest diff.
+                    state.auto_expanded = false;
                 }
                 Task::none()
             }
@@ -1361,6 +1388,8 @@ impl App {
             Message::AnchorClear(pane) => {
                 if let Some(state) = self.panes.get_mut(pane) {
                     state.annotate_op = None;
+                    // A different session has a different newest diff.
+                    state.auto_expanded = false;
                     state.annotate_path.clear();
                     state.annotate_lines.clear();
                 }
@@ -4476,6 +4505,44 @@ fn author_for(keys: Option<&KeysDto>, email: &str) -> Member {
     }
 }
 
+/// What an artifact entry actually IS, taken from the `kind: ` prefix the host
+/// writes into its summary (`diff: …`, `memo: …`, `log: …`,
+/// `live-snapshot: …`).
+///
+/// The card used to be badged with the bare word `artifact`, which is what made
+/// a diff unfindable: a reviewer scrolling a session record had no way to tell
+/// which anonymous grey box held the code (ledger `532826c2`). Falls back to
+/// `artifact` when there is no recognisable prefix, so an unknown kind is never
+/// mislabelled as something it is not.
+fn artifact_label(summary: &str) -> &str {
+    let Some((prefix, _)) = summary.split_once(':') else {
+        return "artifact";
+    };
+    let prefix = prefix.trim();
+    match prefix {
+        "diff" | "memo" | "log" | "live-snapshot" => prefix,
+        // A prefix with spaces is prose that happens to contain a colon, not a
+        // kind — "I'll make both edits: …" must not become a badge.
+        _ => "artifact",
+    }
+}
+
+/// The newest diff artifact belonging to `session`, if any — the one a reviewer
+/// opening a session almost always wants to look at.
+///
+/// Entries arrive in timeline order, so the last match is the newest. Used to
+/// expand it automatically: a reviewer had to pick the channel, find the
+/// session, scroll a long record, recognise an anonymous card and click "show
+/// content" before the gesture could start (ledger `532826c2`), and this
+/// deletes the last three of those.
+fn newest_diff_artifact<'a>(entries: &'a [EntryDto], session: &str) -> Option<&'a EntryDto> {
+    entries.iter().rfind(|entry| {
+        entry.kind == "artifact"
+            && entry.target.as_deref() == Some(session)
+            && artifact_label(&entry.summary) == "diff"
+    })
+}
+
 fn chip_style(color: Color, active: bool) -> button::Style {
     button::Style {
         background: Some(Background::Color(if active {
@@ -4593,8 +4660,16 @@ fn entry_card<'a>(
     aim: Option<Aim<'a>>,
 ) -> Element<'a, Message> {
     let accent = kind_color(&entry.kind);
+    // An artifact is badged with WHAT IT IS (`diff`, `memo`, `log`), not the
+    // generic word `artifact` — otherwise every artifact in a session record
+    // looks identical and the diff is unfindable (ledger `532826c2`).
+    let kind_label = if entry.kind == "artifact" {
+        artifact_label(&entry.summary)
+    } else {
+        &entry.kind
+    };
     let mut head = row![
-        badge(&entry.kind, accent),
+        badge(kind_label, accent),
         text(entry.author.clone()).size(11).color(MUTED)
     ]
     .spacing(8);
@@ -4809,6 +4884,27 @@ fn popup_anchor(pane: &Pane) -> Option<u32> {
     )
 }
 
+/// A hint telling the reviewer what to click on a diff, shown only while they
+/// are actually in commenting mode (`aim`).
+///
+/// Deliberately says nothing on a non-diff artifact. An earlier version
+/// advertised "not pointable: comments anchor to diff lines and live feed
+/// blocks only", and Dan's answer was that he does not want the limitation
+/// explained, he wants it gone — everything should be pointable. Advertising a
+/// restriction we intend to remove is worse than saying nothing, so the
+/// negative case is left silent until the anchor vocabulary covers it.
+fn pointability_note(is_diff: bool, commenting: bool) -> Option<Element<'static, Message>> {
+    (is_diff && commenting).then(|| {
+        text(
+            "click an added or context line to comment on it — removed lines have no line \
+             number in the new file",
+        )
+        .size(10)
+        .color(MUTED)
+        .into()
+    })
+}
+
 /// Render an artifact's content inline: a diff gets per-line add/remove/hunk
 /// colour; anything else is shown verbatim. Monospace; long artifacts are
 /// truncated (the web view holds the full text).
@@ -4825,27 +4921,35 @@ fn artifact_body<'a>(
     md: Option<&'a [markdown::Item]>,
     aim: Option<Aim<'a>>,
 ) -> Element<'a, Message> {
-    // A memo renders as formatted Markdown.
+    // A memo renders as formatted Markdown. It takes an early return, so the
+    // pointability note has to be emitted HERE as well as at the end of the
+    // plain-text path below — adding it only there is why memos silently had
+    // no label at all.
     if let Some(items) = md {
-        return container(
+        let mut col = column![
             markdown::view(items, Theme::CatppuccinMocha)
-                .map(|url| Message::OpenUrl(url.to_string())),
-        )
-        .padding(8)
-        .width(Fill)
-        .style(|_theme| container::Style {
-            background: Some(Background::Color(Color {
-                a: 0.6,
-                ..Color::from_rgb(0.067, 0.067, 0.106)
-            })),
-            border: Border {
-                color: BORDER,
-                width: 1.0,
-                radius: 4.0.into(),
-            },
-            ..container::Style::default()
-        })
-        .into();
+                .map(|url| Message::OpenUrl(url.to_string()))
+        ]
+        .spacing(6);
+        if let Some(note) = pointability_note(false, aim.is_some()) {
+            col = col.push(note);
+        }
+        return container(col)
+            .padding(8)
+            .width(Fill)
+            .style(|_theme| container::Style {
+                background: Some(Background::Color(Color {
+                    a: 0.6,
+                    ..Color::from_rgb(0.067, 0.067, 0.106)
+                })),
+                border: Border {
+                    color: BORDER,
+                    width: 1.0,
+                    radius: 4.0.into(),
+                },
+                ..container::Style::default()
+            })
+            .into();
     }
     let lines: Vec<&str> = body.lines().collect();
     let is_diff = format == "diff";
@@ -4895,6 +4999,9 @@ fn artifact_body<'a>(
             .size(11)
             .color(MUTED),
         );
+    }
+    if let Some(note) = pointability_note(is_diff, aim.is_some()) {
+        col = col.push(note);
     }
     container(col)
         .padding(8)
@@ -5143,6 +5250,7 @@ impl Pane {
             brief_text: None,
             keys: None,
             keys_error: None,
+            auto_expanded: false,
             members_open: false,
             identity_form: None,
             identity_pending: false,
@@ -7163,5 +7271,101 @@ diff --git a/lib.rs b/lib.rs
             FirstFrame::Failed(reason) => assert!(reason.contains("expected a challenge")),
             _ => panic!("expected a failure"),
         }
+    }
+
+    #[test]
+    fn artifact_label_names_what_the_artifact_is() {
+        // The card used to read `artifact` for all of these, which is what made
+        // a diff unfindable in a session record.
+        assert_eq!(
+            artifact_label("diff: uncommitted changes in D:\\tmp\\demo after turn 1"),
+            "diff"
+        );
+        assert_eq!(artifact_label("memo: I'll make both edits."), "memo");
+        assert_eq!(artifact_label("log: turn output"), "log");
+        assert_eq!(
+            artifact_label("live-snapshot: live session plane snapshot (2323 bytes)"),
+            "live-snapshot"
+        );
+    }
+
+    #[test]
+    fn artifact_label_refuses_to_badge_prose_that_happens_to_contain_a_colon() {
+        // A memo's own text often has a colon; treating the leading words as a
+        // kind would put arbitrary prose in the badge.
+        assert_eq!(
+            artifact_label("Both edits are done: lib.rs and notes.md"),
+            "artifact"
+        );
+        assert_eq!(artifact_label("no colon at all"), "artifact");
+        assert_eq!(artifact_label(""), "artifact");
+    }
+
+    /// An artifact entry as `view.json` delivers it.
+    fn artifact_entry(id: &str, target: &str, summary: &str) -> EntryDto {
+        EntryDto {
+            id: id.into(),
+            kind: "artifact".into(),
+            target: Some(target.into()),
+            summary: summary.into(),
+            ..sample_entry()
+        }
+    }
+
+    #[test]
+    fn the_newest_diff_of_the_watched_session_is_the_one_to_expand() {
+        // Entries arrive in timeline order, so the LAST matching diff is the
+        // newest — that is the one a reviewer opening a session wants.
+        let entries = vec![
+            artifact_entry("a", "s1", "diff: after turn 1"),
+            artifact_entry("b", "s1", "memo: some prose"),
+            artifact_entry("c", "s1", "diff: after turn 2"),
+            artifact_entry("d", "s2", "diff: another session's diff"),
+        ];
+        assert_eq!(
+            newest_diff_artifact(&entries, "s1").map(|e| e.id.as_str()),
+            Some("c")
+        );
+        assert_eq!(
+            newest_diff_artifact(&entries, "s2").map(|e| e.id.as_str()),
+            Some("d"),
+            "another session's diff must not be picked for s1, nor s1's for s2"
+        );
+    }
+
+    #[test]
+    fn a_session_with_no_diff_expands_nothing() {
+        // Auto-expanding must be a no-op rather than picking a memo, otherwise
+        // opening a session pops open unrelated prose.
+        let entries = vec![
+            artifact_entry("a", "s1", "memo: some prose"),
+            artifact_entry("b", "s1", "live-snapshot: 2323 bytes"),
+        ];
+        assert!(newest_diff_artifact(&entries, "s1").is_none());
+        assert!(newest_diff_artifact(&[], "s1").is_none());
+    }
+
+    #[test]
+    fn the_diff_hint_appears_only_on_a_diff_and_only_while_commenting() {
+        // A diff gets a hint about what to click. A non-diff gets NOTHING —
+        // deliberately, since advertising "not pointable" advertises a
+        // restriction that is on its way out (Dan: everything should be
+        // pointable), and saying nothing is better than saying that.
+        assert!(
+            pointability_note(true, true).is_some(),
+            "a diff says what to click"
+        );
+        assert!(
+            pointability_note(false, true).is_none(),
+            "a memo or log stays silent rather than advertising a limitation"
+        );
+    }
+
+    #[test]
+    fn the_pointability_note_only_appears_while_commenting() {
+        // Reading, not commenting: a note about anchoring would be noise on
+        // every artifact in the record.
+        assert!(pointability_note(true, false).is_none());
+        assert!(pointability_note(false, false).is_none());
     }
 }
