@@ -321,4 +321,17 @@ mod persistence_tests {
         assert_eq!(load(&path).left_split.get(), NavSplit::MAX);
         let _ = std::fs::remove_file(&path);
     }
+
+    #[test]
+    fn save_creates_nested_directories_if_missing() {
+        let base = std::env::temp_dir().join("junto-iced-shell-nested-dir");
+        let path = base.join("subdir").join("ui.toml");
+        let state = ShellState::default();
+
+        save(&path, &state).expect("save should succeed and create directories");
+        assert_eq!(load(&path), state);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
