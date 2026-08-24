@@ -17,8 +17,8 @@ use iced::futures::channel::mpsc;
 use iced::widget::canvas::{self, Canvas, Frame, Geometry, Path, Stroke};
 use iced::widget::pane_grid;
 use iced::widget::{
-    Space, button, checkbox, column, combo_box, container, markdown, pick_list, row, scrollable,
-    text, text_input, tooltip,
+    Space, button, checkbox, column, combo_box, container, markdown, mouse_area, pick_list, row,
+    scrollable, text, text_input, tooltip,
 };
 use iced::{
     Background, Border, Center, Color, Element, Fill, Length, Padding, Point, Rectangle, Renderer,
@@ -26,15 +26,13 @@ use iced::{
 };
 use junto_kernel::{
     Anchor, Annotation, AnnotationId, CodeAnchor, CommitOid, ContentDigest, EntryId, Member,
-    SigningKey, Span, StreamAnchor, Timestamp,
+    RecordAnchor, SigningKey, Span, StreamAnchor, Timestamp,
 };
 use junto_live::{Frame as WireFrame, LiveDoc, Presence};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
-use pointing::{
-    anchor_click, diff_row_targets, popup_anchor_line, watch_identity, watcher_initials,
-};
+use pointing::{diff_row_targets, drag_lines, popup_anchor_line, watch_identity, watcher_initials};
 use popover::Popover;
 
 const HOST: &str = "http://127.0.0.1:1727";
@@ -53,9 +51,12 @@ const BLUE: Color = Color::from_rgb(0.537, 0.706, 0.980); // --accent #89b4fa
 
 fn main() -> iced::Result {
     let icon = iced::window::icon::from_file_data(include_bytes!("../icon.png"), None).ok();
-    iced::application("junto — native spike", App::update, App::view)
+    // 0.14 takes the boot function FIRST and sets the title separately; the
+    // old `application(title, ..).run_with(boot)` shape is gone.
+    iced::application(App::new, App::update, App::view)
+        .title("junto — native spike")
         .subscription(App::subscription)
-        .theme(|_| Theme::CatppuccinMocha)
+        .theme(|_: &App| Theme::CatppuccinMocha)
         // The web uses `Inter, system-ui, sans-serif`; on Windows system-ui is
         // Segoe UI (used by name at runtime — not bundled, so no redistribution).
         // Cross-platform parity later = bundle Inter (OFL, MIT-compatible).
@@ -66,7 +67,7 @@ fn main() -> iced::Result {
             size: Size::new(1400.0, 1040.0),
             ..Default::default()
         })
-        .run_with(App::new)
+        .run()
 }
 
 struct App {
@@ -78,6 +79,11 @@ struct App {
     order: Vec<pane_grid::Pane>,
     /// Available channel names for the type-ahead picker.
     channels: combo_box::State<String>,
+    /// The same names as a plain list, for widgets that need to OFFER them
+    /// rather than type-ahead them — the converge target picker. Kept beside
+    /// `channels` because `combo_box::State` consumes its options and two
+    /// `combo_box`es sharing one `State` would share its filter text too.
+    channel_names: Vec<String>,
     /// The whole lineage DAG, drawn as the always-visible top branch graph.
     lineage: Option<LineageGraphDto>,
     /// Cross-channel "needs you" items — the focus board.
@@ -186,6 +192,26 @@ struct Pane {
     /// Mutually exclusive with `annotate_path`: pointing at a line clears
     /// this, and pointing at a block clears the path.
     annotate_op: Option<usize>,
+    /// The record content the composer is aimed at: `(entry id, content
+    /// digest)`, set by clicking a line of any artifact that is not a diff row
+    /// with a known commit.
+    ///
+    /// This is the third anchor kind (`junto_kernel::RecordAnchor`, Dan's call
+    /// 2026-08-23): content already IN the record — a memo, a log, a snapshot,
+    /// an uncommitted diff's text — which is immutable and digest-addressable,
+    /// so it needs none of the re-anchoring machinery a file span does.
+    /// Mutually exclusive with both `annotate_path` and `annotate_op`.
+    annotate_record: Option<(String, String)>,
+    /// The row a press-drag started on, in the units of whatever is aimed
+    /// (`Some` only between press and release). A drag extends the selection to
+    /// each row entered while this is set; releasing, or leaving the artifact,
+    /// clears it.
+    drag_from: Option<u32>,
+    /// The row under the cursor, keyed by its target so two artifacts sharing a
+    /// line number cannot both light up. Tracked by hand because these rows are
+    /// `mouse_area`s, not `button`s: a button reports no drag state, which is
+    /// why the first version of this gesture had to be directional clicking.
+    hover: Option<(String, u32)>,
     /// The most recent commit oid seen in a `{"kind":"diff","commit":…}`
     /// worktree event on this pane's live doc (`Message::WorktreeDiff`) —
     /// the ONLY source a `CodeAnchor`'s commit may come from. `None` means
@@ -229,7 +255,7 @@ struct Pane {
     /// feedback and disables the buttons until the host responds.
     act_pending: HashSet<String>,
     /// The timeline scrollable's id, so we can snap it to the newest entry.
-    scroll_id: scrollable::Id,
+    scroll_id: iced::widget::Id,
     /// Expanded artifacts' inline content, keyed by artifact entry id. Absent =
     /// collapsed; present = expanded (loading / loaded / error).
     artifacts: HashMap<String, ArtifactContent>,
@@ -272,6 +298,9 @@ struct Pane {
     /// disclosure instead of silently reading as "no members" (a fetch
     /// failure and a genuinely empty roster must never look the same).
     keys_error: Option<String>,
+    /// Whether this pane has already auto-expanded a session's newest diff.
+    /// Set once so a manual collapse is not undone by the next refetch.
+    auto_expanded: bool,
     /// Whether the members disclosure is expanded.
     members_open: bool,
     /// The founder identity act currently open in this pane, if any — the
@@ -584,6 +613,11 @@ enum ArtifactContent {
         body: String,
         /// Parsed Markdown, for memo-format artifacts (parsed once on load).
         md: Option<Vec<markdown::Item>>,
+        /// The digest of `body`, computed once on arrival rather than per frame,
+        /// and by the same formula the host used when it stored these bytes
+        /// (`ContentDigest::sha256_of`) so a `RecordAnchor` built here matches
+        /// the artifact's recorded provenance.
+        digest: String,
     },
     Error(String),
 }
@@ -737,6 +771,34 @@ enum IdentityResult {
     Parked(usize),
 }
 
+/// What a rendered row points at — the two anchor kinds a row can make.
+///
+/// Carried by the pointing messages so one row widget serves both, and so the
+/// `update` handler never has to guess which claim a click meant from the state
+/// it happens to find lying around.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AnchorTarget {
+    /// A line of a file at the session's commit (`CodeAnchor`): the new-file
+    /// path. The stronger claim, available only where a diff row occupies a real
+    /// new-file line.
+    Code(String),
+    /// A line of content already in the record (`RecordAnchor`): the entry that
+    /// attached it, and that content's digest.
+    Record(String, String),
+}
+
+impl AnchorTarget {
+    /// The identity a hover or a drag is scoped to, so a drag can never jump
+    /// between two files (or two artifacts) mid-gesture and produce a span whose
+    /// halves came from different content.
+    fn key(&self) -> &str {
+        match self {
+            Self::Code(path) => path,
+            Self::Record(entry, _) => entry,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum Message {
     ChannelsLoaded(Vec<String>),
@@ -794,12 +856,17 @@ enum Message {
     /// commit oid) — mirrored into `Pane::worktree_commit`, the only source
     /// the composer's `CodeAnchor` may ever take a commit from.
     WorktreeDiff(String, String),
-    // --- pointing: click a rendered row/block to aim the composer ---
-    /// A rendered diff row was clicked (pane, new-file path, new-file line,
-    /// `pointing::diff_row_targets`) — prefills the composer's `path`/`lines`
-    /// instead of the reviewer typing them, extending the range on a second
-    /// click further down the same file (`pointing::anchor_click`).
-    AnchorRow(pane_grid::Pane, String, u32),
+    // --- pointing: press-drag-release across rendered rows to aim the composer ---
+    /// The mouse went down on a rendered row (pane, what that row points at,
+    /// the row's line in that target's own units) — aims the composer at a
+    /// single line and begins a drag.
+    AnchorPress(pane_grid::Pane, AnchorTarget, u32),
+    /// The cursor entered a rendered row. Always updates the hover paint; while
+    /// a drag is in progress on the SAME target it also extends the selection
+    /// (`pointing::drag_lines`).
+    AnchorOver(pane_grid::Pane, AnchorTarget, u32),
+    /// The mouse came up, or left the artifact entirely — ends any drag.
+    AnchorRelease(pane_grid::Pane),
     /// A rendered feed block's gutter was clicked (pane, the block's own
     /// `conversation` container index) — aims the `StreamAnchor` there
     /// instead of at the newest event.
@@ -943,6 +1010,7 @@ impl App {
             focus: Some(first),
             order: vec![first],
             channels: combo_box::State::new(Vec::new()),
+            channel_names: Vec::new(),
             lineage: None,
             focus_items: Vec::new(),
             agents: Vec::new(),
@@ -1015,6 +1083,7 @@ impl App {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::ChannelsLoaded(names) => {
+                self.channel_names = names.clone();
                 self.channels = combo_box::State::new(names);
                 Task::none()
             }
@@ -1142,6 +1211,20 @@ impl App {
                                 state.worktree_commit = None;
                             }
                         }
+                        // Put the code on screen without hunting for it: a
+                        // watched session's newest diff artifact is expanded
+                        // once, automatically (ledger `532826c2`). Once only,
+                        // so collapsing it by hand is not undone by the next
+                        // refetch.
+                        let auto_expand = state
+                            .watched
+                            .as_deref()
+                            .filter(|_| !state.auto_expanded)
+                            .and_then(|session| newest_diff_artifact(&dto.entries, session))
+                            .map(|entry| entry.id.clone());
+                        if auto_expand.is_some() {
+                            state.auto_expanded = true;
+                        }
                         state.content = Content::Loaded(dto);
                         let base = state.base().to_string();
                         let channel = state.channel.clone();
@@ -1150,14 +1233,15 @@ impl App {
                         // disclosure reads (device-key-enrollment plan,
                         // Task 13) — every view.json load keeps keys.json
                         // in step.
-                        Task::batch([
-                            scrollable::snap_to(
-                                state.scroll_id.clone(),
-                                scrollable::RelativeOffset::END,
-                            ),
+                        let mut tasks = vec![
+                            iced::widget::operation::snap_to_end(state.scroll_id.clone()),
                             fetch_brief(pane, base.clone(), channel.clone()),
                             fetch_keys(pane, base, &channel),
-                        ])
+                        ];
+                        if let Some(artifact) = auto_expand {
+                            tasks.push(Task::done(Message::ToggleArtifact(pane, artifact)));
+                        }
+                        Task::batch(tasks)
                     }
                     Err(err) => {
                         state.content = Content::Error(err);
@@ -1196,6 +1280,8 @@ impl App {
                     // feed is cleared here, so keeping it would aim at an op
                     // from a different session.
                     state.annotate_op = None;
+                    // A different session has a different newest diff.
+                    state.auto_expanded = false;
                 }
                 Task::none()
             }
@@ -1210,6 +1296,8 @@ impl App {
                     state.conversation_len = 0;
                     state.worktree_commit = None;
                     state.annotate_op = None;
+                    // A different session has a different newest diff.
+                    state.auto_expanded = false;
                 }
                 Task::none()
             }
@@ -1236,9 +1324,7 @@ impl App {
                     }
                 }
                 // Keep the newest live output in view.
-                scroll.map_or_else(Task::none, |id| {
-                    scrollable::snap_to(id, scrollable::RelativeOffset::END)
-                })
+                scroll.map_or_else(Task::none, iced::widget::operation::snap_to_end)
             }
             Message::LiveEnded(session) => {
                 let mut to_refresh = None;
@@ -1327,19 +1413,31 @@ impl App {
                 }
                 Task::none()
             }
-            Message::AnchorRow(pane, path, line) => {
+            Message::AnchorPress(pane, target, line) => {
                 if let Some(state) = self.panes.get_mut(pane) {
-                    let (path, lines) = anchor_click(
-                        &state.annotate_path,
-                        parse_span(&state.annotate_lines),
-                        &path,
-                        line,
-                    );
-                    state.annotate_path = path;
-                    state.annotate_lines = lines;
-                    // A code anchor and a stream anchor are mutually
-                    // exclusive; pointing at a line drops any block picked.
-                    state.annotate_op = None;
+                    state.aim_at(&target, drag_lines(line, line));
+                    state.drag_from = Some(line);
+                }
+                Task::none()
+            }
+            Message::AnchorOver(pane, target, line) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    state.hover = Some((target.key().to_string(), line));
+                    // Extend only within the target the drag started on: a span
+                    // whose ends came from two different files would be a signed
+                    // claim about code that never existed.
+                    if let Some(from) = state.drag_from
+                        && state.aimed_key() == Some(target.key())
+                    {
+                        state.aim_at(&target, drag_lines(from, line));
+                    }
+                }
+                Task::none()
+            }
+            Message::AnchorRelease(pane) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    state.drag_from = None;
+                    state.hover = None;
                 }
                 Task::none()
             }
@@ -1350,12 +1448,16 @@ impl App {
                     // `StreamAnchor` rather than a `CodeAnchor`.
                     state.annotate_path.clear();
                     state.annotate_lines.clear();
+                    state.annotate_record = None;
                 }
                 Task::none()
             }
             Message::AnchorClear(pane) => {
                 if let Some(state) = self.panes.get_mut(pane) {
                     state.annotate_op = None;
+                    state.annotate_record = None;
+                    // A different session has a different newest diff.
+                    state.auto_expanded = false;
                     state.annotate_path.clear();
                     state.annotate_lines.clear();
                 }
@@ -1433,15 +1535,51 @@ impl App {
                     return Task::none();
                 };
                 let path = state.annotate_path.trim().to_string();
-                // Anchor-sourcing rule: a `CodeAnchor` may only be built from
-                // a commit oid this pane has actually seen arrive over the
-                // wire (`Pane::worktree_commit`, set only from a real
+                // Anchor-sourcing rule, now three-way. A `RecordAnchor` is
+                // preferred when the reviewer clicked record content, because
+                // its claim is exactly true by construction: the entry id and
+                // the digest name bytes that an append-only log can never
+                // change, so there is nothing to fabricate and nothing to
+                // re-anchor. A `CodeAnchor` is the stronger claim where it is
+                // available, but it may only be built from a commit oid this
+                // pane has actually SEEN arrive over the wire
+                // (`Pane::worktree_commit`, set only from a real
                 // `{"kind":"diff","commit":…}` worktree event) — never
-                // fabricated, never a placeholder. Anything else, including
-                // an empty path, is a `StreamAnchor` on a conversation event
-                // instead. Clicking a row only fills in the two inputs a
-                // reviewer used to type; it does not relax this rule.
-                let anchor = if path.is_empty() {
+                // fabricated, never a placeholder. Anything else, including an
+                // empty path, is a `StreamAnchor` on a conversation event.
+                // Clicking a row only fills in what a reviewer used to type; it
+                // does not relax any of this.
+                let anchor = if let Some((entry, digest)) = state.annotate_record.clone() {
+                    let Ok(entry) = entry.parse::<EntryId>() else {
+                        push_error(
+                            state,
+                            "malformed entry id for the clicked content".to_string(),
+                        );
+                        return Task::none();
+                    };
+                    let Ok(digest) = ContentDigest::new(digest) else {
+                        push_error(
+                            state,
+                            "malformed digest for the clicked content".to_string(),
+                        );
+                        return Task::none();
+                    };
+                    let Some(span) = parse_span(&state.annotate_lines) else {
+                        push_error(
+                            state,
+                            format!(
+                                "invalid line range '{}' — use \"12\" or \"12-14\"",
+                                state.annotate_lines
+                            ),
+                        );
+                        return Task::none();
+                    };
+                    Anchor::Record(RecordAnchor {
+                        entry,
+                        digest,
+                        span,
+                    })
+                } else if path.is_empty() {
                     // The block the reviewer pointed at, else the newest
                     // event. Nothing picked and an empty container means
                     // there is no real index to name, which is refused
@@ -1632,10 +1770,17 @@ impl App {
                         Ok(dto) => {
                             let md = (dto.format == "markdown")
                                 .then(|| markdown::parse(&dto.content).collect::<Vec<_>>());
+                            // Digested here, from the bytes actually received,
+                            // so a `RecordAnchor` names exactly what the
+                            // reviewer was looking at.
+                            let digest = ContentDigest::sha256_of(dto.content.as_bytes())
+                                .as_str()
+                                .to_string();
                             ArtifactContent::Loaded {
                                 format: dto.format,
                                 body: dto.content,
                                 md,
+                                digest,
                             }
                         }
                         Err(err) => ArtifactContent::Error(err),
@@ -1682,7 +1827,7 @@ impl App {
                 let scroll = state.scroll_id.clone();
                 Task::batch([
                     post_steer(pane, base, channel, session, text),
-                    scrollable::snap_to(scroll, scrollable::RelativeOffset::END),
+                    iced::widget::operation::snap_to_end(scroll),
                 ])
             }
             Message::Steered(pane, result) => {
@@ -2414,26 +2559,45 @@ impl App {
                     .as_ref()
                     .filter(|_| state.streaming)
                     .map(|session| {
-                        // Id includes the nonce so a new turn restarts the stream.
-                        let id = (session.clone(), state.stream_nonce);
                         // The typed override, else this machine's own identity.
                         let email = watch_identity(&state.watch_email, identity_email);
+                        // 0.14 replaced `run_with_id(id, stream)` with
+                        // `run_with(data, builder)`, where `builder` is a plain
+                        // fn pointer and `data` is BOTH the stream's input and
+                        // its identity — so the nonce rides in the data, which
+                        // is what makes a new turn restart the subscription.
                         match email {
-                            Some(email) => iced::Subscription::run_with_id(
-                                id,
-                                live_ws_stream(
+                            Some(email) => iced::Subscription::run_with(
+                                (
                                     state.base().to_string(),
                                     state.channel.clone(),
                                     session.clone(),
                                     email,
+                                    state.stream_nonce,
                                 ),
+                                |(base, channel, session, email, _nonce): &(
+                                    String,
+                                    String,
+                                    String,
+                                    String,
+                                    u64,
+                                )| {
+                                    live_ws_stream(
+                                        base.clone(),
+                                        channel.clone(),
+                                        session.clone(),
+                                        email.clone(),
+                                    )
+                                },
                             ),
                             // No identity anywhere: a websocket would only fail
                             // its handshake, so keep the unauthenticated local
                             // progress feed (and no composer, honestly).
-                            None => iced::Subscription::run_with_id(
-                                id,
-                                session_stream(state.channel.clone(), session.clone()),
+                            None => iced::Subscription::run_with(
+                                (state.channel.clone(), session.clone(), state.stream_nonce),
+                                |(channel, session, _nonce): &(String, String, u64)| {
+                                    session_stream(channel.clone(), session.clone())
+                                },
                             ),
                         }
                     })
@@ -2630,7 +2794,13 @@ impl App {
         let mut body = row![].spacing(6);
         for id in &self.order {
             if let Some(pane) = self.panes.get(*id) {
-                body = body.push(column_pane(*id, pane, &self.agents, machine_email));
+                body = body.push(column_pane(
+                    *id,
+                    pane,
+                    &self.agents,
+                    machine_email,
+                    &self.channel_names,
+                ));
             }
         }
 
@@ -2658,11 +2828,11 @@ fn admin_toolbar(current: Option<AdminView>) -> Element<'static, Message> {
     };
     row![
         text("junto").size(15),
-        Space::with_width(16),
+        Space::new().width(16),
         tab("channels", None),
         tab("settings", Some(AdminView::Settings)),
         tab("agents", Some(AdminView::Agents)),
-        Space::with_width(Fill),
+        Space::new().width(Fill),
         button(text("↻ refresh").size(12))
             .on_press(Message::RefreshAll)
             .padding([4, 12])
@@ -2881,7 +3051,7 @@ fn agents_panel(app: &App) -> Element<'_, Message> {
                 text(truncate(&role, 70)).size(11).color(MUTED),
             ]
             .spacing(2),
-            Space::with_width(Fill),
+            Space::new().width(Fill),
             button(text("edit").size(11))
                 .on_press(Message::AgentEdit(a.clone()))
                 .padding([2, 8])
@@ -3032,7 +3202,7 @@ fn agents_panel(app: &App) -> Element<'_, Message> {
 fn title_row(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
     row![
         text(pane.channel.clone()).size(15),
-        Space::with_width(Fill),
+        Space::new().width(Fill),
         button("↻").on_press(Message::Refresh(id)).padding(4),
         button("×").on_press(Message::Close(id)).padding(4),
     ]
@@ -3096,12 +3266,13 @@ fn column_pane<'a>(
     pane: &'a Pane,
     agents: &'a [AgentDto],
     machine_email: Option<&'a str>,
+    channels: &'a [String],
 ) -> Element<'a, Message> {
     container(
         column![
             title_row(id, pane),
             remote_row(id, pane, machine_email),
-            pane_body(id, pane, agents)
+            pane_body(id, pane, agents, channels)
         ]
         .spacing(8),
     )
@@ -3123,15 +3294,11 @@ fn column_pane<'a>(
 /// The curated brief (recall bridge) rendered as Markdown in a card at the top
 /// of a pane — standing decisions + what needs attention.
 fn brief_panel<'a>(items: &'a [markdown::Item], raw: &str) -> Element<'a, Message> {
-    let body = markdown::view(
-        items,
-        markdown::Settings::default(),
-        markdown::Style::from_palette(Theme::CatppuccinMocha.palette()),
-    )
-    .map(|url| Message::OpenUrl(url.to_string()));
+    let body =
+        markdown::view(items, Theme::CatppuccinMocha).map(|url| Message::OpenUrl(url.to_string()));
     let head = row![
         text("brief").size(11).color(TEAL),
-        Space::with_width(Fill),
+        Space::new().width(Fill),
         copy_button(raw.to_string()),
     ]
     .align_y(Center);
@@ -3152,7 +3319,18 @@ fn brief_panel<'a>(items: &'a [markdown::Item], raw: &str) -> Element<'a, Messag
 
 /// The inline form for a channel lifecycle act: the inputs it needs, a
 /// confirm/cancel row, and any error.
-fn lifecycle_form(id: pane_grid::Pane, pane: &Pane, kind: LifecycleKind) -> Element<'_, Message> {
+///
+/// `channels` are the names a converge may target. Converge and Rename used to
+/// share one free-text box, but they are opposites: Rename invents a NEW name,
+/// while Converge must name a channel that ALREADY EXISTS — and typing an
+/// existing name by hand, exactly, from a list the app is already holding, is
+/// the failure mode Dan hit converging the dogfood channel.
+fn lifecycle_form<'a>(
+    id: pane_grid::Pane,
+    pane: &'a Pane,
+    kind: LifecycleKind,
+    channels: &'a [String],
+) -> Element<'a, Message> {
     let mut col = column![].spacing(6);
     match kind {
         LifecycleKind::Diverge => {
@@ -3164,15 +3342,37 @@ fn lifecycle_form(id: pane_grid::Pane, pane: &Pane, kind: LifecycleKind) -> Elem
                     .padding(6),
             );
         }
-        LifecycleKind::Converge | LifecycleKind::Rename => {
-            let target_placeholder = if kind == LifecycleKind::Rename {
-                "new channel name…"
-            } else {
-                "target channel name…"
-            };
+        LifecycleKind::Converge => {
+            // A channel cannot converge into itself, so it is not offered.
+            let targets: Vec<String> = channels
+                .iter()
+                .filter(|name| *name != &pane.channel)
+                .cloned()
+                .collect();
+            let selected =
+                (!pane.lifecycle_target.trim().is_empty()).then(|| pane.lifecycle_target.clone());
             col = col
                 .push(
-                    text_input(target_placeholder, &pane.lifecycle_target)
+                    pick_list(targets, selected, move |name: String| {
+                        Message::LifecycleTargetChanged(id, name)
+                    })
+                    .placeholder("converge into which channel?")
+                    .text_size(12)
+                    .padding(6)
+                    .width(Fill),
+                )
+                .push(
+                    text_input("rationale (required)…", &pane.lifecycle_text)
+                        .on_input(move |v| Message::LifecycleTextChanged(id, v))
+                        .on_submit(Message::LifecycleSubmit(id))
+                        .size(12)
+                        .padding(6),
+                );
+        }
+        LifecycleKind::Rename => {
+            col = col
+                .push(
+                    text_input("new channel name…", &pane.lifecycle_target)
                         .on_input(move |v| Message::LifecycleTargetChanged(id, v))
                         .size(12)
                         .padding(6),
@@ -3402,7 +3602,8 @@ fn identity_form<'a>(
                 .align_y(Center);
             for (idx, (name, ticked)) in pane.identity_channels.iter().enumerate() {
                 channels = channels.push(
-                    checkbox(name.clone(), *ticked)
+                    checkbox(*ticked)
+                        .label(name.clone())
                         .on_toggle(move |_| Message::IdentityChannelToggle(id, idx))
                         .size(13)
                         .text_size(11),
@@ -3612,7 +3813,8 @@ fn annotate_composer(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
         .on_submit(Message::AnnotateSubmit(id))
         .size(12)
         .padding(6);
-    let urgent = checkbox("urgent", pane.annotate_urgent)
+    let urgent = checkbox(pane.annotate_urgent)
+        .label("urgent")
         .on_toggle(move |on| Message::AnnotateUrgentToggled(id, on))
         .size(14)
         .text_size(11);
@@ -3652,6 +3854,15 @@ fn annotate_composer(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
 /// configured font (Segoe UI) and paint as tofu boxes — Dan could not find the
 /// feed gutter at all because of it (ledger `02ff24be`). `●` and `×` do render.
 fn aim_label(pane: &Pane) -> String {
+    // Checked first because it is the only aim that can never be refused: the
+    // bytes are already in the record, so there is no commit to wait for.
+    if let Some((entry, _)) = &pane.annotate_record {
+        return format!(
+            "● line {} of entry {}",
+            pane.annotate_lines,
+            &entry[..8.min(entry.len())]
+        );
+    }
     let path = pane.annotate_path.trim();
     if !path.is_empty() {
         return match pane.worktree_commit.as_deref() {
@@ -3676,7 +3887,7 @@ fn aim_label(pane: &Pane) -> String {
 fn annotate_popup(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
     let head = row![
         text(aim_label(pane)).size(11).color(TEAL),
-        Space::with_width(Fill),
+        Space::new().width(Fill),
         button(text("×").size(12))
             .on_press(Message::AnchorClear(id))
             .padding([0, 6])
@@ -3689,7 +3900,8 @@ fn annotate_popup(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
         .on_submit(Message::AnnotateSubmit(id))
         .size(12)
         .padding(6);
-    let urgent = checkbox("urgent", pane.annotate_urgent)
+    let urgent = checkbox(pane.annotate_urgent)
+        .label("urgent")
         .on_toggle(move |on| Message::AnnotateUrgentToggled(id, on))
         .size(14)
         .text_size(11);
@@ -3700,7 +3912,7 @@ fn annotate_popup(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
         column![
             head,
             body_input,
-            row![Space::with_width(Fill), urgent, submit]
+            row![Space::new().width(Fill), urgent, submit]
                 .spacing(8)
                 .align_y(Center),
         ]
@@ -3726,6 +3938,7 @@ fn pane_body<'a>(
     id: pane_grid::Pane,
     pane: &'a Pane,
     agents: &'a [AgentDto],
+    channels: &'a [String],
 ) -> Element<'a, Message> {
     let dto = match &pane.content {
         Content::Loading => {
@@ -3777,7 +3990,7 @@ fn pane_body<'a>(
     }
     header = header.push(bar);
     if let Some(kind) = pane.lifecycle {
-        header = header.push(lifecycle_form(id, pane, kind));
+        header = header.push(lifecycle_form(id, pane, kind, channels));
     }
 
     // Launch a session: intent + agent picker + mode toggle + workspace.
@@ -3824,7 +4037,8 @@ fn pane_body<'a>(
     };
     // Mode as a checkbox (matches the web): unchecked = a single turn (default);
     // checked = the code-PR push-gate verify/Grader loop (docs/adr/0025).
-    let mode_checkbox = checkbox("code-PR push-gate (verify loop)", pane.launch_outcome)
+    let mode_checkbox = checkbox(pane.launch_outcome)
+        .label("code-PR push-gate (verify loop)")
         .on_toggle(move |on| Message::LaunchModeChanged(id, on))
         .size(16)
         .text_size(12);
@@ -3884,7 +4098,7 @@ fn pane_body<'a>(
         if !pane.watchers.is_empty() {
             header = header.push(watchers_chip(&pane.watchers));
         }
-        header = header.push(Space::with_width(Fill));
+        header = header.push(Space::new().width(Fill));
         header = header.push(
             button(text("× close").size(11))
                 .on_press(Message::CloseSession(id))
@@ -3897,15 +4111,33 @@ fn pane_body<'a>(
         // targets and stop being them together with it.
         let aim = pane.annotate_tx.is_some().then(|| Aim {
             path: pane.annotate_path.as_str(),
+            record: pane
+                .annotate_record
+                .as_ref()
+                .map(|(entry, _)| entry.as_str()),
             span: parse_span(&pane.annotate_lines),
             popup_at: popup_anchor(pane),
+            hover: pane.hover.as_ref().map(|(key, line)| (key.as_str(), *line)),
             pane,
         });
+        // REVIEW-FIRST ARRANGEMENT (ledger `532826c2`). The session's newest
+        // diff is the pane's PRIMARY object and the entry record becomes a side
+        // panel, because a reviewer arrives wanting to look at code and used to
+        // get a filing cabinet in which code was a collapsed row. Falls back to
+        // the record-only column when the session has no diff at all, rather
+        // than showing an empty code panel.
+        let primary = newest_diff_artifact(&dto.entries, &session_id);
+
         // The session's persisted record: its SessionStarted entry plus every
-        // entry targeting it (memos, artifacts), in timeline order.
+        // entry targeting it (memos, artifacts), in timeline order. The primary
+        // diff is omitted — it is already the main panel, and showing it twice
+        // is how the record got long enough to hide things in.
         let mut record = column![].spacing(8);
         for entry in &dto.entries {
-            if entry.id == session_id || entry.target.as_deref() == Some(session_id.as_str()) {
+            let is_primary = primary.is_some_and(|p| p.id == entry.id);
+            if !is_primary
+                && (entry.id == session_id || entry.target.as_deref() == Some(session_id.as_str()))
+            {
                 record = record.push(timeline_entry(
                     id,
                     entry,
@@ -3932,6 +4164,7 @@ fn pane_body<'a>(
             }
             record = record.push(feed);
         }
+        let record_scroll = scrollable(record).id(pane.scroll_id.clone()).height(Fill);
 
         // Steer (resumes a landed turn, or steers a live one) + interrupt.
         let placeholder = if pane.streaming {
@@ -3953,17 +4186,40 @@ fn pane_body<'a>(
             interrupt_btn,
         ]
         .spacing(6);
-        let mut session_col = column![
-            header,
-            scrollable(record).id(pane.scroll_id.clone()).height(Fill),
-            steer
-        ]
-        .spacing(8);
+        let main_area: Element<Message> = match primary {
+            Some(artifact) => row![
+                container(code_panel(id, pane, artifact, aim)).width(Length::FillPortion(3)),
+                container(record_scroll).width(Length::FillPortion(2)),
+            ]
+            .spacing(10)
+            .height(Fill)
+            .into(),
+            None => record_scroll.into(),
+        };
+        let mut session_col = column![header, main_area, steer].spacing(8);
         // The bottom composer is the fallback surface. While a floating panel is
         // anchored to the clicked row it IS the composer, so showing both would
         // put two comment boxes on screen for one comment.
-        if pane.annotate_tx.is_some() && popup_anchor(pane).is_none() {
-            session_col = session_col.push(annotate_composer(id, pane));
+        if pane.annotate_tx.is_some() {
+            if popup_anchor(pane).is_none() {
+                session_col = session_col.push(annotate_composer(id, pane));
+            }
+        } else {
+            // Say why there is nothing to click. Pointing needs a live,
+            // authenticated socket, because a `CodeAnchor`'s commit may only
+            // come from a `Message::WorktreeDiff` that actually arrived on the
+            // wire — so on a landed session the diff rows are deliberately
+            // inert. They look identical either way, and the host closes a
+            // finished session's socket silently, so without this line the
+            // reviewer just finds that clicking does nothing.
+            session_col = session_col.push(
+                text(
+                    "commenting needs a live turn — steer above to resume this \
+                     session, then click a diff line",
+                )
+                .size(11)
+                .color(MUTED),
+            );
         }
         session_col.into()
     } else {
@@ -3982,7 +4238,7 @@ fn pane_body<'a>(
             dto.entries.iter().find(|e| e.id == hid).map(|entry| {
                 let header = row![
                     text("▾ needs you").size(11).color(YELLOW),
-                    Space::with_width(Fill),
+                    Space::new().width(Fill),
                     button(text("dismiss").size(11).color(MUTED))
                         .on_press(Message::ClearHighlight(id))
                         .padding([2, 8])
@@ -4097,35 +4353,38 @@ fn feed_block<'a>(
     let gutter: Element<Message> = match item.op {
         Some(op) => {
             let lit = picked == Some(op);
-            button(Space::new(Length::Fixed(3.0), Length::Fixed(14.0)))
-                .on_press(Message::AnchorStream(id, op))
-                .width(GUTTER)
-                .padding([0, 5])
-                .style(move |_theme, status| {
-                    let hovered =
-                        matches!(status, button::Status::Hovered | button::Status::Pressed);
-                    button::Style {
-                        background: Some(Background::Color(if lit {
-                            MAUVE
-                        } else if hovered {
-                            Color { a: 0.75, ..MAUVE }
-                        } else {
-                            // Dim but present: a reviewer has to be able to see
-                            // that the target exists before hovering it.
-                            Color { a: 0.30, ..MUTED }
-                        })),
-                        border: Border {
-                            radius: 2.0.into(),
-                            ..Border::default()
-                        },
-                        ..button::Style::default()
-                    }
-                })
-                .into()
+            button(
+                Space::new()
+                    .width(Length::Fixed(3.0))
+                    .height(Length::Fixed(14.0)),
+            )
+            .on_press(Message::AnchorStream(id, op))
+            .width(GUTTER)
+            .padding([0, 5])
+            .style(move |_theme, status| {
+                let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+                button::Style {
+                    background: Some(Background::Color(if lit {
+                        MAUVE
+                    } else if hovered {
+                        Color { a: 0.75, ..MAUVE }
+                    } else {
+                        // Dim but present: a reviewer has to be able to see
+                        // that the target exists before hovering it.
+                        Color { a: 0.30, ..MUTED }
+                    })),
+                    border: Border {
+                        radius: 2.0.into(),
+                        ..Border::default()
+                    },
+                    ..button::Style::default()
+                }
+            })
+            .into()
         }
         // A line the app invented locally exists in no document, so there is
         // no op id to name and nothing to point at.
-        None => Space::with_width(GUTTER).into(),
+        None => Space::new().width(GUTTER).into(),
     };
     row![gutter, feed_line(item)]
         .spacing(4)
@@ -4157,12 +4416,8 @@ fn feed_line(item: &FeedItem) -> Element<'_, Message> {
     }
     // Model prose renders as Markdown; status/tool/error lines stay plain.
     if let Some(md) = &item.md {
-        return markdown::view(
-            md,
-            markdown::Settings::default(),
-            markdown::Style::from_palette(Theme::CatppuccinMocha.palette()),
-        )
-        .map(|url| Message::OpenUrl(url.to_string()));
+        return markdown::view(md, Theme::CatppuccinMocha)
+            .map(|url| Message::OpenUrl(url.to_string()));
     }
     let event = &item.event;
     let body = if event.html {
@@ -4394,6 +4649,84 @@ fn author_for(keys: Option<&KeysDto>, email: &str) -> Member {
     }
 }
 
+/// What an artifact entry actually IS, taken from the `kind: ` prefix the host
+/// writes into its summary (`diff: …`, `memo: …`, `log: …`,
+/// `live-snapshot: …`).
+///
+/// The card used to be badged with the bare word `artifact`, which is what made
+/// a diff unfindable: a reviewer scrolling a session record had no way to tell
+/// which anonymous grey box held the code (ledger `532826c2`). Falls back to
+/// `artifact` when there is no recognisable prefix, so an unknown kind is never
+/// mislabelled as something it is not.
+fn artifact_label(summary: &str) -> &str {
+    let Some((prefix, _)) = summary.split_once(':') else {
+        return "artifact";
+    };
+    let prefix = prefix.trim();
+    match prefix {
+        "diff" | "memo" | "log" | "live-snapshot" => prefix,
+        // A prefix with spaces is prose that happens to contain a colon, not a
+        // kind — "I'll make both edits: …" must not become a badge.
+        _ => "artifact",
+    }
+}
+
+/// The newest diff artifact belonging to `session`, if any — the one a reviewer
+/// opening a session almost always wants to look at.
+///
+/// Entries arrive in timeline order, so the last match is the newest. Used to
+/// expand it automatically: a reviewer had to pick the channel, find the
+/// session, scroll a long record, recognise an anonymous card and click "show
+/// content" before the gesture could start (ledger `532826c2`), and this
+/// deletes the last three of those.
+fn newest_diff_artifact<'a>(entries: &'a [EntryDto], session: &str) -> Option<&'a EntryDto> {
+    entries.iter().rfind(|entry| {
+        entry.kind == "artifact"
+            && entry.target.as_deref() == Some(session)
+            && artifact_label(&entry.summary) == "diff"
+    })
+}
+
+/// The session's newest diff, rendered as the pane's primary object rather than
+/// as one collapsed card among many (`532826c2`: "the gesture is fine; reaching
+/// the code is the problem").
+///
+/// It carries no collapse control, and its card is omitted from the side record
+/// so the same diff is never on screen twice. Content normally arrives via the
+/// load-time auto-expand; when it has not (a refresh that raced it, or a
+/// collapse performed before this arrangement put the diff here) the panel
+/// offers a button rather than a stuck spinner, so it can never be dead.
+fn code_panel<'a>(
+    id: pane_grid::Pane,
+    pane: &'a Pane,
+    artifact: &'a EntryDto,
+    aim: Option<Aim<'a>>,
+) -> Element<'a, Message> {
+    let head = row![
+        badge("diff", kind_color("artifact")),
+        text(artifact.summary.clone()).size(12).color(MUTED),
+    ]
+    .spacing(8)
+    .align_y(Center);
+    let body: Element<Message> = match pane.artifacts.get(&artifact.id) {
+        Some(ArtifactContent::Loaded {
+            format,
+            body,
+            md,
+            digest,
+        }) => artifact_body(id, &artifact.id, digest, format, body, md.as_deref(), aim),
+        Some(ArtifactContent::Loading) => text("loading the diff…").size(11).color(MUTED).into(),
+        Some(ArtifactContent::Error(err)) => text(format!("⚠ {err}")).size(11).color(RED).into(),
+        None => button(text("show the diff").size(11))
+            .on_press(Message::ToggleArtifact(id, artifact.id.clone()))
+            .padding(6)
+            .into(),
+    };
+    column![head, scrollable(body).height(Fill)]
+        .spacing(6)
+        .into()
+}
+
 fn chip_style(color: Color, active: bool) -> button::Style {
     button::Style {
         background: Some(Background::Color(if active {
@@ -4463,7 +4796,7 @@ fn entry_acts(entry: &EntryDto) -> Option<(&'static str, &'static str)> {
 /// continuous connecting line needs a `Fill` height, which Iced forbids inside
 /// a scrollable — dots-only still reads as a node history.)
 fn rail(color: Color) -> Element<'static, Message> {
-    column![Space::with_height(6), dot(color)]
+    column![Space::new().height(6), dot(color)]
         .align_x(Center)
         .width(Length::Fixed(18.0))
         .into()
@@ -4471,7 +4804,7 @@ fn rail(color: Color) -> Element<'static, Message> {
 
 /// A small filled circle (a history node).
 fn dot(color: Color) -> Element<'static, Message> {
-    container(Space::new(0.0, 0.0))
+    container(Space::new())
         .width(Length::Fixed(11.0))
         .height(Length::Fixed(11.0))
         .style(move |_theme| container::Style {
@@ -4511,8 +4844,16 @@ fn entry_card<'a>(
     aim: Option<Aim<'a>>,
 ) -> Element<'a, Message> {
     let accent = kind_color(&entry.kind);
+    // An artifact is badged with WHAT IT IS (`diff`, `memo`, `log`), not the
+    // generic word `artifact` — otherwise every artifact in a session record
+    // looks identical and the diff is unfindable (ledger `532826c2`).
+    let kind_label = if entry.kind == "artifact" {
+        artifact_label(&entry.summary)
+    } else {
+        &entry.kind
+    };
     let mut head = row![
-        badge(&entry.kind, accent),
+        badge(kind_label, accent),
         text(entry.author.clone()).size(11).color(MUTED)
     ]
     .spacing(8);
@@ -4526,17 +4867,12 @@ fn entry_card<'a>(
     if show_unverified {
         head = head.push(badge("unverified", YELLOW));
     }
-    head = head.push(Space::with_width(Fill));
+    head = head.push(Space::new().width(Fill));
     head = head.push(copy_button(entry.summary.clone()));
 
     // The body: a session memo renders as Markdown; everything else is plain.
     let body: Element<Message> = if let Some(items) = summary_md {
-        markdown::view(
-            items,
-            markdown::Settings::default(),
-            markdown::Style::from_palette(Theme::CatppuccinMocha.palette()),
-        )
-        .map(|url| Message::OpenUrl(url.to_string()))
+        markdown::view(items, Theme::CatppuccinMocha).map(|url| Message::OpenUrl(url.to_string()))
     } else {
         text(entry.summary.clone()).size(13).color(TEXT).into()
     };
@@ -4565,7 +4901,7 @@ fn entry_card<'a>(
             let color = if affirmative { GREEN } else { RED };
             let inner = row![
                 text(opt.label.clone()).size(11),
-                Space::with_width(Fill),
+                Space::new().width(Fill),
                 text(opt.act.clone()).size(10),
             ]
             .spacing(8)
@@ -4655,10 +4991,24 @@ fn entry_card<'a>(
             Some(ArtifactContent::Error(err)) => {
                 card = card.push(text(format!("⚠ {err}")).size(11).color(RED));
             }
-            Some(ArtifactContent::Loaded { format, body, md }) => {
-                card = card
-                    .push(row![Space::with_width(Fill), copy_button(body.clone())].align_y(Center));
-                card = card.push(artifact_body(id, format, body, md.as_deref(), aim));
+            Some(ArtifactContent::Loaded {
+                format,
+                body,
+                md,
+                digest,
+            }) => {
+                card = card.push(
+                    row![Space::new().width(Fill), copy_button(body.clone())].align_y(Center),
+                );
+                card = card.push(artifact_body(
+                    id,
+                    &entry.id,
+                    digest,
+                    format,
+                    body,
+                    md.as_deref(),
+                    aim,
+                ));
             }
             None => {}
         }
@@ -4691,8 +5041,13 @@ fn entry_card<'a>(
 /// that are not on screen would be a click that appears to do nothing.
 #[derive(Clone, Copy)]
 struct Aim<'a> {
-    /// The composer's current `path`, untrimmed (as typed).
+    /// The composer's current `path`, untrimmed (as typed). Empty when the aim
+    /// is at record content or the live stream rather than at a file.
     path: &'a str,
+    /// The record entry the composer is aimed at, when pointing at content
+    /// already in the record (`Pane::annotate_record`). Mutually exclusive with
+    /// a non-empty `path`.
+    record: Option<&'a str>,
     /// The composer's current `lines`, parsed — `None` while it is empty or
     /// malformed.
     span: Option<Span>,
@@ -4701,6 +5056,10 @@ struct Aim<'a> {
     /// Resolved by `popup_anchor`, which refuses a row that is not actually
     /// rendered, so the panel can never be aimed at nothing.
     popup_at: Option<u32>,
+    /// The row under the cursor as `(target key, line)`, so exactly one row
+    /// paints its hover. Tracked in state because these rows are `mouse_area`s,
+    /// which report no hover status of their own.
+    hover: Option<(&'a str, u32)>,
     /// The pane, so the row owning the panel can build it in place.
     pane: &'a Pane,
 }
@@ -4717,10 +5076,16 @@ const MAX_DIFF_ROWS: usize = 500;
 /// composer at all: the bottom composer hides while the panel is up, so
 /// promising a panel that has no anchor would remove the only way to comment.
 fn popup_anchor(pane: &Pane) -> Option<u32> {
+    // A record aim needs no rendering check: the aimed entry IS the artifact
+    // being rendered, and the row was clicked to set the span in the first
+    // place, so the line necessarily exists in what is on screen.
+    if pane.annotate_record.is_some() {
+        return parse_span(&pane.annotate_lines).map(|span| span.end);
+    }
     let diffs = pane.artifacts.values().filter_map(|content| match content {
-        ArtifactContent::Loaded { format, body, md } if format == "diff" && md.is_none() => {
-            Some(body.as_str())
-        }
+        ArtifactContent::Loaded {
+            format, body, md, ..
+        } if format == "diff" && md.is_none() => Some(body.as_str()),
         _ => None,
     });
     popup_anchor_line(
@@ -4735,27 +5100,31 @@ fn popup_anchor(pane: &Pane) -> Option<u32> {
 /// colour; anything else is shown verbatim. Monospace; long artifacts are
 /// truncated (the web view holds the full text).
 ///
-/// With an `aim`, every diff row that occupies a line of the NEW file becomes a
-/// click target that aims the composer there (`pointing::diff_row_targets`);
-/// rows inside the aimed span are lit. Headers, hunk markers and removed rows
-/// stay plain text, which is also how a reviewer can see at a glance what is
-/// pointable.
+/// With an `aim`, EVERY rendered line is a click target (ledger `9d0ea0b6`:
+/// pointing that works only on the added lines of a committed diff violates
+/// least surprise). A diff row occupying a line of the new file aims a
+/// `CodeAnchor` at that file line (`pointing::diff_row_targets`); every other
+/// line — a header, a hunk marker, a removed row, a whole memo or log — aims a
+/// `RecordAnchor` at that line of this artifact's stored content, which is
+/// immutable and digest-addressable. Rows inside the aimed span are lit.
+///
+/// A Markdown artifact renders formatted while READING and as pointable
+/// monospace lines while commenting, because a line is what an anchor can name:
+/// rendered Markdown has no stable line to point at, and refusing to point at
+/// memos at all is the defect this replaces.
 fn artifact_body<'a>(
     id: pane_grid::Pane,
+    entry: &'a str,
+    digest: &'a str,
     format: &str,
     body: &'a str,
     md: Option<&'a [markdown::Item]>,
     aim: Option<Aim<'a>>,
 ) -> Element<'a, Message> {
-    // A memo renders as formatted Markdown.
-    if let Some(items) = md {
+    if let Some(items) = md.filter(|_| aim.is_none()) {
         return container(
-            markdown::view(
-                items,
-                markdown::Settings::default(),
-                markdown::Style::from_palette(Theme::CatppuccinMocha.palette()),
-            )
-            .map(|url| Message::OpenUrl(url.to_string())),
+            markdown::view(items, Theme::CatppuccinMocha)
+                .map(|url| Message::OpenUrl(url.to_string())),
         )
         .padding(8)
         .width(Fill)
@@ -4785,31 +5154,53 @@ fn artifact_body<'a>(
     let mut col = column![].spacing(1);
     for (i, line) in lines.iter().enumerate().take(MAX_DIFF_ROWS) {
         let color = if is_diff { diff_line_color(line) } else { TEXT };
-        match (aim, targets.get(i).copied().flatten()) {
-            (Some(aim), Some((path, file_line))) => {
-                let aimed_here = aim.path.trim() == path;
-                let lit = aimed_here
-                    && aim
-                        .span
-                        .is_some_and(|s| s.start <= file_line && file_line <= s.end);
-                let row = diff_row(id, line, color, path, file_line, lit);
-                // The comment surface hangs off the row it is about, rather than
-                // sitting 800px away at the bottom of the pane (ledger
-                // `02ff24be`). Exactly one row in the pane carries it.
-                if aimed_here && aim.popup_at == Some(file_line) {
-                    col = col.push(Popover::new(row, Some(annotate_popup(id, aim.pane))));
-                } else {
-                    col = col.push(row);
-                }
-            }
-            _ => {
-                col = col.push(
-                    text((*line).to_string())
-                        .font(iced::Font::MONOSPACE)
-                        .size(12)
-                        .color(color),
-                );
-            }
+        let Some(aim) = aim else {
+            col = col.push(
+                text((*line).to_string())
+                    .font(iced::Font::MONOSPACE)
+                    .size(12)
+                    .color(color),
+            );
+            continue;
+        };
+        // `line_no` is this row's own 1-indexed position in the stored content,
+        // which is what a `RecordAnchor` names; `file_line` is the position in
+        // the NEW file, which is what a `CodeAnchor` names. They are different
+        // numbers and must never be swapped.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "capped at MAX_DIFF_ROWS, far below u32::MAX"
+        )]
+        let line_no = (i + 1) as u32;
+        // A diff row that occupies a real new-file line makes the stronger
+        // claim; everything else points at this artifact's stored text.
+        let (target, row_line) = match targets.get(i).copied().flatten() {
+            Some((path, file_line)) => (AnchorTarget::Code(path.to_string()), file_line),
+            None => (
+                AnchorTarget::Record(entry.to_string(), digest.to_string()),
+                line_no,
+            ),
+        };
+        // Aimed HERE means the composer is pointed at this row's own target, so
+        // `lit` and the panel can never appear on a row belonging to a different
+        // file or artifact.
+        let aimed_here = match &target {
+            AnchorTarget::Code(path) => aim.record.is_none() && aim.path.trim() == path,
+            AnchorTarget::Record(record, _) => aim.record == Some(record.as_str()),
+        };
+        let lit = aimed_here
+            && aim
+                .span
+                .is_some_and(|s| s.start <= row_line && row_line <= s.end);
+        let hovered = aim.hover == Some((target.key(), row_line));
+        let row = anchor_row(id, line, color, target, row_line, lit, hovered);
+        // The comment surface hangs off the row it is about, rather than sitting
+        // 800px away at the bottom of the pane (ledger `02ff24be`). Exactly one
+        // row in the pane carries it: the aimed span's end.
+        if aimed_here && aim.popup_at == Some(row_line) {
+            col = col.push(Popover::new(row, Some(annotate_popup(id, aim.pane))));
+        } else {
+            col = col.push(row);
         }
     }
     if lines.len() > MAX_DIFF_ROWS {
@@ -4822,7 +5213,19 @@ fn artifact_body<'a>(
             .color(MUTED),
         );
     }
-    container(col)
+    // A release outside any row would otherwise leave `drag_from` set, and the
+    // next hover — with no button down — would silently extend the selection.
+    // Leaving the artifact ends the gesture, which bounds that to the one case
+    // a `mouse_area` cannot observe.
+    let body: Element<Message> = if aim.is_some() {
+        mouse_area(col)
+            .on_release(Message::AnchorRelease(id))
+            .on_exit(Message::AnchorRelease(id))
+            .into()
+    } else {
+        col.into()
+    };
+    container(body)
         .padding(8)
         .width(Fill)
         .style(|_theme| container::Style {
@@ -4861,20 +5264,34 @@ fn diff_line_color(line: &str) -> Color {
     }
 }
 
-/// One anchorable diff row: a full-width click target that stays invisible
-/// until hovered, so a 500-row diff reads as a diff rather than as 500
-/// buttons. Clicking aims the composer at this row's new-file line
-/// (`Message::AnchorRow`); `lit` paints the rows already inside the aimed
-/// span, which is the only feedback that a range was picked at all.
-fn diff_row<'a>(
+/// One anchorable row: a full-width target that stays invisible until hovered,
+/// so a 500-row diff reads as a diff and a memo reads as prose rather than as
+/// hundreds of buttons.
+///
+/// A `mouse_area`, deliberately not a `button`. A button reports no drag state
+/// at all, which is why the first version of this gesture was "click a line,
+/// then click a lower line" — directional, undiscoverable, and Dan's complaint
+/// (2026-08-23). `on_press`/`on_enter`/`on_release` give press-drag-release
+/// selection instead, at the cost of painting hover by hand (`hovered`).
+///
+/// `lit` paints rows already inside the aimed span, which is the only feedback
+/// that a range was picked. Colour distinguishes the claim: mauve for a
+/// `CodeAnchor` at a file line, teal for a `RecordAnchor` at stored content, so
+/// a reviewer can tell which one a drag is making without reading the composer.
+fn anchor_row<'a>(
     id: pane_grid::Pane,
     body: &str,
     color: Color,
-    path: &str,
+    target: AnchorTarget,
     line: u32,
     lit: bool,
+    hovered: bool,
 ) -> Element<'a, Message> {
-    button(
+    let paint = match target {
+        AnchorTarget::Code(_) => MAUVE,
+        AnchorTarget::Record(..) => TEAL,
+    };
+    let row = container(
         text(body.to_string())
             .font(iced::Font::MONOSPACE)
             .size(12)
@@ -4882,23 +5299,23 @@ fn diff_row<'a>(
     )
     .width(Fill)
     .padding([0, 4])
-    .on_press(Message::AnchorRow(id, path.to_string(), line))
-    .style(move |_theme, status| {
-        let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
-        button::Style {
-            background: (lit || hovered).then_some(Background::Color(Color {
-                a: if lit { 0.28 } else { 0.14 },
-                ..MAUVE
-            })),
-            text_color: color,
-            border: Border {
-                radius: 3.0.into(),
-                ..Border::default()
-            },
-            ..button::Style::default()
-        }
-    })
-    .into()
+    .style(move |_theme| container::Style {
+        background: (lit || hovered).then_some(Background::Color(Color {
+            a: if lit { 0.28 } else { 0.14 },
+            ..paint
+        })),
+        text_color: Some(color),
+        border: Border {
+            radius: 3.0.into(),
+            ..Border::default()
+        },
+        ..container::Style::default()
+    });
+    mouse_area(row)
+        .on_press(Message::AnchorPress(id, target.clone(), line))
+        .on_enter(Message::AnchorOver(id, target, line))
+        .on_release(Message::AnchorRelease(id))
+        .into()
 }
 
 /// A small "copy" button that writes `text` to the clipboard (Iced static text
@@ -5023,6 +5440,39 @@ fn status_color(status: &str) -> Color {
 }
 
 impl Pane {
+    /// Aim the composer at `target` over `lines`, keeping the three anchor kinds
+    /// mutually exclusive.
+    ///
+    /// Every pointing gesture goes through here so the exclusivity is stated
+    /// once: an aim left half-set — a stale `annotate_path` beside a fresh
+    /// `annotate_record`, say — would make `AnnotateSubmit` sign the wrong kind
+    /// of claim, and that is a corrupt record rather than a cosmetic bug.
+    fn aim_at(&mut self, target: &AnchorTarget, lines: String) {
+        self.annotate_lines = lines;
+        self.annotate_op = None;
+        match target {
+            AnchorTarget::Code(path) => {
+                self.annotate_path = path.clone();
+                self.annotate_record = None;
+            }
+            AnchorTarget::Record(entry, digest) => {
+                // Record content is not a file: the empty path is what tells
+                // `AnnotateSubmit` this is not a `CodeAnchor`.
+                self.annotate_path.clear();
+                self.annotate_record = Some((entry.clone(), digest.clone()));
+            }
+        }
+    }
+
+    /// The key of whatever the composer is currently aimed at, or `None` when it
+    /// is aimed at the live stream (which has no rows to drag across).
+    fn aimed_key(&self) -> Option<&str> {
+        if let Some((entry, _)) = &self.annotate_record {
+            return Some(entry.as_str());
+        }
+        Some(self.annotate_path.trim()).filter(|path| !path.is_empty())
+    }
+
     fn loading(channel: &str) -> Self {
         Pane {
             channel: channel.to_string(),
@@ -5037,6 +5487,9 @@ impl Pane {
             annotate_email: None,
             conversation_len: 0,
             annotate_op: None,
+            annotate_record: None,
+            drag_from: None,
+            hover: None,
             worktree_commit: None,
             annotate_path: String::new(),
             annotate_lines: String::new(),
@@ -5053,7 +5506,7 @@ impl Pane {
             act_drafts: HashMap::new(),
             act_errors: HashMap::new(),
             act_pending: HashSet::new(),
-            scroll_id: scrollable::Id::unique(),
+            scroll_id: iced::widget::Id::unique(),
             artifacts: HashMap::new(),
             launch_expanded: false,
             show_full_history: false,
@@ -5069,6 +5522,7 @@ impl Pane {
             brief_text: None,
             keys: None,
             keys_error: None,
+            auto_expanded: false,
             members_open: false,
             identity_form: None,
             identity_pending: false,
@@ -5905,7 +6359,7 @@ fn fetch_channels() -> Task<Message> {
 /// (`/channels/{channel}/sessions/{session}/stream`) into `Message::Live`.
 fn session_stream(channel: String, session: String) -> impl iced::futures::Stream<Item = Message> {
     use iced::futures::{SinkExt, StreamExt};
-    iced::stream::channel(64, move |mut output| async move {
+    iced::stream::channel::<Message>(64, move |mut output: mpsc::Sender<Message>| async move {
         let url = format!("{HOST}/channels/{channel}/sessions/{session}/stream");
         let Ok(response) = reqwest::get(&url).await else {
             let _ = output.send(Message::LiveEnded(session)).await;
@@ -6061,6 +6515,49 @@ where
         .await
 }
 
+/// What the FIRST frame on a freshly opened live socket means.
+enum FirstFrame {
+    /// The handshake is on: sign this nonce.
+    Challenge(String),
+    /// The session has no live document, so there is nothing to watch. The host
+    /// answers that with `End` BEFORE challenging and calls it "graceful, not a
+    /// failure" (`crates/junto/src/live_ws.rs`) — watching a landed session is
+    /// the ordinary case and must close quietly.
+    QuietEnd,
+    /// A real failure, with something worth showing the reviewer.
+    Failed(String),
+}
+
+/// Classify the first frame of a live-socket handshake.
+///
+/// Split out because getting this wrong is user-visible, and was: treating the
+/// pre-challenge `End` as "expected a challenge" put a "handshake failed" line
+/// in the feed every time anyone watched a session that was not currently
+/// running a turn — which became every local watch once the websocket stopped
+/// being remote-only.
+fn classify_first_frame(
+    incoming: Option<
+        Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>,
+    >,
+) -> FirstFrame {
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+    match incoming {
+        Some(Ok(WsMessage::Text(text))) => match serde_json::from_str::<WireFrame>(text.as_str()) {
+            Ok(WireFrame::Challenge { nonce }) => FirstFrame::Challenge(nonce),
+            Ok(WireFrame::End) => FirstFrame::QuietEnd,
+            // The host also refuses before challenging when the session is not
+            // watchable at all; that reason IS worth showing, unlike `End`.
+            Ok(WireFrame::Rejected { reason }) => FirstFrame::Failed(reason),
+            _ => FirstFrame::Failed("handshake failed: expected a challenge".into()),
+        },
+        // A clean close carrying no frame means the same as `End`: nothing to
+        // watch. Only a transport error or a non-text frame is a failure.
+        Some(Ok(WsMessage::Close(_))) | None => FirstFrame::QuietEnd,
+        Some(Ok(_)) => FirstFrame::Failed("handshake failed: expected a challenge".into()),
+        Some(Err(err)) => FirstFrame::Failed(format!("handshake failed: {err}")),
+    }
+}
+
 /// A long-lived subscription streaming a session's live feed from a REMOTE
 /// host's authenticated live websocket (`/channels/{channel}/sessions/{session}/live`)
 /// into `Message::Live`/`Message::Watchers` — the websocket counterpart of
@@ -6087,7 +6584,7 @@ fn live_ws_stream(
     use iced::futures::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-    iced::stream::channel(64, move |mut output| async move {
+    iced::stream::channel::<Message>(64, move |mut output: mpsc::Sender<Message>| async move {
         let Some(signing_key) = load_signing_key(&email) else {
             let _ = output
                 .send(Message::Live(
@@ -6116,33 +6613,18 @@ fn live_ws_stream(
         };
         let (mut write, mut read) = socket.split();
 
-        // Handshake: Challenge → Auth → AuthOk (or Rejected/anything else).
-        let nonce = match read.next().await {
-            Some(Ok(WsMessage::Text(text))) => {
-                match serde_json::from_str::<WireFrame>(text.as_str()) {
-                    Ok(WireFrame::Challenge { nonce }) => nonce,
-                    _ => {
-                        let _ = output
-                            .send(Message::Live(
-                                session.clone(),
-                                None,
-                                error_event("handshake failed: expected a challenge".into()),
-                            ))
-                            .await;
-                        let _ = output.send(Message::LiveEnded(session)).await;
-                        return;
-                    }
-                }
+        // Handshake: Challenge → Auth → AuthOk. What the FIRST frame means is
+        // classified by `classify_first_frame`, so the distinction that matters
+        // — a graceful `End` versus a real failure — is unit-tested.
+        let nonce = match classify_first_frame(read.next().await) {
+            FirstFrame::Challenge(nonce) => nonce,
+            FirstFrame::QuietEnd => {
+                let _ = output.send(Message::LiveEnded(session)).await;
+                return;
             }
-            _ => {
+            FirstFrame::Failed(reason) => {
                 let _ = output
-                    .send(Message::Live(
-                        session.clone(),
-                        None,
-                        error_event(
-                            "handshake failed: connection closed before a challenge arrived".into(),
-                        ),
-                    ))
+                    .send(Message::Live(session.clone(), None, error_event(reason)))
                     .await;
                 let _ = output.send(Message::LiveEnded(session)).await;
                 return;
@@ -6573,6 +7055,217 @@ fn post_steer(
 mod tests {
     use super::*;
 
+    /// Headless UI test, which is the reason for the 0.14 upgrade. Verifying
+    /// that clicking a diff row emits the right anchor used to mean driving the
+    /// real window through Win32 — stolen focus, DPI-scaled coordinates, and
+    /// dropped keystrokes. `iced_test` selects a widget BY ITS TEXT and clicks
+    /// it in memory, so the same claim is now an ordinary assertion.
+    #[test]
+    fn clicking_a_rendered_diff_row_emits_that_rows_anchor() {
+        let diff = "\
+diff --git a/lib.rs b/lib.rs
++++ b/lib.rs
+@@ -1,3 +1,4 @@
+ fn one() {}
+-fn two() {}
++fn two() { println!(\"two\"); }
+ fn three() {}
+";
+        // A pane is only needed so the aimed row can build its panel; nothing
+        // is aimed here, so the rows are plain click targets.
+        let (panes, id) = pane_grid::State::new(Pane::loading("c"));
+        let pane = panes.get(id).expect("the pane just created");
+        let aim = Aim {
+            path: "",
+            record: None,
+            span: None,
+            popup_at: None,
+            hover: None,
+            pane,
+        };
+
+        let mut ui = iced_test::simulator(artifact_body(
+            id,
+            "a1",
+            "sha256:x",
+            "diff",
+            diff,
+            None,
+            Some(aim),
+        ));
+
+        // The added line is row 5 of the diff and line 2 of the NEW file: the
+        // removed row above it consumes no new-file line.
+        ui.click("+fn two() { println!(\"two\"); }")
+            .expect("the added row is a click target");
+        let messages: Vec<Message> = ui.into_messages().collect();
+
+        // A click is now a press AND a release (`mouse_area`), so the assertion
+        // names the press rather than demanding the whole list be one message.
+        assert!(
+            messages.iter().any(|m| matches!(
+                m,
+                Message::AnchorPress(_, AnchorTarget::Code(path), 2) if path == "lib.rs"
+            )),
+            "expected a code anchor press at lib.rs:2, got {messages:?}"
+        );
+    }
+
+    /// Builds a pane watching session `s1`, whose record holds one diff
+    /// artifact with its content already fetched.
+    fn reviewing_pane() -> (pane_grid::State<Pane>, pane_grid::Pane, &'static str) {
+        const DIFF: &str = "\
+diff --git a/lib.rs b/lib.rs
++++ b/lib.rs
+@@ -1,3 +1,4 @@
+ fn one() {}
++fn two() { println!(\"two\"); }
+";
+        let entry = |id: &str, kind: &str, summary: &str| EntryDto {
+            id: id.into(),
+            author: "omp@oh-my-pi.dev".into(),
+            kind: kind.into(),
+            summary: summary.into(),
+            status: None,
+            unrecognized: false,
+            unverified: false,
+            target: Some("s1".into()),
+            frame: Vec::new(),
+        };
+        let (mut panes, id) = pane_grid::State::new(Pane::loading("c"));
+        let pane = panes.get_mut(id).expect("the pane just created");
+        pane.watched = Some("s1".into());
+        pane.content = Content::Loaded(ChannelDto {
+            id: "c".into(),
+            name: Some("c".into()),
+            closed: false,
+            party: Vec::new(),
+            workspace: None,
+            sessions: Vec::new(),
+            entries: vec![
+                entry("s1", "session", "did a thing"),
+                entry("m1", "memo", "memo: some prose"),
+                entry("a1", "artifact", "diff: lib.rs"),
+            ],
+        });
+        pane.artifacts.insert(
+            "a1".into(),
+            ArtifactContent::Loaded {
+                format: "diff".into(),
+                body: DIFF.into(),
+                md: None,
+                digest: ContentDigest::sha256_of(DIFF.as_bytes())
+                    .as_str()
+                    .to_string(),
+            },
+        );
+        (panes, id, DIFF)
+    }
+
+    #[test]
+    fn watching_a_session_puts_its_diff_on_screen_with_no_clicks() {
+        // The review-first arrangement's whole claim (ledger `532826c2`): a
+        // reviewer who opens a session is looking AT the code, having clicked
+        // nothing. Simulating `pane_body` rather than `artifact_body` is the
+        // point — it is the layout, not the diff renderer, that is on trial.
+        let (panes, id, _) = reviewing_pane();
+        let pane = panes.get(id).expect("the pane just built");
+        let mut ui = iced_test::simulator(pane_body(id, pane, &[], &[]));
+
+        ui.find("+fn two() { println!(\"two\"); }")
+            .expect("the diff's added line must be on screen before any click");
+    }
+
+    #[test]
+    fn the_primary_diff_is_not_also_a_card_in_the_side_record() {
+        // Showing it twice is how the record got long enough to hide things in,
+        // so the artifact's own card must be gone - while the memo beside it,
+        // which has no primary panel, stays.
+        let (panes, id, _) = reviewing_pane();
+        let pane = panes.get(id).expect("the pane just built");
+        let mut ui = iced_test::simulator(pane_body(id, pane, &[], &[]));
+
+        ui.find("memo: some prose")
+            .expect("a non-diff entry still belongs in the side record");
+        assert!(
+            ui.find("diff: lib.rs").is_ok(),
+            "the primary panel labels itself with the artifact's summary"
+        );
+        // An artifact card carries a toggle; the primary panel never does, so
+        // with the primary excluded no toggle exists in the pane at all. The
+        // label reads "hide" here because this artifact's content is loaded.
+        assert!(
+            ui.find("hide content ▾").is_err(),
+            "the primary diff must not also appear as a card in the record"
+        );
+    }
+
+    #[test]
+    fn clicking_a_removed_diff_row_anchors_the_record_not_the_file() {
+        // CONTRACT DELIBERATELY INVERTED (Dan, 2026-08-23: "EVERYTHING should be
+        // pointable"). This test previously asserted a removed row emitted
+        // NOTHING, which was correct while `CodeAnchor` was the only anchor a
+        // diff row could make: a deleted line has no line in the new file, so
+        // there was nothing truthful to point at. `Anchor::Record` gives it
+        // something — the line still exists in the stored artifact's TEXT, at
+        // row 3 — so the row is now a target for that claim instead, and the
+        // old silence is the bug rather than the guarantee.
+        let diff = "+++ b/lib.rs\n@@ -1,2 +1,1 @@\n-fn gone() {}\n fn stays() {}\n";
+        let (panes, id) = pane_grid::State::new(Pane::loading("c"));
+        let pane = panes.get(id).expect("the pane just created");
+        let aim = Aim {
+            path: "",
+            record: None,
+            span: None,
+            popup_at: None,
+            hover: None,
+            pane,
+        };
+
+        let mut ui = iced_test::simulator(artifact_body(
+            id,
+            "a1",
+            "sha256:x",
+            "diff",
+            diff,
+            None,
+            Some(aim),
+        ));
+        ui.click("-fn gone() {}")
+            .expect("a removed row is a record target");
+        let messages: Vec<Message> = ui.into_messages().collect();
+
+        assert!(
+            messages.iter().any(|m| matches!(
+                m,
+                Message::AnchorPress(_, AnchorTarget::Record(entry, digest), 3)
+                    if entry == "a1" && digest == "sha256:x"
+            )),
+            "expected a record anchor at line 3 of a1, got {messages:?}"
+        );
+        // The surviving context line keeps its stronger claim: it has a real
+        // new-file line, so it still anchors the FILE, not the artifact text.
+        let mut ui = iced_test::simulator(artifact_body(
+            id,
+            "a1",
+            "sha256:x",
+            "diff",
+            diff,
+            None,
+            Some(aim),
+        ));
+        ui.click(" fn stays() {}")
+            .expect("a context row is a target");
+        let messages: Vec<Message> = ui.into_messages().collect();
+        assert!(
+            messages.iter().any(|m| matches!(
+                m,
+                Message::AnchorPress(_, AnchorTarget::Code(path), 1) if path == "lib.rs"
+            )),
+            "expected a code anchor at lib.rs:1, got {messages:?}"
+        );
+    }
+
     #[test]
     fn ws_url_swaps_http_and_https_schemes() {
         assert_eq!(
@@ -6921,6 +7614,262 @@ mod tests {
         assert!(
             invite_countdown_live(true, Some(60_000), 0),
             "an open form with an unexpired code ticks"
+        );
+    }
+
+    /// Build the text frame the host would actually send.
+    fn ws_text(
+        frame: &WireFrame,
+    ) -> Option<
+        Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>,
+    > {
+        Some(Ok(tokio_tungstenite::tungstenite::Message::text(
+            serde_json::to_string(frame).expect("WireFrame always serializes"),
+        )))
+    }
+
+    #[test]
+    fn a_pre_challenge_end_closes_quietly_rather_than_failing() {
+        // THE BUG, reported from the running app: the host answers a session
+        // with no live document by sending `End` before any challenge — its own
+        // code calls that "graceful, not a failure" — and the client reported
+        // "handshake failed: expected a challenge". Confirmed against the real
+        // host: the first and only frame for a landed session is {"t":"end"}.
+        // It became visible on every watch once the websocket stopped being
+        // remote-only.
+        assert!(matches!(
+            classify_first_frame(ws_text(&WireFrame::End)),
+            FirstFrame::QuietEnd
+        ));
+    }
+
+    #[test]
+    fn a_challenge_starts_the_handshake() {
+        let framed = ws_text(&WireFrame::Challenge {
+            nonce: "abc123".into(),
+        });
+        match classify_first_frame(framed) {
+            FirstFrame::Challenge(nonce) => assert_eq!(nonce, "abc123"),
+            _ => panic!("expected a challenge"),
+        }
+    }
+
+    #[test]
+    fn a_refusal_surfaces_its_reason_but_end_never_does() {
+        // A `Rejected` reason is actionable ("not a member", "no such
+        // session"); `End` is not, which is the whole distinction.
+        match classify_first_frame(ws_text(&WireFrame::Rejected {
+            reason: "not a member of this channel".into(),
+        })) {
+            FirstFrame::Failed(reason) => assert_eq!(reason, "not a member of this channel"),
+            _ => panic!("expected a failure"),
+        }
+    }
+
+    #[test]
+    fn a_silent_close_is_nothing_to_watch_not_a_failure() {
+        assert!(matches!(classify_first_frame(None), FirstFrame::QuietEnd));
+        assert!(matches!(
+            classify_first_frame(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(
+                None
+            )))),
+            FirstFrame::QuietEnd
+        ));
+    }
+
+    #[test]
+    fn an_unexpected_frame_is_still_a_handshake_failure() {
+        // `AuthOk` before a challenge is genuinely wrong, and must not be
+        // swallowed quietly along with `End`.
+        match classify_first_frame(ws_text(&WireFrame::AuthOk)) {
+            FirstFrame::Failed(reason) => assert!(reason.contains("expected a challenge")),
+            _ => panic!("expected a failure"),
+        }
+    }
+
+    #[test]
+    fn artifact_label_names_what_the_artifact_is() {
+        // The card used to read `artifact` for all of these, which is what made
+        // a diff unfindable in a session record.
+        assert_eq!(
+            artifact_label("diff: uncommitted changes in D:\\tmp\\demo after turn 1"),
+            "diff"
+        );
+        assert_eq!(artifact_label("memo: I'll make both edits."), "memo");
+        assert_eq!(artifact_label("log: turn output"), "log");
+        assert_eq!(
+            artifact_label("live-snapshot: live session plane snapshot (2323 bytes)"),
+            "live-snapshot"
+        );
+    }
+
+    #[test]
+    fn artifact_label_refuses_to_badge_prose_that_happens_to_contain_a_colon() {
+        // A memo's own text often has a colon; treating the leading words as a
+        // kind would put arbitrary prose in the badge.
+        assert_eq!(
+            artifact_label("Both edits are done: lib.rs and notes.md"),
+            "artifact"
+        );
+        assert_eq!(artifact_label("no colon at all"), "artifact");
+        assert_eq!(artifact_label(""), "artifact");
+    }
+
+    /// An artifact entry as `view.json` delivers it.
+    fn artifact_entry(id: &str, target: &str, summary: &str) -> EntryDto {
+        EntryDto {
+            id: id.into(),
+            kind: "artifact".into(),
+            target: Some(target.into()),
+            summary: summary.into(),
+            ..sample_entry()
+        }
+    }
+
+    #[test]
+    fn the_newest_diff_of_the_watched_session_is_the_one_to_expand() {
+        // Entries arrive in timeline order, so the LAST matching diff is the
+        // newest — that is the one a reviewer opening a session wants.
+        let entries = vec![
+            artifact_entry("a", "s1", "diff: after turn 1"),
+            artifact_entry("b", "s1", "memo: some prose"),
+            artifact_entry("c", "s1", "diff: after turn 2"),
+            artifact_entry("d", "s2", "diff: another session's diff"),
+        ];
+        assert_eq!(
+            newest_diff_artifact(&entries, "s1").map(|e| e.id.as_str()),
+            Some("c")
+        );
+        assert_eq!(
+            newest_diff_artifact(&entries, "s2").map(|e| e.id.as_str()),
+            Some("d"),
+            "another session's diff must not be picked for s1, nor s1's for s2"
+        );
+    }
+
+    #[test]
+    fn a_session_with_no_diff_expands_nothing() {
+        // Auto-expanding must be a no-op rather than picking a memo, otherwise
+        // opening a session pops open unrelated prose.
+        let entries = vec![
+            artifact_entry("a", "s1", "memo: some prose"),
+            artifact_entry("b", "s1", "live-snapshot: 2323 bytes"),
+        ];
+        assert!(newest_diff_artifact(&entries, "s1").is_none());
+        assert!(newest_diff_artifact(&[], "s1").is_none());
+    }
+
+    #[test]
+    fn a_memo_renders_formatted_while_reading_and_pointable_while_commenting() {
+        // The restriction the deleted `pointability_note` used to explain is
+        // gone rather than better worded. A memo is prose, so it renders as
+        // Markdown when nobody is commenting; a line is the only thing an anchor
+        // can name, so the same memo becomes clickable monospace lines the
+        // moment the composer is aimed at anything.
+        let memo = "# Findings\n\nThe handshake was mine.\n";
+        let md: Vec<markdown::Item> = markdown::parse(memo).collect();
+        let (panes, id) = pane_grid::State::new(Pane::loading("c"));
+        let pane = panes.get(id).expect("the pane just created");
+
+        let mut reading = iced_test::simulator(artifact_body(
+            id,
+            "m1",
+            "sha256:x",
+            "markdown",
+            memo,
+            Some(&md),
+            None,
+        ));
+        // Rendered Markdown drops the literal "# " of the heading; the raw line
+        // is therefore absent exactly while it is unpointable.
+        assert!(
+            reading.click("# Findings").is_err(),
+            "a memo being read is prose, not click targets"
+        );
+
+        let aim = Aim {
+            path: "",
+            record: None,
+            span: None,
+            popup_at: None,
+            hover: None,
+            pane,
+        };
+        let mut commenting = iced_test::simulator(artifact_body(
+            id,
+            "m1",
+            "sha256:x",
+            "markdown",
+            memo,
+            Some(&md),
+            Some(aim),
+        ));
+        commenting
+            .click("The handshake was mine.")
+            .expect("a memo's lines are pointable while commenting");
+        let messages: Vec<Message> = commenting.into_messages().collect();
+        assert!(
+            messages.iter().any(|m| matches!(
+                m,
+                Message::AnchorPress(_, AnchorTarget::Record(entry, _), 3) if entry == "m1"
+            )),
+            "expected a record anchor at line 3 of the memo, got {messages:?}"
+        );
+    }
+
+    #[test]
+    fn aiming_at_one_anchor_kind_clears_the_others() {
+        // The corruption risk this guards: an aim left half-set — a stale
+        // `annotate_path` beside a fresh `annotate_record` — makes
+        // `AnnotateSubmit` sign the WRONG KIND of claim, which is a bad entry in
+        // an append-only record rather than a cosmetic bug.
+        let mut pane = Pane::loading("c");
+        pane.annotate_op = Some(4);
+
+        pane.aim_at(&AnchorTarget::Code("lib.rs".into()), drag_lines(2, 4));
+        assert_eq!(pane.annotate_path, "lib.rs");
+        assert_eq!(pane.annotate_lines, "2-4");
+        assert!(
+            pane.annotate_record.is_none(),
+            "a code aim clears the record"
+        );
+        assert!(pane.annotate_op.is_none(), "a code aim clears the stream");
+
+        pane.aim_at(
+            &AnchorTarget::Record("a1".into(), "sha256:x".into()),
+            drag_lines(7, 7),
+        );
+        assert_eq!(pane.annotate_record, Some(("a1".into(), "sha256:x".into())));
+        assert!(
+            pane.annotate_path.is_empty(),
+            "a record aim must clear the path, or submit builds a CodeAnchor"
+        );
+    }
+
+    #[test]
+    fn a_drag_is_scoped_to_the_target_it_started_on() {
+        // `aimed_key` is what stops a drag crossing from one file (or artifact)
+        // into another: a span whose two ends came from different content would
+        // be a signed claim about code that never existed.
+        let mut pane = Pane::loading("c");
+        assert_eq!(pane.aimed_key(), None, "the live stream has no rows");
+
+        pane.aim_at(&AnchorTarget::Code(" lib.rs ".into()), drag_lines(1, 1));
+        assert_eq!(
+            pane.aimed_key(),
+            Some("lib.rs"),
+            "the key is trimmed, since the path is also a free text input"
+        );
+
+        pane.aim_at(
+            &AnchorTarget::Record("a1".into(), "sha256:x".into()),
+            drag_lines(1, 1),
+        );
+        assert_eq!(pane.aimed_key(), Some("a1"));
+        assert_ne!(
+            pane.aimed_key(),
+            Some(AnchorTarget::Code("lib.rs".into()).key()),
+            "a drag started in a diff cannot extend into an artifact's text"
         );
     }
 }

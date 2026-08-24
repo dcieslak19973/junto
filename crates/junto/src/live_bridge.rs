@@ -299,7 +299,7 @@ pub(crate) fn format_steer(
             // a pinned `excerpt`, as the excerpt itself.
             let stream_excerpt = match &annotation.anchor {
                 Anchor::Stream(stream) => resolve_stream_excerpt(live_doc, &stream.op_id),
-                Anchor::Code(_) => None,
+                Anchor::Code(_) | Anchor::Record(_) => None,
             };
             let location = match &annotation.anchor {
                 Anchor::Code(code) => {
@@ -331,6 +331,16 @@ pub(crate) fn format_steer(
                 Anchor::Stream(stream) => format!(
                     "on conversation event {} (could not resolve — the event is unavailable)",
                     capped_location(&stream.op_id)
+                ),
+                // Record content is immutable and digest-pinned, so there is
+                // nothing to re-anchor and no drift note to make — the span
+                // means now exactly what it meant when it was written. The
+                // entry id is what the agent needs to find the content again.
+                Anchor::Record(record) => format!(
+                    "on lines {}-{} of {}",
+                    record.span.start,
+                    record.span.end,
+                    capped_location(&record.entry.to_string())
                 ),
             };
             let on = if matches!(annotation.anchor, Anchor::Stream(_)) {

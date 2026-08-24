@@ -317,30 +317,24 @@ fn hunk_new_start(line: &str) -> Option<u32> {
     (start > 0).then_some(start)
 }
 
-/// What the composer's `path` and `lines` inputs become after clicking the diff
-/// row for `line` of `path`, given what they hold now.
+/// The `lines` input's value for a press-drag-release across rows `from` → `to`.
 ///
-/// A second click further down the same file **extends** the range — `"12"`
-/// then row 14 gives `"12-14"`, which is exactly the form
-/// `main::parse_span` already accepts, so the gesture invents no second
-/// format. A click in a different file, or on/above the current start,
-/// restarts at a single line.
+/// Non-directional by construction: dragging up the screen selects the same
+/// range as dragging down it. This replaced a click-then-click-lower gesture
+/// that extended only *downward* from the first click and restarted silently
+/// otherwise — undiscoverable, and directional for no reason a reviewer could
+/// see (Dan, 2026-08-23). A single row (no drag) yields the bare number, so the
+/// common case still reads as `"12"` rather than `"12-12"`.
+///
+/// The output is exactly what `main::parse_span` already accepts, so the gesture
+/// invents no second format.
 #[must_use]
-pub fn anchor_click(
-    current_path: &str,
-    current: Option<Span>,
-    path: &str,
-    line: u32,
-) -> (String, String) {
-    // `current_path` comes from a free text input that `AnnotateSubmit` trims,
-    // so compare trimmed or a stray space would silently restart the range.
-    if current_path.trim() == path
-        && let Some(span) = current
-        && line > span.start
-    {
-        return (path.to_string(), format!("{}-{line}", span.start));
+pub fn drag_lines(from: u32, to: u32) -> String {
+    if from == to {
+        return from.to_string();
     }
-    (path.to_string(), line.to_string())
+    let (lo, hi) = if from < to { (from, to) } else { (to, from) };
+    format!("{lo}-{hi}")
 }
 
 /// The email a pane should authenticate its live websocket as: the reviewer's
@@ -793,75 +787,28 @@ new file mode 100644
     }
 
     #[test]
-    fn anchor_click_on_an_empty_composer_starts_a_single_line() {
+    fn a_press_with_no_drag_selects_the_single_row() {
+        assert_eq!(drag_lines(12, 12), "12", "not \"12-12\"");
+    }
+
+    #[test]
+    fn dragging_up_selects_the_same_range_as_dragging_down() {
+        // The whole point of replacing the old click-then-click-lower gesture:
+        // it grew downward only, so half of every attempt silently restarted.
+        assert_eq!(drag_lines(12, 14), "12-14");
         assert_eq!(
-            anchor_click("", None, "src/lib.rs", 12),
-            ("src/lib.rs".to_string(), "12".to_string())
+            drag_lines(14, 12),
+            "12-14",
+            "a drag upward is the same selection, not a restart"
         );
     }
 
     #[test]
-    fn anchor_click_further_down_the_same_file_extends_to_a_range() {
-        let current = Span::new(12, 12).unwrap();
-        assert_eq!(
-            anchor_click("src/lib.rs", Some(current), "src/lib.rs", 14),
-            ("src/lib.rs".to_string(), "12-14".to_string()),
-            "the second click extends, in exactly the form parse_span accepts"
-        );
-    }
-
-    #[test]
-    fn anchor_click_extends_from_the_existing_start_not_the_existing_end() {
-        let current = Span::new(12, 14).unwrap();
-        assert_eq!(
-            anchor_click("src/lib.rs", Some(current), "src/lib.rs", 20),
-            ("src/lib.rs".to_string(), "12-20".to_string()),
-            "a third click grows the same range rather than starting a new one"
-        );
-    }
-
-    #[test]
-    fn anchor_click_in_another_file_restarts() {
-        let current = Span::new(12, 14).unwrap();
-        assert_eq!(
-            anchor_click("src/lib.rs", Some(current), "src/other.rs", 3),
-            ("src/other.rs".to_string(), "3".to_string())
-        );
-    }
-
-    #[test]
-    fn anchor_click_above_or_on_the_current_start_restarts() {
-        let current = Span::new(12, 14).unwrap();
-        assert_eq!(
-            anchor_click("src/lib.rs", Some(current), "src/lib.rs", 5),
-            ("src/lib.rs".to_string(), "5".to_string()),
-            "clicking above the start reads as picking a new start"
-        );
-        assert_eq!(
-            anchor_click("src/lib.rs", Some(current), "src/lib.rs", 12),
-            ("src/lib.rs".to_string(), "12".to_string()),
-            "re-clicking the start collapses the range instead of no-oping"
-        );
-    }
-
-    #[test]
-    fn anchor_click_tolerates_a_hand_typed_path_with_whitespace() {
-        // `annotate_path` is a free text input; `AnnotateSubmit` trims it, so
-        // the extend check must compare trimmed too or a stray space would
-        // silently restart the range.
-        let current = Span::new(12, 12).unwrap();
-        assert_eq!(
-            anchor_click(" src/lib.rs ", Some(current), "src/lib.rs", 14),
-            ("src/lib.rs".to_string(), "12-14".to_string())
-        );
-    }
-
-    #[test]
-    fn anchor_click_with_unparseable_current_lines_starts_fresh() {
-        assert_eq!(
-            anchor_click("src/lib.rs", None, "src/lib.rs", 14),
-            ("src/lib.rs".to_string(), "14".to_string())
-        );
+    fn a_drag_span_is_a_form_parse_span_accepts() {
+        // The gesture must not invent a second range format.
+        assert_eq!(crate::parse_span(&drag_lines(3, 9)), Span::new(3, 9).ok());
+        assert_eq!(crate::parse_span(&drag_lines(9, 3)), Span::new(3, 9).ok());
+        assert_eq!(crate::parse_span(&drag_lines(7, 7)), Span::new(7, 7).ok());
     }
 
     #[test]

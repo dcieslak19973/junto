@@ -1,23 +1,24 @@
 //! A floating, interactive popover anchored to the widget it wraps.
 //!
-//! Iced 0.13 has no popover primitive. Overlays exist, but only inside
-//! `pick_list`/`combo_box`/`tooltip`, and `tooltip`'s overlay is **draw-only**:
-//! it implements neither `on_event` nor `operate`, so nothing inside it can be
-//! clicked or take focus. An interactive floating panel therefore needs a custom
-//! [`Widget`] returning a real [`overlay::Overlay`], which is what this is.
+//! Iced still has no popover primitive in 0.14. `float` (added in 0.14, PR
+//! #2916) is NOT one: its `layout` delegates to `self.content.layout(...)`, so
+//! the content keeps reserving layout space and `float` only lifts it into an
+//! overlay for drawing and interaction. That is right for a dragged or zoomed
+//! element and wrong for a panel that must not reflow the diff underneath it.
+//! `tooltip` is no help either — its overlay draws only.
 //!
-//! It exists for one reason: clicking a diff row put the comment box ~800
-//! physical pixels away at the bottom of the pane, so the gesture and its
-//! consequence lived in different places (ledger `02ff24be`). Anchoring the
-//! comment surface to the clicked row is what Zed's Delta and Warp both do.
+//! So this remains a custom [`Widget`] returning a real [`overlay::Overlay`].
+//! It exists because clicking a diff row used to put the comment box ~800
+//! physical pixels away at the bottom of the pane, leaving the gesture and its
+//! consequence in different places (ledger `02ff24be`).
 //!
-//! Unlike an inline expansion this does **not** reflow the diff: the panel
-//! floats above it and escapes the enclosing `scrollable`'s clip, because
-//! overlays are laid out against the whole viewport.
+//! Unlike an inline expansion the panel floats above the diff without moving
+//! it, and escapes the enclosing `scrollable`'s clip, because overlays are laid
+//! out against the whole viewport.
 
 use iced::advanced::widget::{Operation, Tree, Widget, tree};
 use iced::advanced::{Clipboard, Layout, Shell, layout, mouse, overlay, renderer};
-use iced::{Element, Event, Length, Point, Rectangle, Size, Vector, event};
+use iced::{Element, Event, Length, Rectangle, Size, Vector};
 
 /// Draws `anchor` inline and, while `popup` is `Some`, floats it just below the
 /// anchor as an interactive overlay.
@@ -85,7 +86,7 @@ where
     }
 
     fn layout(
-        &self,
+        &mut self,
         tree: &mut Tree,
         renderer: &Renderer,
         limits: &layout::Limits,
@@ -93,7 +94,7 @@ where
         // Only the anchor takes part in ordinary layout; the panel is laid out
         // by the overlay against the viewport, so the diff never reflows.
         self.anchor
-            .as_widget()
+            .as_widget_mut()
             .layout(&mut tree.children[0], renderer, limits)
     }
 
@@ -119,18 +120,18 @@ where
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn on_event(
+    fn update(
         &mut self,
         tree: &mut Tree,
-        event: Event,
+        event: &Event,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
         renderer: &Renderer,
         clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
-    ) -> event::Status {
-        self.anchor.as_widget_mut().on_event(
+    ) {
+        self.anchor.as_widget_mut().update(
             &mut tree.children[0],
             event,
             layout,
@@ -139,7 +140,7 @@ where
             clipboard,
             shell,
             viewport,
-        )
+        );
     }
 
     fn mouse_interaction(
@@ -160,25 +161,26 @@ where
     }
 
     fn operate(
-        &self,
+        &mut self,
         tree: &mut Tree,
         layout: Layout<'_>,
         renderer: &Renderer,
         operation: &mut dyn Operation,
     ) {
         self.anchor
-            .as_widget()
+            .as_widget_mut()
             .operate(&mut tree.children[0], layout, renderer, operation);
     }
 
-    fn overlay<'b>(
-        &'b mut self,
-        tree: &'b mut Tree,
-        layout: Layout<'_>,
+    fn overlay<'a>(
+        &'a mut self,
+        tree: &'a mut Tree,
+        layout: Layout<'a>,
         renderer: &Renderer,
+        viewport: &Rectangle,
         translation: Vector,
-    ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
-        let _ = renderer;
+    ) -> Option<overlay::Element<'a, Message, Theme, Renderer>> {
+        let _ = (renderer, viewport);
         // `translation` carries the enclosing scrollable's offset, so the panel
         // tracks its row as the diff scrolls.
         let anchor_bounds = layout.bounds() + translation;
@@ -224,7 +226,7 @@ where
     fn layout(&mut self, renderer: &Renderer, bounds: Size) -> layout::Node {
         let viewport = Rectangle::with_size(bounds);
         let width = self.width.min(viewport.width - 16.0).max(120.0);
-        let node = self.popup.as_widget().layout(
+        let node = self.popup.as_widget_mut().layout(
             self.tree,
             renderer,
             &layout::Limits::new(Size::ZERO, Size::new(width, viewport.height)).width(width),
@@ -269,34 +271,34 @@ where
         );
     }
 
-    fn on_event(
+    fn update(
         &mut self,
-        event: Event,
+        event: &Event,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
         renderer: &Renderer,
         clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
-    ) -> event::Status {
+    ) {
         let bounds = layout.bounds();
         let inner = layout.children().next().unwrap_or(layout);
-        self.popup.as_widget_mut().on_event(
+        self.popup.as_widget_mut().update(
             self.tree, event, inner, cursor, renderer, clipboard, shell, &bounds,
-        )
+        );
     }
 
     fn mouse_interaction(
         &self,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
-        viewport: &Rectangle,
         renderer: &Renderer,
     ) -> mouse::Interaction {
+        let bounds = layout.bounds();
         self.popup.as_widget().mouse_interaction(
             self.tree,
             layout.children().next().unwrap_or(layout),
             cursor,
-            viewport,
+            &bounds,
             renderer,
         )
     }
@@ -304,15 +306,11 @@ where
     fn operate(&mut self, layout: Layout<'_>, renderer: &Renderer, operation: &mut dyn Operation) {
         // Required for focus to reach a text input inside the panel — exactly
         // what `tooltip`'s overlay omits, and why its content is inert.
-        self.popup.as_widget().operate(
+        self.popup.as_widget_mut().operate(
             self.tree,
             layout.children().next().unwrap_or(layout),
             renderer,
             operation,
         );
-    }
-
-    fn is_over(&self, layout: Layout<'_>, _renderer: &Renderer, cursor: Point) -> bool {
-        layout.bounds().contains(cursor)
     }
 }

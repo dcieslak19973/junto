@@ -36,7 +36,9 @@ pub mod subject;
 pub mod substrate;
 pub mod time;
 
-pub use anchor::{Anchor, Annotation, AnnotationId, CodeAnchor, CommitOid, Span, StreamAnchor};
+pub use anchor::{
+    Anchor, Annotation, AnnotationId, CodeAnchor, CommitOid, RecordAnchor, Span, StreamAnchor,
+};
 pub use entry::{AssertionKind, DecisionFrame, EntryPayload, FrameAct, FrameOption, LedgerEntry};
 pub use error::{Error, Result};
 pub use gate::{ApprovalRequirement, GateStatus};

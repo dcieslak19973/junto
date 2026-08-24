@@ -24,7 +24,6 @@ use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use sha2::Digest as _;
 use tokio::sync::{broadcast, mpsc};
 
 use junto_kernel::{
@@ -1200,13 +1199,13 @@ fn store_artifact(
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join(name);
     std::fs::write(&path, content).with_context(|| format!("writing {}", path.display()))?;
-    let digest = format!("sha256:{:x}", sha2::Sha256::digest(content.as_bytes()));
+    let digest = ContentDigest::sha256_of(content.as_bytes());
     let uri = Uri::new(format!(
         "file:///{}",
         path.display().to_string().replace('\\', "/")
     ))
     .context("artifact uri")?;
-    let digest = ContentDigest::new(digest).context("artifact digest")?;
+
     Ok(ProvenanceRef::with_digest(uri, digest))
 }
 
