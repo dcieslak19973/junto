@@ -843,6 +843,8 @@ enum Message {
     PaneResized(pane_grid::ResizeEvent),
     /// A pane dragged to a new position.
     PaneDragged(pane_grid::DragEvent),
+    /// A pane was clicked — retargets the blades to it.
+    PaneClicked(pane_grid::Pane),
     /// Split the focused pane along `axis`.
     SplitPane(pane_grid::Axis),
     // Live session pane.
@@ -1319,22 +1321,39 @@ impl App {
                 Task::none()
             }
             Message::PaneDragged(_) => Task::none(),
+            Message::PaneClicked(pane) => {
+                self.focus = Some(pane);
+                Task::none()
+            }
             Message::SplitPane(axis) => {
                 let Some(focus) = self.focus else {
                     return Task::none();
                 };
                 // A split shows what the pane being split showed — duplicate
-                // the focused pane's channel rather than opening a pane on
-                // the empty string, which is unfetchable (no channel to ask
-                // the host for) and, worse, becomes the very next
-                // `open_or_focus`'s split target, silently orphaning it.
-                let Some(channel) = self.panes.get(focus).map(|state| state.channel.clone()) else {
+                // the focused pane's channel AND its remote override rather
+                // than opening a pane on the empty string, which is
+                // unfetchable (no channel to ask the host for) and, worse,
+                // becomes the very next `open_or_focus`'s split target,
+                // silently orphaning it. Dropping `remote` here used to
+                // silently retarget a remote-watched split at THIS
+                // machine's local channel of the same name (or error, if
+                // none existed) — the one case where the comment above was
+                // false; `base`/`remote` now travel together, matching how
+                // `Message::Refresh` already resolves a pane's effective
+                // host.
+                let Some((channel, remote)) = self
+                    .panes
+                    .get(focus)
+                    .map(|state| (state.channel.clone(), state.remote.clone()))
+                else {
                     return Task::none();
                 };
-                if let Some((new_pane, _)) = self.panes.split(axis, focus, Pane::loading(&channel))
-                {
+                let base = remote.clone().unwrap_or_else(|| HOST.to_string());
+                let mut new_state = Pane::loading(&channel);
+                new_state.remote = remote;
+                if let Some((new_pane, _)) = self.panes.split(axis, focus, new_state) {
                     self.focus = Some(new_pane);
-                    return fetch(new_pane, HOST.to_string(), &channel);
+                    return fetch(new_pane, base, &channel);
                 }
                 Task::none()
             }
@@ -2702,9 +2721,16 @@ impl App {
             .then(|| iced::time::every(std::time::Duration::from_secs(1)).map(|_| Message::Tick));
         // Zed's dock bindings, since that is the reference point. These add no
         // state: they fire the same messages the chevrons do. The
-        // command/control guard is load-bearing — without it a bare "b" or
-        // "r" typed into the new-channel field or the composer would steal
-        // the keystroke and toggle a blade instead of inserting the letter.
+        // command/control guard is still load-bearing, but not against a
+        // FOCUSED text field: `iced::keyboard::listen()` only ever yields
+        // events the rest of the UI left `Status::Ignored` (`iced_futures`'s
+        // `keyboard::listen`), and a focused `text_input` marks its own key
+        // events `Captured` — so a bare "b" typed into the new-channel
+        // field or the composer never reaches this filter at all. The guard
+        // instead protects the case where NOTHING is focused: without it, a
+        // bare "b" or "r" typed anywhere else in the shell (e.g. right after
+        // a click elsewhere clears focus) would toggle a blade rather than
+        // being silently dropped.
         let keys = iced::keyboard::listen().filter_map(|event| {
             let iced::keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
                 return None;
@@ -2766,6 +2792,7 @@ impl App {
         })
         .on_resize(10, Message::PaneResized)
         .on_drag(Message::PaneDragged)
+        .on_click(Message::PaneClicked)
         .width(Fill)
         .height(Fill)
         .spacing(6);
@@ -2801,7 +2828,14 @@ impl App {
 
         column![
             top_bar,
-            row![left, container(center).width(Fill), right].spacing(0),
+            row![
+                left,
+                container(center)
+                    .id(iced::widget::Id::new("center-pane-grid"))
+                    .width(Fill),
+                right
+            ]
+            .spacing(0),
         ]
         .into()
     }
@@ -2918,7 +2952,8 @@ fn channel_nav(app: &App) -> Element<'_, Message> {
             button(text(name.as_str()).size(12))
                 .on_press(Message::ChannelPicked(name.clone()))
                 .padding(4)
-                .width(Fill),
+                .width(Fill)
+                .style(|_t, _s| chip_style(MUTED, false)),
         );
     }
     // Axis-aware splitting of the focused pane — the workspace-level
@@ -2993,10 +3028,12 @@ fn left_blade(app: &App) -> Element<'_, Message> {
     let switcher = row![
         button(text("attention").size(12))
             .on_press(Message::LeftViewPicked(shell::LeftView::Attention))
-            .padding(4),
+            .padding(4)
+            .style(move |_t, _s| tab_style(app.shell.left_view == shell::LeftView::Attention)),
         button(text("sessions").size(12))
             .on_press(Message::LeftViewPicked(shell::LeftView::Sessions))
-            .padding(4),
+            .padding(4)
+            .style(move |_t, _s| tab_style(app.shell.left_view == shell::LeftView::Sessions)),
     ]
     .spacing(4);
 
@@ -3009,13 +3046,17 @@ fn left_blade(app: &App) -> Element<'_, Message> {
         button(text("‹").size(13))
             .on_press(Message::ToggleLeftBlade)
             .padding(4),
-        container(channel_nav(app)).height(Length::FillPortion(
-            (app.shell.left_split.get() * 100.0) as u16
-        )),
+        container(channel_nav(app))
+            .id(iced::widget::Id::new("left-blade-nav"))
+            .height(Length::FillPortion(
+                (app.shell.left_split.get() * 100.0) as u16
+            )),
         switcher,
-        container(body).height(Length::FillPortion(
-            ((1.0 - app.shell.left_split.get()) * 100.0) as u16
-        )),
+        container(body)
+            .id(iced::widget::Id::new("left-blade-body"))
+            .height(Length::FillPortion(
+                ((1.0 - app.shell.left_split.get()) * 100.0) as u16
+            )),
     ]
     .spacing(6)
     .padding(8)
@@ -3027,10 +3068,12 @@ fn right_blade(app: &App) -> Element<'_, Message> {
     let switcher = row![
         button(text("artifacts").size(12))
             .on_press(Message::RightViewPicked(shell::RightView::Artifacts))
-            .padding(4),
+            .padding(4)
+            .style(move |_t, _s| tab_style(app.shell.right_view == shell::RightView::Artifacts)),
         button(text("lineage").size(12))
             .on_press(Message::RightViewPicked(shell::RightView::Lineage))
-            .padding(4),
+            .padding(4)
+            .style(move |_t, _s| tab_style(app.shell.right_view == shell::RightView::Lineage)),
     ]
     .spacing(4);
 
@@ -3072,6 +3115,10 @@ fn lineage_view(app: &App) -> Element<'_, Message> {
                     .width(Fill)
                     .height(Length::Fixed(content_h)),
             )
+            .direction(scrollable::Direction::Both {
+                vertical: scrollable::Scrollbar::default(),
+                horizontal: scrollable::Scrollbar::default(),
+            })
             .height(Fill)
             .into()
         }
@@ -8213,6 +8260,122 @@ diff --git a/lib.rs b/lib.rs
             pane.aimed_key(),
             Some(AnchorTarget::Code("lib.rs".into()).key()),
             "a drag started in a diff cannot extend into an artifact's text"
+        );
+    }
+
+    /// Settles, by real headless layout rather than by reading the source,
+    /// whether iced 0.14's "Prioritized Shrink over Fill" compression
+    /// (CHANGELOG #3045) collapses the center `PaneGrid` to zero height.
+    /// `iced_test::simulator` performs REAL layout of the actual root
+    /// `App::view()`, so it can answer this directly.
+    ///
+    /// EMPIRICAL VERDICT: it does not collapse. The proxy is the
+    /// `container(center)` wrapper the grid sits in, tagged
+    /// `"center-pane-grid"` in `view()` for exactly this test, whose
+    /// `Target::bounds()` reports the real cross-axis height the row
+    /// actually handed it — in the default 768px-tall simulator window this
+    /// measures ~733px, not zero and not a tab-bar sliver.
+    ///
+    /// `"loading…"` text (`pane_body`'s `Content::Loading` arm) is NOT a
+    /// valid proxy for this, despite living deep inside the grid: a plain
+    /// `text` widget always reports its own intrinsic glyph size regardless
+    /// of how much space its ancestors were given, so an assertion on it
+    /// passes or fails identically whether the collapse is real or not —
+    /// verified directly: its bounds (height 20.8) were bit-for-bit
+    /// identical whether or not the surrounding chain carried
+    /// `.height(Fill)`, which proves that proxy measures the text, never
+    /// the grid.
+    ///
+    /// The reviewer's derivation conflates the two flex axes:
+    /// `iced_core::layout::flex::resolve` only zeroes a `Fill` child's
+    /// *cross*-axis size when the parent's cross axis is compressed
+    /// (`cross = if cross_compress { 0.0 } else { max_cross }`,
+    /// `flex.rs:93`) — a Fill child's *main*-axis size instead comes from
+    /// `available = axis.main(limits.max()) - total_spacing`, computed
+    /// unconditionally, compression or not (`flex.rs:94`). The shell's
+    /// `column![grid]` is a `Column`, whose main axis IS height — so the
+    /// grid's `.height(Fill)` is a main-axis fill in its immediate parent,
+    /// never zeroed by compression at all. Compression only ever zeroes a
+    /// widget's *cross* axis, which for this chain is width, and every
+    /// width in this chain is either `Fill` (never re-compressed, since
+    /// `Limits::width`/`height` only sets `compression = true` for
+    /// `Shrink`, and only clears it for `Fixed` — never for `Fill`,
+    /// `limits.rs:55-88`) or the blades' own `Length::Fixed` (which clears
+    /// compression for itself directly). Nowhere in the actual chain does a
+    /// Fill *cross*-axis child sit under a compressed cross axis.
+    #[test]
+    fn the_center_pane_grid_gets_real_height_not_a_zero_height_sliver() {
+        let (mut app, _) = App::new();
+        // Hermetic regardless of this machine's own `<junto-home>/ui.toml`:
+        // both blades expanded, default widths, is exactly the layout the
+        // reviewer's derivation describes.
+        app.shell = shell::ShellState::default();
+
+        let mut ui = iced_test::simulator(app.view());
+        let target = ui
+            .find(iced::widget::Id::new("center-pane-grid"))
+            .expect("the center container must be laid out");
+
+        assert!(
+            target.bounds().height > 100.0,
+            "expected the center pane grid's container to receive real \
+             height in a 768px-tall window, got a laid-out height of {:?} — \
+             the predicted zero-height/sliver collapse",
+            target.bounds()
+        );
+    }
+
+    /// Settles whether `left_blade`'s `FillPortion`-split nav/body columns
+    /// actually observe the persisted `NavSplit` ratio, or whether — per the
+    /// review finding — the enclosing `column![...]` being Shrink in both
+    /// axes leaves `FillPortion` inert. Same method as the Fix-1 test:
+    /// `iced_test` real layout, read back through tagged container ids
+    /// rather than trusted from source.
+    ///
+    /// EMPIRICAL VERDICT: it is not inert. Measured ratio is exactly 0.55 —
+    /// `NavSplit::DEFAULT` — with the enclosing column left untouched
+    /// (still Shrink in both axes, no code change). Consistent with the
+    /// Fix-1 finding: height is this column's MAIN axis, and a `Fill`/
+    /// `FillPortion` child's main-axis size comes from the ordinary
+    /// available-space budget regardless of the parent's own compression
+    /// (`flex.rs:94`) — only a Fill child's CROSS axis (here, width) would
+    /// be zeroed by a compressed parent, and neither child asks for Fill
+    /// width.
+    #[test]
+    fn the_left_blades_nav_and_body_observe_the_persisted_split() {
+        let (mut app, _) = App::new();
+        app.shell = shell::ShellState::default();
+        assert_eq!(
+            shell::NavSplit::DEFAULT,
+            0.55,
+            "this test's ratio assertion assumes the documented default"
+        );
+
+        let mut ui = iced_test::simulator(app.view());
+        let nav = ui
+            .find(iced::widget::Id::new("left-blade-nav"))
+            .expect("the left blade's nav container must be laid out")
+            .bounds();
+        let body = ui
+            .find(iced::widget::Id::new("left-blade-body"))
+            .expect("the left blade's body container must be laid out")
+            .bounds();
+
+        assert!(
+            nav.height > 20.0 && body.height > 20.0,
+            "expected both the nav and body halves to receive real, non-\
+             degenerate height, got nav {nav:?} and body {body:?}"
+        );
+        // `NavSplit::DEFAULT` (0.55) means the nav half should be
+        // moderately taller than the body half, not equal (which is what an
+        // inert `FillPortion` — both children falling back to their
+        // intrinsic content size — would produce instead by coincidence).
+        let ratio = nav.height / (nav.height + body.height);
+        assert!(
+            (ratio - shell::NavSplit::DEFAULT).abs() < 0.05,
+            "expected the nav/body height ratio to track NavSplit::DEFAULT \
+             (0.55), got {ratio} from nav {nav:?} and body {body:?} — a \
+             FillPortion that inert would not track it at all",
         );
     }
 }

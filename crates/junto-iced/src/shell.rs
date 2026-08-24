@@ -326,7 +326,24 @@ mod persistence_tests {
     fn save_creates_nested_directories_if_missing() {
         let base = std::env::temp_dir().join("junto-iced-shell-nested-dir");
         let path = base.join("subdir").join("ui.toml");
-        let state = ShellState::default();
+        // Cleanup runs FIRST and unconditionally, so a previous run that
+        // panicked mid-test (leaving the directory behind) cannot make
+        // this run pass vacuously by finding its own leftover state
+        // already on disk before `save` ever ran.
+        let _ = std::fs::remove_dir_all(&base);
+        // Differs from `ShellState::default()` in at least one field: `load`
+        // is total and returns the default on ANY failure (missing file,
+        // unreadable, unparseable), so asserting the round trip against the
+        // default would also pass if `save` silently wrote nothing at all —
+        // it is the only coverage of `save`'s `create_dir_all` branch, so it
+        // must be able to fail.
+        let state = ShellState {
+            left_collapsed: true,
+            left_view: LeftView::Sessions,
+            right_view: RightView::Lineage,
+            right_width: BladeWidth::new(400.0),
+            ..Default::default()
+        };
 
         save(&path, &state).expect("save should succeed and create directories");
         assert_eq!(load(&path), state);
