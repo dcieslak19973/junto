@@ -2664,47 +2664,6 @@ impl App {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        let adder_row = row![
-            text("open ▸").size(13).color(MUTED),
-            combo_box(
-                &self.channels,
-                "type to search channels…",
-                None,
-                Message::ChannelPicked,
-            )
-            .width(260),
-            text("· new ▸").size(13).color(MUTED),
-            text_input("new channel name…", &self.new_channel)
-                .on_input(Message::NewChannelChanged)
-                .on_submit(Message::CreateChannel)
-                .width(200)
-                .padding(6),
-        ]
-        .spacing(8)
-        .align_y(Center);
-        // When several substrates are registered, the host needs to know which.
-        let adder_row = if self.substrates.len() > 1 {
-            adder_row.push(
-                pick_list(
-                    self.substrates.clone(),
-                    self.new_channel_repo.clone(),
-                    Message::NewChannelRepoChanged,
-                )
-                .text_size(12)
-                .padding(6),
-            )
-        } else {
-            adder_row
-        };
-        let adder_row =
-            adder_row.push(button("create").on_press(Message::CreateChannel).padding(6));
-        let adder: Element<Message> = match &self.new_channel_error {
-            Some(err) => column![adder_row, text(format!("⚠ {err}")).size(11).color(RED)]
-                .spacing(4)
-                .into(),
-            None => adder_row.into(),
-        };
-
         // Admin views replace the channel workspace when open.
         if let Some(view) = self.admin {
             let panel = match view {
@@ -2764,66 +2723,6 @@ impl App {
                 .into(),
         };
 
-        // The focus board: a visible top banner of cross-channel "needs you"
-        // items. Click one to open its channel pane (acting inline is next).
-        let focus_inner: Element<Message> = if self.focus_items.is_empty() {
-            text("focus · all clear").size(13).color(GREEN).into()
-        } else {
-            let mut items = row![
-                text(format!("needs you ({}) ▸", self.focus_items.len()))
-                    .size(13)
-                    .color(YELLOW)
-            ]
-            .spacing(8)
-            .align_y(Center);
-            for item in &self.focus_items {
-                let (tag, color) = match item.kind.as_str() {
-                    "gate" => ("gate", YELLOW),
-                    "awaiting-execution" => ("exec", MAUVE),
-                    _ => ("ratify", BLUE),
-                };
-                let chan = item.channel_name.clone().unwrap_or_default();
-                let label = format!(
-                    "{tag} · {chan} · {}: {}",
-                    item.author,
-                    truncate(&item.summary, 40)
-                );
-                let mut chip = button(text(label).size(11))
-                    .padding([3, 9])
-                    .style(move |_t, _s| chip_style(color, false));
-                if let Some(name) = &item.channel_name {
-                    chip = chip.on_press(Message::FocusChipPicked(
-                        name.clone(),
-                        item.entry_id.clone(),
-                    ));
-                }
-                items = items.push(chip);
-            }
-            // Fixed height taller than the chips so the chips align to the top
-            // and the horizontal scrollbar gets its own band below them
-            // (otherwise it overlays the chips).
-            scrollable(items.padding([6, 0]))
-                .direction(scrollable::Direction::Horizontal(
-                    scrollable::Scrollbar::default(),
-                ))
-                .width(Fill)
-                .height(Length::Fixed(44.0))
-                .into()
-        };
-        let focus_board = container(focus_inner)
-            .width(Fill)
-            .center_y(Length::Fixed(56.0))
-            .padding([0, 12])
-            .style(|_theme| container::Style {
-                background: Some(Background::Color(SURFACE)),
-                border: Border {
-                    color: BORDER,
-                    width: 1.0,
-                    radius: 6.0.into(),
-                },
-                ..container::Style::default()
-            });
-
         // Shared-width columns, reflowing as channels open/close.
         let machine_email = self
             .settings
@@ -2849,7 +2748,7 @@ impl App {
             bottom: 0.0,
             left: 10.0,
         });
-        let center: Element<Message> = column![focus_board, adder, ribbon, body.height(Fill)]
+        let center: Element<Message> = column![ribbon, body.height(Fill)]
             .spacing(10)
             .padding(10)
             .into();
@@ -2937,6 +2836,110 @@ fn blade_stub<'a>(side: Side, badge: Option<usize>) -> Element<'a, Message> {
         .into()
 }
 
+/// The open/create channel controls: a type-ahead picker for existing
+/// channels plus a name field, substrate picker, and error display for a
+/// new one.
+fn adder(app: &App) -> Element<'_, Message> {
+    let adder_row = row![
+        text("open ▸").size(13).color(MUTED),
+        combo_box(
+            &app.channels,
+            "type to search channels…",
+            None,
+            Message::ChannelPicked,
+        )
+        .width(260),
+        text("· new ▸").size(13).color(MUTED),
+        text_input("new channel name…", &app.new_channel)
+            .on_input(Message::NewChannelChanged)
+            .on_submit(Message::CreateChannel)
+            .width(200)
+            .padding(6),
+    ]
+    .spacing(8)
+    .align_y(Center);
+    // When several substrates are registered, the host needs to know which.
+    let adder_row = if app.substrates.len() > 1 {
+        adder_row.push(
+            pick_list(
+                app.substrates.clone(),
+                app.new_channel_repo.clone(),
+                Message::NewChannelRepoChanged,
+            )
+            .text_size(12)
+            .padding(6),
+        )
+    } else {
+        adder_row
+    };
+    let adder_row = adder_row.push(button("create").on_press(Message::CreateChannel).padding(6));
+    match &app.new_channel_error {
+        Some(err) => column![adder_row, text(format!("⚠ {err}")).size(11).color(RED)]
+            .spacing(4)
+            .into(),
+        None => adder_row.into(),
+    }
+}
+
+/// Pinned navigation: the open channels, then the controls to open or create
+/// one. Lives at the top of the left blade and never toggles away.
+fn channel_nav(app: &App) -> Element<'_, Message> {
+    let mut list = column![].spacing(2);
+    for name in &app.channel_names {
+        list = list.push(
+            button(text(name.as_str()).size(12))
+                .on_press(Message::ChannelPicked(name.clone()))
+                .padding(4)
+                .width(Fill),
+        );
+    }
+    column![scrollable(list).height(Fill), adder(app)]
+        .spacing(6)
+        .into()
+}
+
+/// One focus-board chip: a tagged, coloured summary of a cross-channel
+/// "needs you" item that jumps to its entry when clicked.
+fn focus_chip(item: &FocusItem) -> Element<'_, Message> {
+    let (tag, color) = match item.kind.as_str() {
+        "gate" => ("gate", YELLOW),
+        "awaiting-execution" => ("exec", MAUVE),
+        _ => ("ratify", BLUE),
+    };
+    let chan = item.channel_name.clone().unwrap_or_default();
+    let label = format!(
+        "{tag} · {chan} · {}: {}",
+        item.author,
+        truncate(&item.summary, 40)
+    );
+    let mut chip = button(text(label).size(11))
+        .padding([3, 9])
+        .style(move |_t, _s| chip_style(color, false));
+    if let Some(name) = &item.channel_name {
+        chip = chip.on_press(Message::FocusChipPicked(
+            name.clone(),
+            item.entry_id.clone(),
+        ));
+    }
+    chip.into()
+}
+
+/// The cross-channel "needs you" items — the focus board, relocated out of
+/// the permanent top banner into the left blade where it can be put away.
+fn attention_view(app: &App) -> Element<'_, Message> {
+    // Body moved verbatim from the former top-banner block; it becomes a
+    // vertical list rather than a horizontal chip strip, since the blade is
+    // tall and narrow rather than short and wide.
+    if app.focus_items.is_empty() {
+        return text("focus · all clear").size(13).color(GREEN).into();
+    }
+    let mut items = column![].spacing(4);
+    for item in &app.focus_items {
+        items = items.push(focus_chip(item));
+    }
+    scrollable(items).height(Fill).into()
+}
+
 /// The left blade: pinned channel navigation above a switchable
 /// Attention/Sessions view. Nav is pinned rather than switchable so changing
 /// channels never costs a round trip through a view switcher.
@@ -2951,21 +2954,22 @@ fn left_blade(app: &App) -> Element<'_, Message> {
     ]
     .spacing(4);
 
-    // Filled in by Task 4 (attention) and Task 5 (sessions).
     let body: Element<Message> = match app.shell.left_view {
-        shell::LeftView::Attention => text("attention").size(12).into(),
+        shell::LeftView::Attention => attention_view(app),
         shell::LeftView::Sessions => text("sessions").size(12).into(),
     };
 
     column![
-        // Pinned nav — replaced with the real channel list in Task 4.
-        container(text("channels").size(12)).height(Length::FillPortion(
+        row![
+            button(text("‹").size(13))
+                .on_press(Message::ToggleLeftBlade)
+                .padding(4),
+            switcher,
+        ]
+        .spacing(6),
+        container(channel_nav(app)).height(Length::FillPortion(
             (app.shell.left_split.get() * 100.0) as u16
         )),
-        button(text("‹").size(13))
-            .on_press(Message::ToggleLeftBlade)
-            .padding(4),
-        switcher,
         container(body).height(Length::FillPortion(
             ((1.0 - app.shell.left_split.get()) * 100.0) as u16
         )),
