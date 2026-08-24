@@ -2676,53 +2676,6 @@ impl App {
                 .into();
         }
 
-        // The always-visible branch graph: the *whole* lineage DAG (every
-        // channel, every diverge/converge), with currently-open channels
-        // highlighted. Visible regardless of how many panes are open.
-        let open: HashSet<String> = self
-            .order
-            .iter()
-            .filter_map(|id| self.panes.get(*id).map(|p| p.channel.clone()))
-            .collect();
-        let ribbon: Element<Message> = match &self.lineage {
-            Some(graph) => {
-                // Sticky ambient (row 0) pinned above a taller, vertically-
-                // scrollable graph of the whole lineage.
-                let canvas = LineageCanvas::layout(graph, &open);
-                let content_h = canvas.height.max(60.0);
-                // Shorter history scroll; a roomier pinned-ambient strip. Both
-                // shrink the band overall so the channel columns get more room.
-                let scroll_h = content_h.min(150.0);
-                let pinned = Canvas::new(canvas.pinned())
-                    .width(Fill)
-                    .height(Length::Fixed(48.0));
-                let scroll = scrollable(
-                    Canvas::new(canvas)
-                        .width(Fill)
-                        .height(Length::Fixed(content_h)),
-                )
-                .height(Fill);
-                container(column![pinned, scroll])
-                    .width(Fill)
-                    .height(Length::Fixed(scroll_h + 56.0))
-                    .padding(6)
-                    .style(|_theme| container::Style {
-                        background: Some(Background::Color(Color { a: 0.4, ..SURFACE })),
-                        border: Border {
-                            radius: 6.0.into(),
-                            ..Border::default()
-                        },
-                        ..container::Style::default()
-                    })
-                    .into()
-            }
-            None => container(text("loading lineage…").size(12).color(MUTED))
-                .width(Fill)
-                .height(Length::Fixed(40.0))
-                .padding(8)
-                .into(),
-        };
-
         // Shared-width columns, reflowing as channels open/close.
         let machine_email = self
             .settings
@@ -2748,10 +2701,7 @@ impl App {
             bottom: 0.0,
             left: 10.0,
         });
-        let center: Element<Message> = column![ribbon, body.height(Fill)]
-            .spacing(10)
-            .padding(10)
-            .into();
+        let center: Element<Message> = column![body.height(Fill)].spacing(10).padding(10).into();
 
         // The three-pane shell: collapsible blades either side of the channel
         // workspace. Each blade collapses to a stub rather than to zero so the
@@ -2964,8 +2914,7 @@ fn left_blade(app: &App) -> Element<'_, Message> {
 
     let body: Element<Message> = match app.shell.left_view {
         shell::LeftView::Attention => attention_view(app),
-        // Filled in by Task 5.
-        shell::LeftView::Sessions => text("sessions").size(12).into(),
+        shell::LeftView::Sessions => sessions_view(app),
     };
 
     column![
@@ -2997,10 +2946,9 @@ fn right_blade(app: &App) -> Element<'_, Message> {
     ]
     .spacing(4);
 
-    // Filled in by Task 5.
     let body: Element<Message> = match app.shell.right_view {
-        shell::RightView::Artifacts => text("artifacts").size(12).into(),
-        shell::RightView::Lineage => text("lineage").size(12).into(),
+        shell::RightView::Artifacts => artifacts_view(app),
+        shell::RightView::Lineage => lineage_view(app),
     };
 
     column![
@@ -3016,6 +2964,150 @@ fn right_blade(app: &App) -> Element<'_, Message> {
     .spacing(6)
     .padding(8)
     .into()
+}
+
+/// The whole lineage DAG, relocated from the always-visible top ribbon into
+/// the right blade. Freed from the top band it no longer needs the 150px
+/// scroll cap the ribbon imposed — it gets the blade's full height.
+fn lineage_view(app: &App) -> Element<'_, Message> {
+    match &app.lineage {
+        Some(graph) => {
+            let open: HashSet<String> = app
+                .panes
+                .iter()
+                .map(|(_, pane)| pane.channel.clone())
+                .collect();
+            let canvas = LineageCanvas::layout(graph, &open);
+            let content_h = canvas.height.max(60.0);
+            scrollable(
+                Canvas::new(canvas)
+                    .width(Fill)
+                    .height(Length::Fixed(content_h)),
+            )
+            .height(Fill)
+            .into()
+        }
+        None => text("no lineage yet").size(12).color(MUTED).into(),
+    }
+}
+
+/// Artifacts attached to the focused channel — diffs, logs, charts. Rendered
+/// from the focused pane's existing artifact state rather than a new fetch.
+fn artifacts_view(app: &App) -> Element<'_, Message> {
+    let Some(id) = app.focus else {
+        return text("no channel focused").size(12).color(MUTED).into();
+    };
+    let Some(pane) = app.panes.get(id) else {
+        return text("no channel focused").size(12).color(MUTED).into();
+    };
+    let mut items = column![].spacing(4);
+    for entry in pane.artifact_entries() {
+        items = items.push(artifact_row(id, pane, entry));
+    }
+    scrollable(items).height(Fill).into()
+}
+
+/// Agent sessions for the focused channel.
+fn sessions_view(app: &App) -> Element<'_, Message> {
+    let Some(id) = app.focus else {
+        return text("no channel focused").size(12).color(MUTED).into();
+    };
+    let Some(pane) = app.panes.get(id) else {
+        return text("no channel focused").size(12).color(MUTED).into();
+    };
+    let mut items = column![].spacing(4);
+    for session in pane.session_list() {
+        items = items.push(session_row(id, pane, session));
+    }
+    scrollable(items).height(Fill).into()
+}
+
+/// One artifact entry in the right blade's Artifacts view: the same kind
+/// badge, `Message::ToggleArtifact` wiring, and (once expanded) the same
+/// `artifact_body` rendering the pane's own entry card uses with no pointing
+/// aim — the code path `entry_card` already takes whenever the pane's
+/// annotate composer isn't live — rather than new artifact markup.
+fn artifact_row<'a>(
+    id: pane_grid::Pane,
+    pane: &'a Pane,
+    entry: &'a EntryDto,
+) -> Element<'a, Message> {
+    let expanded = pane.artifacts.get(&entry.id);
+    let toggle_label = if expanded.is_some() {
+        "hide content ▾"
+    } else {
+        "show content ▸"
+    };
+    let mut card = column![
+        row![
+            badge(artifact_label(&entry.summary), kind_color(&entry.kind)),
+            text(truncate(&entry.author, 24)).size(11).color(MUTED),
+        ]
+        .spacing(8),
+        button(text(toggle_label).size(11))
+            .on_press(Message::ToggleArtifact(id, entry.id.clone()))
+            .padding([2, 8])
+            .style(|_t, _s| chip_style(TEAL, false)),
+    ]
+    .spacing(6);
+    match expanded {
+        Some(ArtifactContent::Loading) => {
+            card = card.push(text("loading…").size(11).color(MUTED));
+        }
+        Some(ArtifactContent::Error(err)) => {
+            card = card.push(text(format!("⚠ {err}")).size(11).color(RED));
+        }
+        Some(ArtifactContent::Loaded {
+            format,
+            body,
+            md,
+            digest,
+        }) => {
+            card = card.push(artifact_body(
+                id,
+                &entry.id,
+                digest,
+                format,
+                body,
+                md.as_deref(),
+                None,
+            ));
+        }
+        None => {}
+    }
+    container(card)
+        .padding(8)
+        .width(Fill)
+        .style(|_theme| container::Style {
+            background: Some(Background::Color(SURFACE)),
+            border: Border {
+                color: BORDER,
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            text_color: Some(TEXT),
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// One session chip in the left blade's Sessions view: the same intent/state
+/// label, colour, and `Message::Watch` wiring as the pane's own inline
+/// session-chip row, stacked full-width instead of run inline so it fits the
+/// blade rather than overflowing it.
+fn session_row<'a>(
+    id: pane_grid::Pane,
+    pane: &Pane,
+    session: &'a SessionDto,
+) -> Element<'a, Message> {
+    let watching = pane.watched.as_deref() == Some(session.id.as_str());
+    let label = format!("{} · {}", truncate(&session.intent, 22), session.state);
+    button(text(label).size(11))
+        .on_press(Message::Watch(id, session.id.clone()))
+        .width(Fill)
+        .padding([3, 8])
+        .style(move |_t, _s| chip_style(status_color(&session.state), watching))
+        .into()
 }
 
 /// A tab button: the active tab is filled + accented; the rest are plain.
@@ -5721,6 +5813,30 @@ impl Pane {
     fn base(&self) -> &str {
         self.remote.as_deref().unwrap_or(HOST)
     }
+
+    /// This channel's sessions from the pane's already-fetched `view.json`
+    /// data — empty while `content` is still `Loading` or `Error`, never a
+    /// panic. The blade's Sessions view reads through this rather than
+    /// matching on `Content` itself.
+    fn session_list(&self) -> &[SessionDto] {
+        match &self.content {
+            Content::Loaded(dto) => &dto.sessions,
+            Content::Loading | Content::Error(_) => &[],
+        }
+    }
+
+    /// This channel's artifact entries (`entry.kind == "artifact"`) from the
+    /// pane's already-fetched `view.json` data — empty while `content` is
+    /// still `Loading` or `Error`. Named `artifact_entries`, not `artifacts`,
+    /// because that name already belongs to the expanded-inline-content
+    /// cache (`Pane::artifacts`) and means something different.
+    fn artifact_entries(&self) -> impl Iterator<Item = &EntryDto> {
+        let entries: &[EntryDto] = match &self.content {
+            Content::Loaded(dto) => &dto.entries,
+            Content::Loading | Content::Error(_) => &[],
+        };
+        entries.iter().filter(|entry| entry.kind == "artifact")
+    }
 }
 
 // ---- the branch graph: a horizontal time-axis lineage strip, matching the
@@ -5848,13 +5964,6 @@ impl LineageCanvas {
             height,
             pinned: false,
         }
-    }
-
-    /// A clone that renders only the ambient (row 0) track — the sticky mainline.
-    fn pinned(&self) -> Self {
-        let mut c = self.clone();
-        c.pinned = true;
-        c
     }
 
     /// Log-scaled age → x, newest on the right (matches the web's `strip_age_x`).
