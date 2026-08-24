@@ -1,11 +1,13 @@
 //! SPIKE — a native junto surface in Iced (`docs/native-ui-toolkit-assessment.md`).
 //!
-//! A tmux-style **vertical-split pane workspace**: each pane is a junto channel,
-//! rendered from the host's structured JSON read-API (`/channels/{name}/view.json`)
-//! into native widgets — a **lineage strip** (the split/side-quest history), the
-//! party, and the **entry timeline** as colour-coded cards. Type a channel name
-//! and `+ pane` to split a column; drag dividers to resize. The point is to feel
-//! whether native (Iced) beats the webview as the desktop power-surface.
+//! A tmux-style **2D pane workspace** (`iced::widget::pane_grid`): each pane is a
+//! junto channel, rendered from the host's structured JSON read-API
+//! (`/channels/{name}/view.json`) into native widgets — a **lineage strip** (the
+//! split/side-quest history), the party, and the **entry timeline** as
+//! colour-coded cards. Open a channel from the left blade, then split → / split ↓
+//! to divide the workspace on either axis, nestable to any depth; drag dividers
+//! to resize, drag a pane's title bar to reorder. The point is to feel whether
+//! native (Iced) beats the webview as the desktop power-surface.
 
 mod pointing;
 mod popover;
@@ -72,15 +74,14 @@ fn main() -> iced::Result {
 }
 
 struct App {
-    /// pane_grid::State is used purely as a keyed store of panes; rendering is
-    /// the custom shared-width Columns layout, not a PaneGrid.
+    /// The pane workspace: rendered directly by `pane_grid::PaneGrid` in
+    /// `view`, which is what buys arbitrary 2D nesting — split any pane on
+    /// either axis, at any depth.
     panes: pane_grid::State<Pane>,
     focus: Option<pane_grid::Pane>,
     /// Three-pane shell layout — collapse, widths, active blade views.
     /// Loaded at startup and written back on every change (`shell::save`).
     shell: shell::ShellState,
-    /// Left-to-right pane order (pane_grid's own iteration isn't ordered).
-    order: Vec<pane_grid::Pane>,
     /// Available channel names for the type-ahead picker.
     channels: combo_box::State<String>,
     /// The same names as a plain list, for widgets that need to OFFER them
@@ -838,6 +839,12 @@ enum Message {
     Fetched(pane_grid::Pane, Result<ChannelDto, String>),
     Refresh(pane_grid::Pane),
     Close(pane_grid::Pane),
+    /// A divider drag between panes.
+    PaneResized(pane_grid::ResizeEvent),
+    /// A pane dragged to a new position.
+    PaneDragged(pane_grid::DragEvent),
+    /// Split the focused pane along `axis`.
+    SplitPane(pane_grid::Axis),
     // Live session pane.
     Watch(pane_grid::Pane, String),
     /// Close the session view, returning the pane to its timeline.
@@ -1020,7 +1027,6 @@ impl App {
         let app = App {
             panes,
             focus: Some(first),
-            order: vec![first],
             channels: combo_box::State::new(Vec::new()),
             channel_names: Vec::new(),
             lineage: None,
@@ -1071,22 +1077,29 @@ impl App {
     /// (when resolved) and the fetch task for a freshly-opened pane.
     fn open_or_focus(&mut self, name: &str) -> (Option<pane_grid::Pane>, Task<Message>) {
         if let Some(existing) = self
-            .order
+            .panes
             .iter()
-            .copied()
-            .find(|p| self.panes.get(*p).is_some_and(|s| s.channel == name))
+            .find(|(_, state)| state.channel == name)
+            .map(|(id, _)| *id)
         {
             self.focus = Some(existing);
             return (Some(existing), Task::none());
         }
-        let Some(target) = self.focus.or_else(|| self.order.last().copied()) else {
+        // `focus` is set at startup and only ever reassigned to `Some`, so this
+        // fallback is unreachable today; it exists for the type. Unlike the old
+        // `order.last()` (the most-recently-opened, rightmost pane), a
+        // `pane_grid::State` has no spatial "last" — this falls back to the
+        // lowest-id (oldest) pane instead.
+        let Some(target) = self
+            .focus
+            .or_else(|| self.panes.iter().next().map(|(id, _)| *id))
+        else {
             return (None, Task::none());
         };
         if let Some((new_pane, _)) =
             self.panes
                 .split(pane_grid::Axis::Vertical, target, Pane::loading(name))
         {
-            self.order.push(new_pane);
             self.focus = Some(new_pane);
             return (Some(new_pane), fetch(new_pane, HOST.to_string(), name));
         }
@@ -1292,9 +1305,26 @@ impl App {
                 Task::none()
             }
             Message::Close(pane) => {
-                self.order.retain(|p| *p != pane);
                 if let Some((_, sibling)) = self.panes.close(pane) {
                     self.focus = Some(sibling);
+                }
+                Task::none()
+            }
+            Message::PaneResized(pane_grid::ResizeEvent { split, ratio }) => {
+                self.panes.resize(split, ratio);
+                Task::none()
+            }
+            Message::PaneDragged(pane_grid::DragEvent::Dropped { pane, target }) => {
+                self.panes.drop(pane, target);
+                Task::none()
+            }
+            Message::PaneDragged(_) => Task::none(),
+            Message::SplitPane(axis) => {
+                let Some(focus) = self.focus else {
+                    return Task::none();
+                };
+                if let Some((new_pane, _)) = self.panes.split(axis, focus, Pane::loading("")) {
+                    self.focus = Some(new_pane);
                 }
                 Task::none()
             }
@@ -2273,10 +2303,10 @@ impl App {
                     fetch_agents(),
                     fetch_settings(),
                 ];
-                for id in &self.order {
-                    if let Some(state) = self.panes.get(*id) {
-                        tasks.push(fetch(*id, state.base().to_string(), &state.channel));
-                    }
+                // Order doesn't matter for a refresh fan-out — every open pane
+                // gets refetched regardless of iteration order.
+                for (id, state) in self.panes.iter() {
+                    tasks.push(fetch(*id, state.base().to_string(), &state.channel));
                 }
                 Task::batch(tasks)
             }
@@ -2699,24 +2729,28 @@ impl App {
                 .into();
         }
 
-        // Shared-width columns, reflowing as channels open/close.
-        let machine_email = self
-            .settings
-            .as_ref()
-            .and_then(|s| s.identity.as_ref())
-            .map(|i| i.email.as_str());
-        let mut body = row![].spacing(6);
-        for id in &self.order {
-            if let Some(pane) = self.panes.get(*id) {
-                body = body.push(column_pane(
-                    *id,
-                    pane,
-                    &self.agents,
-                    machine_email,
-                    &self.channel_names,
-                ));
-            }
-        }
+        // The channel workspace. `pane_grid::State` has always been the store;
+        // this is the widget finally rendering it, which is what buys
+        // arbitrary 2D nesting — split any pane on either axis, at any depth.
+        let grid = pane_grid::PaneGrid::new(&self.panes, |id, pane, _maximized| {
+            pane_grid::Content::new(channel_pane(self, id, pane)).title_bar(
+                pane_grid::TitleBar::new(text(pane.channel.as_str()).size(13))
+                    .controls(Element::from(
+                        row![
+                            button("↻").on_press(Message::Refresh(id)).padding(4),
+                            button("×").on_press(Message::Close(id)).padding(4),
+                        ]
+                        .spacing(6),
+                    ))
+                    .always_show_controls()
+                    .padding(6),
+            )
+        })
+        .on_resize(10, Message::PaneResized)
+        .on_drag(Message::PaneDragged)
+        .width(Fill)
+        .height(Fill)
+        .spacing(6);
 
         let top_bar = container(admin_toolbar(self.admin)).padding(Padding {
             top: 10.0,
@@ -2724,7 +2758,7 @@ impl App {
             bottom: 0.0,
             left: 10.0,
         });
-        let center: Element<Message> = column![body.height(Fill)].spacing(10).padding(10).into();
+        let center: Element<Message> = column![grid].spacing(10).padding(10).into();
 
         // The three-pane shell: collapsible blades either side of the channel
         // workspace. Each blade collapses to a stub rather than to zero so the
@@ -2869,7 +2903,20 @@ fn channel_nav(app: &App) -> Element<'_, Message> {
                 .width(Fill),
         );
     }
-    column![scrollable(list).height(Fill), adder(app)]
+    // Axis-aware splitting of the focused pane — the workspace-level
+    // counterpart to `adder`'s "open a channel into a pane".
+    let split_row = row![
+        button(text("split →").size(12))
+            .on_press(Message::SplitPane(pane_grid::Axis::Vertical))
+            .width(Fill)
+            .padding(4),
+        button(text("split ↓").size(12))
+            .on_press(Message::SplitPane(pane_grid::Axis::Horizontal))
+            .width(Fill)
+            .padding(4),
+    ]
+    .spacing(4);
+    column![scrollable(list).height(Fill), adder(app), split_row]
         .spacing(6)
         .into()
 }
@@ -3498,18 +3545,6 @@ fn agents_panel(app: &App) -> Element<'_, Message> {
         .into()
 }
 
-/// A pane's title bar (channel name + refresh/close).
-fn title_row(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
-    row![
-        text(pane.channel.clone()).size(15),
-        Space::new().width(Fill),
-        button("↻").on_press(Message::Refresh(id)).padding(4),
-        button("×").on_press(Message::Close(id)).padding(4),
-    ]
-    .spacing(6)
-    .into()
-}
-
 /// A pane's remote-watch controls: the host base URL to watch a session on
 /// (blank = this machine, `HOST`) and the member email to authenticate the
 /// live websocket as (`load_signing_key` reads that identity's key from
@@ -3560,23 +3595,25 @@ fn remote_row<'a>(
     col.into()
 }
 
-/// One channel pane as a bordered column (custom Columns layout).
-fn column_pane<'a>(
-    id: pane_grid::Pane,
-    pane: &'a Pane,
-    agents: &'a [AgentDto],
-    machine_email: Option<&'a str>,
-    channels: &'a [String],
-) -> Element<'a, Message> {
+/// One channel pane's body: the remote-watch controls plus the entry feed.
+/// The channel name and refresh/close controls live in the pane's
+/// `pane_grid::TitleBar` instead (built at the call site in `view`) — only a
+/// `TitleBar`'s area is draggable, so that's what gives PaneGrid's
+/// drag-to-reorder a grab handle.
+fn channel_pane<'a>(app: &'a App, id: pane_grid::Pane, pane: &'a Pane) -> Element<'a, Message> {
+    let machine_email = app
+        .settings
+        .as_ref()
+        .and_then(|s| s.identity.as_ref())
+        .map(|i| i.email.as_str());
     container(
         column![
-            title_row(id, pane),
             remote_row(id, pane, machine_email),
-            pane_body(id, pane, agents, channels)
+            pane_body(id, pane, &app.agents, &app.channel_names)
         ]
         .spacing(8),
     )
-    .width(Length::FillPortion(1))
+    .width(Fill)
     .height(Fill)
     .padding(8)
     .style(|_theme| container::Style {
