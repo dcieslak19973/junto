@@ -3000,6 +3000,11 @@ fn artifacts_view(app: &App) -> Element<'_, Message> {
     let Some(pane) = app.panes.get(id) else {
         return text("no channel focused").size(12).color(MUTED).into();
     };
+    match &pane.content {
+        Content::Loading => return text("loading…").size(12).color(MUTED).into(),
+        Content::Error(err) => return text(format!("⚠ {err}")).size(12).color(RED).into(),
+        Content::Loaded(_) => {}
+    }
     let mut items = column![].spacing(4);
     for entry in pane.artifact_entries() {
         items = items.push(artifact_row(id, pane, entry));
@@ -3015,6 +3020,11 @@ fn sessions_view(app: &App) -> Element<'_, Message> {
     let Some(pane) = app.panes.get(id) else {
         return text("no channel focused").size(12).color(MUTED).into();
     };
+    match &pane.content {
+        Content::Loading => return text("loading…").size(12).color(MUTED).into(),
+        Content::Error(err) => return text(format!("⚠ {err}")).size(12).color(RED).into(),
+        Content::Loaded(_) => {}
+    }
     let mut items = column![].spacing(4);
     for session in pane.session_list() {
         items = items.push(session_row(id, pane, session));
@@ -5871,9 +5881,6 @@ struct LineageCanvas {
     now_ms: i64,
     span_ms: i64,
     height: f32,
-    /// When true, render only the ambient (row 0) track at a fixed y — the
-    /// sticky mainline pinned above the scrollable graph.
-    pinned: bool,
 }
 
 impl LineageCanvas {
@@ -5962,7 +5969,6 @@ impl LineageCanvas {
             now_ms,
             span_ms: (now_ms - min_ms).max(1),
             height,
-            pinned: false,
         }
     }
 
@@ -5994,40 +6000,6 @@ impl canvas::Program<Message> for LineageCanvas {
         let right = (bounds.width - 24.0).max(left + 60.0);
         let hover = cursor.position_in(bounds);
         let mut tooltip: Option<(Point, String)> = None;
-
-        // Pinned mode: draw only the ambient (row 0) track at a fixed y — the
-        // sticky mainline that stays above the scrollable graph.
-        if self.pinned {
-            if let Some(track) = self.tracks.iter().find(|t| t.row == 0) {
-                let y = bounds.height / 2.0;
-                let x0 = self.x_of(track.first_ms, left, right);
-                let x1 = self.x_of(track.last_ms, left, right).max(x0 + MIN_TRACK);
-                frame.stroke(
-                    &Path::line(Point::new(x0, y), Point::new(x1, y)),
-                    Stroke::default().with_color(TEAL).with_width(3.0),
-                );
-                frame.fill(&Path::circle(Point::new(x1, y), 5.0), TEAL);
-                for (ms, label) in &track.milestones {
-                    let mx = self.x_of(*ms, left, right).clamp(x0, x1);
-                    frame.fill(&Path::circle(Point::new(mx, y), 2.5), TEXT);
-                    if let Some(h) = hover
-                        && (h.x - mx).abs() < 5.0
-                        && (h.y - y).abs() < 5.0
-                    {
-                        tooltip = Some((Point::new(mx, y), label.clone()));
-                    }
-                }
-                frame.fill_text(canvas::Text {
-                    content: format!("⚓ {}", truncate(&track.name, 18)),
-                    position: Point::new(8.0, y - 8.0),
-                    color: TEAL,
-                    size: 13.0.into(),
-                    ..canvas::Text::default()
-                });
-                draw_tooltip(&mut frame, tooltip, bounds);
-            }
-            return vec![frame.into_geometry()];
-        }
 
         // Per-track x-range with a minimum length so diverge/converge keep a gap.
         let mut ranges = vec![(0.0_f32, 0.0_f32); self.tracks.len()];
