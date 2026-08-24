@@ -78,6 +78,11 @@ struct App {
     order: Vec<pane_grid::Pane>,
     /// Available channel names for the type-ahead picker.
     channels: combo_box::State<String>,
+    /// The same names as a plain list, for widgets that need to OFFER them
+    /// rather than type-ahead them — the converge target picker. Kept beside
+    /// `channels` because `combo_box::State` consumes its options and two
+    /// `combo_box`es sharing one `State` would share its filter text too.
+    channel_names: Vec<String>,
     /// The whole lineage DAG, drawn as the always-visible top branch graph.
     lineage: Option<LineageGraphDto>,
     /// Cross-channel "needs you" items — the focus board.
@@ -943,6 +948,7 @@ impl App {
             focus: Some(first),
             order: vec![first],
             channels: combo_box::State::new(Vec::new()),
+            channel_names: Vec::new(),
             lineage: None,
             focus_items: Vec::new(),
             agents: Vec::new(),
@@ -1015,6 +1021,7 @@ impl App {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::ChannelsLoaded(names) => {
+                self.channel_names = names.clone();
                 self.channels = combo_box::State::new(names);
                 Task::none()
             }
@@ -2630,7 +2637,13 @@ impl App {
         let mut body = row![].spacing(6);
         for id in &self.order {
             if let Some(pane) = self.panes.get(*id) {
-                body = body.push(column_pane(*id, pane, &self.agents, machine_email));
+                body = body.push(column_pane(
+                    *id,
+                    pane,
+                    &self.agents,
+                    machine_email,
+                    &self.channel_names,
+                ));
             }
         }
 
@@ -3096,12 +3109,13 @@ fn column_pane<'a>(
     pane: &'a Pane,
     agents: &'a [AgentDto],
     machine_email: Option<&'a str>,
+    channels: &'a [String],
 ) -> Element<'a, Message> {
     container(
         column![
             title_row(id, pane),
             remote_row(id, pane, machine_email),
-            pane_body(id, pane, agents)
+            pane_body(id, pane, agents, channels)
         ]
         .spacing(8),
     )
@@ -3152,7 +3166,18 @@ fn brief_panel<'a>(items: &'a [markdown::Item], raw: &str) -> Element<'a, Messag
 
 /// The inline form for a channel lifecycle act: the inputs it needs, a
 /// confirm/cancel row, and any error.
-fn lifecycle_form(id: pane_grid::Pane, pane: &Pane, kind: LifecycleKind) -> Element<'_, Message> {
+///
+/// `channels` are the names a converge may target. Converge and Rename used to
+/// share one free-text box, but they are opposites: Rename invents a NEW name,
+/// while Converge must name a channel that ALREADY EXISTS — and typing an
+/// existing name by hand, exactly, from a list the app is already holding, is
+/// the failure mode Dan hit converging the dogfood channel.
+fn lifecycle_form<'a>(
+    id: pane_grid::Pane,
+    pane: &'a Pane,
+    kind: LifecycleKind,
+    channels: &'a [String],
+) -> Element<'a, Message> {
     let mut col = column![].spacing(6);
     match kind {
         LifecycleKind::Diverge => {
@@ -3164,15 +3189,37 @@ fn lifecycle_form(id: pane_grid::Pane, pane: &Pane, kind: LifecycleKind) -> Elem
                     .padding(6),
             );
         }
-        LifecycleKind::Converge | LifecycleKind::Rename => {
-            let target_placeholder = if kind == LifecycleKind::Rename {
-                "new channel name…"
-            } else {
-                "target channel name…"
-            };
+        LifecycleKind::Converge => {
+            // A channel cannot converge into itself, so it is not offered.
+            let targets: Vec<String> = channels
+                .iter()
+                .filter(|name| *name != &pane.channel)
+                .cloned()
+                .collect();
+            let selected =
+                (!pane.lifecycle_target.trim().is_empty()).then(|| pane.lifecycle_target.clone());
             col = col
                 .push(
-                    text_input(target_placeholder, &pane.lifecycle_target)
+                    pick_list(targets, selected, move |name: String| {
+                        Message::LifecycleTargetChanged(id, name)
+                    })
+                    .placeholder("converge into which channel?")
+                    .text_size(12)
+                    .padding(6)
+                    .width(Fill),
+                )
+                .push(
+                    text_input("rationale (required)…", &pane.lifecycle_text)
+                        .on_input(move |v| Message::LifecycleTextChanged(id, v))
+                        .on_submit(Message::LifecycleSubmit(id))
+                        .size(12)
+                        .padding(6),
+                );
+        }
+        LifecycleKind::Rename => {
+            col = col
+                .push(
+                    text_input("new channel name…", &pane.lifecycle_target)
                         .on_input(move |v| Message::LifecycleTargetChanged(id, v))
                         .size(12)
                         .padding(6),
@@ -3726,6 +3773,7 @@ fn pane_body<'a>(
     id: pane_grid::Pane,
     pane: &'a Pane,
     agents: &'a [AgentDto],
+    channels: &'a [String],
 ) -> Element<'a, Message> {
     let dto = match &pane.content {
         Content::Loading => {
@@ -3777,7 +3825,7 @@ fn pane_body<'a>(
     }
     header = header.push(bar);
     if let Some(kind) = pane.lifecycle {
-        header = header.push(lifecycle_form(id, pane, kind));
+        header = header.push(lifecycle_form(id, pane, kind, channels));
     }
 
     // Launch a session: intent + agent picker + mode toggle + workspace.
