@@ -243,13 +243,13 @@ struct App {
     /// `ShellState`, since a half-finished gesture is not layout worth
     /// saving.
     blade_drag: Option<BladeDrag>,
-    /// The channel whose placement is pending, if any — set by pressing
-    /// an unopened channel's chip (no entry) or an unopened attention
-    /// chip (with the entry to jump to once it lands), cleared by
-    /// choosing a placement, pressing the chip again, or an outside
-    /// click. Transient like `blade_drag`: a half-made placement choice
-    /// is not layout worth persisting, so this lives on `App`, not
-    /// `ShellState`.
+    /// The channel whose placement is pending, if any — set by pressing an
+    /// unopened channel's chip (`PendingTarget::Channel`), an unopened
+    /// attention chip (`Entry`, the entry to jump to), or an unwatched
+    /// session chip (`Session`, the session to watch), cleared by choosing
+    /// a placement, pressing the chip again, or an outside click.
+    /// Transient like `blade_drag`: a half-made placement choice is not
+    /// layout worth persisting, so this lives on `App`, not `ShellState`.
     pending: Option<PendingOpen>,
     /// Available channel names for the type-ahead picker.
     channels: combo_box::State<String>,
@@ -973,15 +973,30 @@ impl AnchorTarget {
     }
 }
 
-/// A channel the user has chosen to open but not yet placed, plus the entry
-/// to jump to once it lands (attention chips carry one; channel chips
-/// don't) — the one mechanism `App::pending` uses for both an unopened
-/// channel chip's floating menu and an unopened attention chip's inline
-/// placement row, rather than two parallel fields.
+/// What a landed `PendingOpen` should do once its channel is on screen:
+/// nothing (a channel chip), jump to a carried entry (an attention chip),
+/// or start watching a carried session (a session chip). An enum, not a
+/// second `Option` field beside one already on `PendingOpen` — a pending
+/// only ever carries at most one target kind, and two parallel `Option`s
+/// would let both or neither be set, the illegal state this replaces.
+#[derive(Debug, Clone, PartialEq)]
+enum PendingTarget {
+    /// Just open the channel — nothing further to do.
+    Channel,
+    /// Jump to this entry once the channel lands (an attention chip).
+    Entry(String),
+    /// Watch this session once the channel lands (a session chip).
+    Session(String),
+}
+
+/// A channel the user has chosen to open but not yet placed, plus what to
+/// do once it lands — the one mechanism `App::pending` uses for an
+/// unopened channel chip's floating menu, an unopened attention chip's
+/// inline row, and an unwatched session chip's inline row alike.
 #[derive(Debug, Clone, PartialEq)]
 struct PendingOpen {
     channel: String,
-    entry: Option<String>,
+    target: PendingTarget,
 }
 
 /// Where an unopened channel's chip should dock when pressed — the explicit
@@ -1362,6 +1377,25 @@ impl App {
         }
     }
 
+    /// Apply a placed pending's post-open step to the pane it landed in:
+    /// pin an attention chip's entry (`pin_entry`), or start watching a
+    /// session chip's session. A bare channel-chip target needs nothing
+    /// further — placing it already put the right channel on screen.
+    /// Shared by `Message::ChannelPlaced`'s three landing branches (no
+    /// focus yet, a split, or "here"), so the step exists once rather
+    /// than duplicated per branch.
+    fn apply_pending_target(&mut self, pane: pane_grid::Pane, target: PendingTarget) {
+        match target {
+            PendingTarget::Channel => {}
+            PendingTarget::Entry(entry) => self.pin_entry(pane, entry),
+            PendingTarget::Session(session) => {
+                if let Some(state) = self.panes.get_mut(pane) {
+                    state.watched = Some(session);
+                }
+            }
+        }
+    }
+
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::ChannelsLoaded(names) => {
@@ -1375,13 +1409,13 @@ impl App {
             }
             Message::FocusLoaded(items) => {
                 self.focus_items = items;
-                // An attention-originated pending (one carrying an entry)
+                // An attention-originated pending (an `Entry` target)
                 // whose channel has scrolled off the board would otherwise
-                // render an orphaned inline placement row with nothing left
-                // to explain it; a channel chip's pending (no entry) is
-                // unrelated to the board and is left alone.
+                // render an orphaned inline placement row with nothing
+                // left to explain it; a channel or session chip's pending
+                // is unrelated to the board and is left alone.
                 if let Some(pending) = &self.pending
-                    && pending.entry.is_some()
+                    && matches!(&pending.target, PendingTarget::Entry(_))
                     && !self
                         .focus_items
                         .iter()
@@ -1417,16 +1451,14 @@ impl App {
                     if let Some((_, sibling)) = self.panes.close(pane) {
                         self.focus = Some(sibling);
                     }
-                } else if self
-                    .pending
-                    .as_ref()
-                    .is_some_and(|pending| pending.entry.is_none() && pending.channel == name)
-                {
+                } else if self.pending.as_ref().is_some_and(|pending| {
+                    matches!(&pending.target, PendingTarget::Channel) && pending.channel == name
+                }) {
                     self.pending = None;
                 } else {
                     self.pending = Some(PendingOpen {
                         channel: name,
-                        entry: None,
+                        target: PendingTarget::Channel,
                     });
                 }
                 Task::none()
@@ -1435,24 +1467,24 @@ impl App {
                 self.pending = None;
                 let PendingOpen {
                     channel: name,
-                    entry,
+                    target,
                 } = pending;
                 // Every placement here is meaningless with nothing focused
                 // to split or replace — degrade all three to the plain
                 // open/focus path (`ChannelPicked`'s own behaviour) rather
                 // than presenting a choice that has nothing to act on.
-                let Some(target) = self.focus else {
+                let Some(focused) = self.focus else {
                     let (pane, task) = self.open_or_focus(&name);
-                    if let (Some(pane), Some(entry)) = (pane, entry) {
-                        self.pin_entry(pane, entry);
+                    if let Some(pane) = pane {
+                        self.apply_pending_target(pane, target);
                     }
                     return task;
                 };
                 match placement.axis() {
                     Some(axis) => {
-                        let (pane, task) = self.split_channel(axis, target, &name);
-                        if let (Some(pane), Some(entry)) = (pane, entry) {
-                            self.pin_entry(pane, entry);
+                        let (pane, task) = self.split_channel(axis, focused, &name);
+                        if let Some(pane) = pane {
+                            self.apply_pending_target(pane, target);
                         }
                         task
                     }
@@ -1464,17 +1496,15 @@ impl App {
                         // per-pane view/form field to a fresh
                         // `Pane::loading`, since none of it describes the
                         // new channel.
-                        let Some(state) = self.panes.get_mut(target) else {
+                        let Some(state) = self.panes.get_mut(focused) else {
                             return Task::none();
                         };
                         let remote = state.remote.clone();
                         let base = state.base().to_string();
                         *state = Pane::loading(&name);
                         state.remote = remote;
-                        if let Some(entry) = entry {
-                            self.pin_entry(target, entry);
-                        }
-                        fetch(target, base, &name)
+                        self.apply_pending_target(focused, target);
+                        fetch(focused, base, &name)
                     }
                 }
             }
@@ -1486,16 +1516,14 @@ impl App {
                 task
             }
             Message::FocusChipToggled(name, entry_id) => {
-                if self
-                    .pending
-                    .as_ref()
-                    .is_some_and(|pending| pending.entry.as_deref() == Some(entry_id.as_str()))
-                {
+                if self.pending.as_ref().is_some_and(|pending| {
+                    matches!(&pending.target, PendingTarget::Entry(id) if id == &entry_id)
+                }) {
                     self.pending = None;
                 } else {
                     self.pending = Some(PendingOpen {
                         channel: name,
-                        entry: Some(entry_id),
+                        target: PendingTarget::Entry(entry_id),
                     });
                 }
                 Task::none()
@@ -3800,10 +3828,9 @@ fn channel_nav(app: &App) -> Element<'_, Message> {
         let row: Element<Message> = if active {
             chip
         } else {
-            let pending = app
-                .pending
-                .as_ref()
-                .filter(|pending| pending.entry.is_none() && pending.channel == *name);
+            let pending = app.pending.as_ref().filter(|pending| {
+                matches!(&pending.target, PendingTarget::Channel) && pending.channel == *name
+            });
             // 170px: enough for an icon plus the longest row label ("use
             // this pane") at `TEXT_META` with room to breathe — this menu
             // has no list to grow, just three fixed rows, so it needs
@@ -3917,7 +3944,7 @@ fn attention_view(app: &App) -> Element<'_, Message> {
         // matched by entry id so two items sharing a channel don't both
         // grow a row.
         if let Some(pending) = &app.pending
-            && pending.entry.as_deref() == Some(item.entry_id.as_str())
+            && matches!(&pending.target, PendingTarget::Entry(id) if id == &item.entry_id)
         {
             items = items.push(attention_placement_row(pending));
         }
@@ -9585,7 +9612,7 @@ mod channel_chip_tests {
             app.pending,
             Some(PendingOpen {
                 channel: "unopened".to_string(),
-                entry: None,
+                target: PendingTarget::Channel,
             })
         );
 
@@ -9604,7 +9631,7 @@ mod channel_chip_tests {
         app.channel_names.push("unopened".to_string());
         app.pending = Some(PendingOpen {
             channel: "unopened".to_string(),
-            entry: None,
+            target: PendingTarget::Channel,
         });
 
         let _ = app.update(Message::ChannelToggled("unopened".to_string()));
@@ -9620,7 +9647,7 @@ mod channel_chip_tests {
         let _ = app.update(Message::ChannelPlaced(
             PendingOpen {
                 channel: "new-channel".to_string(),
-                entry: None,
+                target: PendingTarget::Channel,
             },
             Placement::Here,
         ));
@@ -9641,7 +9668,7 @@ mod channel_chip_tests {
         let _ = app.update(Message::ChannelPlaced(
             PendingOpen {
                 channel: "replacement".to_string(),
-                entry: None,
+                target: PendingTarget::Channel,
             },
             Placement::Here,
         ));
@@ -9661,7 +9688,7 @@ mod channel_chip_tests {
         let _ = app.update(Message::ChannelPlaced(
             PendingOpen {
                 channel: "sibling".to_string(),
-                entry: None,
+                target: PendingTarget::Channel,
             },
             Placement::Right,
         ));
@@ -9779,7 +9806,7 @@ mod attention_chip_tests {
         app.focus_items = vec![focus_item("unopened", "entry-3")];
         app.pending = Some(PendingOpen {
             channel: "unopened".to_string(),
-            entry: Some("entry-3".to_string()),
+            target: PendingTarget::Entry("entry-3".to_string()),
         });
 
         let mut ui = iced_test::simulator(attention_view(&app));
@@ -9812,7 +9839,7 @@ mod attention_chip_tests {
         let (mut app, _) = App::new();
         app.pending = Some(PendingOpen {
             channel: "unopened".to_string(),
-            entry: Some("entry-4".to_string()),
+            target: PendingTarget::Entry("entry-4".to_string()),
         });
 
         let _ = app.update(Message::FocusLoaded(vec![focus_item(
