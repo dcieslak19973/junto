@@ -205,6 +205,20 @@ const ICON_BELL: char = '\u{e05d}';
 const ICON_BOT: char = '\u{e1ba}';
 const ICON_FILE_DIFF: char = '\u{e319}';
 const ICON_GIT_BRANCH: char = '\u{e0e5}';
+const ICON_REFRESH_CW: char = '\u{e148}';
+/// A hollow, unbranching origin node — `lineage_view`'s rail glyph for a
+/// `LineageRole::Root` node.
+const ICON_CIRCLE: char = '\u{e07a}';
+/// A dot inside a ring — `lineage_view`'s rail glyph for the focused
+/// channel, overriding whatever its `LineageRole` would otherwise pick.
+const ICON_CIRCLE_DOT: char = '\u{e348}';
+/// A small filled node — `lineage_view`'s rail glyph for a
+/// `LineageRole::Ordinary` node.
+const ICON_DOT: char = '\u{e453}';
+/// `lineage_view`'s rail glyph for a `LineageRole::Fork` node.
+const ICON_GIT_FORK: char = '\u{e28c}';
+/// `lineage_view`'s rail glyph for a `LineageRole::Converged` node.
+const ICON_GIT_MERGE: char = '\u{e0e7}';
 
 /// The default font at Semibold weight — the one hierarchy tool this pass
 /// introduces. Reserved for `TEXT_TITLE`-sized text and blade section
@@ -270,8 +284,16 @@ struct App {
     /// Transient like `pending`/`blade_drag`: a half-typed filter is not
     /// layout worth persisting, so this lives on `App`, not `ShellState`.
     channel_filter: String,
-    /// The whole lineage DAG, drawn as the always-visible top branch graph.
+    /// The whole lineage DAG, rendered as a vertical list (`lineage_view`).
     lineage: Option<LineageGraphDto>,
+    /// Whether the right blade's lineage section is collapsed. Transient
+    /// like `channel_filter`/`creating`: a chrome toggle, not layout worth
+    /// persisting, so this lives on `App`, not `ShellState`.
+    lineage_collapsed: bool,
+    /// Node ids whose per-row relations/milestones disclosure is expanded
+    /// (`lineage_view`'s per-row chevron). Transient like
+    /// `lineage_collapsed`.
+    lineage_expanded: HashSet<String>,
     /// Cross-channel "needs you" items — the focus board.
     focus_items: Vec<FocusItem>,
     /// Configured Agents the launch picker offers (`/agents.json`).
@@ -1188,6 +1210,20 @@ enum Message {
     /// An artifact's content arrived (pane, artifact id, Ok or error).
     ArtifactLoaded(pane_grid::Pane, String, Result<ArtifactDto, String>),
     LineageGraphLoaded(Option<LineageGraphDto>),
+    /// Press the lineage header's chevron: collapse/expand the section.
+    ToggleLineageCollapsed,
+    /// Press a lineage row's disclosure chevron: expand/collapse that
+    /// node's relations + milestones detail (the node's id).
+    LineageRowToggled(String),
+    /// Press the lineage header's refresh icon: refetch just the lineage DAG.
+    RefreshLineage,
+    /// Press a lineage row's channel name: focus its pane if already open,
+    /// else open (or, pressed again, close) a placement menu for it —
+    /// exactly `Message::ChannelToggled`'s own logic, except an
+    /// already-open channel is FOCUSED rather than closed, since a
+    /// history view should always take you there
+    /// (`Message::FocusChipPicked`'s own reasoning for attention chips).
+    LineageChannelPicked(String),
     FocusLoaded(Vec<FocusItem>),
     AgentsLoaded(Vec<AgentDto>),
     WorkspacesLoaded(Vec<String>),
@@ -1385,6 +1421,8 @@ impl App {
             channel_names: Vec::new(),
             channel_filter: String::new(),
             lineage: None,
+            lineage_collapsed: false,
+            lineage_expanded: HashSet::new(),
             focus_items: Vec::new(),
             agents: Vec::new(),
             recent_workspaces: Vec::new(),
@@ -1571,6 +1609,35 @@ impl App {
         }
     }
 
+    /// The shared half of `Message::ChannelToggled`'s and
+    /// `Message::LineageChannelPicked`'s logic: if `name` already has a
+    /// pane, return it — the caller decides what "already open" means
+    /// (close it, for a channel chip; focus it, for a lineage row).
+    /// Otherwise, opens or closes a `PendingTarget::Channel` placement
+    /// menu for it, exactly like an unopened channel chip, and returns
+    /// `None`.
+    fn open_pane_or_toggle_pending(&mut self, name: String) -> Option<pane_grid::Pane> {
+        let existing = self
+            .panes
+            .iter()
+            .find(|(_, state)| state.channel == name)
+            .map(|(id, _)| *id);
+        if existing.is_some() {
+            return existing;
+        }
+        if self.pending.as_ref().is_some_and(|pending| {
+            matches!(&pending.target, PendingTarget::Channel) && pending.channel == name
+        }) {
+            self.pending = None;
+        } else {
+            self.pending = Some(PendingOpen {
+                channel: name,
+                target: PendingTarget::Channel,
+            });
+        }
+        None
+    }
+
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::ChannelsLoaded(names) => {
@@ -1579,6 +1646,23 @@ impl App {
             }
             Message::LineageGraphLoaded(graph) => {
                 self.lineage = graph;
+                Task::none()
+            }
+            Message::ToggleLineageCollapsed => {
+                self.lineage_collapsed = !self.lineage_collapsed;
+                Task::none()
+            }
+            Message::LineageRowToggled(id) => {
+                if !self.lineage_expanded.remove(&id) {
+                    self.lineage_expanded.insert(id);
+                }
+                Task::none()
+            }
+            Message::RefreshLineage => fetch_lineage_graph(),
+            Message::LineageChannelPicked(name) => {
+                if let Some(pane) = self.open_pane_or_toggle_pending(name) {
+                    self.focus_pane(pane);
+                }
                 Task::none()
             }
             Message::FocusLoaded(items) => {
@@ -1616,28 +1700,14 @@ impl App {
                 Task::none()
             }
             Message::ChannelToggled(name) => {
-                let existing = self
-                    .panes
-                    .iter()
-                    .find(|(_, state)| state.channel == name)
-                    .map(|(id, _)| *id);
-                if let Some(pane) = existing {
-                    // `State::close` removes nothing and returns `None` for
-                    // the last remaining pane; `channel_nav` disables the
-                    // chip's press in that case (mirroring the title bar's
-                    // own `×` guard) rather than reaching this dead end.
-                    if let Some((_, sibling)) = self.panes.close(pane) {
-                        self.focus_pane(sibling);
-                    }
-                } else if self.pending.as_ref().is_some_and(|pending| {
-                    matches!(&pending.target, PendingTarget::Channel) && pending.channel == name
-                }) {
-                    self.pending = None;
-                } else {
-                    self.pending = Some(PendingOpen {
-                        channel: name,
-                        target: PendingTarget::Channel,
-                    });
+                // `State::close` removes nothing and returns `None` for the
+                // last remaining pane; `channel_nav` disables the chip's
+                // press in that case (mirroring the title bar's own `×`
+                // guard) rather than reaching this dead end.
+                if let Some(pane) = self.open_pane_or_toggle_pending(name)
+                    && let Some((_, sibling)) = self.panes.close(pane)
+                {
+                    self.focus_pane(sibling);
                 }
                 Task::none()
             }
@@ -4249,43 +4319,305 @@ fn right_blade(app: &App) -> Element<'_, Message> {
         .into()
 }
 
-/// The whole lineage DAG, relocated from the always-visible top ribbon into
-/// the right blade. Freed from the top band it no longer needs the 150px
-/// scroll cap the ribbon imposed — it gets the blade's full height.
+/// The whole lineage DAG as a vertical list, one row per channel, newest
+/// activity first — modelled on Orca's "Commit Tree" rather than the old
+/// horizontal time-axis `LineageCanvas` it replaced. That graph scaled its
+/// track width with the time span, needing real horizontal room; a
+/// narrow blade (the right blade's actual, user-configured width) left it
+/// almost nothing to draw in and the whole graph went blank. A vertical
+/// list scales with nothing horizontally — a fixed-width rail plus a
+/// `truncate()`d name — so it survives any blade width, including the
+/// narrowest one this shell allows (`lineage_view_tests`).
 ///
-/// The scrollable here is deliberately vertical-only, NOT both-axis. A
-/// `scrollable::Direction::Both` arms width-compression on the canvas's own
-/// `Limits` (`Scrollable::layout`, `iced_widget-0.14.2/src/scrollable.rs:
-/// 447-462`), which makes `Canvas::layout`'s `Length::Fill` width resolve to
-/// its zero intrinsic size instead of the blade's real width
-/// (`Limits::resolve`, `iced_core-0.14.0/src/layout/limits.rs:167-171`) —
-/// `Canvas::draw` then bails out on `bounds.width < 1.0`
-/// (`canvas.rs:290-294`) and the whole graph goes blank at every blade
-/// width, not just `BladeWidth::MIN`. `LineageCanvas` only carries a
-/// `height` field and derives its horizontal `right` edge from the ACTUAL
-/// bounds at draw time, so there is no fixed content width to hand a
-/// horizontal scrollbar either. The narrow-blade clip this leaves
-/// unresolved is a known limitation of the graph's provisional placement in
-/// a blade rather than its original full-window-width ribbon.
+/// Rail continuity is suggested, not drawn: a short `BORDER` hairline
+/// above and below each row's glyph (`lineage_rail`), stacked with tight
+/// spacing, reads as a rail without a `Fill`-height line (which Iced
+/// forbids inside a scrollable's content column — `rail`'s own doc
+/// comment covers the same limitation for the entry timeline). Curved
+/// branch connectors are deliberately out of scope: the graph is a real
+/// DAG (one hub forks six ways), curves are canvas work, and every
+/// relation is already spelled out in a row's own disclosure.
 fn lineage_view(app: &App) -> Element<'_, Message> {
-    match &app.lineage {
-        Some(graph) => {
-            let open: HashSet<String> = app
-                .panes
-                .iter()
-                .map(|(_, pane)| pane.channel.clone())
-                .collect();
-            let canvas = LineageCanvas::layout(graph, &open);
-            let content_h = canvas.height.max(60.0);
-            scrollable(
-                Canvas::new(canvas)
-                    .width(Fill)
-                    .height(Length::Fixed(content_h)),
-            )
-            .height(Fill)
+    let Some(graph) = &app.lineage else {
+        return text("no lineage yet").size(TEXT_BODY).color(MUTED).into();
+    };
+
+    let header = lineage_header(app, graph.nodes.len());
+    if app.lineage_collapsed {
+        return column![header].into();
+    }
+
+    let open: HashSet<String> = app
+        .panes
+        .iter()
+        .map(|(_, pane)| pane.channel.clone())
+        .collect();
+    let focused_channel = app
+        .focus
+        .and_then(|id| app.panes.get(id))
+        .map(|pane| pane.channel.as_str());
+    let by_id: HashMap<&str, &GNode> = graph
+        .nodes
+        .iter()
+        .map(|node| (node.id.as_str(), node))
+        .collect();
+
+    let mut list = column![];
+    for node in lineage_row_order(graph) {
+        let relations = node_relations(graph, &node.id);
+        let role = node_role(&relations);
+        let is_focused = focused_channel == Some(node.name.as_str());
+        let is_open = open.contains(&node.name);
+        let color = if is_focused {
+            TEXT
+        } else if is_open {
+            TEAL
+        } else {
+            MUTED
+        };
+        let expanded = app.lineage_expanded.contains(&node.id);
+        list = list.push(lineage_row(
+            node,
+            &by_id,
+            &relations,
+            lineage_glyph(role, is_focused),
+            color,
+            is_open,
+            expanded,
+            app.pending.as_ref(),
+        ));
+    }
+
+    column![header, scrollable(list).height(Fill)]
+        .spacing(SP)
+        .height(Fill)
+        .into()
+}
+
+/// The lineage section's header: a collapse chevron, the section label and
+/// its node count (mirrors `channel_nav`'s own `text("channels")…
+/// semibold()` header), and a refresh trigger that refetches just the
+/// lineage DAG.
+fn lineage_header(app: &App, count: usize) -> Element<'_, Message> {
+    row![
+        icon_button(
+            if app.lineage_collapsed {
+                ICON_CHEVRON_RIGHT
+            } else {
+                ICON_CHEVRON_DOWN
+            },
+            if app.lineage_collapsed {
+                "expand lineage"
+            } else {
+                "collapse lineage"
+            },
+            tooltip::Position::Bottom,
+            Message::ToggleLineageCollapsed,
+        ),
+        text("lineage")
+            .size(TEXT_META)
+            .color(MUTED)
+            .font(semibold()),
+        text(count.to_string()).size(TEXT_META).color(MUTED),
+        Space::new().width(Fill),
+        icon_button(
+            ICON_REFRESH_CW,
+            "refresh lineage",
+            tooltip::Position::Bottom,
+            Message::RefreshLineage,
+        ),
+    ]
+    .spacing(SP_TIGHT)
+    .align_y(Center)
+    .into()
+}
+
+/// The rail glyph for one row, from its structural role and whether its
+/// channel is the one currently focused. Focus overrides role — the
+/// glyph's job is "where am I", which a plain ordinary node showing as
+/// focused is just as true of as a fork point.
+fn lineage_glyph(role: LineageRole, focused: bool) -> char {
+    if focused {
+        return ICON_CIRCLE_DOT;
+    }
+    match role {
+        LineageRole::Fork => ICON_GIT_FORK,
+        LineageRole::Converged => ICON_GIT_MERGE,
+        LineageRole::Root => ICON_CIRCLE,
+        LineageRole::Ordinary => ICON_DOT,
+    }
+}
+
+/// One lineage row: the fixed-width rail, a per-row disclosure chevron,
+/// and the channel name, plus — while `expanded` — that node's relations
+/// and milestones underneath. Clicking the name behaves like a channel
+/// chip (`channel_nav`): an unopened channel offers the same
+/// `placement_choices` menu (`placement_menu`, reused verbatim, not
+/// copied); an already-open one is focused rather than closed
+/// (`Message::LineageChannelPicked`'s own doc comment covers why).
+fn lineage_row<'a>(
+    node: &'a GNode,
+    by_id: &HashMap<&'a str, &'a GNode>,
+    relations: &LineageRelations<'a>,
+    glyph: char,
+    color: Color,
+    is_open: bool,
+    expanded: bool,
+    pending: Option<&PendingOpen>,
+) -> Element<'a, Message> {
+    let disclosure = icon_button(
+        if expanded {
+            ICON_CHEVRON_DOWN
+        } else {
+            ICON_CHEVRON_RIGHT
+        },
+        if expanded {
+            "hide relations"
+        } else {
+            "show relations"
+        },
+        tooltip::Position::Bottom,
+        Message::LineageRowToggled(node.id.clone()),
+    );
+
+    let name_button = button(
+        text(truncate(&node.name, 28))
+            .size(TEXT_BODY)
+            .wrapping(text::Wrapping::None),
+    )
+    .on_press(Message::LineageChannelPicked(node.name.clone()))
+    .padding([SP_TIGHT, SP])
+    .width(Fill)
+    .style(move |_theme, status| lineage_name_style(color, status));
+    let name_cell: Element<Message> = if is_open {
+        name_button.into()
+    } else {
+        let row_pending = pending.filter(|pending| {
+            matches!(&pending.target, PendingTarget::Channel) && pending.channel == node.name
+        });
+        Popover::new(name_button, row_pending.map(placement_menu))
+            .width(170.0)
+            .on_dismiss(Message::LineageChannelPicked(node.name.clone()))
             .into()
-        }
-        None => text("no lineage yet").size(TEXT_BODY).color(MUTED).into(),
+    };
+
+    let header_row = row![lineage_rail(glyph, color), disclosure, name_cell]
+        .spacing(SP_TIGHT)
+        .align_y(Center);
+
+    let mut col = column![header_row].spacing(SP_TIGHT);
+    if expanded {
+        col = col.push(lineage_detail(by_id, node, relations));
+    }
+    col.into()
+}
+
+/// The rail cell for one lineage row: the role glyph on a short `BORDER`
+/// hairline above and below it, mirroring `rail()`/`dot()`'s own git-log
+/// idiom for the entry timeline — fixed pixel segments, not a
+/// `Fill`-height line (`lineage_view`'s own doc comment covers why).
+/// Fixed-width so every row's glyph lines up in one column.
+fn lineage_rail(glyph: char, color: Color) -> Element<'static, Message> {
+    let hairline = || {
+        container(Space::new())
+            .width(Length::Fixed(1.0))
+            .height(Length::Fixed(6.0))
+            .style(|_theme| container::Style {
+                background: Some(Background::Color(BORDER)),
+                ..container::Style::default()
+            })
+    };
+    column![hairline(), icon(glyph).color(color), hairline()]
+        .align_x(Center)
+        .width(Length::Fixed(ICON_BTN))
+        .into()
+}
+
+/// Joins names the way a sentence would: "a", "a and b", or "a, b, and c"
+/// — used for a fork's "diverged into" line, which otherwise reads as a
+/// bare comma list for every real fork with more than one child.
+fn join_and(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, second] => format!("{first} and {second}"),
+        [init @ .., last] => format!("{}, and {last}", init.join(", ")),
+    }
+}
+
+/// A lineage row's expanded detail: its relations in words — diverged
+/// from/into, converged into — then its milestones, each `truncate()`d
+/// (the live data's labels run past 70 characters). Indented under the
+/// rail so it reads as this row's own detail, not a sibling row.
+fn lineage_detail<'a>(
+    by_id: &HashMap<&'a str, &'a GNode>,
+    node: &'a GNode,
+    relations: &LineageRelations<'a>,
+) -> Element<'a, Message> {
+    let name_of = |id: &str| {
+        by_id
+            .get(id)
+            .map_or_else(|| id.to_string(), |n| n.name.clone())
+    };
+
+    let mut lines = Vec::new();
+    if let Some(parent) = relations.parent {
+        lines.push(format!("diverged from {}", name_of(parent)));
+    }
+    if !relations.children.is_empty() {
+        let names: Vec<String> = relations.children.iter().map(|id| name_of(id)).collect();
+        lines.push(format!("diverged into {}", join_and(&names)));
+    }
+    if let Some(target) = relations.converged_into {
+        lines.push(format!("converged into {}", name_of(target)));
+    }
+
+    let mut detail = column![].spacing(SP_TIGHT);
+    for line in lines {
+        detail = detail.push(text(line).size(TEXT_META).color(MUTED));
+    }
+    let mut milestones: Vec<&MilestoneDto> = node.milestones.iter().collect();
+    // The host's own array order isn't documented as chronological — sort
+    // explicitly so a node's history always reads oldest-to-newest here,
+    // regardless of how it arrived over the wire.
+    milestones.sort_by_key(|m| m.ms);
+    for milestone in milestones {
+        detail = detail.push(
+            text(truncate(&milestone.label, 80))
+                .size(TEXT_META)
+                .color(MUTED),
+        );
+    }
+
+    container(detail)
+        .padding(Padding {
+            top: SP_TIGHT,
+            right: SP_TIGHT,
+            bottom: SP_TIGHT,
+            left: ICON_BTN + SP_TIGHT,
+        })
+        .into()
+}
+
+/// The lineage row's channel-name button: `ghost_style`'s own ethos (a
+/// list row is not a filled control) but keeping the row's own state
+/// colour (focused/open/neither) as the text colour instead of
+/// `ghost_style`'s fixed `MUTED` — that colour IS the row's whole signal.
+fn lineage_name_style(color: Color, status: button::Status) -> button::Style {
+    let tint = |a: f32| Some(Background::Color(Color { a, ..SURFACE }));
+    button::Style {
+        background: match status {
+            button::Status::Hovered => tint(0.4),
+            button::Status::Pressed => tint(0.6),
+            _ => None,
+        },
+        text_color: color,
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: 4.0.into(),
+        },
+        ..button::Style::default()
     }
 }
 
@@ -10708,5 +11040,245 @@ mod lineage_tests {
             node_role(&node_relations(&hub_graph(), "ghostly")),
             LineageRole::Root
         );
+    }
+}
+
+#[cfg(test)]
+mod lineage_view_tests {
+    use super::*;
+
+    fn one_node_graph(name: &str) -> LineageGraphDto {
+        LineageGraphDto {
+            nodes: vec![GNode {
+                id: "n1".to_string(),
+                name: name.to_string(),
+                first_ms: Some(1),
+                last_ms: Some(1),
+                milestones: Vec::new(),
+            }],
+            edges: Vec::new(),
+        }
+    }
+
+    fn app_with_lineage(graph: LineageGraphDto) -> App {
+        let (mut app, _) = App::new();
+        app.shell.right_view = shell::RightView::Lineage;
+        app.lineage = Some(graph);
+        app
+    }
+
+    fn app_with_lineage_view(name: &str) -> App {
+        app_with_lineage(one_node_graph(name))
+    }
+
+    #[test]
+    fn no_lineage_shows_the_quiet_fallback_message() {
+        let (app, _) = App::new();
+        let mut ui = iced_test::simulator(lineage_view(&app));
+        ui.find("no lineage yet")
+            .expect("with no lineage fetched yet, the quiet message must show");
+    }
+
+    #[test]
+    fn the_header_shows_the_node_count() {
+        let app = app_with_lineage(LineageGraphDto {
+            nodes: vec![
+                GNode {
+                    id: "a".into(),
+                    name: "a".into(),
+                    first_ms: None,
+                    last_ms: None,
+                    milestones: Vec::new(),
+                },
+                GNode {
+                    id: "b".into(),
+                    name: "b".into(),
+                    first_ms: None,
+                    last_ms: None,
+                    milestones: Vec::new(),
+                },
+            ],
+            edges: Vec::new(),
+        });
+        let mut ui = iced_test::simulator(lineage_view(&app));
+        ui.find("2").expect("the header must show the node count");
+    }
+
+    #[test]
+    fn collapsing_the_section_hides_the_row_list_but_keeps_the_header() {
+        let mut app = app_with_lineage_view("junto-dev");
+        app.lineage_collapsed = true;
+        let mut ui = iced_test::simulator(lineage_view(&app));
+        ui.find("lineage")
+            .expect("the header must stay visible while collapsed");
+        assert!(
+            ui.find("junto-dev").is_err(),
+            "a collapsed section must not render its row list"
+        );
+    }
+
+    #[test]
+    fn pressing_the_header_chevron_toggles_lineage_collapsed() {
+        let (mut app, _) = App::new();
+        assert!(!app.lineage_collapsed);
+        let _ = app.update(Message::ToggleLineageCollapsed);
+        assert!(
+            app.lineage_collapsed,
+            "the first press must collapse the section"
+        );
+        let _ = app.update(Message::ToggleLineageCollapsed);
+        assert!(
+            !app.lineage_collapsed,
+            "the second press must expand it again"
+        );
+    }
+
+    #[test]
+    fn pressing_a_rows_disclosure_expands_and_collapses_its_detail() {
+        let (mut app, _) = App::new();
+        let _ = app.update(Message::LineageRowToggled("n1".to_string()));
+        assert!(app.lineage_expanded.contains("n1"));
+        let _ = app.update(Message::LineageRowToggled("n1".to_string()));
+        assert!(!app.lineage_expanded.contains("n1"));
+    }
+
+    #[test]
+    fn expanding_a_row_shows_its_relations_and_milestones() {
+        let mut app = app_with_lineage(LineageGraphDto {
+            nodes: vec![
+                GNode {
+                    id: "hub".into(),
+                    name: "hub".into(),
+                    first_ms: Some(1),
+                    last_ms: Some(1),
+                    milestones: Vec::new(),
+                },
+                GNode {
+                    id: "child".into(),
+                    name: "child".into(),
+                    first_ms: Some(2),
+                    last_ms: Some(2),
+                    milestones: vec![MilestoneDto {
+                        ms: 1,
+                        label: "kickoff".to_string(),
+                    }],
+                },
+            ],
+            edges: vec![GEdge {
+                from: "hub".into(),
+                to: "child".into(),
+                relation: "diverge".into(),
+            }],
+        });
+        app.lineage_expanded.insert("child".to_string());
+        let mut ui = iced_test::simulator(lineage_view(&app));
+        ui.find("diverged from hub")
+            .expect("an expanded child row must name its parent");
+        ui.find("kickoff")
+            .expect("an expanded row must list its milestones");
+    }
+
+    #[test]
+    fn the_focused_channels_row_uses_the_circle_dot_glyph() {
+        // `App::new`'s own pane is "junto-dev" and focused.
+        let app = app_with_lineage_view("junto-dev");
+        let mut ui = iced_test::simulator(lineage_view(&app));
+        ui.find(ICON_CIRCLE_DOT.to_string().as_str())
+            .expect("the focused channel's row must use the circle-dot glyph");
+    }
+
+    #[test]
+    fn a_forking_nodes_row_uses_the_git_fork_glyph() {
+        let app = app_with_lineage(LineageGraphDto {
+            nodes: vec![
+                GNode {
+                    id: "hub".into(),
+                    name: "hub".into(),
+                    first_ms: Some(1),
+                    last_ms: Some(2),
+                    milestones: Vec::new(),
+                },
+                GNode {
+                    id: "child".into(),
+                    name: "child".into(),
+                    first_ms: Some(1),
+                    last_ms: Some(1),
+                    milestones: Vec::new(),
+                },
+            ],
+            edges: vec![GEdge {
+                from: "hub".into(),
+                to: "child".into(),
+                relation: "diverge".into(),
+            }],
+        });
+        let mut ui = iced_test::simulator(lineage_view(&app));
+        ui.find(ICON_GIT_FORK.to_string().as_str())
+            .expect("a node with children must use the git-fork glyph");
+    }
+
+    #[test]
+    fn picking_an_open_channels_row_focuses_it_without_closing_its_pane() {
+        let (mut app, _) = App::new();
+        let first = app.focus.expect("App::new focuses its one pane");
+        let (other_pane, _split) = app
+            .panes
+            .split(pane_grid::Axis::Vertical, first, Pane::loading("other"))
+            .expect("splitting the only pane must succeed");
+        // `split` leaves focus on the original pane, not the new one.
+
+        let _ = app.update(Message::LineageChannelPicked("other".to_string()));
+
+        assert_eq!(
+            app.panes.len(),
+            2,
+            "picking an open channel's row must not close its pane"
+        );
+        assert_eq!(
+            app.focus,
+            Some(other_pane),
+            "picking an open channel's row must focus its pane"
+        );
+    }
+
+    #[test]
+    fn picking_an_unopened_channels_row_offers_placement_like_a_channel_chip() {
+        let (mut app, _) = App::new();
+        let _ = app.update(Message::LineageChannelPicked("unopened".to_string()));
+        assert_eq!(
+            app.pending,
+            Some(PendingOpen {
+                channel: "unopened".to_string(),
+                target: PendingTarget::Channel,
+            })
+        );
+    }
+
+    #[test]
+    fn a_lineage_row_stays_single_line_at_the_narrowest_reported_blade_width() {
+        // 211px: the exact right-blade width that left the old horizontal
+        // `LineageCanvas` almost nothing to draw in and rendered it blank —
+        // the width this vertical list must survive without a row's name
+        // wrapping to a second line and inflating the row's height.
+        for name in [
+            "junto-dev",
+            "a-very-long-channel-name-that-would-overflow-a-narrow-blade",
+        ] {
+            let app = app_with_lineage_view(name);
+            let mut ui = iced_test::Simulator::with_size(
+                iced_test::core::Settings::default(),
+                Size::new(211.0, 600.0),
+                right_blade(&app),
+            );
+            let expected = truncate(name, 28);
+            let target = ui
+                .find(expected.as_str())
+                .unwrap_or_else(|_| panic!("the row for {name:?} must render a findable name"));
+            let bounds = target.bounds();
+            assert!(
+                bounds.height < 20.0,
+                "the row for {name:?} must render on one line at a 211px blade width, not wrap to two; got {bounds:?}"
+            );
+        }
     }
 }
