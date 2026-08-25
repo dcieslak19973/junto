@@ -3003,7 +3003,7 @@ impl App {
         }
         shell_row = shell_row.push(right);
 
-        column![top_bar, shell_row.spacing(0)].into()
+        column![top_bar, shell_row.spacing(0), footer(self)].into()
     }
 }
 
@@ -3031,6 +3031,59 @@ fn admin_toolbar(current: Option<AdminView>) -> Element<'static, Message> {
     .spacing(SP_TIGHT)
     .align_y(Center)
     .into()
+}
+
+/// The bottom status strip: the last child of the root column, carrying
+/// metadata (focused channel, pane count, attention count, host) so the
+/// panels above don't have to carry it — the user's own suggestion for
+/// reducing clutter, and the thin-bottom-footer counterpart to
+/// `admin_toolbar`'s top strip.
+fn footer(app: &App) -> Element<'_, Message> {
+    let pane = app.focus.and_then(|id| app.panes.get(id));
+    let channel = pane
+        .map(|p| p.channel.as_str())
+        .unwrap_or("no channel focused");
+    let panes = app.panes.len();
+    let pane_word = if panes == 1 { "pane" } else { "panes" };
+    let host = pane.map_or("local", |p| {
+        let base = p.base();
+        if base == HOST { "local" } else { base }
+    });
+
+    let mut segments = vec![channel.to_string(), format!("{panes} {pane_word}")];
+    let attention = app.focus_items.len();
+    if attention > 0 {
+        let word = if attention == 1 { "needs" } else { "need" };
+        segments.push(format!("{attention} {word} you"));
+    }
+    segments.push(host.to_string());
+
+    let mut strip = row![].spacing(SP).align_y(Center);
+    for (i, segment) in segments.into_iter().enumerate() {
+        if i > 0 {
+            strip = strip.push(text("·").size(TEXT_META).color(MUTED));
+        }
+        strip = strip.push(text(segment).size(TEXT_META).color(MUTED));
+    }
+
+    container(strip)
+        .width(Fill)
+        .padding(Padding {
+            top: SP_TIGHT,
+            right: SP_LOOSE,
+            bottom: SP_TIGHT,
+            left: SP_LOOSE,
+        })
+        .style(|_theme| container::Style {
+            background: Some(Background::Color(Color { a: 0.4, ..SURFACE })),
+            border: Border {
+                color: BORDER,
+                width: 1.0,
+                radius: 0.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
 }
 
 /// Which side of the shell a blade sits on — used only to point its stub's
@@ -8705,5 +8758,32 @@ diff --git a/lib.rs b/lib.rs
              (0.55), got {ratio} from nav {nav:?} and body {body:?} — a \
              FillPortion that inert would not track it at all",
         );
+    }
+
+    /// The bottom status strip omits its attention segment entirely when
+    /// nothing needs the user — showing "0 need you" would be worse than
+    /// showing nothing, since the footer's whole point is to carry only
+    /// metadata worth a glance.
+    #[test]
+    fn the_footer_omits_the_attention_segment_when_nothing_needs_attention() {
+        let (mut app, _) = App::new();
+        app.shell = shell::ShellState::default();
+        assert!(
+            app.focus_items.is_empty(),
+            "this test assumes the default app starts with nothing needing attention"
+        );
+
+        let mut ui = iced_test::simulator(app.view());
+
+        assert!(
+            ui.find("need you").is_err(),
+            "the attention segment must be entirely absent at zero, not shown as \"0 need you\""
+        );
+        ui.find("junto-dev")
+            .expect("the focused channel's name must still be on the footer");
+        ui.find("1 pane")
+            .expect("the singular pane count must still be on the footer");
+        ui.find("local")
+            .expect("the default host must still be on the footer");
     }
 }
