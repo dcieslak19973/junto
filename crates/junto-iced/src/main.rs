@@ -4909,17 +4909,18 @@ impl canvas::Program<Message> for LineageRailCanvas {
     }
 }
 
-/// A flowing branch/reconnect connector between two lane positions — a
-/// cubic Bézier with vertical tangents at both ends (each control point
-/// pulled to the OTHER end's x, at the shared vertical midpoint), which
-/// reads as one continuous curve the way the user's TVA-branch reference
-/// does, rather than the flowchart elbow a two-segment line would give.
+/// A branch/reconnect connector between two lane positions: one straight
+/// segment, the `\` and `/` of `git log --graph`.
+///
+/// This was a cubic Bézier with vertical tangents at both ends, on the
+/// reasoning that a flowing curve suited the branching-timeline reference.
+/// Over a 10px lane and a ~25px row that reads as a wiggle rather than a
+/// branch — the two tangents turn every connector into an S — and stacked
+/// down a column of twenty channels it reads as noise. A git graph angles
+/// only at the junction and runs straight everywhere else, which is what
+/// makes a lane legible at this scale.
 fn lineage_connector(from: Point, to: Point) -> Path {
-    let mid_y = (from.y + to.y) / 2.0;
-    Path::new(|builder| {
-        builder.move_to(from);
-        builder.bezier_curve_to(Point::new(from.x, mid_y), Point::new(to.x, mid_y), to);
-    })
+    Path::line(from, to)
 }
 
 /// A structurally significant node (root or fork) gets a slightly larger
