@@ -582,27 +582,25 @@ struct GEdge {
     relation: String,
 }
 
-// ---- pure lineage-graph logic: row order, structural relations, and a
-// node's role — decidable from `LineageGraphDto` alone, with no widget or
-// `App` state, and tested as such (`lineage_tests`) before `lineage_view`
-// (the vertical-list rewrite of the old horizontal `LineageCanvas`) ever
+// ---- pure lineage-graph logic: hierarchical row order, lane assignment,
+// per-row rail geometry, structural relations, and a node's role —
+// decidable from `LineageGraphDto` alone, with no widget or `App` state,
+// and tested as such (`lineage_tests`) before `lineage_view` (the
+// vertical-list rewrite of the old horizontal `LineageCanvas`) ever
 // touches them. ----
 
-/// Newest-activity-first ordering for the lineage list: sort nodes by
-/// `last_ms` descending. A node's `last_ms` is `None` when its channel has
-/// no recorded entries yet — treated as the oldest possible activity
+/// Comparator for every level of `lineage_hierarchy`'s order — roots
+/// against each other, and each node's children against their siblings:
+/// newest `last_ms` first. A node's `last_ms` is `None` when its channel
+/// has no recorded entries yet — treated as the oldest possible activity
 /// (`i64::MIN`), on the reasoning that "no evidence of recent activity"
 /// belongs at the bottom of a newest-first list, not jumping to the top.
 /// Ties (equal `last_ms`, including two `None`s) break on `name` so the
 /// list never silently reorders between two frames over identical data.
-fn lineage_row_order(graph: &LineageGraphDto) -> Vec<&GNode> {
-    let mut nodes: Vec<&GNode> = graph.nodes.iter().collect();
-    nodes.sort_by(|a, b| {
-        let a_key = a.last_ms.unwrap_or(i64::MIN);
-        let b_key = b.last_ms.unwrap_or(i64::MIN);
-        b_key.cmp(&a_key).then_with(|| a.name.cmp(&b.name))
-    });
-    nodes
+fn lineage_activity_order(a: &&GNode, b: &&GNode) -> std::cmp::Ordering {
+    let a_key = a.last_ms.unwrap_or(i64::MIN);
+    let b_key = b.last_ms.unwrap_or(i64::MIN);
+    b_key.cmp(&a_key).then_with(|| a.name.cmp(&b.name))
 }
 
 /// One node's structural relations within the lineage DAG, as borrowed
@@ -637,9 +635,11 @@ fn node_relations<'a>(graph: &'a LineageGraphDto, id: &str) -> LineageRelations<
     relations
 }
 
-/// A node's structural role in the lineage DAG — what `lineage_view` picks
-/// the rail glyph from, computed from a node's own `LineageRelations`
-/// rather than re-scanning the graph, so it's testable in isolation.
+/// A node's structural role in the lineage DAG — what `lineage_view` used
+/// to pick the rail glyph from, and what `lineage_rail_rows` now bundles
+/// into each row's description — computed from a node's own
+/// `LineageRelations` rather than re-scanning the graph, so it's testable
+/// in isolation.
 ///
 /// A node can satisfy more than one of these at once — the real data's own
 /// hub channel is both a root (no parent) AND a fork (six diverges out).
@@ -669,6 +669,284 @@ fn node_role(relations: &LineageRelations) -> LineageRole {
     } else {
         LineageRole::Ordinary
     }
+}
+
+/// A node's owner for the hierarchical row order (`lineage_hierarchy`) and
+/// lane assignment (`lineage_lanes`): its diverge parent if it has one,
+/// else its converge target — so a node with no diverge edge at all (the
+/// live data's `pointing-dogfood-20260823`, which only converges) still
+/// sits with the channel it reconnects into instead of stranded among
+/// unrelated roots. `None` only for a genuine root: no diverge parent AND
+/// no converge target.
+fn lineage_owner<'a>(graph: &'a LineageGraphDto, id: &str) -> Option<&'a str> {
+    let relations = node_relations(graph, id);
+    relations.parent.or(relations.converged_into)
+}
+
+/// The mutable accumulators `lineage_visit`'s DFS threads through the
+/// hierarchy walk, bundled into one `&mut` argument (rather than four)
+/// the same way `LineageRowState` bundles a row's presentation state —
+/// keeps the recursive call well under clippy's argument limit without
+/// an `#[allow]`.
+#[derive(Default)]
+struct LineageWalk<'a> {
+    visited: HashSet<&'a str>,
+    order: Vec<&'a GNode>,
+    /// Each visited node's own subtree span: the index, into `order`, of
+    /// the last row inside that node's own subtree — `lineage_rail_rows`
+    /// uses this to know when an ancestor's branch has no more rows left.
+    ends: HashMap<&'a str, usize>,
+    /// Each visited node's REALIZED structural parent — absent for a
+    /// root, and (this is what makes cycle-breaking sound for the rail,
+    /// not just for termination) absent for whichever side of a broken
+    /// cycle got visited first, since that side is never actually
+    /// nested under the other in the emitted order.
+    parents: HashMap<&'a str, &'a str>,
+}
+
+/// Depth-first-emits `node` and its children (from the static `children`
+/// adjacency, already sorted newest-first) into `walk`, recording the
+/// parent it was actually reached through — `None` for a root or a
+/// cycle-breaking re-entry point.
+///
+/// The data is a DAG in practice, but a converge-derived owner could in
+/// principle close a loop (two nodes converging into each other with
+/// neither having a diverge parent, so each "owns" the other per
+/// `lineage_owner`). `walk.visited`'s guard breaks that loop rather than
+/// recursing forever: a node already visited returns immediately, before
+/// `parents` is touched, so the cycle's second edge is simply never
+/// realized.
+fn lineage_visit<'a>(
+    node: &'a GNode,
+    parent: Option<&'a str>,
+    children: &HashMap<&'a str, Vec<&'a GNode>>,
+    walk: &mut LineageWalk<'a>,
+) {
+    if !walk.visited.insert(node.id.as_str()) {
+        return;
+    }
+    if let Some(parent) = parent {
+        walk.parents.insert(node.id.as_str(), parent);
+    }
+    walk.order.push(node);
+    if let Some(kids) = children.get(node.id.as_str()) {
+        for child in kids {
+            lineage_visit(child, Some(node.id.as_str()), children, walk);
+        }
+    }
+    walk.ends.insert(node.id.as_str(), walk.order.len() - 1);
+}
+
+/// The hierarchical row order, plus the structure `lineage_lanes` and
+/// `lineage_rail_rows` need afterward. Each subtree is contiguous — a
+/// root (no `lineage_owner`), newest-first, immediately followed by its
+/// descendants depth-first, each level's siblings also newest-first — so
+/// a branch and everything that diverged from or converges into it sit
+/// near each other instead of scattered by raw activity time.
+///
+/// A cycle (`lineage_visit`'s own doc comment covers how) can leave nodes
+/// unreachable from any real root; anything `walk.visited` doesn't cover
+/// once every root is drained is emitted afterward as its own root,
+/// newest-first, so a cycle breaks rather than a node silently vanishing.
+fn lineage_hierarchy<'a>(
+    graph: &'a LineageGraphDto,
+) -> (
+    Vec<&'a GNode>,
+    HashMap<&'a str, usize>,
+    HashMap<&'a str, &'a str>,
+) {
+    let by_id: HashMap<&str, &GNode> = graph.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+
+    let mut children: HashMap<&str, Vec<&GNode>> = HashMap::new();
+    let mut roots: Vec<&GNode> = Vec::new();
+    for node in &graph.nodes {
+        match lineage_owner(graph, &node.id).filter(|owner| by_id.contains_key(*owner)) {
+            Some(owner) => children.entry(owner).or_default().push(node),
+            None => roots.push(node),
+        }
+    }
+    roots.sort_by(lineage_activity_order);
+    for siblings in children.values_mut() {
+        siblings.sort_by(lineage_activity_order);
+    }
+
+    let mut walk = LineageWalk::default();
+    for root in &roots {
+        lineage_visit(root, None, &children, &mut walk);
+    }
+    let mut leftover: Vec<&GNode> = graph
+        .nodes
+        .iter()
+        .filter(|node| !walk.visited.contains(node.id.as_str()))
+        .collect();
+    leftover.sort_by(lineage_activity_order);
+    for node in leftover {
+        lineage_visit(node, None, &children, &mut walk);
+    }
+
+    (walk.order, walk.ends, walk.parents)
+}
+
+/// The lineage list's row order (`lineage_hierarchy`'s own doc comment
+/// covers the shape) — the entry point for callers that only need the
+/// order, not the lane/rail structure derived alongside it.
+fn lineage_row_order(graph: &LineageGraphDto) -> Vec<&GNode> {
+    lineage_hierarchy(graph).0
+}
+
+/// Cap on the rail's rendered depth (`lineage_lanes`): the live graph's
+/// deepest chain is 3 hops from a root, so 4 lanes (indices `0..MAX_LANE`)
+/// already covers it with a spare lane, while keeping the rail
+/// (`LANE_W * MAX_LANE` wide — `lineage_rail_cell`'s own doc comment
+/// covers the pixel budget) from growing arbitrarily wide against a
+/// pathological long diverge chain. A node deeper than the cap is drawn
+/// in the last lane; `LineageRelations::parent` still names its real
+/// diverge parent for the expanded detail — only the rail's own drawing
+/// is clamped, never the DAG data.
+const MAX_LANE: usize = 4;
+
+/// Which lanes have a through-line in one row — a bitmask rather than a
+/// `Vec`, since `MAX_LANE` bounds it to a handful of bits and keeping it a
+/// plain value keeps `LineageRailRow` (and therefore `LineageRowState`)
+/// `Copy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct LaneSet(u8);
+
+impl LaneSet {
+    fn with(mut self, lane: usize) -> Self {
+        self.0 |= 1 << lane;
+        self
+    }
+
+    fn contains(self, lane: usize) -> bool {
+        self.0 & (1 << lane) != 0
+    }
+
+    /// Every set lane, ascending — what `lineage_rail_cell` iterates to
+    /// draw one through-line per lane.
+    fn lanes(self) -> impl Iterator<Item = usize> {
+        (0..MAX_LANE).filter(move |&lane| self.contains(lane))
+    }
+}
+
+/// Rendered lane for each node — depth in the owner tree
+/// (`lineage_hierarchy`'s own doc comment covers "owner"), capped at
+/// `MAX_LANE - 1`. `order` must already be hierarchical
+/// (`lineage_hierarchy`'s output) so a node's structural parent always
+/// has a lane recorded before its children are visited; a node on the
+/// cycle-broken side of a loop has no `parents` entry at that point and
+/// falls back to lane 0, the same treatment a genuine root gets.
+fn lineage_lanes<'a>(
+    order: &[&'a GNode],
+    parents: &HashMap<&'a str, &'a str>,
+) -> HashMap<&'a str, usize> {
+    let mut lanes: HashMap<&str, usize> = HashMap::new();
+    for node in order {
+        let lane = parents
+            .get(node.id.as_str())
+            .copied()
+            .and_then(|parent| lanes.get(parent))
+            .map(|&parent_lane| (parent_lane + 1).min(MAX_LANE - 1))
+            .unwrap_or(0);
+        lanes.insert(node.id.as_str(), lane);
+    }
+    lanes
+}
+
+/// What one lineage row's rail cell must draw — the pure geometry
+/// `lineage_rail_cell`'s `canvas::Program` turns into paint calls.
+/// Everything here is a lane index or a role; the canvas program owns
+/// turning a lane into an x coordinate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LineageRailRow {
+    /// This row's own lane, already clamped to `MAX_LANE - 1`.
+    lane: usize,
+    role: LineageRole,
+    /// Lanes with a full-height vertical line through this row: a real
+    /// ancestor (by the owner tree, never by lane-number reuse between
+    /// unrelated siblings) whose own subtree still has rows after this
+    /// one.
+    through: LaneSet,
+    /// This row peels off from its owner's lane, drawn from the cell's
+    /// top edge into this row's own lane at the vertical centre. `None`
+    /// only for a root — every non-root row starts a branch here,
+    /// whether the owning edge was a real diverge or a converge-fallback
+    /// (`lineage_owner`'s own doc comment covers the trap that makes
+    /// this matter: a node can reconnect to something it never forked
+    /// from).
+    branch_from: Option<usize>,
+    /// This row's own outgoing `converge` edge lands in this lane, drawn
+    /// from this row's own lane at the vertical centre curving to the
+    /// cell's bottom edge. `None` unless the DAG has a real converge
+    /// edge FROM this node whose target is a lane this layout knows
+    /// about.
+    converge_to: Option<usize>,
+}
+
+/// Builds every row's `LineageRailRow` in one pass over `order` (already
+/// hierarchical) plus each node's `ends`/`parents`/`lanes` entries from
+/// `lineage_hierarchy`/`lineage_lanes`.
+fn lineage_rail_rows<'a>(
+    graph: &'a LineageGraphDto,
+    order: &[&'a GNode],
+    ends: &HashMap<&'a str, usize>,
+    parents: &HashMap<&'a str, &'a str>,
+    lanes: &HashMap<&'a str, usize>,
+) -> HashMap<&'a str, LineageRailRow> {
+    let mut rows = HashMap::with_capacity(order.len());
+    for (index, node) in order.iter().enumerate() {
+        let relations = node_relations(graph, &node.id);
+        let role = node_role(&relations);
+        let lane = lanes.get(node.id.as_str()).copied().unwrap_or(0);
+
+        // `parents` is a forest (each entry set exactly once, strictly
+        // before its own children are visited), so walking it can never
+        // cycle — no separate guard needed here.
+        let mut through = LaneSet::default();
+        let mut ancestor = parents.get(node.id.as_str()).copied();
+        while let Some(id) = ancestor {
+            if ends.get(id).is_some_and(|&end| end > index) {
+                through = through.with(lanes.get(id).copied().unwrap_or(0));
+            }
+            ancestor = parents.get(id).copied();
+        }
+
+        let branch_from = parents
+            .get(node.id.as_str())
+            .copied()
+            .and_then(|parent| lanes.get(parent))
+            .copied();
+        let converge_to = relations
+            .converged_into
+            .and_then(|target| lanes.get(target))
+            .copied();
+
+        rows.insert(
+            node.id.as_str(),
+            LineageRailRow {
+                lane,
+                role,
+                through,
+                branch_from,
+                converge_to,
+            },
+        );
+    }
+    rows
+}
+
+/// Everything `lineage_view` needs to lay out and draw the rail in one
+/// call: the hierarchical row order, and each node's `LineageRailRow`.
+struct LineageLayout<'a> {
+    order: Vec<&'a GNode>,
+    rails: HashMap<&'a str, LineageRailRow>,
+}
+
+fn lineage_layout(graph: &LineageGraphDto) -> LineageLayout<'_> {
+    let (order, ends, parents) = lineage_hierarchy(graph);
+    let lanes = lineage_lanes(&order, &parents);
+    let rails = lineage_rail_rows(graph, &order, &ends, &parents, &lanes);
+    LineageLayout { order, rails }
 }
 
 /// A configured Agent the launch picker offers (mirrors `/agents.json`).
@@ -10676,15 +10954,21 @@ mod lineage_tests {
     }
 
     #[test]
-    fn rows_are_ordered_newest_activity_first() {
+    fn rows_are_ordered_hierarchically_with_each_subtree_contiguous() {
         let graph = hub_graph();
         let order: Vec<&str> = lineage_row_order(&graph)
             .iter()
             .map(|n| n.id.as_str())
             .collect();
+        // "hub" (the root) leads; its own children follow newest-first,
+        // each immediately followed by ITS descendants before the next
+        // sibling — "sub" (child-a's own child) sits right after
+        // "child-a", not off at the top by raw activity time (5000, the
+        // newest of all). "ghostly" (an unrelated root) trails the whole
+        // "hub" subtree rather than interleaving into it.
         assert_eq!(
             order,
-            vec!["sub", "child-a", "child-b", "child-c", "hub", "ghostly"]
+            vec!["hub", "child-a", "sub", "child-b", "child-c", "ghostly"]
         );
     }
 
@@ -10789,6 +11073,268 @@ mod lineage_tests {
             node_role(&node_relations(&hub_graph(), "ghostly")),
             LineageRole::Root
         );
+    }
+
+    /// Mirrors the real graph's shape at small scale, for the hierarchy,
+    /// lane, and rail-row tests: a "spine" root forking two plain leaves
+    /// and a "branchy" fork; "branchy" itself forks "nested" AND is the
+    /// reconnect target of two converge-only nodes with NO diverge
+    /// parent at all ("drifter-1"/"drifter-2" — the live data's
+    /// `pointing-dogfood-20260823` trap); an unrelated isolated root
+    /// ("lonely"); and a converge-only cycle ("loop-a"/"loop-b" converge
+    /// into each other, neither has a diverge parent).
+    fn rail_graph() -> LineageGraphDto {
+        let node = |id: &str, last_ms: i64| GNode {
+            id: id.to_string(),
+            name: id.to_string(),
+            last_ms: Some(last_ms),
+            milestones: Vec::new(),
+        };
+        let edge = |from: &str, to: &str, relation: &str| GEdge {
+            from: from.to_string(),
+            to: to.to_string(),
+            relation: relation.to_string(),
+        };
+        LineageGraphDto {
+            nodes: vec![
+                node("spine", 100),
+                node("twig-a", 500),
+                node("twig-b", 400),
+                node("branchy", 300),
+                node("nested", 600),
+                node("drifter-1", 250),
+                node("drifter-2", 260),
+                node("lonely", 50),
+                node("loop-a", 10),
+                node("loop-b", 20),
+            ],
+            edges: vec![
+                edge("spine", "twig-a", "diverge"),
+                edge("spine", "twig-b", "diverge"),
+                edge("spine", "branchy", "diverge"),
+                edge("branchy", "nested", "diverge"),
+                edge("drifter-1", "branchy", "converge"),
+                edge("drifter-2", "branchy", "converge"),
+                edge("loop-a", "loop-b", "converge"),
+                edge("loop-b", "loop-a", "converge"),
+            ],
+        }
+    }
+
+    /// `n0 -> n1 -> ... -> n{depth}`, one diverge each — for exercising
+    /// `MAX_LANE`'s clamp against a chain deeper than the cap.
+    fn chain_graph(depth: usize) -> LineageGraphDto {
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        for i in 0..=depth {
+            nodes.push(GNode {
+                id: format!("n{i}"),
+                name: format!("n{i}"),
+                last_ms: Some(i as i64),
+                milestones: Vec::new(),
+            });
+            if i > 0 {
+                edges.push(GEdge {
+                    from: format!("n{}", i - 1),
+                    to: format!("n{i}"),
+                    relation: "diverge".to_string(),
+                });
+            }
+        }
+        LineageGraphDto { nodes, edges }
+    }
+
+    fn rail_order(graph: &LineageGraphDto) -> Vec<&str> {
+        lineage_row_order(graph)
+            .iter()
+            .map(|n| n.id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn a_forking_childs_own_child_is_contiguous_with_its_parent() {
+        let graph = rail_graph();
+        let order = rail_order(&graph);
+        let branchy_pos = order.iter().position(|id| *id == "branchy").unwrap();
+        let nested_pos = order.iter().position(|id| *id == "nested").unwrap();
+        assert_eq!(
+            nested_pos,
+            branchy_pos + 1,
+            "a fork's own child must be the very next row, not scattered by activity time (nested is the newest node in the whole graph)"
+        );
+    }
+
+    #[test]
+    fn converge_only_nodes_with_no_diverge_parent_sit_with_their_reconnect_target() {
+        let graph = rail_graph();
+        let order = rail_order(&graph);
+        let branchy_pos = order.iter().position(|id| *id == "branchy").unwrap();
+        let lonely_pos = order.iter().position(|id| *id == "lonely").unwrap();
+        let drifter1_pos = order.iter().position(|id| *id == "drifter-1").unwrap();
+        let drifter2_pos = order.iter().position(|id| *id == "drifter-2").unwrap();
+        // Neither drifter has a diverge edge at all — only `lineage_owner`'s
+        // converge-target fallback keeps them inside "branchy"'s own
+        // contiguous block instead of stranded among unrelated roots.
+        assert!(
+            branchy_pos < drifter1_pos && drifter1_pos < lonely_pos,
+            "a converge-only node must sit inside its reconnect target's subtree, not after it: {order:?}"
+        );
+        assert!(
+            branchy_pos < drifter2_pos && drifter2_pos < lonely_pos,
+            "a converge-only node must sit inside its reconnect target's subtree, not after it: {order:?}"
+        );
+    }
+
+    #[test]
+    fn a_mutual_converge_cycle_terminates_and_visits_each_node_exactly_once() {
+        // Neither "loop-a" nor "loop-b" has a diverge parent, and each
+        // converges into the other — `lineage_owner` makes each the
+        // other's owner, a cycle no real root ever reaches. Completing at
+        // all (not hanging) is half the proof; visiting each exactly once
+        // is the other half.
+        let graph = rail_graph();
+        let order = rail_order(&graph);
+        assert_eq!(order.iter().filter(|id| **id == "loop-a").count(), 1);
+        assert_eq!(order.iter().filter(|id| **id == "loop-b").count(), 1);
+        assert_eq!(order.len(), graph.nodes.len());
+    }
+
+    fn lanes_of(graph: &LineageGraphDto) -> HashMap<String, usize> {
+        let (order, _ends, parents) = lineage_hierarchy(graph);
+        lineage_lanes(&order, &parents)
+            .into_iter()
+            .map(|(id, lane)| (id.to_string(), lane))
+            .collect()
+    }
+
+    #[test]
+    fn a_root_is_lane_zero() {
+        let lanes = lanes_of(&rail_graph());
+        assert_eq!(lanes["spine"], 0);
+        assert_eq!(lanes["lonely"], 0);
+    }
+
+    #[test]
+    fn a_childs_lane_is_its_parents_lane_plus_one() {
+        let lanes = lanes_of(&rail_graph());
+        assert_eq!(lanes["twig-a"], 1);
+        assert_eq!(lanes["branchy"], 1);
+    }
+
+    #[test]
+    fn a_grandchilds_lane_is_two() {
+        let lanes = lanes_of(&rail_graph());
+        assert_eq!(lanes["nested"], 2);
+    }
+
+    #[test]
+    fn a_converge_only_trap_node_shares_its_owners_childrens_lane() {
+        // "drifter-1"/"drifter-2" have no diverge parent, but
+        // `lineage_owner`'s fallback still nests them under "branchy" —
+        // the same lane as "nested", "branchy"'s real diverge child.
+        let lanes = lanes_of(&rail_graph());
+        assert_eq!(lanes["drifter-1"], 2);
+        assert_eq!(lanes["drifter-2"], 2);
+    }
+
+    #[test]
+    fn a_chain_deeper_than_max_lane_clamps_instead_of_growing() {
+        let graph = chain_graph(6);
+        let lanes = lanes_of(&graph);
+        assert_eq!(lanes["n0"], 0);
+        assert_eq!(lanes["n1"], 1);
+        assert_eq!(lanes["n2"], 2);
+        assert_eq!(lanes["n3"], MAX_LANE - 1);
+        assert_eq!(
+            lanes["n6"],
+            MAX_LANE - 1,
+            "a node past the cap must clamp to the last lane, not grow the rail"
+        );
+    }
+
+    fn rails_of(graph: &LineageGraphDto) -> HashMap<String, LineageRailRow> {
+        let layout = lineage_layout(graph);
+        layout
+            .rails
+            .into_iter()
+            .map(|(id, row)| (id.to_string(), row))
+            .collect()
+    }
+
+    #[test]
+    fn a_roots_row_has_no_branch_in_and_no_through_lines() {
+        let rails = rails_of(&rail_graph());
+        let spine = rails["spine"];
+        assert_eq!(spine.branch_from, None);
+        assert_eq!(spine.through, LaneSet::default());
+        assert_eq!(spine.converge_to, None);
+        assert_eq!(spine.role, LineageRole::Fork);
+    }
+
+    #[test]
+    fn a_childs_row_peels_from_its_parents_lane() {
+        let rails = rails_of(&rail_graph());
+        assert_eq!(rails["twig-a"].branch_from, Some(0));
+    }
+
+    #[test]
+    fn a_row_carries_a_through_line_while_its_ancestors_subtree_still_has_rows_left() {
+        let rails = rails_of(&rail_graph());
+        // "twig-a" is "spine"'s first child; "spine" still owns "twig-b",
+        // "branchy", "nested", and both drifters below it.
+        assert!(rails["twig-a"].through.contains(0));
+    }
+
+    #[test]
+    fn the_last_row_of_a_finished_subtree_carries_no_through_line_for_it() {
+        let rails = rails_of(&rail_graph());
+        // "drifter-1" is the very last row inside BOTH "branchy"'s and
+        // "spine"'s subtrees — nothing of either continues below it.
+        let drifter1 = rails["drifter-1"];
+        assert!(!drifter1.through.contains(0));
+        assert!(!drifter1.through.contains(1));
+    }
+
+    #[test]
+    fn a_converge_only_trap_node_peels_from_and_reconnects_to_the_same_lane() {
+        // No real diverge, so the "branch" and the "converge" both point
+        // at "branchy"'s lane — a peel-out-and-back-in shape, not a
+        // misleading fork.
+        let rails = rails_of(&rail_graph());
+        let drifter2 = rails["drifter-2"];
+        assert_eq!(drifter2.branch_from, drifter2.converge_to);
+        assert_eq!(drifter2.branch_from, Some(1));
+        assert_eq!(drifter2.role, LineageRole::Converged);
+    }
+
+    #[test]
+    fn an_isolated_root_has_no_rail_connectors_at_all() {
+        let rails = rails_of(&rail_graph());
+        let lonely = rails["lonely"];
+        assert_eq!(lonely.branch_from, None);
+        assert_eq!(lonely.converge_to, None);
+        assert_eq!(lonely.through, LaneSet::default());
+        assert_eq!(lonely.role, LineageRole::Root);
+    }
+
+    #[test]
+    fn the_cycle_broken_side_has_no_branch_in_but_still_shows_its_converge() {
+        // Whichever of "loop-a"/"loop-b" the walk reaches first (here,
+        // "loop-b", newer) is never actually nested under the other —
+        // `lineage_visit`'s own doc comment covers why — so it has no
+        // `branch_from`, even though it still has a real outgoing
+        // converge to draw.
+        let rails = rails_of(&rail_graph());
+        let loop_b = rails["loop-b"];
+        assert_eq!(loop_b.branch_from, None);
+        assert!(loop_b.converge_to.is_some());
+    }
+
+    #[test]
+    fn the_other_cycle_node_peels_from_the_lane_the_walk_assigned_it() {
+        let rails = rails_of(&rail_graph());
+        let lanes = lanes_of(&rail_graph());
+        assert_eq!(rails["loop-a"].branch_from, Some(lanes["loop-b"]));
     }
 }
 
