@@ -3711,48 +3711,69 @@ fn adder(app: &App) -> Element<'_, Message> {
     }
 }
 
-/// The floating menu an unopened channel's chip opens (`channel_nav`,
-/// `Message::ChannelToggled`): the three placements `Message::ChannelPlaced`
-/// can act on, in the file's ghost-row vocabulary (`ghost_style`) rather
-/// than a filled control, since this is a transient pick, not a persistent
-/// toggle.
-fn placement_menu(name: &str) -> Element<'_, Message> {
+/// Where `placement_choices` lays out its three controls: the channel
+/// chips' floating menu wants a full-width column (one choice per row,
+/// filling the menu's fixed width); the attention panel's inline row wants
+/// them side by side and only as wide as their labels, since there is no
+/// floating menu to size around them.
+#[derive(Debug, Clone, Copy)]
+enum PlacementLayout {
+    Menu,
+    Inline,
+}
+
+/// The three ways to dock a pending channel — split right, split below, or
+/// reuse the focused pane — in the file's ghost-row vocabulary
+/// (`ghost_style`) rather than a filled control, since this is a transient
+/// pick, not a persistent toggle. Shared by the channel chips' floating
+/// menu (`placement_menu`) and the attention panel's inline placement row
+/// (`attention_placement_row`), so the three controls and their labels
+/// exist in exactly one place rather than duplicated per call site.
+fn placement_choices(pending: &PendingOpen, layout: PlacementLayout) -> Element<'static, Message> {
+    let width = match layout {
+        PlacementLayout::Menu => Fill,
+        PlacementLayout::Inline => Length::Shrink,
+    };
     let row_button = |code_point: char, label: &'static str, placement: Placement| {
         button(
             row![icon(code_point).color(MUTED), text(label).size(TEXT_META)]
                 .spacing(SP_TIGHT)
                 .align_y(Center),
         )
-        .on_press(Message::ChannelPlaced(
-            PendingOpen {
-                channel: name.to_string(),
-                entry: None,
-            },
-            placement,
-        ))
+        .on_press(Message::ChannelPlaced(pending.clone(), placement))
         .padding([SP_TIGHT, SP])
-        .width(Fill)
+        .width(width)
         .style(|_theme, status| ghost_style(status))
+        .into()
     };
-    container(
-        column![
-            row_button(ICON_COLUMNS_2, "split right", Placement::Right),
-            row_button(ICON_ROWS_2, "split below", Placement::Below),
-            row_button(ICON_PANEL_LEFT, "use this pane", Placement::Here),
-        ]
-        .spacing(SP_TIGHT),
-    )
-    .padding(SP_TIGHT)
-    .style(|_theme| container::Style {
-        background: Some(Background::Color(SURFACE)),
-        border: Border {
-            color: BORDER,
-            width: 1.0,
-            radius: 6.0.into(),
-        },
-        ..container::Style::default()
-    })
-    .into()
+    let choices = [
+        row_button(ICON_COLUMNS_2, "split right", Placement::Right),
+        row_button(ICON_ROWS_2, "split below", Placement::Below),
+        row_button(ICON_PANEL_LEFT, "use this pane", Placement::Here),
+    ];
+    match layout {
+        PlacementLayout::Menu => column(choices).spacing(SP_TIGHT).into(),
+        PlacementLayout::Inline => row(choices).spacing(SP_TIGHT).into(),
+    }
+}
+
+/// The floating menu an unopened channel's chip opens (`channel_nav`,
+/// `Message::ChannelToggled`): `placement_choices` in a bordered, elevated
+/// panel (`SURFACE`/`BORDER`) since it floats over the workspace rather
+/// than sitting inline in a list.
+fn placement_menu(pending: &PendingOpen) -> Element<'static, Message> {
+    container(placement_choices(pending, PlacementLayout::Menu))
+        .padding(SP_TIGHT)
+        .style(|_theme| container::Style {
+            background: Some(Background::Color(SURFACE)),
+            border: Border {
+                color: BORDER,
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
 }
 
 /// Pinned navigation: the open channels, then the controls to open or create
@@ -3779,15 +3800,15 @@ fn channel_nav(app: &App) -> Element<'_, Message> {
         let row: Element<Message> = if active {
             chip
         } else {
-            let open = app
+            let pending = app
                 .pending
                 .as_ref()
-                .is_some_and(|pending| pending.entry.is_none() && pending.channel == *name);
+                .filter(|pending| pending.entry.is_none() && pending.channel == *name);
             // 170px: enough for an icon plus the longest row label ("use
             // this pane") at `TEXT_META` with room to breathe — this menu
             // has no list to grow, just three fixed rows, so it needs
             // nothing near the footer's 360px list panels.
-            Popover::new(chip, open.then(|| placement_menu(name)))
+            Popover::new(chip, pending.map(placement_menu))
                 .width(170.0)
                 .on_dismiss(Message::ChannelToggled(name.clone()))
                 .into()
@@ -3825,8 +3846,12 @@ fn channel_nav(app: &App) -> Element<'_, Message> {
 }
 
 /// One focus-board chip: a tagged, coloured summary of a cross-channel
-/// "needs you" item that jumps to its entry when clicked.
-fn focus_chip(item: &FocusItem) -> Element<'_, Message> {
+/// "needs you" item. If its channel is already open, jumps straight to the
+/// entry (`Message::FocusChipPicked`) — an attention item always means
+/// "take me there", so unlike a channel chip this never toggles a pane
+/// closed. If it isn't open yet, toggles an inline placement row beneath
+/// it instead (`Message::FocusChipToggled`, `attention_placement_row`).
+fn focus_chip<'a>(app: &App, item: &'a FocusItem) -> Element<'a, Message> {
     let (tag, color) = match item.kind.as_str() {
         "gate" => ("gate", YELLOW),
         "awaiting-execution" => ("exec", MAUVE),
@@ -3842,12 +3867,30 @@ fn focus_chip(item: &FocusItem) -> Element<'_, Message> {
         .padding([SP_TIGHT, SP])
         .style(move |_t, _s| chip_style(color, false));
     if let Some(name) = &item.channel_name {
-        chip = chip.on_press(Message::FocusChipPicked(
-            name.clone(),
-            item.entry_id.clone(),
-        ));
+        let open = app.panes.iter().any(|(_, state)| state.channel == *name);
+        chip = chip.on_press(if open {
+            Message::FocusChipPicked(name.clone(), item.entry_id.clone())
+        } else {
+            Message::FocusChipToggled(name.clone(), item.entry_id.clone())
+        });
     }
     chip.into()
+}
+
+/// The inline placement row beneath an attention chip whose channel isn't
+/// open yet: `placement_choices` laid out horizontally (`PlacementLayout::
+/// Inline`) rather than inside another `Popover` — the attention panel is
+/// itself a `Popover` popup, and `Popover`'s `Floating` overlay never
+/// implements `overlay::Overlay::overlay`, so a nested one would silently
+/// never render. Indented under its chip so the association is obvious;
+/// pressing the chip again (`Message::FocusChipToggled`) backs out without
+/// choosing.
+fn attention_placement_row(pending: &PendingOpen) -> Element<'static, Message> {
+    row![
+        Space::new().width(SP_LOOSE),
+        placement_choices(pending, PlacementLayout::Inline),
+    ]
+    .into()
 }
 
 /// The cross-channel "needs you" items — the focus board, relocated out of
@@ -3869,7 +3912,15 @@ fn attention_view(app: &App) -> Element<'_, Message> {
     ]
     .spacing(SP_TIGHT);
     for item in &app.focus_items {
-        items = items.push(focus_chip(item));
+        items = items.push(focus_chip(app, item));
+        // Only one inline row at a time, for whichever chip is pending —
+        // matched by entry id so two items sharing a channel don't both
+        // grow a row.
+        if let Some(pending) = &app.pending
+            && pending.entry.as_deref() == Some(item.entry_id.as_str())
+        {
+            items = items.push(attention_placement_row(pending));
+        }
     }
     scrollable(items).into()
 }
@@ -9627,6 +9678,151 @@ mod channel_chip_tests {
                 .iter()
                 .any(|(_, state)| state.channel == "sibling"),
             "the new pane must show the placed channel"
+        );
+    }
+}
+
+#[cfg(test)]
+mod attention_chip_tests {
+    use super::*;
+
+    fn focus_item(channel: &str, entry_id: &str) -> FocusItem {
+        FocusItem {
+            kind: "gate".to_string(),
+            entry_id: entry_id.to_string(),
+            channel: channel.to_string(),
+            channel_name: Some(channel.to_string()),
+            author: "someone".to_string(),
+            summary: "needs a look".to_string(),
+        }
+    }
+
+    #[test]
+    fn clicking_an_attention_chip_for_an_already_open_channel_focuses_it_and_highlights_the_entry_with_no_placement_row()
+     {
+        let (mut app, _) = App::new();
+        app.focus_items = vec![focus_item("junto-dev", "entry-1")];
+
+        let mut ui = iced_test::simulator(attention_view(&app));
+        ui.click("gate · junto-dev · someone: needs a look")
+            .expect("the attention chip is a click target");
+        let messages: Vec<Message> = ui.into_messages().collect();
+        assert!(
+            matches!(
+                &messages[..],
+                [Message::FocusChipPicked(name, entry)]
+                    if name == "junto-dev" && entry == "entry-1"
+            ),
+            "an already-open channel's chip must publish FocusChipPicked, got {messages:?}"
+        );
+
+        for message in messages {
+            let _ = app.update(message);
+        }
+        let focused = app.focus.expect("App::new focuses its one pane");
+        assert_eq!(
+            app.panes
+                .get(focused)
+                .and_then(|state| state.highlight_entry.as_deref()),
+            Some("entry-1"),
+            "the entry must be pinned in the focused pane"
+        );
+
+        let mut ui = iced_test::simulator(attention_view(&app));
+        assert!(
+            ui.find("split right").is_err(),
+            "an already-open channel's chip must never show a placement row"
+        );
+    }
+
+    #[test]
+    fn clicking_an_attention_chip_for_an_unopened_channel_shows_the_placement_row_without_opening_it()
+     {
+        let (mut app, _) = App::new();
+        app.focus_items = vec![focus_item("unopened", "entry-2")];
+
+        let mut ui = iced_test::simulator(attention_view(&app));
+        ui.click("gate · unopened · someone: needs a look")
+            .expect("the attention chip is a click target");
+        let messages: Vec<Message> = ui.into_messages().collect();
+        assert!(
+            matches!(
+                &messages[..],
+                [Message::FocusChipToggled(name, entry)]
+                    if name == "unopened" && entry == "entry-2"
+            ),
+            "an unopened channel's chip must publish FocusChipToggled, got {messages:?}"
+        );
+
+        for message in messages {
+            let _ = app.update(message);
+        }
+        assert!(
+            !app.panes
+                .iter()
+                .any(|(_, state)| state.channel == "unopened"),
+            "showing the placement row must not itself open a pane"
+        );
+
+        let mut menu = iced_test::simulator(attention_view(&app));
+        menu.find("split right")
+            .expect("the right placement is offered inline");
+        menu.find("split below")
+            .expect("the below placement is offered inline");
+        menu.find("use this pane")
+            .expect("the here placement is offered inline");
+    }
+
+    #[test]
+    fn choosing_an_inline_placement_opens_the_pane_and_pins_the_entry() {
+        let (mut app, _) = App::new();
+        app.focus_items = vec![focus_item("unopened", "entry-3")];
+        app.pending = Some(PendingOpen {
+            channel: "unopened".to_string(),
+            entry: Some("entry-3".to_string()),
+        });
+
+        let mut ui = iced_test::simulator(attention_view(&app));
+        ui.click("split right")
+            .expect("the inline right placement is a click target");
+        let messages: Vec<Message> = ui.into_messages().collect();
+        for message in messages {
+            let _ = app.update(message);
+        }
+
+        let pane = app
+            .panes
+            .iter()
+            .find(|(_, state)| state.channel == "unopened")
+            .map(|(id, _)| id)
+            .copied()
+            .expect("the placement must open a pane for the pending channel");
+        assert_eq!(
+            app.panes
+                .get(pane)
+                .and_then(|state| state.highlight_entry.as_deref()),
+            Some("entry-3"),
+            "placing an attention chip's channel must pin its entry"
+        );
+        assert_eq!(app.pending, None, "placing must clear the pending state");
+    }
+
+    #[test]
+    fn pending_is_cleared_when_its_channel_leaves_the_focus_items() {
+        let (mut app, _) = App::new();
+        app.pending = Some(PendingOpen {
+            channel: "unopened".to_string(),
+            entry: Some("entry-4".to_string()),
+        });
+
+        let _ = app.update(Message::FocusLoaded(vec![focus_item(
+            "elsewhere",
+            "entry-5",
+        )]));
+
+        assert_eq!(
+            app.pending, None,
+            "a pending attention placement must clear once its channel drops off the board"
         );
     }
 }
