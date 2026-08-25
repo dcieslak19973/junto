@@ -25,7 +25,7 @@ use iced::widget::{
 };
 use iced::{
     Background, Border, Center, Color, Element, Fill, Length, Padding, Point, Rectangle, Renderer,
-    Right, Size, Task, Theme, mouse,
+    Size, Task, Theme, mouse,
 };
 use junto_kernel::{
     Anchor, Annotation, AnnotationId, CodeAnchor, CommitOid, ContentDigest, EntryId, Member,
@@ -3347,7 +3347,36 @@ impl App {
         .height(Fill)
         .spacing(SP);
 
-        let top_bar = container(admin_toolbar(self.admin)).padding(Padding {
+        // Both blades' collapse toggles live in the top bar's corners, not
+        // pinned to their blade's own edge — a toggle here can never jump
+        // when its blade resizes or collapses, since it isn't part of the
+        // blade at all (`left_blade`/`right_blade`/`blade_stub`).
+        let left_toggle = icon_button(
+            ICON_PANEL_LEFT,
+            if self.shell.left_collapsed {
+                "open channels · ctrl+b"
+            } else {
+                "close channels · ctrl+b"
+            },
+            tooltip::Position::Bottom,
+            Message::ToggleLeftBlade,
+        );
+        let right_toggle = icon_button(
+            ICON_PANEL_RIGHT,
+            if self.shell.right_collapsed {
+                "open artifacts & lineage · ctrl+r"
+            } else {
+                "close artifacts & lineage · ctrl+r"
+            },
+            tooltip::Position::Bottom,
+            Message::ToggleRightBlade,
+        );
+        let top_bar = container(
+            row![left_toggle, admin_toolbar(self.admin), right_toggle]
+                .spacing(SP)
+                .align_y(Center),
+        )
+        .padding(Padding {
             top: SP_LOOSE,
             right: SP_LOOSE,
             bottom: 0.0,
@@ -3362,7 +3391,7 @@ impl App {
         // attention badge stays legible even when the blade is put away
         // (docs/attention.md — attention is the spine).
         let left: Element<Message> = if self.shell.left_collapsed {
-            blade_stub(Side::Left, Some(self.focus_items.len()))
+            blade_stub(Some(self.focus_items.len()))
         } else {
             container(left_blade(self))
                 .width(Length::Fixed(self.shell.left_width.get()))
@@ -3370,7 +3399,7 @@ impl App {
                 .into()
         };
         let right: Element<Message> = if self.shell.right_collapsed {
-            blade_stub(Side::Right, None)
+            blade_stub(None)
         } else {
             container(right_blade(self))
                 .width(Length::Fixed(self.shell.right_width.get()))
@@ -3605,8 +3634,9 @@ fn bottom_panel(app: &App, view: shell::BottomView) -> Element<'_, Message> {
         .into()
 }
 
-/// Which side of the shell a blade sits on — used only to point its stub's
-/// chevron outward and to route the stub's click to the right message.
+/// Which side of the shell a blade sits on — used to route a divider drag
+/// or reset to the right blade (`blade_divider`, `BladeDrag`,
+/// `Message::BladeReset`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Side {
     Left,
@@ -3628,25 +3658,15 @@ struct BladeDrag {
     origin_x: Option<f32>,
 }
 
-/// The collapsed form of a blade: a narrow rail carrying a chevron to reopen
-/// it and, on the left, the count of items wanting attention. Collapsing must
-/// not be able to hide that count entirely.
-fn blade_stub<'a>(side: Side, badge: Option<usize>) -> Element<'a, Message> {
-    let (glyph, tip, message) = match side {
-        Side::Left => (
-            ICON_PANEL_LEFT,
-            "open channels · ctrl+b",
-            Message::ToggleLeftBlade,
-        ),
-        Side::Right => (
-            ICON_PANEL_RIGHT,
-            "open artifacts & lineage · ctrl+r",
-            Message::ToggleRightBlade,
-        ),
-    };
-    let mut rail = column![icon_button(glyph, tip, tooltip::Position::Bottom, message)]
-        .spacing(SP)
-        .align_x(Center);
+/// The collapsed form of a blade: a narrow rail carrying, on the left, the
+/// count of items wanting attention. Collapsing must not be able to hide
+/// that count entirely. No longer carries its own reopen toggle — both
+/// blades' toggles now live in the top bar's corners (`App::view`), the
+/// one place a toggle can sit and never move when the blade it controls
+/// resizes or collapses; a second copy here would just be the same
+/// message behind a second control.
+fn blade_stub<'a>(badge: Option<usize>) -> Element<'a, Message> {
+    let mut rail = column![].spacing(SP).align_x(Center);
     if let Some(count) = badge.filter(|count| *count > 0) {
         rail = rail.push(text(count.to_string()).size(TEXT_META).color(RED));
     }
@@ -4035,26 +4055,18 @@ fn attention_view(app: &App) -> Element<'_, Message> {
 /// The left blade: pinned channel navigation, and nothing else — the
 /// former switchable Attention/Sessions view beneath it now lives in the
 /// footer-triggered floating panel (`bottom_panel`), so nothing is left to
-/// switch.
+/// switch. Its own collapse toggle used to sit here, outside this
+/// function's padding and flush to the window's left edge, pinned there
+/// only to stop it jumping under the cursor on collapse. That toggle now
+/// lives in the top bar instead (`App::view`), where it can't move when
+/// this blade resizes or collapses, so the pinning — and the outer column
+/// it required — is gone; this is a straightforward padded container.
 fn left_blade(app: &App) -> Element<'_, Message> {
-    // The toggle sits OUTSIDE the blade's padding, flush to the window's
-    // left edge — the same x it occupies collapsed, in `blade_stub`'s
-    // unpadded rail. Padding it in with the rest would put it SP in from
-    // the edge expanded but flush at 0 collapsed, jumping under the cursor
-    // on every collapse.
-    column![
-        icon_button(
-            ICON_PANEL_LEFT,
-            "close channels · ctrl+b",
-            tooltip::Position::Bottom,
-            Message::ToggleLeftBlade,
-        ),
-        container(channel_nav(app))
-            .padding(SP)
-            .width(Fill)
-            .height(Fill),
-    ]
-    .into()
+    container(channel_nav(app))
+        .padding(SP)
+        .width(Fill)
+        .height(Fill)
+        .into()
 }
 
 /// The right blade: a switchable Artifacts/Lineage view.
@@ -4094,21 +4106,12 @@ fn right_blade(app: &App) -> Element<'_, Message> {
 
     let rest = column![switcher, body].spacing(SP);
 
-    // Mirrors `left_blade`: the toggle sits outside the padding, flush to
-    // the window's right edge — `align_x(Right)` positions the unpadded
-    // toggle there while the full-width padded container beneath it keeps
-    // its content inset as before.
-    column![
-        icon_button(
-            ICON_PANEL_RIGHT,
-            "close artifacts & lineage · ctrl+r",
-            tooltip::Position::Bottom,
-            Message::ToggleRightBlade,
-        ),
-        container(rest).padding(SP).width(Fill).height(Fill),
-    ]
-    .align_x(Right)
-    .into()
+    // Mirrors `left_blade`: the toggle used to sit outside the padding
+    // here, flush to the window's right edge, pinned so it wouldn't jump
+    // under the cursor on collapse. It now lives in the top bar instead
+    // (`App::view`), so `align_x(Right)` and the wrapping column it
+    // needed are both gone — this is a straightforward padded container.
+    container(rest).padding(SP).width(Fill).height(Fill).into()
 }
 
 /// The whole lineage DAG, relocated from the always-visible top ribbon into
