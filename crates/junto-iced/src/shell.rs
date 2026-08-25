@@ -43,6 +43,16 @@ impl BladeWidth {
     /// Comfortable for a channel list plus badges.
     pub const DEFAULT: f32 = 280.0;
 
+    /// The left blade holds the channel list; this is comfortable for a
+    /// name plus a badge without stealing width from the center.
+    pub const LEFT_DEFAULT: f32 = 280.0;
+    /// The right blade holds artifacts and the lineage DAG, whose canvas
+    /// derives its track region as `width - 24 - LABEL_W` (`LABEL_W` =
+    /// 150px): 280px would leave it ~90px of track, barely enough to draw a
+    /// diverge/converge connector. 520px gives it ~330px, matching the
+    /// reference three-pane layout.
+    pub const RIGHT_DEFAULT: f32 = 520.0;
+
     /// Clamp `px` into the usable range. A non-finite value (NaN from a
     /// degenerate drag, infinity from a corrupt file) yields the default
     /// rather than propagating into layout.
@@ -130,7 +140,7 @@ impl From<NavSplit> for f32 {
 /// `#[serde(default)]` is what makes a partial file safe: a state file written
 /// by an older build, or hand-truncated, fills its missing fields with
 /// defaults instead of failing to parse.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ShellState {
     /// Whether the left blade is collapsed to its stub.
@@ -147,6 +157,27 @@ pub struct ShellState {
     pub right_view: RightView,
     /// Where the left blade divides pinned nav from its switchable view.
     pub left_split: NavSplit,
+}
+
+impl Default for ShellState {
+    /// Hand-written rather than derived: the two blades have different
+    /// per-side defaults (`BladeWidth::LEFT_DEFAULT`/`RIGHT_DEFAULT`), which
+    /// a derived `Default` cannot express — it would defer to
+    /// `BladeWidth`'s own single `Default` impl for both fields. This is
+    /// also what `#[serde(default)]` calls to fill missing fields in a
+    /// partial file, so it is what makes per-side defaults survive a
+    /// partial `ui.toml` too.
+    fn default() -> Self {
+        Self {
+            left_collapsed: false,
+            right_collapsed: false,
+            left_width: BladeWidth::new(BladeWidth::LEFT_DEFAULT),
+            right_width: BladeWidth::new(BladeWidth::RIGHT_DEFAULT),
+            left_view: LeftView::default(),
+            right_view: RightView::default(),
+            left_split: NavSplit::default(),
+        }
+    }
 }
 
 impl ShellState {
@@ -246,6 +277,18 @@ mod clamp_tests {
         assert!(!state.left_collapsed);
         assert!(!state.right_collapsed);
     }
+
+    #[test]
+    fn the_left_and_right_blades_have_different_defaults_by_design() {
+        // Regression guard: a future change that collapses the two sides
+        // back to one shared default must fail this loudly, since the right
+        // blade's lineage canvas depends on the wider default for a usable
+        // track region (see `BladeWidth::RIGHT_DEFAULT`).
+        let state = ShellState::default();
+        assert_eq!(state.left_width.get(), BladeWidth::LEFT_DEFAULT);
+        assert_eq!(state.right_width.get(), BladeWidth::RIGHT_DEFAULT);
+        assert_ne!(state.left_width, state.right_width);
+    }
 }
 
 #[cfg(test)]
@@ -300,7 +343,8 @@ mod persistence_tests {
         std::fs::write(&path, "left_collapsed = true\n").expect("write temp file");
         let loaded = load(&path);
         assert!(loaded.left_collapsed);
-        assert_eq!(loaded.right_width, BladeWidth::default());
+        assert_eq!(loaded.left_width.get(), BladeWidth::LEFT_DEFAULT);
+        assert_eq!(loaded.right_width.get(), BladeWidth::RIGHT_DEFAULT);
         assert_eq!(loaded.left_view, LeftView::default());
         let _ = std::fs::remove_file(&path);
     }
