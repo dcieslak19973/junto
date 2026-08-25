@@ -74,10 +74,6 @@ const SP_SECTION: f32 = 16.0;
 /// Width of a blade's drag handle. Reserved even when the blade is collapsed
 /// so collapsing changes only the blade's own width, never the row's total.
 const DIVIDER_W: f32 = 5.0;
-/// Maximum height of the floating attention/sessions panel (`bottom_panel`)
-/// — content shorter than this hugs its own size; content taller than this
-/// scrolls inside via the panel's own scrollable, exactly as before.
-const DRAWER_H: f32 = 240.0;
 
 /// Every icon-only button is this square, so a row of them reads as a grid
 /// rather than as boxes that each shrank to their own glyph plus padding.
@@ -3291,10 +3287,13 @@ fn footer(app: &App) -> Element<'_, Message> {
 /// The floating attention/sessions panel: opened by pressing one of the
 /// footer's trigger chips, which anchors it via `Popover` so it rises from
 /// THAT chip's x-position and floats over the workspace instead of
-/// displacing it. `DRAWER_H` caps its height rather than fixing it, so a
-/// short list hugs its own size; a longer one is capped and scrolls inside
-/// via the same `scrollable(..)` `attention_view`/`sessions_view` already
-/// wrap their lists in.
+/// displacing it.
+///
+/// No height cap here on purpose. `Popover`'s overlay caps the panel to the
+/// room actually available above the chip, which is nearly the whole window,
+/// so a long list grows until it genuinely cannot fit before any scrollbar
+/// appears. This container must therefore stay content-sized, or it would
+/// fight that cap and reintroduce the fixed-height box.
 fn bottom_panel(app: &App, view: shell::BottomView) -> Element<'_, Message> {
     let (title, body) = match view {
         shell::BottomView::Attention => ("attention", attention_view(app)),
@@ -3306,7 +3305,6 @@ fn bottom_panel(app: &App, view: shell::BottomView) -> Element<'_, Message> {
     let header = text(title).size(TEXT_BODY).font(semibold());
 
     container(column![header, body].spacing(SP))
-        .max_height(DRAWER_H)
         .padding(SP)
         .style(|_theme| container::Style {
             background: Some(Background::Color(SURFACE)),

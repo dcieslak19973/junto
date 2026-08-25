@@ -20,6 +20,14 @@ use iced::advanced::widget::{Operation, Tree, Widget, tree};
 use iced::advanced::{Clipboard, Layout, Shell, layout, mouse, overlay, renderer};
 use iced::{Element, Event, Length, Rectangle, Size, Vector};
 
+/// Breathing room kept between a floated panel and the viewport edge, matching
+/// the 8px inset `pointing::popover_position` already applies horizontally.
+const EDGE_MARGIN: f32 = 8.0;
+
+/// A floor for the height cap, so a panel anchored hard against an edge is
+/// still given a usable box rather than being squeezed to nothing.
+const MIN_PANEL_HEIGHT: f32 = 120.0;
+
 /// Draws `anchor` inline and, while `popup` is `Some`, floats it just below the
 /// anchor as an interactive overlay.
 pub struct Popover<'a, Message, Theme, Renderer> {
@@ -243,10 +251,29 @@ where
     fn layout(&mut self, renderer: &Renderer, bounds: Size) -> layout::Node {
         let viewport = Rectangle::with_size(bounds);
         let width = self.width.min(viewport.width - 16.0).max(120.0);
+        // Cap the panel to the room actually available on the roomier side of
+        // the anchor, rather than to the whole viewport. Two reasons, and the
+        // first is correctness: `popover_position` flips a panel above its
+        // anchor with `(anchor.y - panel_h - gap).max(0.0)`, so a panel taller
+        // than the space above an anchor near the bottom edge — a status-strip
+        // chip, say — clamps to y = 0 and then extends back down OVER the
+        // anchor. The second is that a list panel should grow to nearly the
+        // window's height before it starts scrolling, so scrollbars appear only
+        // when the content genuinely cannot fit.
+        //
+        // This is a cap, not a height: the popup still measures its own
+        // content, so a short list hugs it and only a long one reaches the cap.
+        let space_below = (viewport.height
+            - (self.anchor_bounds.y + self.anchor_bounds.height)
+            - self.gap
+            - EDGE_MARGIN)
+            .max(0.0);
+        let space_above = (self.anchor_bounds.y - self.gap - EDGE_MARGIN).max(0.0);
+        let max_height = space_below.max(space_above).max(MIN_PANEL_HEIGHT);
         let node = self.popup.as_widget_mut().layout(
             self.tree,
             renderer,
-            &layout::Limits::new(Size::ZERO, Size::new(width, viewport.height)).width(width),
+            &layout::Limits::new(Size::ZERO, Size::new(width, max_height)).width(width),
         );
         let size = node.size();
 
