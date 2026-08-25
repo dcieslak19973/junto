@@ -4769,8 +4769,12 @@ fn lineage_row<'a>(
             .into()
     };
 
+    // The marker fill reuses `color` — the same focused (TEXT) / open
+    // (TEAL) / neither (MUTED) state already driving the name text below
+    // — so an open pane or the focused row is findable by colour alone,
+    // without reading every name in the list.
     let header_row = row![
-        lineage_rail_cell(rail, TEXT, is_focused),
+        lineage_rail_cell(rail, color, is_focused),
         disclosure,
         name_cell
     ]
