@@ -28,6 +28,19 @@ const EDGE_MARGIN: f32 = 8.0;
 /// still given a usable box rather than being squeezed to nothing.
 const MIN_PANEL_HEIGHT: f32 = 120.0;
 
+/// Which of `pointing`'s two pure placement rules a [`Popover`]'s panel
+/// uses. `Below` is the default: every existing caller (the footer's two
+/// chips, the channel-chip and lineage-name placement menus, and the diff
+/// annotate popup) wants below-or-above and is unaffected by this type
+/// existing. `Side` is for a panel that must not move the row it hangs off
+/// — see `pointing::popover_position_side`'s own doc comment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PopupPlacement {
+    #[default]
+    Below,
+    Side,
+}
+
 /// Draws `anchor` inline and, while `popup` is `Some`, floats it just below the
 /// anchor as an interactive overlay.
 pub struct Popover<'a, Message, Theme, Renderer> {
@@ -41,6 +54,10 @@ pub struct Popover<'a, Message, Theme, Renderer> {
     /// Message published when a left click lands outside the open panel.
     /// `None` (the default) means no outside-click dismissal at all.
     on_dismiss: Option<Message>,
+    /// Which of `pointing`'s two placement rules the panel uses.
+    /// `PopupPlacement::Below` (the default) is every existing caller's
+    /// behaviour, untouched.
+    placement: PopupPlacement,
 }
 
 impl<'a, Message, Theme, Renderer> Popover<'a, Message, Theme, Renderer> {
@@ -55,6 +72,7 @@ impl<'a, Message, Theme, Renderer> Popover<'a, Message, Theme, Renderer> {
             gap: 4.0,
             width: 560.0,
             on_dismiss: None,
+            placement: PopupPlacement::default(),
         }
     }
 
@@ -70,6 +88,15 @@ impl<'a, Message, Theme, Renderer> Popover<'a, Message, Theme, Renderer> {
     #[must_use]
     pub fn on_dismiss(mut self, message: Message) -> Self {
         self.on_dismiss = Some(message);
+        self
+    }
+
+    /// Choose which of `pointing`'s two placement rules the panel uses.
+    /// Opt-in: leaving this unset keeps `PopupPlacement::Below`, so every
+    /// caller before this method existed is unaffected.
+    #[must_use]
+    pub fn placement(mut self, placement: PopupPlacement) -> Self {
+        self.placement = placement;
         self
     }
 }
@@ -213,6 +240,7 @@ where
             anchor_bounds,
             gap: self.gap,
             width: self.width,
+            placement: self.placement,
             on_dismiss,
         })))
     }
@@ -238,6 +266,8 @@ struct Floating<'a, 'b, Message, Theme, Renderer> {
     anchor_bounds: Rectangle,
     gap: f32,
     width: f32,
+    /// Which of `pointing`'s two placement rules this frame's overlay uses.
+    placement: PopupPlacement,
     /// Taken from `Popover` for this frame's overlay; published on an
     /// outside left click and then consumed.
     on_dismiss: Option<Message>,
@@ -251,25 +281,41 @@ where
     fn layout(&mut self, renderer: &Renderer, bounds: Size) -> layout::Node {
         let viewport = Rectangle::with_size(bounds);
         let width = self.width.min(viewport.width - 16.0).max(120.0);
-        // Cap the panel to the room actually available on the roomier side of
-        // the anchor, rather than to the whole viewport. Two reasons, and the
-        // first is correctness: `popover_position` flips a panel above its
-        // anchor with `(anchor.y - panel_h - gap).max(0.0)`, so a panel taller
-        // than the space above an anchor near the bottom edge — a status-strip
+        // Cap the panel's height per placement, not to the whole viewport.
+        //
+        // Below/above (the default): cap to the room actually available on
+        // the roomier side of the anchor. Two reasons, and the first is
+        // correctness: `popover_position` flips a panel above its anchor
+        // with `(anchor.y - panel_h - gap).max(0.0)`, so a panel taller than
+        // the space above an anchor near the bottom edge — a status-strip
         // chip, say — clamps to y = 0 and then extends back down OVER the
         // anchor. The second is that a list panel should grow to nearly the
-        // window's height before it starts scrolling, so scrollbars appear only
-        // when the content genuinely cannot fit.
+        // window's height before it starts scrolling, so scrollbars appear
+        // only when the content genuinely cannot fit.
         //
-        // This is a cap, not a height: the popup still measures its own
-        // content, so a short list hugs it and only a long one reaches the cap.
+        // Side: `popover_position_side` never flips vertically — it centres
+        // on the anchor and clamps into the viewport — so a panel beside a
+        // row has nearly the FULL viewport height available, not just the
+        // sliver above or below that one row. Capping it to
+        // `space_below`/`space_above` would starve it for no reason: a
+        // lineage row near the top of a tall list would get a detail panel
+        // only a few pixels tall even though the whole window is free below
+        // it. So a side panel's cap is the viewport height less the same
+        // top/bottom insets `popover_position_side` itself clamps into.
+        //
+        // Either way this is a cap, not a height: the popup still measures
+        // its own content, so a short panel hugs it and only a long one
+        // reaches the cap.
         let space_below = (viewport.height
             - (self.anchor_bounds.y + self.anchor_bounds.height)
             - self.gap
             - EDGE_MARGIN)
             .max(0.0);
         let space_above = (self.anchor_bounds.y - self.gap - EDGE_MARGIN).max(0.0);
-        let max_height = space_below.max(space_above).max(MIN_PANEL_HEIGHT);
+        let max_height = match self.placement {
+            PopupPlacement::Below => space_below.max(space_above).max(MIN_PANEL_HEIGHT),
+            PopupPlacement::Side => (viewport.height - 2.0 * EDGE_MARGIN).max(MIN_PANEL_HEIGHT),
+        };
         let node = self.popup.as_widget_mut().layout(
             self.tree,
             renderer,
@@ -277,20 +323,28 @@ where
         );
         let size = node.size();
 
-        // Placement is delegated so it can be unit-tested without a renderer
-        // (`pointing::popover_position`): below the row, flipped above when
-        // there is no room, and pulled back inside the right edge.
-        let (x, y) = crate::pointing::popover_position(
-            crate::pointing::Rect {
-                x: self.anchor_bounds.x,
-                y: self.anchor_bounds.y,
-                width: self.anchor_bounds.width,
-                height: self.anchor_bounds.height,
-            },
-            (size.width, size.height),
-            (viewport.width, viewport.height),
-            self.gap,
-        );
+        // Placement itself is delegated so it can be unit-tested without a
+        // renderer: below the row, flipped above when there is no room and
+        // pulled back inside the right edge (`pointing::popover_position`,
+        // the default), or beside the row, flipped to whichever side fits
+        // and vertically centred (`pointing::popover_position_side`, opt-in
+        // via `Popover::placement`).
+        let anchor = crate::pointing::Rect {
+            x: self.anchor_bounds.x,
+            y: self.anchor_bounds.y,
+            width: self.anchor_bounds.width,
+            height: self.anchor_bounds.height,
+        };
+        let panel = (size.width, size.height);
+        let viewport_size = (viewport.width, viewport.height);
+        let (x, y) = match self.placement {
+            PopupPlacement::Below => {
+                crate::pointing::popover_position(anchor, panel, viewport_size, self.gap)
+            }
+            PopupPlacement::Side => {
+                crate::pointing::popover_position_side(anchor, panel, viewport_size, self.gap)
+            }
+        };
 
         layout::Node::with_children(size, vec![node]).translate(Vector::new(x, y))
     }
