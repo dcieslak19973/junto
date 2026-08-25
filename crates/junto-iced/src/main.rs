@@ -3339,7 +3339,7 @@ impl App {
         let top_bar = container(admin_toolbar(self.admin)).padding(Padding {
             top: SP_LOOSE,
             right: SP_LOOSE,
-            bottom: 0.0,
+            bottom: SP,
             left: SP_LOOSE,
         });
         let center: Element<Message> = container(column![grid].spacing(SP_LOOSE).padding(SP_LOOSE))
@@ -3414,8 +3414,26 @@ impl App {
         ]
         .spacing(0);
 
-        column![top_bar, shell_row, footer(self)].into()
+        column![top_bar, separator(), shell_row, footer(self)].into()
     }
+}
+
+/// A hairline across the full window width, marking where one band of chrome
+/// ends and the next begins — currently the boundary between the top tab bar
+/// and the workspace beneath it.
+///
+/// A 1px styled container rather than `iced::widget::rule`: every other
+/// divider and border in this file is expressed as a container style, and one
+/// vocabulary is worth more here than reaching for a second widget.
+fn separator<'a>() -> Element<'a, Message> {
+    container(Space::new())
+        .width(Fill)
+        .height(Length::Fixed(1.0))
+        .style(|_theme| container::Style {
+            background: Some(Background::Color(BORDER)),
+            ..container::Style::default()
+        })
+        .into()
 }
 
 /// The always-visible top tab bar: channels · settings · agents.
