@@ -72,6 +72,12 @@ const SP_LOOSE: f32 = 12.0;
 /// Section spacing: between major regions.
 const SP_SECTION: f32 = 16.0;
 
+/// Every icon-only button is this square, so a row of them reads as a grid
+/// rather than as boxes that each shrank to their own glyph plus padding.
+/// Also the width of a collapsed blade's stub rail — the rail is exactly one
+/// icon button wide, which is why the two share a constant.
+const ICON_BTN: f32 = 24.0;
+
 /// The additional icon family loaded in `main` (`assets/lucide.ttf`, Lucide
 /// 0.469.0) — Segoe UI's own punctuation (`‹ › ▸ ▾ ↻ × → ↓ ⚠`) was standing
 /// in for icons at text metrics, with mismatched stroke weights and no
@@ -83,6 +89,17 @@ const ICON_FONT: iced::Font = iced::Font::with_name("lucide");
 /// was half of what made the old punctuation-as-icons look hand-drawn.
 fn icon(codepoint: char) -> iced::widget::Text<'static> {
     text(codepoint.to_string()).font(ICON_FONT).size(TEXT_BODY)
+}
+
+/// An icon-only button: fixed square, glyph centred. Owns geometry so no
+/// call site sets its own size or padding.
+fn icon_button<'a>(codepoint: char, message: Message) -> iced::widget::Button<'a, Message> {
+    let glyph: Element<'a, Message> = Element::new(icon(codepoint));
+    button(container(glyph).center(Length::Fill))
+        .on_press(message)
+        .width(Length::Fixed(ICON_BTN))
+        .height(Length::Fixed(ICON_BTN))
+        .padding(0)
 }
 
 /// Lucide codepoints for the shell-chrome icons `icon` renders above, taken
@@ -2934,16 +2951,13 @@ impl App {
                 )
                 .controls(Element::from(
                     row![
-                        button(icon(ICON_ROTATE_CW))
-                            .on_press(Message::Refresh(id))
-                            .padding(SP_TIGHT),
+                        icon_button(ICON_ROTATE_CW, Message::Refresh(id)),
                         // `State::close` removes nothing and returns `None`
                         // when `pane` has no sibling (the single-pane case,
                         // which is also the app's startup state) — disable
                         // rather than publish a click that does nothing.
-                        button(icon(ICON_X))
-                            .on_press_maybe((self.panes.len() > 1).then_some(Message::Close(id)))
-                            .padding(SP_TIGHT),
+                        icon_button(ICON_X, Message::Close(id))
+                            .on_press_maybe((self.panes.len() > 1).then_some(Message::Close(id))),
                     ]
                     .spacing(SP),
                 ))
@@ -3117,14 +3131,14 @@ fn blade_stub<'a>(side: Side, badge: Option<usize>) -> Element<'a, Message> {
         Side::Left => (ICON_PANEL_LEFT, Message::ToggleLeftBlade),
         Side::Right => (ICON_PANEL_RIGHT, Message::ToggleRightBlade),
     };
-    let mut rail = column![button(icon(glyph)).on_press(message).padding(SP_TIGHT)]
+    let mut rail = column![icon_button(glyph, message)]
         .spacing(SP)
         .align_x(Center);
     if let Some(count) = badge.filter(|count| *count > 0) {
         rail = rail.push(text(count.to_string()).size(TEXT_META).color(RED));
     }
     container(rail)
-        .width(Length::Fixed(24.0))
+        .width(Length::Fixed(ICON_BTN))
         .height(Fill)
         .into()
 }
@@ -3215,14 +3229,11 @@ fn channel_nav(app: &App) -> Element<'_, Message> {
     // Axis-aware splitting of the focused pane — the workspace-level
     // counterpart to `adder`'s "open a channel into a pane".
     let split_row = row![
-        button(icon(ICON_COLUMNS_2))
-            .on_press(Message::SplitPane(pane_grid::Axis::Vertical))
-            .width(Fill)
-            .padding(SP_TIGHT),
-        button(icon(ICON_ROWS_2))
-            .on_press(Message::SplitPane(pane_grid::Axis::Horizontal))
-            .width(Fill)
-            .padding(SP_TIGHT),
+        icon_button(
+            ICON_COLUMNS_2,
+            Message::SplitPane(pane_grid::Axis::Vertical)
+        ),
+        icon_button(ICON_ROWS_2, Message::SplitPane(pane_grid::Axis::Horizontal)),
     ]
     .spacing(SP_TIGHT);
     column![
@@ -3318,9 +3329,7 @@ fn left_blade(app: &App) -> Element<'_, Message> {
     };
 
     column![
-        button(icon(ICON_PANEL_LEFT))
-            .on_press(Message::ToggleLeftBlade)
-            .padding(SP_TIGHT),
+        icon_button(ICON_PANEL_LEFT, Message::ToggleLeftBlade),
         container(channel_nav(app))
             .id(iced::widget::Id::new("left-blade-nav"))
             .height(Length::FillPortion(
@@ -3368,9 +3377,7 @@ fn right_blade(app: &App) -> Element<'_, Message> {
     column![
         row![
             switcher,
-            button(icon(ICON_PANEL_RIGHT))
-                .on_press(Message::ToggleRightBlade)
-                .padding(SP_TIGHT)
+            icon_button(ICON_PANEL_RIGHT, Message::ToggleRightBlade)
         ]
         .spacing(SP),
         body,
