@@ -3305,19 +3305,27 @@ fn attention_view(app: &App) -> Element<'_, Message> {
 fn left_blade(app: &App) -> Element<'_, Message> {
     let switcher = row![
         button(
-            row![icon(ICON_BELL), text("attention").size(TEXT_BODY)]
-                .spacing(SP_TIGHT)
-                .align_y(Center),
+            container(
+                row![icon(ICON_BELL), text("attention").size(TEXT_BODY)]
+                    .spacing(SP_TIGHT)
+                    .align_y(Center),
+            )
+            .center_x(Fill),
         )
         .on_press(Message::LeftViewPicked(shell::LeftView::Attention))
+        .width(Length::FillPortion(1))
         .padding(SP_TIGHT)
         .style(move |_t, _s| tab_style(app.shell.left_view == shell::LeftView::Attention)),
         button(
-            row![icon(ICON_BOT), text("sessions").size(TEXT_BODY)]
-                .spacing(SP_TIGHT)
-                .align_y(Center),
+            container(
+                row![icon(ICON_BOT), text("sessions").size(TEXT_BODY)]
+                    .spacing(SP_TIGHT)
+                    .align_y(Center),
+            )
+            .center_x(Fill),
         )
         .on_press(Message::LeftViewPicked(shell::LeftView::Sessions))
+        .width(Length::FillPortion(1))
         .padding(SP_TIGHT)
         .style(move |_t, _s| tab_style(app.shell.left_view == shell::LeftView::Sessions)),
     ]
@@ -3351,19 +3359,27 @@ fn left_blade(app: &App) -> Element<'_, Message> {
 fn right_blade(app: &App) -> Element<'_, Message> {
     let switcher = row![
         button(
-            row![icon(ICON_FILE_DIFF), text("artifacts").size(TEXT_BODY)]
-                .spacing(SP_TIGHT)
-                .align_y(Center),
+            container(
+                row![icon(ICON_FILE_DIFF), text("artifacts").size(TEXT_BODY)]
+                    .spacing(SP_TIGHT)
+                    .align_y(Center),
+            )
+            .center_x(Fill),
         )
         .on_press(Message::RightViewPicked(shell::RightView::Artifacts))
+        .width(Length::FillPortion(1))
         .padding(SP_TIGHT)
         .style(move |_t, _s| tab_style(app.shell.right_view == shell::RightView::Artifacts)),
         button(
-            row![icon(ICON_GIT_BRANCH), text("lineage").size(TEXT_BODY)]
-                .spacing(SP_TIGHT)
-                .align_y(Center),
+            container(
+                row![icon(ICON_GIT_BRANCH), text("lineage").size(TEXT_BODY)]
+                    .spacing(SP_TIGHT)
+                    .align_y(Center),
+            )
+            .center_x(Fill),
         )
         .on_press(Message::RightViewPicked(shell::RightView::Lineage))
+        .width(Length::FillPortion(1))
         .padding(SP_TIGHT)
         .style(move |_t, _s| tab_style(app.shell.right_view == shell::RightView::Lineage)),
     ]
