@@ -3194,13 +3194,10 @@ fn bottom_drawer(app: &App, view: shell::BottomView) -> Element<'_, Message> {
         shell::BottomView::Sessions => ("sessions", sessions_view(app)),
     };
 
-    let header = row![
-        text(title).size(TEXT_BODY).font(semibold()),
-        Space::new().width(Fill),
-        icon_button(ICON_X, Message::BottomViewToggled(view)),
-    ]
-    .spacing(SP)
-    .align_y(Center);
+    // No close button: the footer chip that opened this drawer toggles it
+    // shut, so a second dismiss control here is a redundant target in the
+    // one strip whose whole purpose is reducing clutter.
+    let header = text(title).size(TEXT_BODY).font(semibold());
 
     container(column![header, body].spacing(SP).height(Fill))
         .width(Fill)
