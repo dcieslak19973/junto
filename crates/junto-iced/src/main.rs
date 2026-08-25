@@ -6450,9 +6450,22 @@ fn aim_label(pane: &Pane) -> String {
     if !path.is_empty() {
         return match pane.worktree_commit.as_deref() {
             Some(commit) => format!("● {path}:{} @ {}", pane.annotate_lines, &commit[..7]),
-            // No commit has arrived, so `AnnotateSubmit` will refuse this
-            // rather than fabricate one — say so before they type.
-            None => format!("no commit seen yet for this worktree — cannot anchor {path}"),
+            // Live, but `Message::WorktreeDiff` hasn't landed yet — this IS
+            // transient, so `AnnotateSubmit` will refuse for now rather than
+            // fabricate a commit, and the wording says so.
+            None if pane.annotate_tx.is_some() => {
+                format!("no commit seen yet for this worktree — cannot anchor {path}")
+            }
+            // Not live at all: no commit is EVER coming without a resume, and
+            // the resumed worktree's commit would postdate what the reviewer
+            // is looking at — no `CodeAnchor` is legitimate here
+            // (`AnnotateSubmit`'s not-live path). Say what submitting will
+            // actually do instead of a refusal that would never lift.
+            None => format!(
+                "● not live — submitting resumes the session and records a \
+                 stream comment about {path}:{}",
+                pane.annotate_lines
+            ),
         };
     }
     match pane.annotate_op {
@@ -6462,11 +6475,15 @@ fn aim_label(pane: &Pane) -> String {
 }
 
 /// The floating comment panel: the same signed-annotation composer, anchored to
-/// the row it is about instead of pinned to the bottom of the pane.
+/// the row it is about instead of pinned to the bottom of the pane. Live or
+/// not — `pane_body`'s `aim` is built either way, so this can open over a
+/// finished session's diff too; `AnnotateSubmit`'s not-live path resumes the
+/// session with the typed text instead of signing and sending it directly.
 ///
 /// Deliberately carries no `path`/`lines` inputs — the reviewer got here by
-/// clicking, so there is nothing to type. `×` clears the aim and hands the
-/// bottom composer back.
+/// clicking, so there is nothing to type. `×` clears the aim and hands back
+/// whatever was showing before it: the bottom composer if live, the hint
+/// otherwise.
 fn annotate_popup(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
     let head = row![
         text(aim_label(pane)).size(TEXT_META).color(TEAL),
@@ -6709,10 +6726,13 @@ fn pane_body<'a>(
             .style(|_t, _s| chip_style(MUTED, false)),
         );
 
-        // Where the composer is aimed. `Some` exactly while the composer is on
-        // screen (`annotate_tx`), so diff rows and feed gutters become click
-        // targets and stop being them together with it.
-        let aim = pane.annotate_tx.is_some().then(|| Aim {
+        // Where the composer is aimed. Built whenever a session's diff is on
+        // screen at all — live or finished — so diff rows and feed gutters
+        // are always click targets here: `AnnotateSubmit` has a legitimate
+        // path for a comment either way (sign-and-send live, resume-and-hold
+        // otherwise); it is only a `CodeAnchor` specifically that ever needs
+        // liveness (`aim_label`'s not-live wording covers that case).
+        let aim = Some(Aim {
             path: pane.annotate_path.as_str(),
             record: pane
                 .annotate_record
@@ -6802,23 +6822,26 @@ fn pane_body<'a>(
         let mut session_col = column![header, main_area, steer].spacing(SP);
         // The bottom composer is the fallback surface. While a floating panel is
         // anchored to the clicked row it IS the composer, so showing both would
-        // put two comment boxes on screen for one comment.
+        // put two comment boxes on screen for one comment. It still needs a
+        // live, authenticated socket to sign and send over directly
+        // (`Pane::annotate_tx`'s own docs) — but clicking a diff line no
+        // longer does: `aim`, above, is built whether or not this session is
+        // live, so a click still opens the row's own popup, whose submit
+        // takes `AnnotateSubmit`'s not-live path (resumes with the text,
+        // holds it as a pending comment) instead of this bottom box.
         if pane.annotate_tx.is_some() {
             if popup_anchor(pane).is_none() {
                 session_col = session_col.push(annotate_composer(id, pane));
             }
         } else {
-            // Say why there is nothing to click. Pointing needs a live,
-            // authenticated socket, because a `CodeAnchor`'s commit may only
-            // come from a `Message::WorktreeDiff` that actually arrived on the
-            // wire — so on a landed session the diff rows are deliberately
-            // inert. They look identical either way, and the host closes a
-            // finished session's socket silently, so without this line the
-            // reviewer just finds that clicking does nothing.
+            // Say what a click still does, since there is otherwise nothing
+            // on screen telling the reviewer that clicking is not inert —
+            // the host closes a finished session's socket silently, giving
+            // no other hint that this pane is not live.
             session_col = session_col.push(
                 text(
-                    "commenting needs a live turn — steer above to resume this \
-                     session, then click a diff line",
+                    "not live — click a diff line to comment; submitting \
+                     resumes the session with that note",
                 )
                 .size(TEXT_META)
                 .color(MUTED),
@@ -7678,9 +7701,10 @@ fn entry_card<'a>(
 }
 
 /// Where the annotation composer is currently aimed, threaded down to the diff
-/// renderer. `Some` only while the composer is live (`Pane::annotate_tx`), which
-/// is the same condition that makes pointing meaningful at all: aiming inputs
-/// that are not on screen would be a click that appears to do nothing.
+/// renderer. Built whenever a session's diff is on screen at all — live or
+/// finished (`pane_body`'s own doc comment on its `aim` local covers why a
+/// finished session is still aimable) — so `None` here now means only "no
+/// session diff is on screen", not "not live".
 #[derive(Clone, Copy)]
 struct Aim<'a> {
     /// The composer's current `path`, untrimmed (as typed). Empty when the aim
