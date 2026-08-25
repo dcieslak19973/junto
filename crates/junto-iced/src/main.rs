@@ -3032,15 +3032,19 @@ fn admin_toolbar(current: Option<AdminView>) -> Element<'static, Message> {
     };
     row![
         text("junto").size(TEXT_TITLE).font(semibold()),
-        Space::new().width(16),
+        Space::new().width(SP_SECTION),
         tab("channels", None),
         tab("settings", Some(AdminView::Settings)),
         tab("agents", Some(AdminView::Agents)),
         Space::new().width(Fill),
-        button(text("↻ refresh").size(TEXT_BODY))
-            .on_press(Message::RefreshAll)
-            .padding([SP_TIGHT, SP_LOOSE])
-            .style(|_t, _s| chip_style(MUTED, false)),
+        button(
+            row![icon(ICON_ROTATE_CW), text("refresh").size(TEXT_BODY)]
+                .spacing(SP_TIGHT)
+                .align_y(Center),
+        )
+        .on_press(Message::RefreshAll)
+        .padding([SP_TIGHT, SP_LOOSE])
+        .style(|_t, _s| chip_style(MUTED, false)),
     ]
     .spacing(SP_TIGHT)
     .align_y(Center)
@@ -3206,7 +3210,14 @@ fn adder(app: &App) -> Element<'_, Message> {
     }
     match &app.new_channel_error {
         Some(err) => adder_col
-            .push(text(format!("⚠ {err}")).size(TEXT_META).color(RED))
+            .push(
+                row![
+                    icon(ICON_CIRCLE_ALERT).color(RED),
+                    text(err).size(TEXT_META).color(RED)
+                ]
+                .spacing(SP_TIGHT)
+                .align_y(Center),
+            )
             .into(),
         None => adder_col.into(),
     }
@@ -3288,7 +3299,7 @@ fn attention_view(app: &App) -> Element<'_, Message> {
             .into();
     }
     let mut items = column![
-        text(format!("needs you ({}) ▸", app.focus_items.len()))
+        text(format!("needs you ({})", app.focus_items.len()))
             .size(TEXT_BODY)
             .color(YELLOW)
     ]
@@ -3551,7 +3562,14 @@ fn artifact_row<'a>(
             card = card.push(text("loading…").size(TEXT_META).color(MUTED));
         }
         Some(ArtifactContent::Error(err)) => {
-            card = card.push(text(format!("⚠ {err}")).size(TEXT_META).color(RED));
+            card = card.push(
+                row![
+                    icon(ICON_CIRCLE_ALERT).color(RED),
+                    text(err).size(TEXT_META).color(RED)
+                ]
+                .spacing(SP_TIGHT)
+                .align_y(Center),
+            );
         }
         Some(ArtifactContent::Loaded {
             format,
@@ -3726,7 +3744,14 @@ fn settings_panel(app: &App) -> Element<'_, Message> {
         .padding(SP),
     );
     if let Some(err) = &app.join_error {
-        join = join.push(text(format!("⚠ {err}")).size(TEXT_META).color(RED));
+        join = join.push(
+            row![
+                icon(ICON_CIRCLE_ALERT).color(RED),
+                text(err).size(TEXT_META).color(RED)
+            ]
+            .spacing(SP_TIGHT)
+            .align_y(Center),
+        );
     }
     if let Some(enrolled) = &app.join_result {
         join = join.push(
@@ -3792,11 +3817,17 @@ fn settings_panel(app: &App) -> Element<'_, Message> {
     );
     repo = repo.push(button("register").on_press(Message::SetupRepo).padding(SP));
     if let Some(msg) = &app.repo_msg {
-        let (label, color) = match msg {
-            Ok(m) => (m.clone(), GREEN),
-            Err(e) => (format!("⚠ {e}"), RED),
+        let status: Element<Message> = match msg {
+            Ok(m) => text(m.clone()).size(TEXT_META).color(GREEN).into(),
+            Err(e) => row![
+                icon(ICON_CIRCLE_ALERT).color(RED),
+                text(e).size(TEXT_META).color(RED)
+            ]
+            .spacing(SP_TIGHT)
+            .align_y(Center)
+            .into(),
         };
-        repo = repo.push(text(label).size(TEXT_META).color(color));
+        repo = repo.push(status);
     }
     col = col.push(admin_card(repo));
     scrollable(col).height(Fill).into()
@@ -3880,12 +3911,7 @@ fn agents_panel(app: &App) -> Element<'_, Message> {
     );
 
     // --- advanced config: MCP servers, skills, local plugins ---
-    let remove_btn = |msg: Message| {
-        button(text("×").size(TEXT_BODY))
-            .on_press(msg)
-            .padding([SP_TIGHT, SP])
-            .style(|_t, _s| chip_style(RED, false))
-    };
+    let remove_btn = |msg: Message| icon_button(ICON_X, msg).style(|_t, _s| chip_style(RED, false));
     let add_btn = |label: &'static str, msg: Message| {
         button(text(label).size(TEXT_META))
             .on_press(msg)
@@ -3962,7 +3988,14 @@ fn agents_panel(app: &App) -> Element<'_, Message> {
     }
     form = form.push(actions);
     if let Some(msg) = &app.agent_msg {
-        form = form.push(text(format!("⚠ {msg}")).size(TEXT_META).color(RED));
+        form = form.push(
+            row![
+                icon(ICON_CIRCLE_ALERT).color(RED),
+                text(msg).size(TEXT_META).color(RED)
+            ]
+            .spacing(SP_TIGHT)
+            .align_y(Center),
+        );
     }
     scrollable(column![list, admin_card(form)].spacing(SP_SECTION))
         .height(Fill)
@@ -3990,7 +4023,7 @@ fn remote_row<'a>(
         None => "watch as (email) — no identity on this machine".to_string(),
     };
     let inputs = row![
-        text("remote ▸").size(TEXT_META).color(MUTED),
+        text("remote").size(TEXT_META).color(MUTED),
         text_input("host (blank = local)", pane.remote.as_deref().unwrap_or(""))
             .on_input(move |v| Message::RemoteChanged(id, v))
             .size(TEXT_META)
@@ -4178,7 +4211,14 @@ fn lifecycle_form<'a>(
         .spacing(SP),
     );
     if let Some(err) = &pane.lifecycle_error {
-        col = col.push(text(format!("⚠ {err}")).size(TEXT_META).color(RED));
+        col = col.push(
+            row![
+                icon(ICON_CIRCLE_ALERT).color(RED),
+                text(err).size(TEXT_META).color(RED)
+            ]
+            .spacing(SP_TIGHT)
+            .align_y(Center),
+        );
     }
     container(col)
         .padding(SP)
@@ -4214,13 +4254,22 @@ fn members_disclosure<'a>(id: pane_grid::Pane, pane: &'a Pane) -> Element<'a, Me
         };
     };
     let device_count: usize = keys.members.iter().map(|m| m.devices.len()).sum();
+    let members_chevron = if pane.members_open {
+        ICON_CHEVRON_DOWN
+    } else {
+        ICON_CHEVRON_RIGHT
+    };
     let header = button(
-        text(format!(
-            "{} members ({}) · devices: {device_count}",
-            if pane.members_open { "▾" } else { "▸" },
-            keys.members.len(),
-        ))
-        .size(TEXT_BODY),
+        row![
+            icon(members_chevron),
+            text(format!(
+                "members ({}) · devices: {device_count}",
+                keys.members.len(),
+            ))
+            .size(TEXT_BODY),
+        ]
+        .spacing(SP_TIGHT)
+        .align_y(Center),
     )
     .on_press(Message::MembersToggle(id))
     .padding(SP)
@@ -4228,14 +4277,21 @@ fn members_disclosure<'a>(id: pane_grid::Pane, pane: &'a Pane) -> Element<'a, Me
 
     let mut col = column![header].spacing(SP);
     if let Some(err) = &pane.keys_error {
-        col = col.push(text(format!("⚠ {err}")).size(TEXT_META).color(RED));
+        col = col.push(
+            row![
+                icon(ICON_CIRCLE_ALERT).color(RED),
+                text(err).size(TEXT_META).color(RED)
+            ]
+            .spacing(SP_TIGHT)
+            .align_y(Center),
+        );
     }
     if pane.members_open {
         for member in &keys.members {
             col = col.push(member_row(id, pane, keys, member));
         }
         if keys.viewer_is_founder {
-            let mut acts = row![text("members ▸").size(TEXT_META).color(MUTED)]
+            let mut acts = row![text("members").size(TEXT_META).color(MUTED)]
                 .spacing(SP)
                 .align_y(Center);
             for form in [IdentityForm::Invite, IdentityForm::Redeem] {
@@ -4367,7 +4423,7 @@ fn identity_form<'a>(
                     .size(TEXT_BODY)
                     .padding(SP),
             );
-            let mut channels = row![text("channels ▸").size(TEXT_META).color(MUTED)]
+            let mut channels = row![text("channels").size(TEXT_META).color(MUTED)]
                 .spacing(SP)
                 .align_y(Center);
             for (idx, (name, ticked)) in pane.identity_channels.iter().enumerate() {
@@ -4462,7 +4518,7 @@ fn identity_form<'a>(
                         .size(TEXT_META)
                         .color(MUTED),
                     );
-                    let mut kind_row = row![text("kind ▸").size(TEXT_META).color(MUTED)]
+                    let mut kind_row = row![text("kind").size(TEXT_META).color(MUTED)]
                         .spacing(SP)
                         .align_y(Center);
                     for kind in ["human", "agent"] {
@@ -4544,7 +4600,14 @@ fn identity_form<'a>(
         );
     }
     if let Some(err) = &pane.identity_error {
-        col = col.push(text(format!("⚠ {err}")).size(TEXT_META).color(RED));
+        col = col.push(
+            row![
+                icon(ICON_CIRCLE_ALERT).color(RED),
+                text(err).size(TEXT_META).color(RED)
+            ]
+            .spacing(SP_TIGHT)
+            .align_y(Center),
+        );
     }
     container(col)
         .padding(SP)
@@ -4609,7 +4672,7 @@ fn annotate_composer(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
         );
     }
     column![
-        row![text("annotate ▸").size(TEXT_META).color(MUTED), aimed]
+        row![text("annotate").size(TEXT_META).color(MUTED), aimed]
             .spacing(SP)
             .align_y(Center),
         row![path_input, lines_input].spacing(SP),
@@ -4661,10 +4724,7 @@ fn annotate_popup(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
     let head = row![
         text(aim_label(pane)).size(TEXT_META).color(TEAL),
         Space::new().width(Fill),
-        button(text("×").size(TEXT_BODY))
-            .on_press(Message::AnchorClear(id))
-            .padding([SP_TIGHT, SP])
-            .style(|_t, _s| chip_style(MUTED, false)),
+        icon_button(ICON_X, Message::AnchorClear(id)).style(|_t, _s| chip_style(MUTED, false)),
     ]
     .spacing(SP)
     .align_y(Center);
@@ -4751,7 +4811,7 @@ fn pane_body<'a>(
             LifecycleKind::Close,
         ]
     };
-    let mut bar = row![text("channel ▸").size(TEXT_META).color(MUTED)]
+    let mut bar = row![text("channel").size(TEXT_META).color(MUTED)]
         .spacing(SP)
         .align_y(Center);
     for &k in acts {
@@ -4787,13 +4847,15 @@ fn pane_body<'a>(
     if !pane.launching {
         launch_btn = launch_btn.on_press(Message::Launch(id));
     }
+    let options_chevron = if pane.launch_expanded {
+        ICON_CHEVRON_DOWN
+    } else {
+        ICON_CHEVRON_RIGHT
+    };
     let options_toggle = button(
-        text(if pane.launch_expanded {
-            "options ▾"
-        } else {
-            "options ▸"
-        })
-        .size(TEXT_BODY),
+        row![icon(options_chevron), text("options").size(TEXT_BODY)]
+            .spacing(SP_TIGHT)
+            .align_y(Center),
     )
     .on_press(Message::ToggleLaunchOptions(id))
     .padding(SP)
@@ -4840,7 +4902,14 @@ fn pane_body<'a>(
         launch = launch.push(options_row).push(mode_checkbox);
     }
     if let Some(err) = &pane.launch_error {
-        launch = launch.push(text(format!("⚠ {err}")).size(TEXT_META).color(RED));
+        launch = launch.push(
+            row![
+                icon(ICON_CIRCLE_ALERT).color(RED),
+                text(err).size(TEXT_META).color(RED)
+            ]
+            .spacing(SP_TIGHT)
+            .align_y(Center),
+        );
     }
 
     // Session chips — click to stream a session's live feed.
@@ -4878,10 +4947,14 @@ fn pane_body<'a>(
         }
         header = header.push(Space::new().width(Fill));
         header = header.push(
-            button(text("× close").size(TEXT_META))
-                .on_press(Message::CloseSession(id))
-                .padding([SP_TIGHT, SP])
-                .style(|_t, _s| chip_style(MUTED, false)),
+            button(
+                row![icon(ICON_X), text("close").size(TEXT_META)]
+                    .spacing(SP_TIGHT)
+                    .align_y(Center),
+            )
+            .on_press(Message::CloseSession(id))
+            .padding([SP_TIGHT, SP])
+            .style(|_t, _s| chip_style(MUTED, false)),
         );
 
         // Where the composer is aimed. `Some` exactly while the composer is on
@@ -5015,7 +5088,7 @@ fn pane_body<'a>(
         let pinned: Option<Element<Message>> = highlight.and_then(|hid| {
             dto.entries.iter().find(|e| e.id == hid).map(|entry| {
                 let header = row![
-                    text("▾ needs you").size(TEXT_META).color(YELLOW),
+                    text("needs you").size(TEXT_META).color(YELLOW),
                     Space::new().width(Fill),
                     button(text("dismiss").size(TEXT_META).color(MUTED))
                         .on_press(Message::ClearHighlight(id))
@@ -5066,15 +5139,24 @@ fn pane_body<'a>(
         };
         if total > 0 {
             let label = if show_all {
-                "▾ hide full history".to_string()
+                "hide full history".to_string()
             } else {
-                format!("▸ show full history ({total} entries)")
+                format!("show full history ({total} entries)")
+            };
+            let history_chevron = if show_all {
+                ICON_CHEVRON_DOWN
+            } else {
+                ICON_CHEVRON_RIGHT
             };
             timeline = timeline.push(
-                button(text(label).size(TEXT_META))
-                    .on_press(Message::ToggleHistory(id))
-                    .padding([SP_TIGHT, SP])
-                    .style(|_t, _s| chip_style(MUTED, false)),
+                button(
+                    row![icon(history_chevron), text(label).size(TEXT_META)]
+                        .spacing(SP_TIGHT)
+                        .align_y(Center),
+                )
+                .on_press(Message::ToggleHistory(id))
+                .padding([SP_TIGHT, SP])
+                .style(|_t, _s| chip_style(MUTED, false)),
             );
         }
         for entry in dto.entries.iter().skip(start) {
@@ -5497,9 +5579,13 @@ fn code_panel<'a>(
             .size(TEXT_META)
             .color(MUTED)
             .into(),
-        Some(ArtifactContent::Error(err)) => {
-            text(format!("⚠ {err}")).size(TEXT_META).color(RED).into()
-        }
+        Some(ArtifactContent::Error(err)) => row![
+            icon(ICON_CIRCLE_ALERT).color(RED),
+            text(err).size(TEXT_META).color(RED)
+        ]
+        .spacing(SP_TIGHT)
+        .align_y(Center)
+        .into(),
         None => button(text("show the diff").size(TEXT_META))
             .on_press(Message::ToggleArtifact(id, artifact.id.clone()))
             .padding(SP)
@@ -5751,7 +5837,14 @@ fn entry_card<'a>(
                     .color(YELLOW),
             );
         } else if let Some(err) = error {
-            acts = acts.push(text(format!("⚠ {err}")).size(TEXT_META).color(RED));
+            acts = acts.push(
+                row![
+                    icon(ICON_CIRCLE_ALERT).color(RED),
+                    text(err).size(TEXT_META).color(RED)
+                ]
+                .spacing(SP_TIGHT)
+                .align_y(Center),
+            );
         }
         card = card.push(acts);
     }
@@ -5759,23 +5852,34 @@ fn entry_card<'a>(
     // Artifacts: a toggle that lazy-loads the diff/memo/log content inline.
     if entry.kind == "artifact" {
         let expanded = artifact.is_some();
-        let toggle_label = if expanded {
-            "hide content ▾"
+        let (toggle_icon, toggle_text) = if expanded {
+            (ICON_CHEVRON_DOWN, "hide content")
         } else {
-            "show content ▸"
+            (ICON_CHEVRON_RIGHT, "show content")
         };
         card = card.push(
-            button(text(toggle_label).size(TEXT_META))
-                .on_press(Message::ToggleArtifact(id, entry.id.clone()))
-                .padding([SP_TIGHT, SP])
-                .style(|_t, _s| chip_style(TEAL, false)),
+            button(
+                row![icon(toggle_icon), text(toggle_text).size(TEXT_META)]
+                    .spacing(SP_TIGHT)
+                    .align_y(Center),
+            )
+            .on_press(Message::ToggleArtifact(id, entry.id.clone()))
+            .padding([SP_TIGHT, SP])
+            .style(|_t, _s| chip_style(TEAL, false)),
         );
         match artifact {
             Some(ArtifactContent::Loading) => {
                 card = card.push(text("loading…").size(TEXT_META).color(MUTED));
             }
             Some(ArtifactContent::Error(err)) => {
-                card = card.push(text(format!("⚠ {err}")).size(TEXT_META).color(RED));
+                card = card.push(
+                    row![
+                        icon(ICON_CIRCLE_ALERT).color(RED),
+                        text(err).size(TEXT_META).color(RED)
+                    ]
+                    .spacing(SP_TIGHT)
+                    .align_y(Center),
+                );
             }
             Some(ArtifactContent::Loaded {
                 format,
@@ -7969,7 +8073,7 @@ diff --git a/lib.rs b/lib.rs
         // with the primary excluded no toggle exists in the pane at all. The
         // label reads "hide" here because this artifact's content is loaded.
         assert!(
-            ui.find("hide content ▾").is_err(),
+            ui.find("hide content").is_err(),
             "the primary diff must not also appear as a card in the record"
         );
     }
