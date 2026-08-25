@@ -1092,8 +1092,6 @@ enum Message {
     PaneDragged(pane_grid::DragEvent),
     /// A pane was clicked — retargets the blades to it.
     PaneClicked(pane_grid::Pane),
-    /// Split the focused pane along `axis`.
-    SplitPane(pane_grid::Axis),
     // Live session pane.
     Watch(pane_grid::Pane, String),
     /// Close the session view, returning the pane to its timeline.
@@ -1859,38 +1857,6 @@ impl App {
             Message::PaneDragged(_) => Task::none(),
             Message::PaneClicked(pane) => {
                 self.focus_pane(pane);
-                Task::none()
-            }
-            Message::SplitPane(axis) => {
-                let Some(focus) = self.focus else {
-                    return Task::none();
-                };
-                // A split shows what the pane being split showed — duplicate
-                // the focused pane's channel AND its remote override rather
-                // than opening a pane on the empty string, which is
-                // unfetchable (no channel to ask the host for) and, worse,
-                // becomes the very next `open_or_focus`'s split target,
-                // silently orphaning it. Dropping `remote` here used to
-                // silently retarget a remote-watched split at THIS
-                // machine's local channel of the same name (or error, if
-                // none existed) — the one case where the comment above was
-                // false; `base`/`remote` now travel together, matching how
-                // `Message::Refresh` already resolves a pane's effective
-                // host.
-                let Some((channel, remote)) = self
-                    .panes
-                    .get(focus)
-                    .map(|state| (state.channel.clone(), state.remote.clone()))
-                else {
-                    return Task::none();
-                };
-                let base = remote.clone().unwrap_or_else(|| HOST.to_string());
-                let mut new_state = Pane::loading(&channel);
-                new_state.remote = remote;
-                if let Some((new_pane, _)) = self.panes.split(axis, focus, new_state) {
-                    self.focus_pane(new_pane);
-                    return fetch(new_pane, base, &channel);
-                }
                 Task::none()
             }
             Message::Watch(pane, session) => {
@@ -3940,23 +3906,6 @@ fn channel_nav(app: &App) -> Element<'_, Message> {
         };
         list = list.push(row);
     }
-    // Axis-aware splitting of the focused pane — the workspace-level
-    // counterpart to `adder`'s "open a channel into a pane".
-    let split_row = row![
-        icon_button(
-            ICON_COLUMNS_2,
-            "split this pane to the right",
-            tooltip::Position::Top,
-            Message::SplitPane(pane_grid::Axis::Vertical),
-        ),
-        icon_button(
-            ICON_ROWS_2,
-            "split this pane downward",
-            tooltip::Position::Top,
-            Message::SplitPane(pane_grid::Axis::Horizontal),
-        ),
-    ]
-    .spacing(SP_TIGHT);
     column![
         text("channels")
             .size(TEXT_META)
@@ -3964,7 +3913,6 @@ fn channel_nav(app: &App) -> Element<'_, Message> {
             .font(semibold()),
         scrollable(list).height(Fill),
         adder(app),
-        split_row
     ]
     .spacing(SP)
     .into()
