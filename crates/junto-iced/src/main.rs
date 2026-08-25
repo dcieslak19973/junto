@@ -36,7 +36,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
 use pointing::{diff_row_targets, drag_lines, popup_anchor_line, watch_identity, watcher_initials};
-use popover::Popover;
+use popover::{Popover, PopupPlacement};
 
 const HOST: &str = "http://127.0.0.1:1727";
 
@@ -277,10 +277,12 @@ struct App {
     /// like `channel_filter`/`creating`: a chrome toggle, not layout worth
     /// persisting, so this lives on `App`, not `ShellState`.
     lineage_collapsed: bool,
-    /// Node ids whose per-row relations/milestones disclosure is expanded
-    /// (`lineage_view`'s per-row chevron). Transient like
-    /// `lineage_collapsed`.
-    lineage_expanded: HashSet<String>,
+    /// The node id whose chevron popover (`lineage_row`'s per-row
+    /// disclosure) is showing its relations/milestones detail, if any. A
+    /// popover shows one panel at a time, so this is a single slot, not a
+    /// set — opening a second row's detail replaces the first rather than
+    /// stacking both. Transient like `lineage_collapsed`.
+    lineage_detail: Option<String>,
     /// Cross-channel "needs you" items — the focus board.
     focus_items: Vec<FocusItem>,
     /// Configured Agents the launch picker offers (`/agents.json`).
@@ -1468,8 +1470,12 @@ enum Message {
     LineageGraphLoaded(Option<LineageGraphDto>),
     /// Press the lineage header's chevron: collapse/expand the section.
     ToggleLineageCollapsed,
-    /// Press a lineage row's disclosure chevron: expand/collapse that
-    /// node's relations + milestones detail (the node's id).
+    /// Press a lineage row's disclosure chevron: open or close a popover
+    /// beside the row showing its relations + milestones detail (the
+    /// node's id) — replaces any other row's open detail, and closes that
+    /// same row's own name placement menu if it was open (`lineage_row`'s
+    /// own doc comment covers why only one of a row's two popovers may
+    /// ever show at once).
     LineageRowToggled(String),
     /// Press the lineage header's refresh icon: refetch just the lineage DAG.
     RefreshLineage,
@@ -1678,7 +1684,7 @@ impl App {
             channel_filter: String::new(),
             lineage: None,
             lineage_collapsed: false,
-            lineage_expanded: HashSet::new(),
+            lineage_detail: None,
             focus_items: Vec::new(),
             agents: Vec::new(),
             recent_workspaces: Vec::new(),
@@ -1902,6 +1908,19 @@ impl App {
             }
             Message::LineageGraphLoaded(graph) => {
                 self.lineage = graph;
+                // A chevron popover left open for a channel that dropped
+                // off the graph (the lineage refetches on a timer) would
+                // otherwise be an orphaned panel with nothing left to
+                // explain it — the same reasoning `FocusLoaded` already
+                // applies to an attention-originated pending below.
+                if let Some(id) = &self.lineage_detail
+                    && !self
+                        .lineage
+                        .as_ref()
+                        .is_some_and(|g| g.nodes.iter().any(|node| &node.id == id))
+                {
+                    self.lineage_detail = None;
+                }
                 Task::none()
             }
             Message::ToggleLineageCollapsed => {
@@ -1909,15 +1928,42 @@ impl App {
                 Task::none()
             }
             Message::LineageRowToggled(id) => {
-                if !self.lineage_expanded.remove(&id) {
-                    self.lineage_expanded.insert(id);
+                let opening = self.lineage_detail.as_deref() != Some(id.as_str());
+                // A row hosts two popovers — this chevron's detail panel
+                // and the name's placement menu — and only one may ever be
+                // open, or they'd stack on the same row. Opening this one
+                // closes that row's placement menu; `LineageChannelPicked`
+                // enforces the same rule the other way round.
+                if opening
+                    && let Some(name) = self
+                        .lineage
+                        .as_ref()
+                        .and_then(|g| g.nodes.iter().find(|node| node.id == id))
+                        .map(|node| node.name.clone())
+                    && self.pending.as_ref().is_some_and(|pending| {
+                        matches!(&pending.target, PendingTarget::Channel) && pending.channel == name
+                    })
+                {
+                    self.pending = None;
                 }
+                self.lineage_detail = opening.then_some(id);
                 Task::none()
             }
             Message::RefreshLineage => fetch_lineage_graph(),
             Message::LineageChannelPicked(name) => {
+                let node_id = self
+                    .lineage
+                    .as_ref()
+                    .and_then(|g| g.nodes.iter().find(|node| node.name == name))
+                    .map(|node| node.id.clone());
                 if let Some(pane) = self.open_pane_or_toggle_pending(name) {
                     self.focus_pane(pane);
+                } else if self.lineage_detail == node_id {
+                    // The other half of `LineageRowToggled`'s rule: opening
+                    // (or re-closing) this row's placement menu must not
+                    // leave that row's chevron detail panel stacked
+                    // underneath it.
+                    self.lineage_detail = None;
                 }
                 Task::none()
             }
@@ -4642,7 +4688,7 @@ fn lineage_view(app: &App) -> Element<'_, Message> {
             color,
             is_focused,
             is_open,
-            expanded: app.lineage_expanded.contains(&node.id),
+            expanded: app.lineage_detail.as_deref() == Some(node.id.as_str()),
         };
         list = list.push(lineage_row(
             node,
@@ -4712,13 +4758,31 @@ struct LineageRowState {
     expanded: bool,
 }
 
+/// Width of a lineage row's chevron popover (`lineage_detail_panel`).
+/// Wider than the 211px right blade this shell allows — the whole point
+/// of floating the detail beside the row instead of expanding it inline
+/// is that the panel is no longer squeezed to the blade's own width —
+/// and wider than the 170px name popover on the same row, since a
+/// milestone label needs room to wrap across a couple of lines rather
+/// than many. Close to, but narrower than, the footer's own 360px chip
+/// panels: a relation or milestone line is a short phrase, not a tagged
+/// summary carrying an author and a channel name too.
+const LINEAGE_DETAIL_W: f32 = 320.0;
+
 /// One lineage row: the rail cell, a per-row disclosure chevron, and the
-/// channel name, plus — while expanded — that node's relations and
-/// milestones underneath. Clicking the name behaves like a channel chip
+/// channel name. The chevron wraps a `Popover` (`PopupPlacement::Side`)
+/// that floats that node's relations and milestones BESIDE the row
+/// instead of expanding it inline — the old inline block pushed every
+/// sibling row down the list and clipped milestone text at the blade's
+/// own narrow width (`lineage_detail_panel`'s own doc comment covers the
+/// panel itself). Clicking the name behaves like a channel chip
 /// (`channel_nav`): an unopened channel offers the same
 /// `placement_choices` menu (`placement_menu`, reused verbatim, not
-/// copied); an already-open one is focused rather than closed
-/// (`Message::LineageChannelPicked`'s own doc comment covers why).
+/// copied) in its own `Popover`; an already-open one is focused rather
+/// than closed (`Message::LineageChannelPicked`'s own doc comment covers
+/// why). A row hosts both popovers but only one may ever show at once —
+/// `Message::LineageRowToggled` and `Message::LineageChannelPicked` each
+/// close the other's popover when they open their own.
 fn lineage_row<'a>(
     node: &'a GNode,
     by_id: &HashMap<&'a str, &'a GNode>,
@@ -4733,7 +4797,7 @@ fn lineage_row<'a>(
         is_open,
         expanded,
     } = state;
-    let disclosure = icon_button(
+    let disclosure_button = icon_button(
         if expanded {
             ICON_CHEVRON_DOWN
         } else {
@@ -4747,6 +4811,14 @@ fn lineage_row<'a>(
         tooltip::Position::Bottom,
         Message::LineageRowToggled(node.id.clone()),
     );
+    let disclosure: Element<Message> = Popover::new(
+        disclosure_button,
+        expanded.then(|| lineage_detail_panel(by_id, node, relations)),
+    )
+    .width(LINEAGE_DETAIL_W)
+    .placement(PopupPlacement::Side)
+    .on_dismiss(Message::LineageRowToggled(node.id.clone()))
+    .into();
 
     let name_button = button(
         text(truncate(&node.name, 28))
@@ -4773,19 +4845,14 @@ fn lineage_row<'a>(
     // (TEAL) / neither (MUTED) state already driving the name text below
     // — so an open pane or the focused row is findable by colour alone,
     // without reading every name in the list.
-    let header_row = row![
+    row![
         lineage_rail_cell(rail, color, is_focused),
         disclosure,
         name_cell
     ]
     .spacing(SP_TIGHT)
-    .align_y(Center);
-
-    let mut col = column![header_row].spacing(SP_TIGHT);
-    if expanded {
-        col = col.push(lineage_detail(by_id, node, relations));
-    }
-    col.into()
+    .align_y(Center)
+    .into()
 }
 
 /// One lane's width in the rail (`lineage_rail_cell`): wide enough for a
@@ -4975,11 +5042,25 @@ fn join_and(names: &[String]) -> String {
     }
 }
 
-/// A lineage row's expanded detail: its relations in words — diverged
-/// from/into, converged into — then its milestones, each `truncate()`d
-/// (the live data's labels run past 70 characters). Indented under the
-/// rail so it reads as this row's own detail, not a sibling row.
-fn lineage_detail<'a>(
+/// The lineage row's chevron popover: the channel name as a heading, then
+/// its relations in words — diverged from/into, converged into — then
+/// its milestones oldest-to-newest. Floats beside the row instead of
+/// expanding it inline (`lineage_row`, `PopupPlacement::Side`), so it no
+/// longer needs to fit inside the 211px right blade — styled as an
+/// elevated floating surface the same way `bottom_panel` is (opaque
+/// `SURFACE`, a `BORDER` hairline, a small radius), not the recessed
+/// translucent fill this file uses for panels that sit flush against
+/// their own background, since this one floats over the workspace.
+///
+/// Milestone labels run past 70 characters in the live data. This panel
+/// lets them WRAP — the default `Text` behaviour, same as every other
+/// multi-line block in this file that doesn't opt out via
+/// `text::Wrapping::None` — rather than `truncate()`ing them the way the
+/// old inline block did. A char-count truncation cutting a label
+/// mid-word was the whole complaint this panel exists to fix, and a
+/// floated panel is not squeezed to the blade's own width, so there is
+/// no longer a reason to shorten the text instead of just showing it.
+fn lineage_detail_panel<'a>(
     by_id: &HashMap<&'a str, &'a GNode>,
     node: &'a GNode,
     relations: &LineageRelations<'a>,
@@ -4990,41 +5071,50 @@ fn lineage_detail<'a>(
             .map_or_else(|| id.to_string(), |n| n.name.clone())
     };
 
-    let mut lines = Vec::new();
+    let mut detail =
+        column![text(node.name.as_str()).size(TEXT_BODY).font(semibold())].spacing(SP_TIGHT);
     if let Some(parent) = relations.parent {
-        lines.push(format!("diverged from {}", name_of(parent)));
+        detail = detail.push(
+            text(format!("diverged from {}", name_of(parent)))
+                .size(TEXT_META)
+                .color(MUTED),
+        );
     }
     if !relations.children.is_empty() {
         let names: Vec<String> = relations.children.iter().map(|id| name_of(id)).collect();
-        lines.push(format!("diverged into {}", join_and(&names)));
+        detail = detail.push(
+            text(format!("diverged into {}", join_and(&names)))
+                .size(TEXT_META)
+                .color(MUTED),
+        );
     }
     if let Some(target) = relations.converged_into {
-        lines.push(format!("converged into {}", name_of(target)));
+        detail = detail.push(
+            text(format!("converged into {}", name_of(target)))
+                .size(TEXT_META)
+                .color(MUTED),
+        );
     }
 
-    let mut detail = column![].spacing(SP_TIGHT);
-    for line in lines {
-        detail = detail.push(text(line).size(TEXT_META).color(MUTED));
-    }
     let mut milestones: Vec<&MilestoneDto> = node.milestones.iter().collect();
     // The host's own array order isn't documented as chronological — sort
     // explicitly so a node's history always reads oldest-to-newest here,
     // regardless of how it arrived over the wire.
     milestones.sort_by_key(|m| m.ms);
     for milestone in milestones {
-        detail = detail.push(
-            text(truncate(&milestone.label, 80))
-                .size(TEXT_META)
-                .color(MUTED),
-        );
+        detail = detail.push(text(milestone.label.as_str()).size(TEXT_META).color(MUTED));
     }
 
     container(detail)
-        .padding(Padding {
-            top: SP_TIGHT,
-            right: SP_TIGHT,
-            bottom: SP_TIGHT,
-            left: ICON_BTN + SP_TIGHT,
+        .padding(SP)
+        .style(|_theme| container::Style {
+            background: Some(Background::Color(SURFACE)),
+            border: Border {
+                color: BORDER,
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            ..container::Style::default()
         })
         .into()
 }
@@ -11570,17 +11660,23 @@ mod lineage_view_tests {
     }
 
     #[test]
-    fn pressing_a_rows_disclosure_expands_and_collapses_its_detail() {
+    fn pressing_a_rows_disclosure_toggles_its_detail_panel() {
         let (mut app, _) = App::new();
         let _ = app.update(Message::LineageRowToggled("n1".to_string()));
-        assert!(app.lineage_expanded.contains("n1"));
+        assert_eq!(app.lineage_detail.as_deref(), Some("n1"));
         let _ = app.update(Message::LineageRowToggled("n1".to_string()));
-        assert!(!app.lineage_expanded.contains("n1"));
+        assert_eq!(app.lineage_detail, None);
     }
 
     #[test]
-    fn expanding_a_row_shows_its_relations_and_milestones() {
-        let mut app = app_with_lineage(LineageGraphDto {
+    fn the_detail_panel_names_relations_in_words_and_shows_milestones_in_full() {
+        // Through `lineage_detail_panel` directly, not `lineage_row`'s
+        // `Popover`: `iced_test`'s `Simulator` does not route events to
+        // overlays, so a popup's own content is only reachable by
+        // rendering the panel-producing function on its own.
+        // `opening_a_rows_detail_panel_does_not_move_its_sibling_rows`
+        // below covers the list itself, but not what the popup shows.
+        let graph = LineageGraphDto {
             nodes: vec![
                 GNode {
                     id: "hub".into(),
@@ -11594,7 +11690,7 @@ mod lineage_view_tests {
                     last_ms: Some(2),
                     milestones: vec![MilestoneDto {
                         ms: 1,
-                        label: "kickoff".to_string(),
+                        label: "a".repeat(90),
                     }],
                 },
             ],
@@ -11603,13 +11699,142 @@ mod lineage_view_tests {
                 to: "child".into(),
                 relation: "diverge".into(),
             }],
-        });
-        app.lineage_expanded.insert("child".to_string());
-        let mut ui = iced_test::simulator(lineage_view(&app));
+        };
+        let by_id: HashMap<&str, &GNode> = graph.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+        let child = &graph.nodes[1];
+        let relations = node_relations(&graph, "child");
+        let long_label = "a".repeat(90);
+
+        let mut ui = iced_test::simulator(lineage_detail_panel(&by_id, child, &relations));
+        ui.find("child")
+            .expect("the panel must head with the channel's own name");
         ui.find("diverged from hub")
-            .expect("an expanded child row must name its parent");
-        ui.find("kickoff")
-            .expect("an expanded row must list its milestones");
+            .expect("the panel must name the parent it diverged from");
+        ui.find(long_label.as_str()).expect(
+            "a milestone label past 70 characters must render in full, not truncated mid-word",
+        );
+    }
+
+    #[test]
+    fn opening_a_rows_detail_panel_does_not_move_its_sibling_rows() {
+        // The regression this change exists to prevent: the old inline
+        // expansion pushed every row below an expanded one down the
+        // list. `iced_test`'s `Simulator` does not route events to
+        // overlays, so this can only assert on the LIST's own layout —
+        // not the popup's contents, covered separately above.
+        let graph = LineageGraphDto {
+            nodes: vec![
+                GNode {
+                    id: "hub".into(),
+                    name: "hub".into(),
+                    last_ms: Some(3),
+                    milestones: Vec::new(),
+                },
+                GNode {
+                    id: "child".into(),
+                    name: "child".into(),
+                    last_ms: Some(2),
+                    milestones: vec![MilestoneDto {
+                        ms: 1,
+                        label: "kickoff".to_string(),
+                    }],
+                },
+                GNode {
+                    id: "after".into(),
+                    name: "after".into(),
+                    last_ms: Some(1),
+                    milestones: Vec::new(),
+                },
+            ],
+            edges: vec![
+                GEdge {
+                    from: "hub".into(),
+                    to: "child".into(),
+                    relation: "diverge".into(),
+                },
+                GEdge {
+                    from: "child".into(),
+                    to: "after".into(),
+                    relation: "diverge".into(),
+                },
+            ],
+        };
+
+        let closed = app_with_lineage(graph.clone());
+        let mut closed_ui = iced_test::simulator(lineage_view(&closed));
+        let closed_y = closed_ui
+            .find("after")
+            .expect("the row after a collapsed one must render")
+            .bounds()
+            .y;
+
+        let mut open = app_with_lineage(graph);
+        open.lineage_detail = Some("child".to_string());
+        let mut open_ui = iced_test::simulator(lineage_view(&open));
+        let open_y = open_ui
+            .find("after")
+            .expect("the row after a row with an open detail panel must still render")
+            .bounds()
+            .y;
+
+        assert_eq!(
+            closed_y, open_y,
+            "opening a row's detail panel must not move any sibling row — it floats beside \
+             the row instead of expanding it inline"
+        );
+    }
+
+    #[test]
+    fn opening_a_rows_detail_panel_closes_that_rows_placement_menu() {
+        let mut app = app_with_lineage_view("unopened");
+        app.pending = Some(PendingOpen {
+            channel: "unopened".to_string(),
+            target: PendingTarget::Channel,
+        });
+
+        let _ = app.update(Message::LineageRowToggled("n1".to_string()));
+
+        assert_eq!(app.lineage_detail.as_deref(), Some("n1"));
+        assert_eq!(
+            app.pending, None,
+            "opening the chevron's detail panel must close that row's name placement menu"
+        );
+    }
+
+    #[test]
+    fn opening_a_rows_placement_menu_closes_that_rows_detail_panel() {
+        let mut app = app_with_lineage_view("unopened");
+        app.lineage_detail = Some("n1".to_string());
+
+        let _ = app.update(Message::LineageChannelPicked("unopened".to_string()));
+
+        assert_eq!(
+            app.lineage_detail, None,
+            "opening that row's name placement menu must close its chevron detail panel"
+        );
+        assert_eq!(
+            app.pending,
+            Some(PendingOpen {
+                channel: "unopened".to_string(),
+                target: PendingTarget::Channel,
+            })
+        );
+    }
+
+    #[test]
+    fn lineage_detail_is_cleared_when_its_channel_leaves_the_graph() {
+        let mut app = app_with_lineage_view("junto-dev");
+        app.lineage_detail = Some("n1".to_string());
+
+        let _ = app.update(Message::LineageGraphLoaded(Some(LineageGraphDto {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+        })));
+
+        assert_eq!(
+            app.lineage_detail, None,
+            "a detail panel for a channel that dropped off the graph must not linger as an orphan"
+        );
     }
 
     #[test]
