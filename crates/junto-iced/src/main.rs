@@ -52,6 +52,36 @@ const YELLOW: Color = Color::from_rgb(0.976, 0.886, 0.686); // --yellow #f9e2af
 const MAUVE: Color = Color::from_rgb(0.796, 0.651, 0.969); // mauve #cba6f7
 const BLUE: Color = Color::from_rgb(0.537, 0.706, 0.980); // --accent #89b4fa
 
+// The type/spacing system: three text sizes with real gaps and four spacing
+// steps on a 4px grid, so hierarchy comes from size + weight + colour-muting
+// instead of nine near-identical sizes that all read as the same weight.
+/// Meta text: timestamps, authors, counts, badges, chip labels, captions.
+/// Usually paired with `MUTED`.
+const TEXT_META: f32 = 11.0;
+/// Body text: the default — entry text, buttons, inputs, list rows.
+const TEXT_BODY: f32 = 13.0;
+/// Title text: pane titles and blade section headers. Paired with
+/// [`semibold`].
+const TEXT_TITLE: f32 = 16.0;
+/// Tight spacing: within a row or chip.
+const SP_TIGHT: f32 = 4.0;
+/// Standard spacing: between siblings.
+const SP: f32 = 8.0;
+/// Loose spacing: blade and container padding.
+const SP_LOOSE: f32 = 12.0;
+/// Section spacing: between major regions.
+const SP_SECTION: f32 = 16.0;
+
+/// The default font at Semibold weight — the one hierarchy tool this pass
+/// introduces. Reserved for `TEXT_TITLE`-sized text and blade section
+/// labels; everything else stays Normal so the weight keeps meaning.
+fn semibold() -> iced::Font {
+    iced::Font {
+        weight: iced::font::Weight::Semibold,
+        ..iced::Font::DEFAULT
+    }
+}
+
 fn main() -> iced::Result {
     let icon = iced::window::icon::from_file_data(include_bytes!("../icon.png"), None).ok();
     // 0.14 takes the boot function FIRST and sets the title separately; the
@@ -2853,8 +2883,8 @@ impl App {
                 AdminView::Agents => agents_panel(self),
             };
             return column![admin_toolbar(self.admin), panel]
-                .spacing(10)
-                .padding(10)
+                .spacing(SP_LOOSE)
+                .padding(SP_LOOSE)
                 .into();
         }
 
@@ -2863,24 +2893,26 @@ impl App {
         // arbitrary 2D nesting — split any pane on either axis, at any depth.
         let grid = pane_grid::PaneGrid::new(&self.panes, |id, pane, _maximized| {
             pane_grid::Content::new(channel_pane(self, id, pane)).title_bar(
-                pane_grid::TitleBar::new(text(pane.channel.as_str()).size(15))
-                    .controls(Element::from(
-                        row![
-                            button("↻").on_press(Message::Refresh(id)).padding(4),
-                            // `State::close` removes nothing and returns `None`
-                            // when `pane` has no sibling (the single-pane case,
-                            // which is also the app's startup state) — disable
-                            // rather than publish a click that does nothing.
-                            button("×")
-                                .on_press_maybe(
-                                    (self.panes.len() > 1).then_some(Message::Close(id))
-                                )
-                                .padding(4),
-                        ]
-                        .spacing(6),
-                    ))
-                    .always_show_controls()
-                    .padding(6),
+                pane_grid::TitleBar::new(
+                    text(pane.channel.as_str())
+                        .size(TEXT_TITLE)
+                        .font(semibold()),
+                )
+                .controls(Element::from(
+                    row![
+                        button("↻").on_press(Message::Refresh(id)).padding(SP_TIGHT),
+                        // `State::close` removes nothing and returns `None`
+                        // when `pane` has no sibling (the single-pane case,
+                        // which is also the app's startup state) — disable
+                        // rather than publish a click that does nothing.
+                        button("×")
+                            .on_press_maybe((self.panes.len() > 1).then_some(Message::Close(id)))
+                            .padding(SP_TIGHT),
+                    ]
+                    .spacing(SP),
+                ))
+                .always_show_controls()
+                .padding(SP),
             )
         })
         .on_resize(10, Message::PaneResized)
@@ -2888,15 +2920,15 @@ impl App {
         .on_click(Message::PaneClicked)
         .width(Fill)
         .height(Fill)
-        .spacing(6);
+        .spacing(SP);
 
         let top_bar = container(admin_toolbar(self.admin)).padding(Padding {
-            top: 10.0,
-            right: 10.0,
+            top: SP_LOOSE,
+            right: SP_LOOSE,
             bottom: 0.0,
-            left: 10.0,
+            left: SP_LOOSE,
         });
-        let center: Element<Message> = container(column![grid].spacing(10).padding(10))
+        let center: Element<Message> = container(column![grid].spacing(SP_LOOSE).padding(SP_LOOSE))
             .id(iced::widget::Id::new("center-grid-column"))
             .into();
 
@@ -2943,24 +2975,24 @@ impl App {
 fn admin_toolbar(current: Option<AdminView>) -> Element<'static, Message> {
     let tab = |label: &'static str, target: Option<AdminView>| {
         let active = current == target;
-        button(text(label).size(13))
+        button(text(label).size(TEXT_BODY))
             .on_press(Message::OpenAdmin(target))
-            .padding([4, 12])
+            .padding([SP_TIGHT, SP_LOOSE])
             .style(move |_t, _s| tab_style(active))
     };
     row![
-        text("junto").size(15),
+        text("junto").size(TEXT_TITLE).font(semibold()),
         Space::new().width(16),
         tab("channels", None),
         tab("settings", Some(AdminView::Settings)),
         tab("agents", Some(AdminView::Agents)),
         Space::new().width(Fill),
-        button(text("↻ refresh").size(12))
+        button(text("↻ refresh").size(TEXT_BODY))
             .on_press(Message::RefreshAll)
-            .padding([4, 12])
+            .padding([SP_TIGHT, SP_LOOSE])
             .style(|_t, _s| chip_style(MUTED, false)),
     ]
-    .spacing(4)
+    .spacing(SP_TIGHT)
     .align_y(Center)
     .into()
 }
@@ -2996,11 +3028,15 @@ fn blade_stub<'a>(side: Side, badge: Option<usize>) -> Element<'a, Message> {
         Side::Left => ("›", Message::ToggleLeftBlade),
         Side::Right => ("‹", Message::ToggleRightBlade),
     };
-    let mut rail = column![button(text(glyph).size(13)).on_press(message).padding(4)]
-        .spacing(6)
-        .align_x(Center);
+    let mut rail = column![
+        button(text(glyph).size(TEXT_BODY))
+            .on_press(message)
+            .padding(SP_TIGHT)
+    ]
+    .spacing(SP)
+    .align_x(Center);
     if let Some(count) = badge.filter(|count| *count > 0) {
-        rail = rail.push(text(count.to_string()).size(11).color(RED));
+        rail = rail.push(text(count.to_string()).size(TEXT_META).color(RED));
     }
     container(rail)
         .width(Length::Fixed(24.0))
@@ -3032,7 +3068,7 @@ fn blade_divider<'a>(side: Side) -> Element<'a, Message> {
 /// new one.
 fn adder(app: &App) -> Element<'_, Message> {
     let open_row = row![
-        text("open ▸").size(13).color(MUTED),
+        text("open ▸").size(TEXT_META).color(MUTED),
         combo_box(
             &app.channels,
             "type to search channels…",
@@ -3041,20 +3077,22 @@ fn adder(app: &App) -> Element<'_, Message> {
         )
         .width(Fill),
     ]
-    .spacing(8)
+    .spacing(SP)
     .align_y(Center);
     let new_row = row![
-        text("· new ▸").size(13).color(MUTED),
+        text("· new ▸").size(TEXT_META).color(MUTED),
         text_input("new channel name…", &app.new_channel)
             .on_input(Message::NewChannelChanged)
             .on_submit(Message::CreateChannel)
             .width(Fill)
-            .padding(6),
-        button("create").on_press(Message::CreateChannel).padding(6),
+            .padding(SP),
+        button("create")
+            .on_press(Message::CreateChannel)
+            .padding(SP),
     ]
-    .spacing(8)
+    .spacing(SP)
     .align_y(Center);
-    let mut adder_col = column![open_row, new_row].spacing(6);
+    let mut adder_col = column![open_row, new_row].spacing(SP);
     // When several substrates are registered, the host needs to know which.
     if app.substrates.len() > 1 {
         adder_col = adder_col.push(
@@ -3063,13 +3101,13 @@ fn adder(app: &App) -> Element<'_, Message> {
                 app.new_channel_repo.clone(),
                 Message::NewChannelRepoChanged,
             )
-            .text_size(12)
-            .padding(6),
+            .text_size(TEXT_BODY)
+            .padding(SP),
         );
     }
     match &app.new_channel_error {
         Some(err) => adder_col
-            .push(text(format!("⚠ {err}")).size(11).color(RED))
+            .push(text(format!("⚠ {err}")).size(TEXT_META).color(RED))
             .into(),
         None => adder_col.into(),
     }
@@ -3078,32 +3116,41 @@ fn adder(app: &App) -> Element<'_, Message> {
 /// Pinned navigation: the open channels, then the controls to open or create
 /// one. Lives at the top of the left blade and never toggles away.
 fn channel_nav(app: &App) -> Element<'_, Message> {
-    let mut list = column![].spacing(2);
+    let mut list = column![].spacing(SP_TIGHT);
     for name in &app.channel_names {
+        let active = app.panes.iter().any(|(_, state)| state.channel == *name);
         list = list.push(
-            button(text(name.as_str()).size(12))
+            button(text(name.as_str()).size(TEXT_BODY))
                 .on_press(Message::ChannelPicked(name.clone()))
-                .padding(4)
+                .padding([SP_TIGHT, SP])
                 .width(Fill)
-                .style(|_t, _s| chip_style(MUTED, false)),
+                .style(move |_t, _s| chip_style(MUTED, active)),
         );
     }
     // Axis-aware splitting of the focused pane — the workspace-level
     // counterpart to `adder`'s "open a channel into a pane".
     let split_row = row![
-        button(text("split →").size(12))
+        button(text("split →").size(TEXT_BODY))
             .on_press(Message::SplitPane(pane_grid::Axis::Vertical))
             .width(Fill)
-            .padding(4),
-        button(text("split ↓").size(12))
+            .padding(SP_TIGHT),
+        button(text("split ↓").size(TEXT_BODY))
             .on_press(Message::SplitPane(pane_grid::Axis::Horizontal))
             .width(Fill)
-            .padding(4),
+            .padding(SP_TIGHT),
     ]
-    .spacing(4);
-    column![scrollable(list).height(Fill), adder(app), split_row]
-        .spacing(6)
-        .into()
+    .spacing(SP_TIGHT);
+    column![
+        text("channels")
+            .size(TEXT_META)
+            .color(MUTED)
+            .font(semibold()),
+        scrollable(list).height(Fill),
+        adder(app),
+        split_row
+    ]
+    .spacing(SP)
+    .into()
 }
 
 /// One focus-board chip: a tagged, coloured summary of a cross-channel
@@ -3120,8 +3167,8 @@ fn focus_chip(item: &FocusItem) -> Element<'_, Message> {
         item.author,
         truncate(&item.summary, 40)
     );
-    let mut chip = button(text(label).size(11))
-        .padding([3, 9])
+    let mut chip = button(text(label).size(TEXT_META))
+        .padding([SP_TIGHT, SP])
         .style(move |_t, _s| chip_style(color, false));
     if let Some(name) = &item.channel_name {
         chip = chip.on_press(Message::FocusChipPicked(
@@ -3139,14 +3186,17 @@ fn attention_view(app: &App) -> Element<'_, Message> {
     // vertical list rather than a horizontal chip strip, since the blade is
     // tall and narrow rather than short and wide.
     if app.focus_items.is_empty() {
-        return text("focus · all clear").size(13).color(GREEN).into();
+        return text("focus · all clear")
+            .size(TEXT_BODY)
+            .color(GREEN)
+            .into();
     }
     let mut items = column![
         text(format!("needs you ({}) ▸", app.focus_items.len()))
-            .size(13)
+            .size(TEXT_BODY)
             .color(YELLOW)
     ]
-    .spacing(4);
+    .spacing(SP_TIGHT);
     for item in &app.focus_items {
         items = items.push(focus_chip(item));
     }
@@ -3158,16 +3208,16 @@ fn attention_view(app: &App) -> Element<'_, Message> {
 /// channels never costs a round trip through a view switcher.
 fn left_blade(app: &App) -> Element<'_, Message> {
     let switcher = row![
-        button(text("attention").size(12))
+        button(text("attention").size(TEXT_BODY))
             .on_press(Message::LeftViewPicked(shell::LeftView::Attention))
-            .padding(4)
+            .padding(SP_TIGHT)
             .style(move |_t, _s| tab_style(app.shell.left_view == shell::LeftView::Attention)),
-        button(text("sessions").size(12))
+        button(text("sessions").size(TEXT_BODY))
             .on_press(Message::LeftViewPicked(shell::LeftView::Sessions))
-            .padding(4)
+            .padding(SP_TIGHT)
             .style(move |_t, _s| tab_style(app.shell.left_view == shell::LeftView::Sessions)),
     ]
-    .spacing(4);
+    .spacing(SP_TIGHT);
 
     let body: Element<Message> = match app.shell.left_view {
         shell::LeftView::Attention => attention_view(app),
@@ -3175,9 +3225,9 @@ fn left_blade(app: &App) -> Element<'_, Message> {
     };
 
     column![
-        button(text("‹").size(13))
+        button(text("‹").size(TEXT_BODY))
             .on_press(Message::ToggleLeftBlade)
-            .padding(4),
+            .padding(SP_TIGHT),
         container(channel_nav(app))
             .id(iced::widget::Id::new("left-blade-nav"))
             .height(Length::FillPortion(
@@ -3190,24 +3240,24 @@ fn left_blade(app: &App) -> Element<'_, Message> {
                 ((1.0 - app.shell.left_split.get()) * 100.0) as u16
             )),
     ]
-    .spacing(6)
-    .padding(8)
+    .spacing(SP)
+    .padding(SP)
     .into()
 }
 
 /// The right blade: a switchable Artifacts/Lineage view.
 fn right_blade(app: &App) -> Element<'_, Message> {
     let switcher = row![
-        button(text("artifacts").size(12))
+        button(text("artifacts").size(TEXT_BODY))
             .on_press(Message::RightViewPicked(shell::RightView::Artifacts))
-            .padding(4)
+            .padding(SP_TIGHT)
             .style(move |_t, _s| tab_style(app.shell.right_view == shell::RightView::Artifacts)),
-        button(text("lineage").size(12))
+        button(text("lineage").size(TEXT_BODY))
             .on_press(Message::RightViewPicked(shell::RightView::Lineage))
-            .padding(4)
+            .padding(SP_TIGHT)
             .style(move |_t, _s| tab_style(app.shell.right_view == shell::RightView::Lineage)),
     ]
-    .spacing(4);
+    .spacing(SP_TIGHT);
 
     let body: Element<Message> = match app.shell.right_view {
         shell::RightView::Artifacts => artifacts_view(app),
@@ -3217,15 +3267,15 @@ fn right_blade(app: &App) -> Element<'_, Message> {
     column![
         row![
             switcher,
-            button(text("›").size(13))
+            button(text("›").size(TEXT_BODY))
                 .on_press(Message::ToggleRightBlade)
-                .padding(4)
+                .padding(SP_TIGHT)
         ]
-        .spacing(6),
+        .spacing(SP),
         body,
     ]
-    .spacing(6)
-    .padding(8)
+    .spacing(SP)
+    .padding(SP)
     .into()
 }
 
@@ -3265,7 +3315,7 @@ fn lineage_view(app: &App) -> Element<'_, Message> {
             .height(Fill)
             .into()
         }
-        None => text("no lineage yet").size(12).color(MUTED).into(),
+        None => text("no lineage yet").size(TEXT_BODY).color(MUTED).into(),
     }
 }
 
@@ -3273,17 +3323,23 @@ fn lineage_view(app: &App) -> Element<'_, Message> {
 /// from the focused pane's existing artifact state rather than a new fetch.
 fn artifacts_view(app: &App) -> Element<'_, Message> {
     let Some(id) = app.focus else {
-        return text("no channel focused").size(12).color(MUTED).into();
+        return text("no channel focused")
+            .size(TEXT_BODY)
+            .color(MUTED)
+            .into();
     };
     let Some(pane) = app.panes.get(id) else {
-        return text("no channel focused").size(12).color(MUTED).into();
+        return text("no channel focused")
+            .size(TEXT_BODY)
+            .color(MUTED)
+            .into();
     };
     match &pane.content {
-        Content::Loading => return text("loading…").size(12).color(MUTED).into(),
-        Content::Error(err) => return text(format!("⚠ {err}")).size(12).color(RED).into(),
+        Content::Loading => return text("loading…").size(TEXT_BODY).color(MUTED).into(),
+        Content::Error(err) => return text(format!("⚠ {err}")).size(TEXT_BODY).color(RED).into(),
         Content::Loaded(_) => {}
     }
-    let mut items = column![].spacing(4);
+    let mut items = column![].spacing(SP_TIGHT);
     for entry in pane.artifact_entries() {
         items = items.push(artifact_row(id, pane, entry));
     }
@@ -3293,17 +3349,23 @@ fn artifacts_view(app: &App) -> Element<'_, Message> {
 /// Agent sessions for the focused channel.
 fn sessions_view(app: &App) -> Element<'_, Message> {
     let Some(id) = app.focus else {
-        return text("no channel focused").size(12).color(MUTED).into();
+        return text("no channel focused")
+            .size(TEXT_BODY)
+            .color(MUTED)
+            .into();
     };
     let Some(pane) = app.panes.get(id) else {
-        return text("no channel focused").size(12).color(MUTED).into();
+        return text("no channel focused")
+            .size(TEXT_BODY)
+            .color(MUTED)
+            .into();
     };
     match &pane.content {
-        Content::Loading => return text("loading…").size(12).color(MUTED).into(),
-        Content::Error(err) => return text(format!("⚠ {err}")).size(12).color(RED).into(),
+        Content::Loading => return text("loading…").size(TEXT_BODY).color(MUTED).into(),
+        Content::Error(err) => return text(format!("⚠ {err}")).size(TEXT_BODY).color(RED).into(),
         Content::Loaded(_) => {}
     }
-    let mut items = column![].spacing(4);
+    let mut items = column![].spacing(SP_TIGHT);
     for session in pane.session_list() {
         items = items.push(session_row(id, pane, session));
     }
@@ -3329,21 +3391,23 @@ fn artifact_row<'a>(
     let mut card = column![
         row![
             badge(artifact_label(&entry.summary), kind_color(&entry.kind)),
-            text(truncate(&entry.author, 24)).size(11).color(MUTED),
+            text(truncate(&entry.author, 24))
+                .size(TEXT_META)
+                .color(MUTED),
         ]
-        .spacing(8),
-        button(text(toggle_label).size(11))
+        .spacing(SP),
+        button(text(toggle_label).size(TEXT_META))
             .on_press(Message::ToggleArtifact(id, entry.id.clone()))
-            .padding([2, 8])
+            .padding([SP_TIGHT, SP])
             .style(|_t, _s| chip_style(TEAL, false)),
     ]
-    .spacing(6);
+    .spacing(SP);
     match expanded {
         Some(ArtifactContent::Loading) => {
-            card = card.push(text("loading…").size(11).color(MUTED));
+            card = card.push(text("loading…").size(TEXT_META).color(MUTED));
         }
         Some(ArtifactContent::Error(err)) => {
-            card = card.push(text(format!("⚠ {err}")).size(11).color(RED));
+            card = card.push(text(format!("⚠ {err}")).size(TEXT_META).color(RED));
         }
         Some(ArtifactContent::Loaded {
             format,
@@ -3364,7 +3428,7 @@ fn artifact_row<'a>(
         None => {}
     }
     container(card)
-        .padding(8)
+        .padding(SP)
         .width(Fill)
         .style(|_theme| container::Style {
             background: Some(Background::Color(SURFACE)),
@@ -3390,10 +3454,10 @@ fn session_row<'a>(
 ) -> Element<'a, Message> {
     let watching = pane.watched.as_deref() == Some(session.id.as_str());
     let label = format!("{} · {}", truncate(&session.intent, 22), session.state);
-    button(text(label).size(11))
+    button(text(label).size(TEXT_META))
         .on_press(Message::Watch(id, session.id.clone()))
         .width(Fill)
-        .padding([3, 8])
+        .padding([SP_TIGHT, SP])
         .style(move |_t, _s| chip_style(status_color(&session.state), watching))
         .into()
 }
@@ -3415,7 +3479,7 @@ fn tab_style(active: bool) -> button::Style {
 /// A bordered card container used by the admin panels.
 fn admin_card<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
     container(content)
-        .padding(10)
+        .padding(SP_LOOSE)
         .width(Fill)
         .style(|_theme| container::Style {
             background: Some(Background::Color(Color { a: 0.4, ..SURFACE })),
@@ -3431,73 +3495,81 @@ fn admin_card<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Messa
 
 /// The settings view: read-only machine status + the register-a-repo form.
 fn settings_panel(app: &App) -> Element<'_, Message> {
-    let mut col = column![text("settings").size(18)].spacing(12);
+    let mut col = column![text("settings").size(TEXT_TITLE).font(semibold())].spacing(SP_SECTION);
     if let Some(s) = &app.settings {
         let kv = |k: &str, v: &str| {
             row![
-                text(format!("{k}:")).size(12).color(MUTED).width(110),
-                text(v.to_string()).size(12).color(TEXT),
+                text(format!("{k}:"))
+                    .size(TEXT_BODY)
+                    .color(MUTED)
+                    .width(110),
+                text(v.to_string()).size(TEXT_BODY).color(TEXT),
             ]
-            .spacing(6)
+            .spacing(SP)
         };
         let mut harness = column![
-            text("harness").size(13).color(TEAL),
+            text("harness").size(TEXT_BODY).color(TEAL),
             kv("protocol", &s.harness.protocol),
             kv("backend", &s.harness.backend),
             kv("auth", &s.harness.auth),
             kv("detail", &s.harness.detail),
         ]
-        .spacing(3);
+        .spacing(SP_TIGHT);
         if let Some(hint) = &s.harness.hint {
-            harness = harness.push(text(format!("hint: {hint}")).size(12).color(YELLOW));
+            harness = harness.push(text(format!("hint: {hint}")).size(TEXT_META).color(YELLOW));
         }
         col = col.push(admin_card(harness));
-        let mut subs = column![text("home substrates").size(13).color(TEAL)].spacing(3);
+        let mut subs =
+            column![text("home substrates").size(TEXT_BODY).color(TEAL)].spacing(SP_TIGHT);
         for p in &s.substrates {
-            subs = subs.push(text(p.clone()).size(12).color(TEXT));
+            subs = subs.push(text(p.clone()).size(TEXT_BODY).color(TEXT));
         }
         col = col.push(admin_card(subs));
-        let mut device = column![text("this device").size(13).color(TEAL)].spacing(3);
+        let mut device = column![text("this device").size(TEXT_BODY).color(TEAL)].spacing(SP_TIGHT);
         match &s.identity {
             Some(i) => {
                 device = device.push(
                     text(format!("{} <{}>", i.name, i.email))
-                        .size(12)
+                        .size(TEXT_BODY)
                         .color(TEXT),
                 );
                 device = device.push(match &app.device_key_fingerprint {
                     Some(fp) => row![
                         badge("key on file", GREEN),
-                        text(fp.clone()).size(11).color(MUTED),
+                        text(fp.clone()).size(TEXT_META).color(MUTED),
                     ]
-                    .spacing(6)
+                    .spacing(SP)
                     .align_y(Center),
                     None => row![
                         text("no device key on file — join a channel below to mint one")
-                            .size(12)
+                            .size(TEXT_META)
                             .color(YELLOW)
                     ],
                 });
             }
             None => {
-                device = device.push(text("(no git identity)").size(12).color(MUTED));
+                device = device.push(text("(no git identity)").size(TEXT_BODY).color(MUTED));
             }
         }
         col = col.push(admin_card(device));
-        col = col.push(text(format!("junto {}", s.version)).size(11).color(MUTED));
+        col = col.push(
+            text(format!("junto {}", s.version))
+                .size(TEXT_META)
+                .color(MUTED),
+        );
     } else {
-        col = col.push(text("loading…").size(12).color(MUTED));
+        col = col.push(text("loading…").size(TEXT_BODY).color(MUTED));
     }
 
     // Join a channel: paste a founder's invite to mint this device's key
     // pair (`POST /devices/enroll`) — the joiner half of pairing a second
     // machine, replacing `junto enroll` in a terminal.
-    let mut join = column![text("join a channel").size(13).color(TEAL)].spacing(6);
+    let mut join = column![text("join a channel").size(TEXT_BODY).color(TEAL)].spacing(SP);
     join = join.push(
         text_input("paste an invite (junto://enroll?code=…)…", &app.join_invite)
             .on_input(Message::JoinInviteChanged)
-            .size(12)
-            .padding(6),
+            .size(TEXT_BODY)
+            .padding(SP),
     );
     let can_join = !app.join_pending && !app.join_invite.trim().is_empty();
     join = join.push(
@@ -3507,43 +3579,43 @@ fn settings_panel(app: &App) -> Element<'_, Message> {
             "join"
         }))
         .on_press_maybe(can_join.then_some(Message::JoinSubmit))
-        .padding(6),
+        .padding(SP),
     );
     if let Some(err) = &app.join_error {
-        join = join.push(text(format!("⚠ {err}")).size(11).color(RED));
+        join = join.push(text(format!("⚠ {err}")).size(TEXT_META).color(RED));
     }
     if let Some(enrolled) = &app.join_result {
         join = join.push(
             column![
                 text(format!("joined as {}", enrolled.email))
-                    .size(12)
+                    .size(TEXT_BODY)
                     .color(GREEN),
                 row![
                     text("enroll code (hand this to the founder)")
-                        .size(12)
+                        .size(TEXT_META)
                         .color(MUTED),
                     copy_button(enrolled.url.clone()),
                 ]
-                .spacing(6)
+                .spacing(SP)
                 .align_y(Center),
-                text(enrolled.url.clone()).size(10).color(TEXT),
+                text(enrolled.url.clone()).size(TEXT_META).color(TEXT),
                 text(format!(
                     "fingerprint (read aloud): {}",
                     enrolled.fingerprint
                 ))
-                .size(11)
+                .size(TEXT_META)
                 .color(TEXT),
                 text(format!(
                     "transport fingerprint: {}",
                     enrolled.transport_fingerprint
                 ))
-                .size(11)
+                .size(TEXT_META)
                 .color(TEXT),
                 text("your secret key never leaves this machine")
-                    .size(11)
+                    .size(TEXT_META)
                     .color(MUTED),
             ]
-            .spacing(4),
+            .spacing(SP_TIGHT),
         );
     }
     col = col.push(admin_card(join));
@@ -3551,18 +3623,18 @@ fn settings_panel(app: &App) -> Element<'_, Message> {
     // Register a repo as a home substrate — the GUI `junto init`.
     let mut repo = column![
         text("register a repo (home substrate)")
-            .size(13)
+            .size(TEXT_BODY)
             .color(TEAL)
     ]
-    .spacing(6);
+    .spacing(SP);
     repo = repo.push(
         row![
             text_input("git repo path…", &app.repo_path)
                 .on_input(Message::RepoPathChanged)
-                .padding(6),
-            button("browse…").on_press(Message::BrowseRepo).padding(6),
+                .padding(SP),
+            button("browse…").on_press(Message::BrowseRepo).padding(SP),
         ]
-        .spacing(6)
+        .spacing(SP)
         .align_y(Center),
     );
     repo = repo.push(
@@ -3571,16 +3643,16 @@ fn settings_panel(app: &App) -> Element<'_, Message> {
             &app.repo_channel,
         )
         .on_input(Message::RepoChannelChanged)
-        .size(12)
-        .padding(6),
+        .size(TEXT_BODY)
+        .padding(SP),
     );
-    repo = repo.push(button("register").on_press(Message::SetupRepo).padding(6));
+    repo = repo.push(button("register").on_press(Message::SetupRepo).padding(SP));
     if let Some(msg) = &app.repo_msg {
         let (label, color) = match msg {
             Ok(m) => (m.clone(), GREEN),
             Err(e) => (format!("⚠ {e}"), RED),
         };
-        repo = repo.push(text(label).size(11).color(color));
+        repo = repo.push(text(label).size(TEXT_META).color(color));
     }
     col = col.push(admin_card(repo));
     scrollable(col).height(Fill).into()
@@ -3589,9 +3661,9 @@ fn settings_panel(app: &App) -> Element<'_, Message> {
 /// The agents view: the configured agents with edit/delete, plus a create/edit
 /// form (core fields — name, harness, role, model).
 fn agents_panel(app: &App) -> Element<'_, Message> {
-    let mut list = column![text("agents").size(18)].spacing(8);
+    let mut list = column![text("agents").size(TEXT_TITLE).font(semibold())].spacing(SP);
     if app.agents.is_empty() {
-        list = list.push(text("no agents configured").size(12).color(MUTED));
+        list = list.push(text("no agents configured").size(TEXT_BODY).color(MUTED));
     }
     for a in &app.agents {
         let detail = a
@@ -3602,21 +3674,21 @@ fn agents_panel(app: &App) -> Element<'_, Message> {
         let role = a.role.clone().unwrap_or_default();
         let entry = row![
             column![
-                text(format!("{} · {}{}", a.name, a.harness, detail)).size(13),
-                text(truncate(&role, 70)).size(11).color(MUTED),
+                text(format!("{} · {}{}", a.name, a.harness, detail)).size(TEXT_BODY),
+                text(truncate(&role, 70)).size(TEXT_META).color(MUTED),
             ]
-            .spacing(2),
+            .spacing(SP_TIGHT),
             Space::new().width(Fill),
-            button(text("edit").size(11))
+            button(text("edit").size(TEXT_META))
                 .on_press(Message::AgentEdit(a.clone()))
-                .padding([2, 8])
+                .padding([SP_TIGHT, SP])
                 .style(|_t, _s| chip_style(BLUE, false)),
-            button(text("delete").size(11))
+            button(text("delete").size(TEXT_META))
                 .on_press(Message::DeleteAgent(a.slug.clone()))
-                .padding([2, 8])
+                .padding([SP_TIGHT, SP])
                 .style(|_t, _s| chip_style(RED, false)),
         ]
-        .spacing(6)
+        .spacing(SP)
         .align_y(Center);
         list = list.push(admin_card(entry));
     }
@@ -3629,14 +3701,14 @@ fn agents_panel(app: &App) -> Element<'_, Message> {
         .unwrap_or_default();
     let mut form = column![
         text(if editing { "edit agent" } else { "new agent" })
-            .size(13)
+            .size(TEXT_BODY)
             .color(TEAL)
     ]
-    .spacing(6);
+    .spacing(SP);
     form = form.push(
         text_input("name (e.g. Security Reviewer)", &app.agent_name)
             .on_input(Message::AgentNameChanged)
-            .padding(6),
+            .padding(SP),
     );
     if !harnesses.is_empty() {
         form = form.push(
@@ -3646,109 +3718,109 @@ fn agents_panel(app: &App) -> Element<'_, Message> {
                 Message::AgentHarnessPicked,
             )
             .placeholder("harness")
-            .text_size(12)
-            .padding(6),
+            .text_size(TEXT_BODY)
+            .padding(SP),
         );
     }
     form = form.push(
         text_input("role / system prompt (optional)", &app.agent_role)
             .on_input(Message::AgentRoleChanged)
-            .size(12)
-            .padding(6),
+            .size(TEXT_BODY)
+            .padding(SP),
     );
     form = form.push(
         text_input("model override (optional)", &app.agent_model)
             .on_input(Message::AgentModelChanged)
-            .size(12)
-            .padding(6),
+            .size(TEXT_BODY)
+            .padding(SP),
     );
 
     // --- advanced config: MCP servers, skills, local plugins ---
     let remove_btn = |msg: Message| {
-        button(text("×").size(12))
+        button(text("×").size(TEXT_BODY))
             .on_press(msg)
-            .padding([2, 8])
+            .padding([SP_TIGHT, SP])
             .style(|_t, _s| chip_style(RED, false))
     };
     let add_btn = |label: &'static str, msg: Message| {
-        button(text(label).size(11))
+        button(text(label).size(TEXT_META))
             .on_press(msg)
-            .padding([2, 8])
+            .padding([SP_TIGHT, SP])
             .style(|_t, _s| chip_style(MUTED, false))
     };
 
-    let mut mcp = column![text("MCP servers").size(12).color(MUTED)].spacing(4);
+    let mut mcp = column![text("MCP servers").size(TEXT_META).color(MUTED)].spacing(SP_TIGHT);
     for (i, (name, url)) in app.agent_mcp.iter().enumerate() {
         mcp = mcp.push(
             row![
                 text_input("name", name)
                     .on_input(move |v| Message::McpNameChanged(i, v))
-                    .size(12)
-                    .padding(6)
+                    .size(TEXT_BODY)
+                    .padding(SP)
                     .width(Length::FillPortion(1)),
                 text_input("https://…/mcp", url)
                     .on_input(move |v| Message::McpUrlChanged(i, v))
-                    .size(12)
-                    .padding(6)
+                    .size(TEXT_BODY)
+                    .padding(SP)
                     .width(Length::FillPortion(2)),
                 remove_btn(Message::McpRemove(i)),
             ]
-            .spacing(6)
+            .spacing(SP)
             .align_y(Center),
         );
     }
     mcp = mcp.push(add_btn("+ add server", Message::McpAddRow));
     form = form.push(mcp);
 
-    let mut skills = column![text("skills").size(12).color(MUTED)].spacing(4);
+    let mut skills = column![text("skills").size(TEXT_META).color(MUTED)].spacing(SP_TIGHT);
     for (i, s) in app.agent_skills.iter().enumerate() {
         skills = skills.push(
             row![
                 text_input("skill name (or plugin:skill)", s)
                     .on_input(move |v| Message::SkillChanged(i, v))
-                    .size(12)
-                    .padding(6),
+                    .size(TEXT_BODY)
+                    .padding(SP),
                 remove_btn(Message::SkillRemove(i)),
             ]
-            .spacing(6)
+            .spacing(SP)
             .align_y(Center),
         );
     }
     skills = skills.push(add_btn("+ add skill", Message::SkillAddRow));
     form = form.push(skills);
 
-    let mut plugins = column![text("local plugins").size(12).color(MUTED)].spacing(4);
+    let mut plugins = column![text("local plugins").size(TEXT_META).color(MUTED)].spacing(SP_TIGHT);
     for (i, p) in app.agent_plugins.iter().enumerate() {
         plugins = plugins.push(
             row![
                 text_input("absolute plugin directory", p)
                     .on_input(move |v| Message::PluginChanged(i, v))
-                    .size(12)
-                    .padding(6),
+                    .size(TEXT_BODY)
+                    .padding(SP),
                 add_btn("browse…", Message::PluginBrowse(i)),
                 remove_btn(Message::PluginRemove(i)),
             ]
-            .spacing(6)
+            .spacing(SP)
             .align_y(Center),
         );
     }
     plugins = plugins.push(add_btn("+ add plugin", Message::PluginAddRow));
     form = form.push(plugins);
 
-    let mut actions = row![button("save").on_press(Message::SaveAgent).padding(6)].spacing(6);
+    let mut actions = row![button("save").on_press(Message::SaveAgent).padding(SP)].spacing(SP);
     if editing {
         actions = actions.push(
-            button(text("new").size(13))
+            button(text("new").size(TEXT_BODY))
                 .on_press(Message::AgentNew)
-                .padding(6)
+                .padding(SP)
                 .style(|_t, _s| chip_style(MUTED, false)),
         );
     }
     form = form.push(actions);
     if let Some(msg) = &app.agent_msg {
-        form = form.push(text(format!("⚠ {msg}")).size(11).color(RED));
+        form = form.push(text(format!("⚠ {msg}")).size(TEXT_META).color(RED));
     }
-    scrollable(column![list, admin_card(form)].spacing(16))
+    scrollable(column![list, admin_card(form)].spacing(SP_SECTION))
         .height(Fill)
         .into()
 }
@@ -3774,21 +3846,21 @@ fn remote_row<'a>(
         None => "watch as (email) — no identity on this machine".to_string(),
     };
     let inputs = row![
-        text("remote ▸").size(11).color(MUTED),
+        text("remote ▸").size(TEXT_META).color(MUTED),
         text_input("host (blank = local)", pane.remote.as_deref().unwrap_or(""))
             .on_input(move |v| Message::RemoteChanged(id, v))
-            .size(11)
-            .padding(4)
+            .size(TEXT_META)
+            .padding(SP_TIGHT)
             .width(Length::FillPortion(2)),
         text_input(&watch_placeholder, &pane.watch_email)
             .on_input(move |v| Message::WatchEmailChanged(id, v))
-            .size(11)
-            .padding(4)
+            .size(TEXT_META)
+            .padding(SP_TIGHT)
             .width(Length::FillPortion(1)),
     ]
-    .spacing(6)
+    .spacing(SP)
     .align_y(Center);
-    let mut col = column![inputs].spacing(2);
+    let mut col = column![inputs].spacing(SP_TIGHT);
     // The live subscription's id is keyed on (session, stream_nonce) — not on
     // these fields — so it keeps a keystroke from tearing down and
     // reconnecting the socket on every character. The cost is that editing
@@ -3796,7 +3868,7 @@ fn remote_row<'a>(
     if pane.streaming {
         col = col.push(
             text("applies on next watch — doesn't affect the running connection")
-                .size(10)
+                .size(TEXT_META)
                 .color(MUTED),
         );
     }
@@ -3819,11 +3891,11 @@ fn channel_pane<'a>(app: &'a App, id: pane_grid::Pane, pane: &'a Pane) -> Elemen
             remote_row(id, pane, machine_email),
             pane_body(id, pane, &app.agents, &app.channel_names)
         ]
-        .spacing(8),
+        .spacing(SP),
     )
     .width(Fill)
     .height(Fill)
-    .padding(8)
+    .padding(SP)
     .style(|_theme| container::Style {
         background: Some(Background::Color(Color { a: 0.4, ..SURFACE })),
         border: Border {
@@ -3842,13 +3914,13 @@ fn brief_panel<'a>(items: &'a [markdown::Item], raw: &str) -> Element<'a, Messag
     let body =
         markdown::view(items, Theme::CatppuccinMocha).map(|url| Message::OpenUrl(url.to_string()));
     let head = row![
-        text("brief").size(11).color(TEAL),
+        text("brief").size(TEXT_META).color(TEAL),
         Space::new().width(Fill),
         copy_button(raw.to_string()),
     ]
     .align_y(Center);
-    container(column![head, body].spacing(6))
-        .padding(10)
+    container(column![head, body].spacing(SP))
+        .padding(SP_LOOSE)
         .width(Fill)
         .style(|_theme| container::Style {
             background: Some(Background::Color(Color { a: 0.5, ..SURFACE })),
@@ -3876,15 +3948,15 @@ fn lifecycle_form<'a>(
     kind: LifecycleKind,
     channels: &'a [String],
 ) -> Element<'a, Message> {
-    let mut col = column![].spacing(6);
+    let mut col = column![].spacing(SP);
     match kind {
         LifecycleKind::Diverge => {
             col = col.push(
                 text_input("side-quest name…", &pane.lifecycle_text)
                     .on_input(move |v| Message::LifecycleTextChanged(id, v))
                     .on_submit(Message::LifecycleSubmit(id))
-                    .size(12)
-                    .padding(6),
+                    .size(TEXT_BODY)
+                    .padding(SP),
             );
         }
         LifecycleKind::Converge => {
@@ -3902,16 +3974,16 @@ fn lifecycle_form<'a>(
                         Message::LifecycleTargetChanged(id, name)
                     })
                     .placeholder("converge into which channel?")
-                    .text_size(12)
-                    .padding(6)
+                    .text_size(TEXT_BODY)
+                    .padding(SP)
                     .width(Fill),
                 )
                 .push(
                     text_input("rationale (required)…", &pane.lifecycle_text)
                         .on_input(move |v| Message::LifecycleTextChanged(id, v))
                         .on_submit(Message::LifecycleSubmit(id))
-                        .size(12)
-                        .padding(6),
+                        .size(TEXT_BODY)
+                        .padding(SP),
                 );
         }
         LifecycleKind::Rename => {
@@ -3919,15 +3991,15 @@ fn lifecycle_form<'a>(
                 .push(
                     text_input("new channel name…", &pane.lifecycle_target)
                         .on_input(move |v| Message::LifecycleTargetChanged(id, v))
-                        .size(12)
-                        .padding(6),
+                        .size(TEXT_BODY)
+                        .padding(SP),
                 )
                 .push(
                     text_input("rationale (required)…", &pane.lifecycle_text)
                         .on_input(move |v| Message::LifecycleTextChanged(id, v))
                         .on_submit(Message::LifecycleSubmit(id))
-                        .size(12)
-                        .padding(6),
+                        .size(TEXT_BODY)
+                        .padding(SP),
                 );
         }
         LifecycleKind::Close | LifecycleKind::Reopen => {
@@ -3935,8 +4007,8 @@ fn lifecycle_form<'a>(
                 text_input("rationale (required)…", &pane.lifecycle_text)
                     .on_input(move |v| Message::LifecycleTextChanged(id, v))
                     .on_submit(Message::LifecycleSubmit(id))
-                    .size(12)
-                    .padding(6),
+                    .size(TEXT_BODY)
+                    .padding(SP),
             );
         }
     }
@@ -3945,8 +4017,8 @@ fn lifecycle_form<'a>(
     } else {
         kind.label()
     };
-    let mut confirm = button(text(confirm_label).size(11))
-        .padding([3, 10])
+    let mut confirm = button(text(confirm_label).size(TEXT_META))
+        .padding([SP_TIGHT, SP_LOOSE])
         .style(|_t, _s| chip_style(GREEN, true));
     if !pane.lifecycle_pending {
         confirm = confirm.on_press(Message::LifecycleSubmit(id));
@@ -3954,18 +4026,18 @@ fn lifecycle_form<'a>(
     col = col.push(
         row![
             confirm,
-            button(text("cancel").size(11))
+            button(text("cancel").size(TEXT_META))
                 .on_press(Message::LifecycleCancel(id))
-                .padding([3, 10])
+                .padding([SP_TIGHT, SP_LOOSE])
                 .style(|_t, _s| chip_style(MUTED, false)),
         ]
-        .spacing(6),
+        .spacing(SP),
     );
     if let Some(err) = &pane.lifecycle_error {
-        col = col.push(text(format!("⚠ {err}")).size(11).color(RED));
+        col = col.push(text(format!("⚠ {err}")).size(TEXT_META).color(RED));
     }
     container(col)
-        .padding(8)
+        .padding(SP)
         .width(Fill)
         .style(|_theme| container::Style {
             background: Some(Background::Color(Color { a: 0.4, ..SURFACE })),
@@ -3987,8 +4059,14 @@ fn lifecycle_form<'a>(
 fn members_disclosure<'a>(id: pane_grid::Pane, pane: &'a Pane) -> Element<'a, Message> {
     let Some(keys) = &pane.keys else {
         return match &pane.keys_error {
-            Some(err) => text(format!("members: {err}")).size(12).color(RED).into(),
-            None => text("members · loading…").size(12).color(MUTED).into(),
+            Some(err) => text(format!("members: {err}"))
+                .size(TEXT_BODY)
+                .color(RED)
+                .into(),
+            None => text("members · loading…")
+                .size(TEXT_BODY)
+                .color(MUTED)
+                .into(),
         };
     };
     let device_count: usize = keys.members.iter().map(|m| m.devices.len()).sum();
@@ -3998,31 +4076,31 @@ fn members_disclosure<'a>(id: pane_grid::Pane, pane: &'a Pane) -> Element<'a, Me
             if pane.members_open { "▾" } else { "▸" },
             keys.members.len(),
         ))
-        .size(12),
+        .size(TEXT_BODY),
     )
     .on_press(Message::MembersToggle(id))
-    .padding(6)
+    .padding(SP)
     .style(|_t, _s| chip_style(MUTED, false));
 
-    let mut col = column![header].spacing(6);
+    let mut col = column![header].spacing(SP);
     if let Some(err) = &pane.keys_error {
-        col = col.push(text(format!("⚠ {err}")).size(11).color(RED));
+        col = col.push(text(format!("⚠ {err}")).size(TEXT_META).color(RED));
     }
     if pane.members_open {
         for member in &keys.members {
             col = col.push(member_row(id, pane, keys, member));
         }
         if keys.viewer_is_founder {
-            let mut acts = row![text("members ▸").size(11).color(MUTED)]
-                .spacing(6)
+            let mut acts = row![text("members ▸").size(TEXT_META).color(MUTED)]
+                .spacing(SP)
                 .align_y(Center);
             for form in [IdentityForm::Invite, IdentityForm::Redeem] {
                 let active = pane.identity_form.as_ref() == Some(&form);
                 let label = form.label();
                 acts = acts.push(
-                    button(text(label).size(11))
+                    button(text(label).size(TEXT_META))
                         .on_press(Message::IdentitySelect(id, form))
-                        .padding([2, 8])
+                        .padding([SP_TIGHT, SP])
                         .style(move |_t, _s| chip_style(TEAL, active)),
                 );
             }
@@ -4034,13 +4112,13 @@ fn members_disclosure<'a>(id: pane_grid::Pane, pane: &'a Pane) -> Element<'a, Me
             if let Some(notice) = &pane.identity_notice {
                 col = col.push(
                     row![
-                        text(notice.clone()).size(11).color(GREEN),
-                        button(text("dismiss").size(10))
+                        text(notice.clone()).size(TEXT_META).color(GREEN),
+                        button(text("dismiss").size(TEXT_META))
                             .on_press(Message::IdentityCancel(id))
-                            .padding([1, 6])
+                            .padding([SP_TIGHT, SP])
                             .style(|_t, _s| chip_style(MUTED, false)),
                     ]
-                    .spacing(8)
+                    .spacing(SP)
                     .align_y(Center),
                 );
             }
@@ -4062,10 +4140,10 @@ fn member_row<'a>(
 ) -> Element<'a, Message> {
     let kind_badge_color = if member.kind == "agent" { MAUVE } else { TEAL };
     let mut head = row![
-        text(&member.display_name).size(12),
+        text(&member.display_name).size(TEXT_BODY),
         badge(&member.kind, kind_badge_color),
     ]
-    .spacing(6)
+    .spacing(SP)
     .align_y(Center);
     let can_revoke =
         keys.viewer_is_founder && !member.revoked && member.email != keys.founder_email;
@@ -4075,19 +4153,22 @@ fn member_row<'a>(
         };
         let active = pane.identity_form.as_ref() == Some(&target);
         head = head.push(
-            button(text("revoke").size(10))
+            button(text("revoke").size(TEXT_META))
                 .on_press(Message::IdentitySelect(id, target))
-                .padding([1, 6])
+                .padding([SP_TIGHT, SP])
                 .style(move |_t, _s| chip_style(RED, active)),
         );
     }
 
-    let mut col = column![head, text(member_summary(member)).size(11).color(MUTED)]
-        .spacing(3)
-        .padding(Padding::default().left(14));
+    let mut col = column![
+        head,
+        text(member_summary(member)).size(TEXT_META).color(MUTED)
+    ]
+    .spacing(SP_TIGHT)
+    .padding(Padding::default().left(SP_LOOSE));
     for grant in &member.devices {
-        let mut line = row![text(device_line(grant)).size(11).color(MUTED)]
-            .spacing(6)
+        let mut line = row![text(device_line(grant)).size(TEXT_META).color(MUTED)]
+            .spacing(SP)
             .align_y(Center);
         let can_retire = keys.viewer_is_founder && grant.retired_at.is_none();
         if can_retire {
@@ -4096,9 +4177,9 @@ fn member_row<'a>(
             };
             let active = pane.identity_form.as_ref() == Some(&target);
             line = line.push(
-                button(text("retire").size(10))
+                button(text("retire").size(TEXT_META))
                     .on_press(Message::IdentitySelect(id, target))
-                    .padding([1, 6])
+                    .padding([SP_TIGHT, SP])
                     .style(move |_t, _s| chip_style(YELLOW, active)),
             );
         }
@@ -4129,7 +4210,7 @@ fn identity_form<'a>(
     pane: &'a Pane,
     form: &'a IdentityForm,
 ) -> Element<'a, Message> {
-    let mut col = column![].spacing(6);
+    let mut col = column![].spacing(SP);
     // Whether the confirm button may activate at all — each kind's own
     // required-input rule, checked here so an unmet requirement makes the
     // button simply absent-of-`on_press`, never present-but-silently-refusing.
@@ -4139,19 +4220,19 @@ fn identity_form<'a>(
             col = col.push(
                 text_input("member email…", &pane.identity_member)
                     .on_input(move |v| Message::IdentityInput(id, IdentityField::Member, v))
-                    .size(12)
-                    .padding(6),
+                    .size(TEXT_BODY)
+                    .padding(SP),
             );
-            let mut channels = row![text("channels ▸").size(11).color(MUTED)]
-                .spacing(6)
+            let mut channels = row![text("channels ▸").size(TEXT_META).color(MUTED)]
+                .spacing(SP)
                 .align_y(Center);
             for (idx, (name, ticked)) in pane.identity_channels.iter().enumerate() {
                 channels = channels.push(
                     checkbox(*ticked)
                         .label(name.clone())
                         .on_toggle(move |_| Message::IdentityChannelToggle(id, idx))
-                        .size(13)
-                        .text_size(11),
+                        .size(TEXT_BODY)
+                        .text_size(TEXT_META),
                 );
             }
             col = col.push(channels);
@@ -4160,21 +4241,24 @@ fn identity_form<'a>(
             if let Some(dto) = &pane.invite_minted {
                 let remaining = countdown(dto.expires_at, now_millis());
                 let status: Element<Message> = if remaining == "expired" {
-                    text("expired — mint another").size(11).color(YELLOW).into()
+                    text("expired — mint another")
+                        .size(TEXT_META)
+                        .color(YELLOW)
+                        .into()
                 } else {
                     column![
                         row![
-                            text(dto.url.clone()).size(11).color(TEAL),
+                            text(dto.url.clone()).size(TEXT_META).color(TEAL),
                             copy_button(dto.url.clone()),
-                            text(remaining).size(11).color(MUTED),
+                            text(remaining).size(TEXT_META).color(MUTED),
                         ]
-                        .spacing(8)
+                        .spacing(SP)
                         .align_y(Center),
                         text(format!("covers: {}", dto.channels.join(", ")))
-                            .size(10)
+                            .size(TEXT_META)
                             .color(MUTED),
                     ]
-                    .spacing(2)
+                    .spacing(SP_TIGHT)
                     .into()
                 };
                 col = col.push(status);
@@ -4182,7 +4266,7 @@ fn identity_form<'a>(
         }
         IdentityForm::Redeem => {
             if !pane.redeem_outcomes.is_empty() {
-                let mut outcomes = column![].spacing(3);
+                let mut outcomes = column![].spacing(SP_TIGHT);
                 for outcome in &pane.redeem_outcomes {
                     let color = match outcome.result.as_str() {
                         "granted" => GREEN,
@@ -4200,12 +4284,12 @@ fn identity_form<'a>(
                         .unwrap_or_default();
                     outcomes = outcomes.push(
                         text(format!("{name} — {}{detail}", outcome.result))
-                            .size(11)
+                            .size(TEXT_META)
                             .color(color),
                     );
                     if let Some(warning) = outcome.warning.as_deref() {
-                        outcomes =
-                            outcomes.push(text(format!("  {warning}")).size(10).color(YELLOW));
+                        outcomes = outcomes
+                            .push(text(format!("  {warning}")).size(TEXT_META).color(YELLOW));
                     }
                 }
                 col = col.push(outcomes);
@@ -4213,8 +4297,8 @@ fn identity_form<'a>(
                 col = col.push(
                     text_input("enroll code (pasted invite)…", &pane.identity_paste)
                         .on_input(move |v| Message::IdentityInput(id, IdentityField::Paste, v))
-                        .size(12)
-                        .padding(6),
+                        .size(TEXT_BODY)
+                        .padding(SP),
                 );
                 if let Some(preview) = &pane.redeem_preview {
                     let channel_set = preview
@@ -4231,22 +4315,22 @@ fn identity_form<'a>(
                             preview.fingerprint,
                             preview.transport_fingerprint
                         ))
-                        .size(11)
+                        .size(TEXT_META)
                         .color(MUTED),
                     );
-                    let mut kind_row = row![text("kind ▸").size(11).color(MUTED)]
-                        .spacing(6)
+                    let mut kind_row = row![text("kind ▸").size(TEXT_META).color(MUTED)]
+                        .spacing(SP)
                         .align_y(Center);
                     for kind in ["human", "agent"] {
                         let active = pane.identity_kind == kind;
                         kind_row = kind_row.push(
-                            button(text(kind).size(11))
+                            button(text(kind).size(TEXT_META))
                                 .on_press(Message::IdentityInput(
                                     id,
                                     IdentityField::Kind,
                                     kind.to_string(),
                                 ))
-                                .padding([2, 8])
+                                .padding([SP_TIGHT, SP])
                                 .style(move |_t, _s| chip_style(TEAL, active)),
                         );
                     }
@@ -4262,23 +4346,23 @@ fn identity_form<'a>(
                 text_input("rationale (required)…", &pane.identity_rationale)
                     .on_input(move |v| Message::IdentityInput(id, IdentityField::Rationale, v))
                     .on_submit(Message::IdentitySubmit(id))
-                    .size(12)
-                    .padding(6),
+                    .size(TEXT_BODY)
+                    .padding(SP),
             );
             ready = !pane.identity_rationale.trim().is_empty();
         }
         IdentityForm::Revoke { .. } => {
             col = col.push(
                 text("the member stays in the party; only their entries after now stop counting.")
-                    .size(11)
+                    .size(TEXT_META)
                     .color(MUTED),
             );
             col = col.push(
                 text_input("rationale (required)…", &pane.identity_rationale)
                     .on_input(move |v| Message::IdentityInput(id, IdentityField::Rationale, v))
                     .on_submit(Message::IdentitySubmit(id))
-                    .size(12)
-                    .padding(6),
+                    .size(TEXT_BODY)
+                    .padding(SP),
             );
             ready = !pane.identity_rationale.trim().is_empty();
         }
@@ -4287,9 +4371,9 @@ fn identity_form<'a>(
     let outcomes_shown = matches!(form, IdentityForm::Redeem) && !pane.redeem_outcomes.is_empty();
     if outcomes_shown {
         col = col.push(
-            button(text("dismiss").size(11))
+            button(text("dismiss").size(TEXT_META))
                 .on_press(Message::IdentityCancel(id))
-                .padding([3, 10])
+                .padding([SP_TIGHT, SP_LOOSE])
                 .style(|_t, _s| chip_style(MUTED, false)),
         );
     } else {
@@ -4298,8 +4382,8 @@ fn identity_form<'a>(
         } else {
             form.label()
         };
-        let mut confirm = button(text(confirm_label).size(11))
-            .padding([3, 10])
+        let mut confirm = button(text(confirm_label).size(TEXT_META))
+            .padding([SP_TIGHT, SP_LOOSE])
             .style(|_t, _s| chip_style(GREEN, true));
         if !pane.identity_pending && ready {
             confirm = confirm.on_press(Message::IdentitySubmit(id));
@@ -4307,19 +4391,19 @@ fn identity_form<'a>(
         col = col.push(
             row![
                 confirm,
-                button(text("cancel").size(11))
+                button(text("cancel").size(TEXT_META))
                     .on_press(Message::IdentityCancel(id))
-                    .padding([3, 10])
+                    .padding([SP_TIGHT, SP_LOOSE])
                     .style(|_t, _s| chip_style(MUTED, false)),
             ]
-            .spacing(6),
+            .spacing(SP),
         );
     }
     if let Some(err) = &pane.identity_error {
-        col = col.push(text(format!("⚠ {err}")).size(11).color(RED));
+        col = col.push(text(format!("⚠ {err}")).size(TEXT_META).color(RED));
     }
     container(col)
-        .padding(8)
+        .padding(SP)
         .width(Fill)
         .style(|_theme| container::Style {
             background: Some(Background::Color(Color { a: 0.4, ..SURFACE })),
@@ -4345,49 +4429,49 @@ fn identity_form<'a>(
 fn annotate_composer(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
     let path_input = text_input("path (blank = comment on the stream)", &pane.annotate_path)
         .on_input(move |v| Message::AnnotatePathChanged(id, v))
-        .size(12)
-        .padding(6)
+        .size(TEXT_BODY)
+        .padding(SP)
         .width(Length::FillPortion(2));
     let lines_input = text_input("lines (\"12\" or \"12-14\")", &pane.annotate_lines)
         .on_input(move |v| Message::AnnotateLinesChanged(id, v))
-        .size(12)
-        .padding(6)
+        .size(TEXT_BODY)
+        .padding(SP)
         .width(Length::FillPortion(1));
     let body_input = text_input("annotate…", &pane.annotate_body)
         .on_input(move |v| Message::AnnotateBodyChanged(id, v))
         .on_submit(Message::AnnotateSubmit(id))
-        .size(12)
-        .padding(6);
+        .size(TEXT_BODY)
+        .padding(SP);
     let urgent = checkbox(pane.annotate_urgent)
         .label("urgent")
         .on_toggle(move |on| Message::AnnotateUrgentToggled(id, on))
-        .size(14)
-        .text_size(11);
-    let submit = button(text("comment").size(11))
+        .size(TEXT_BODY)
+        .text_size(TEXT_META);
+    let submit = button(text("comment").size(TEXT_META))
         .on_press(Message::AnnotateSubmit(id))
-        .padding(6);
+        .padding(SP);
     // What this comment will actually be anchored to, stated plainly. The
     // inputs alone can't say it: an empty path could mean the newest event or a
     // block that was pointed at, and those land on different ops.
-    let mut aimed = row![text(aim_label(pane)).size(11).color(TEAL)]
-        .spacing(6)
+    let mut aimed = row![text(aim_label(pane)).size(TEXT_META).color(TEAL)]
+        .spacing(SP)
         .align_y(Center);
     if pane.annotate_op.is_some() || !pane.annotate_path.trim().is_empty() {
         aimed = aimed.push(
-            button(text("clear").size(10))
+            button(text("clear").size(TEXT_META))
                 .on_press(Message::AnchorClear(id))
-                .padding([1, 6])
+                .padding([SP_TIGHT, SP])
                 .style(|_t, _s| chip_style(MUTED, false)),
         );
     }
     column![
-        row![text("annotate ▸").size(11).color(MUTED), aimed]
-            .spacing(8)
+        row![text("annotate ▸").size(TEXT_META).color(MUTED), aimed]
+            .spacing(SP)
             .align_y(Center),
-        row![path_input, lines_input].spacing(6),
-        row![body_input, urgent, submit].spacing(6).align_y(Center),
+        row![path_input, lines_input].spacing(SP),
+        row![body_input, urgent, submit].spacing(SP).align_y(Center),
     ]
-    .spacing(4)
+    .spacing(SP_TIGHT)
     .into()
 }
 
@@ -4431,39 +4515,39 @@ fn aim_label(pane: &Pane) -> String {
 /// bottom composer back.
 fn annotate_popup(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
     let head = row![
-        text(aim_label(pane)).size(11).color(TEAL),
+        text(aim_label(pane)).size(TEXT_META).color(TEAL),
         Space::new().width(Fill),
-        button(text("×").size(12))
+        button(text("×").size(TEXT_BODY))
             .on_press(Message::AnchorClear(id))
-            .padding([0, 6])
+            .padding([SP_TIGHT, SP])
             .style(|_t, _s| chip_style(MUTED, false)),
     ]
-    .spacing(6)
+    .spacing(SP)
     .align_y(Center);
     let body_input = text_input("comment on these lines…", &pane.annotate_body)
         .on_input(move |v| Message::AnnotateBodyChanged(id, v))
         .on_submit(Message::AnnotateSubmit(id))
-        .size(12)
-        .padding(6);
+        .size(TEXT_BODY)
+        .padding(SP);
     let urgent = checkbox(pane.annotate_urgent)
         .label("urgent")
         .on_toggle(move |on| Message::AnnotateUrgentToggled(id, on))
-        .size(14)
-        .text_size(11);
-    let submit = button(text("comment").size(11))
+        .size(TEXT_BODY)
+        .text_size(TEXT_META);
+    let submit = button(text("comment").size(TEXT_META))
         .on_press(Message::AnnotateSubmit(id))
-        .padding(6);
+        .padding(SP);
     container(
         column![
             head,
             body_input,
             row![Space::new().width(Fill), urgent, submit]
-                .spacing(8)
+                .spacing(SP)
                 .align_y(Center),
         ]
-        .spacing(6),
+        .spacing(SP),
     )
-    .padding(10)
+    .padding(SP_LOOSE)
     .style(|_theme| container::Style {
         // Fully opaque: this floats over the diff, so anything translucent
         // would leave code showing through the comment box.
@@ -4487,11 +4571,13 @@ fn pane_body<'a>(
 ) -> Element<'a, Message> {
     let dto = match &pane.content {
         Content::Loading => {
-            return container(text("loading…").color(MUTED)).padding(12).into();
+            return container(text("loading…").color(MUTED))
+                .padding(SP_LOOSE)
+                .into();
         }
         Content::Error(err) => {
             return container(text(format!("error: {err}")).color(RED))
-                .padding(12)
+                .padding(SP_LOOSE)
                 .into();
         }
         Content::Loaded(dto) => dto,
@@ -4505,10 +4591,10 @@ fn pane_body<'a>(
     // The channel's own header: the members disclosure, a closed badge,
     // and the lifecycle acts (lineage lives in the top window-wide branch
     // graph).
-    let mut header = column![].spacing(6);
+    let mut header = column![].spacing(SP);
     header = header.push(members_disclosure(id, pane));
     if dto.closed {
-        header = header.push(row![badge("closed", RED)].spacing(8).align_y(Center));
+        header = header.push(row![badge("closed", RED)].spacing(SP).align_y(Center));
     }
     // Lifecycle act buttons; a closed channel only offers reopen.
     let acts: &[LifecycleKind] = if dto.closed {
@@ -4521,15 +4607,15 @@ fn pane_body<'a>(
             LifecycleKind::Close,
         ]
     };
-    let mut bar = row![text("channel ▸").size(11).color(MUTED)]
-        .spacing(6)
+    let mut bar = row![text("channel ▸").size(TEXT_META).color(MUTED)]
+        .spacing(SP)
         .align_y(Center);
     for &k in acts {
         let active = pane.lifecycle == Some(k);
         bar = bar.push(
-            button(text(k.label()).size(11))
+            button(text(k.label()).size(TEXT_META))
                 .on_press(Message::LifecycleSelect(id, k))
-                .padding([2, 8])
+                .padding([SP_TIGHT, SP])
                 .style(move |_t, _s| chip_style(MUTED, active)),
         );
     }
@@ -4541,7 +4627,7 @@ fn pane_body<'a>(
     // Launch a session: intent + agent picker + mode toggle + workspace.
     let intent_input = text_input("launch a session — what should it do?", &pane.launch_intent)
         .on_input(move |v| Message::LaunchIntentChanged(id, v))
-        .padding(6);
+        .padding(SP);
     // Don't accept submits/clicks while a launch is in flight.
     let intent_input = if pane.launching {
         intent_input
@@ -4553,7 +4639,7 @@ fn pane_body<'a>(
     } else {
         "launch"
     }))
-    .padding(6);
+    .padding(SP);
     if !pane.launching {
         launch_btn = launch_btn.on_press(Message::Launch(id));
     }
@@ -4563,21 +4649,24 @@ fn pane_body<'a>(
         } else {
             "options ▸"
         })
-        .size(12),
+        .size(TEXT_BODY),
     )
     .on_press(Message::ToggleLaunchOptions(id))
-    .padding(6)
+    .padding(SP)
     .style(|_t, _s| chip_style(MUTED, false));
-    let intent_row = row![intent_input, launch_btn, options_toggle].spacing(6);
+    let intent_row = row![intent_input, launch_btn, options_toggle].spacing(SP);
     let agent_picker: Element<Message> = if agents.is_empty() {
-        text("no agents configured").size(11).color(MUTED).into()
+        text("no agents configured")
+            .size(TEXT_META)
+            .color(MUTED)
+            .into()
     } else {
         pick_list(agents.to_vec(), pane.launch_agent.clone(), move |a| {
             Message::LaunchAgentPicked(id, a)
         })
         .placeholder("default agent")
-        .text_size(12)
-        .padding(6)
+        .text_size(TEXT_BODY)
+        .padding(SP)
         .into()
     };
     // Mode as a checkbox (matches the web): unchecked = a single turn (default);
@@ -4585,8 +4674,8 @@ fn pane_body<'a>(
     let mode_checkbox = checkbox(pane.launch_outcome)
         .label("code-PR push-gate (verify loop)")
         .on_toggle(move |on| Message::LaunchModeChanged(id, on))
-        .size(16)
-        .text_size(12);
+        .size(TEXT_BODY)
+        .text_size(TEXT_BODY);
     let options_row = row![
         agent_picker,
         text_input(
@@ -4594,30 +4683,30 @@ fn pane_body<'a>(
             &pane.launch_workspace,
         )
         .on_input(move |v| Message::LaunchWorkspaceChanged(id, v))
-        .size(12)
-        .padding(6),
-        button(text("browse…").size(12))
+        .size(TEXT_BODY)
+        .padding(SP),
+        button(text("browse…").size(TEXT_BODY))
             .on_press(Message::BrowseWorkspace(id))
-            .padding(6),
+            .padding(SP),
     ]
-    .spacing(6)
+    .spacing(SP)
     .align_y(Center);
-    let mut launch = column![intent_row].spacing(6);
+    let mut launch = column![intent_row].spacing(SP);
     if pane.launch_expanded {
         launch = launch.push(options_row).push(mode_checkbox);
     }
     if let Some(err) = &pane.launch_error {
-        launch = launch.push(text(format!("⚠ {err}")).size(11).color(RED));
+        launch = launch.push(text(format!("⚠ {err}")).size(TEXT_META).color(RED));
     }
 
     // Session chips — click to stream a session's live feed.
-    let mut chips = row![].spacing(6);
+    let mut chips = row![].spacing(SP);
     for session in &dto.sessions {
         let watching = pane.watched.as_deref() == Some(session.id.as_str());
         let label = format!("{} · {}", truncate(&session.intent, 22), session.state);
-        let chip = button(text(label).size(11))
+        let chip = button(text(label).size(TEXT_META))
             .on_press(Message::Watch(id, session.id.clone()))
-            .padding([3, 8])
+            .padding([SP_TIGHT, SP])
             .style(move |_t, _s| chip_style(status_color(&session.state), watching));
         chips = chips.push(chip);
     }
@@ -4629,14 +4718,14 @@ fn pane_body<'a>(
         let session_dto = dto.sessions.iter().find(|s| s.id == session_id);
         let intent = session_dto.map(|s| s.intent.clone()).unwrap_or_default();
         let state_label = session_dto.map(|s| s.state.clone()).unwrap_or_default();
-        let mut header = row![text(format!("session · {}", truncate(&intent, 36))).size(13)]
-            .spacing(8)
+        let mut header = row![text(format!("session · {}", truncate(&intent, 36))).size(TEXT_BODY)]
+            .spacing(SP)
             .align_y(Center);
         if !state_label.is_empty() {
             header = header.push(badge(&state_label, status_color(&state_label)));
         }
         if pane.streaming {
-            header = header.push(text("● live").size(11).color(GREEN));
+            header = header.push(text("● live").size(TEXT_META).color(GREEN));
         }
         // Presence, in the header rather than buried in the feed: who else is
         // looking at this session right now (`Message::Watchers`).
@@ -4645,9 +4734,9 @@ fn pane_body<'a>(
         }
         header = header.push(Space::new().width(Fill));
         header = header.push(
-            button(text("× close").size(11))
+            button(text("× close").size(TEXT_META))
                 .on_press(Message::CloseSession(id))
-                .padding([2, 8])
+                .padding([SP_TIGHT, SP])
                 .style(|_t, _s| chip_style(MUTED, false)),
         );
 
@@ -4677,7 +4766,7 @@ fn pane_body<'a>(
         // entry targeting it (memos, artifacts), in timeline order. The primary
         // diff is omitted — it is already the main panel, and showing it twice
         // is how the record got long enough to hide things in.
-        let mut record = column![].spacing(8);
+        let mut record = column![].spacing(SP);
         for entry in &dto.entries {
             let is_primary = primary.is_some_and(|p| p.id == entry.id);
             if !is_primary
@@ -4699,13 +4788,13 @@ fn pane_body<'a>(
         // The live exchange (your steers + the agent's streaming output). Kept
         // visible after the turn lands until you leave the session.
         if pane.streaming || !pane.feed.is_empty() {
-            record = record.push(text("— live turn —").size(11).color(MUTED));
-            let mut feed = column![].spacing(6);
+            record = record.push(text("— live turn —").size(TEXT_META).color(MUTED));
+            let mut feed = column![].spacing(SP);
             for item in &pane.feed {
                 feed = feed.push(feed_block(id, item, pane.annotate_op));
             }
             if pane.streaming {
-                feed = feed.push(text("● working…").size(11).color(YELLOW));
+                feed = feed.push(text("● working…").size(TEXT_META).color(YELLOW));
             }
             record = record.push(feed);
         }
@@ -4720,28 +4809,28 @@ fn pane_body<'a>(
         let steer_input = text_input(placeholder, &pane.steer_text)
             .on_input(move |v| Message::SteerTextChanged(id, v))
             .on_submit(Message::Steer(id))
-            .padding(6);
-        let mut interrupt_btn = button("interrupt").padding(6);
+            .padding(SP);
+        let mut interrupt_btn = button("interrupt").padding(SP);
         if pane.streaming {
             interrupt_btn = interrupt_btn.on_press(Message::Interrupt(id));
         }
         let steer = row![
             steer_input,
-            button("steer").on_press(Message::Steer(id)).padding(6),
+            button("steer").on_press(Message::Steer(id)).padding(SP),
             interrupt_btn,
         ]
-        .spacing(6);
+        .spacing(SP);
         let main_area: Element<Message> = match primary {
             Some(artifact) => row![
                 container(code_panel(id, pane, artifact, aim)).width(Length::FillPortion(3)),
                 container(record_scroll).width(Length::FillPortion(2)),
             ]
-            .spacing(10)
+            .spacing(SP_LOOSE)
             .height(Fill)
             .into(),
             None => record_scroll.into(),
         };
-        let mut session_col = column![header, main_area, steer].spacing(8);
+        let mut session_col = column![header, main_area, steer].spacing(SP);
         // The bottom composer is the fallback surface. While a floating panel is
         // anchored to the clicked row it IS the composer, so showing both would
         // put two comment boxes on screen for one comment.
@@ -4762,7 +4851,7 @@ fn pane_body<'a>(
                     "commenting needs a live turn — steer above to resume this \
                      session, then click a diff line",
                 )
-                .size(11)
+                .size(TEXT_META)
                 .color(MUTED),
             );
         }
@@ -4782,11 +4871,11 @@ fn pane_body<'a>(
         let pinned: Option<Element<Message>> = highlight.and_then(|hid| {
             dto.entries.iter().find(|e| e.id == hid).map(|entry| {
                 let header = row![
-                    text("▾ needs you").size(11).color(YELLOW),
+                    text("▾ needs you").size(TEXT_META).color(YELLOW),
                     Space::new().width(Fill),
-                    button(text("dismiss").size(11).color(MUTED))
+                    button(text("dismiss").size(TEXT_META).color(MUTED))
                         .on_press(Message::ClearHighlight(id))
-                        .padding([2, 8])
+                        .padding([SP_TIGHT, SP])
                         .style(|_t, _s| chip_style(MUTED, false)),
                 ]
                 .align_y(Center);
@@ -4806,12 +4895,12 @@ fn pane_body<'a>(
                         None
                     )
                 ]
-                .spacing(4)
+                .spacing(SP_TIGHT)
                 .into()
             })
         });
         let total = dto.entries.len();
-        let mut timeline = column![].spacing(8);
+        let mut timeline = column![].spacing(SP);
         // Lead with the channel's curated brief (recall bridge): standing
         // decisions + what needs attention. The full entry history is a click
         // away — when there's no brief, fall back to the most recent entries.
@@ -4838,9 +4927,9 @@ fn pane_body<'a>(
                 format!("▸ show full history ({total} entries)")
             };
             timeline = timeline.push(
-                button(text(label).size(11))
+                button(text(label).size(TEXT_META))
                     .on_press(Message::ToggleHistory(id))
-                    .padding([2, 8])
+                    .padding([SP_TIGHT, SP])
                     .style(|_t, _s| chip_style(MUTED, false)),
             );
         }
@@ -4862,14 +4951,14 @@ fn pane_body<'a>(
         }
         let scroll = scrollable(timeline).id(pane.scroll_id.clone()).height(Fill);
         match pinned {
-            Some(pinned) => column![pinned, scroll].spacing(8).into(),
+            Some(pinned) => column![pinned, scroll].spacing(SP).into(),
             None => scroll.into(),
         }
     };
 
     column![header, launch, chips, main]
-        .spacing(8)
-        .padding([8.0_f32, 10.0])
+        .spacing(SP)
+        .padding([SP, SP_LOOSE])
         .into()
 }
 
@@ -4905,7 +4994,7 @@ fn feed_block<'a>(
             )
             .on_press(Message::AnchorStream(id, op))
             .width(GUTTER)
-            .padding([0, 5])
+            .padding([0.0, SP_TIGHT])
             .style(move |_theme, status| {
                 let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
                 button::Style {
@@ -4932,7 +5021,7 @@ fn feed_block<'a>(
         None => Space::new().width(GUTTER).into(),
     };
     row![gutter, feed_line(item)]
-        .spacing(4)
+        .spacing(SP_TIGHT)
         .align_y(iced::Top)
         .into()
 }
@@ -4944,10 +5033,10 @@ fn feed_line(item: &FeedItem) -> Element<'_, Message> {
     if item.event.kind == "you" {
         return container(
             text(format!("you › {}", item.event.text))
-                .size(13)
+                .size(TEXT_BODY)
                 .color(BLUE),
         )
-        .padding([3, 8])
+        .padding([SP_TIGHT, SP])
         .width(Fill)
         .style(|_theme| container::Style {
             background: Some(Background::Color(Color { a: 0.12, ..BLUE })),
@@ -4977,7 +5066,7 @@ fn feed_line(item: &FeedItem) -> Element<'_, Message> {
         "result" => GREEN,
         _ => TEXT,
     };
-    text(body).size(13).color(color).into()
+    text(body).size(TEXT_BODY).color(color).into()
 }
 
 /// Strip agent-facing id noise from the curated brief before showing it to a
@@ -5249,9 +5338,9 @@ fn code_panel<'a>(
 ) -> Element<'a, Message> {
     let head = row![
         badge("diff", kind_color("artifact")),
-        text(artifact.summary.clone()).size(12).color(MUTED),
+        text(artifact.summary.clone()).size(TEXT_BODY).color(MUTED),
     ]
-    .spacing(8)
+    .spacing(SP)
     .align_y(Center);
     let body: Element<Message> = match pane.artifacts.get(&artifact.id) {
         Some(ArtifactContent::Loaded {
@@ -5260,15 +5349,20 @@ fn code_panel<'a>(
             md,
             digest,
         }) => artifact_body(id, &artifact.id, digest, format, body, md.as_deref(), aim),
-        Some(ArtifactContent::Loading) => text("loading the diff…").size(11).color(MUTED).into(),
-        Some(ArtifactContent::Error(err)) => text(format!("⚠ {err}")).size(11).color(RED).into(),
-        None => button(text("show the diff").size(11))
+        Some(ArtifactContent::Loading) => text("loading the diff…")
+            .size(TEXT_META)
+            .color(MUTED)
+            .into(),
+        Some(ArtifactContent::Error(err)) => {
+            text(format!("⚠ {err}")).size(TEXT_META).color(RED).into()
+        }
+        None => button(text("show the diff").size(TEXT_META))
             .on_press(Message::ToggleArtifact(id, artifact.id.clone()))
-            .padding(6)
+            .padding(SP)
             .into(),
     };
     column![head, scrollable(body).height(Fill)]
-        .spacing(6)
+        .spacing(SP)
         .into()
 }
 
@@ -5322,7 +5416,7 @@ fn timeline_entry<'a>(
             aim
         )
     ]
-    .spacing(10)
+    .spacing(SP_LOOSE)
     .into()
 }
 
@@ -5399,9 +5493,9 @@ fn entry_card<'a>(
     };
     let mut head = row![
         badge(kind_label, accent),
-        text(entry.author.clone()).size(11).color(MUTED)
+        text(entry.author.clone()).size(TEXT_META).color(MUTED)
     ]
-    .spacing(8);
+    .spacing(SP);
     if let Some(status) = &entry.status {
         head = head.push(badge(status, status_color(status)));
     }
@@ -5419,9 +5513,12 @@ fn entry_card<'a>(
     let body: Element<Message> = if let Some(items) = summary_md {
         markdown::view(items, Theme::CatppuccinMocha).map(|url| Message::OpenUrl(url.to_string()))
     } else {
-        text(entry.summary.clone()).size(13).color(TEXT).into()
+        text(entry.summary.clone())
+            .size(TEXT_BODY)
+            .color(TEXT)
+            .into()
     };
-    let mut card = column![head, body].spacing(6);
+    let mut card = column![head, body].spacing(SP);
 
     // Inline verification acts on open assertions/proposals. The decision
     // frame's pre-baked options come first as one-click buttons (each carries
@@ -5430,12 +5527,12 @@ fn entry_card<'a>(
     // so the controls clear once the entry resolves.
     if let Some((affirm, decline)) = entry_acts(entry) {
         let entry_id = entry.id.clone();
-        let mut acts = column![].spacing(6);
+        let mut acts = column![].spacing(SP);
 
         // Pre-baked frame options coherent with this entry's two acts. Stacked
         // full-width so they stay readable in a narrow pane (no horizontal
         // overflow); the act is tagged on the right of each row.
-        let mut options = column![].spacing(4);
+        let mut options = column![].spacing(SP_TIGHT);
         let mut has_options = false;
         for opt in &entry.frame {
             if opt.act != affirm && opt.act != decline {
@@ -5445,15 +5542,15 @@ fn entry_card<'a>(
             let affirmative = opt.act == affirm;
             let color = if affirmative { GREEN } else { RED };
             let inner = row![
-                text(opt.label.clone()).size(11),
+                text(opt.label.clone()).size(TEXT_META),
                 Space::new().width(Fill),
-                text(opt.act.clone()).size(10),
+                text(opt.act.clone()).size(TEXT_META),
             ]
-            .spacing(8)
+            .spacing(SP)
             .align_y(Center);
             let mut opt_btn = button(inner)
                 .width(Fill)
-                .padding([4, 10])
+                .padding([SP_TIGHT, SP_LOOSE])
                 .style(move |_t, _s| chip_style(color, affirmative));
             if !pending {
                 opt_btn = opt_btn.on_press(Message::Act(
@@ -5476,13 +5573,13 @@ fn entry_card<'a>(
                 let entry_id = entry_id.clone();
                 move |v| Message::ActRationaleChanged(id, entry_id.clone(), v)
             })
-            .size(12)
-            .padding(6);
-        let mut affirm_btn = button(text(affirm).size(11))
-            .padding([3, 10])
+            .size(TEXT_BODY)
+            .padding(SP);
+        let mut affirm_btn = button(text(affirm).size(TEXT_META))
+            .padding([SP_TIGHT, SP_LOOSE])
             .style(|_t, _s| chip_style(GREEN, true));
-        let mut decline_btn = button(text(decline).size(11))
-            .padding([3, 10])
+        let mut decline_btn = button(text(decline).size(TEXT_META))
+            .padding([SP_TIGHT, SP_LOOSE])
             .style(|_t, _s| chip_style(RED, false));
         if has_rationale && !pending {
             affirm_btn = affirm_btn.on_press(Message::Act(
@@ -5500,17 +5597,17 @@ fn entry_card<'a>(
         }
         acts = acts.push(
             row![rationale, affirm_btn, decline_btn]
-                .spacing(6)
+                .spacing(SP)
                 .align_y(Center),
         );
         if pending {
             acts = acts.push(
                 text("recording… (writing to the ledger)")
-                    .size(11)
+                    .size(TEXT_META)
                     .color(YELLOW),
             );
         } else if let Some(err) = error {
-            acts = acts.push(text(format!("⚠ {err}")).size(11).color(RED));
+            acts = acts.push(text(format!("⚠ {err}")).size(TEXT_META).color(RED));
         }
         card = card.push(acts);
     }
@@ -5524,17 +5621,17 @@ fn entry_card<'a>(
             "show content ▸"
         };
         card = card.push(
-            button(text(toggle_label).size(11))
+            button(text(toggle_label).size(TEXT_META))
                 .on_press(Message::ToggleArtifact(id, entry.id.clone()))
-                .padding([2, 8])
+                .padding([SP_TIGHT, SP])
                 .style(|_t, _s| chip_style(TEAL, false)),
         );
         match artifact {
             Some(ArtifactContent::Loading) => {
-                card = card.push(text("loading…").size(11).color(MUTED));
+                card = card.push(text("loading…").size(TEXT_META).color(MUTED));
             }
             Some(ArtifactContent::Error(err)) => {
-                card = card.push(text(format!("⚠ {err}")).size(11).color(RED));
+                card = card.push(text(format!("⚠ {err}")).size(TEXT_META).color(RED));
             }
             Some(ArtifactContent::Loaded {
                 format,
@@ -5565,7 +5662,7 @@ fn entry_card<'a>(
         (BORDER, 1.0)
     };
     container(card)
-        .padding(10)
+        .padding(SP_LOOSE)
         .width(Fill)
         .style(move |_theme| container::Style {
             background: Some(Background::Color(SURFACE)),
@@ -5671,7 +5768,7 @@ fn artifact_body<'a>(
             markdown::view(items, Theme::CatppuccinMocha)
                 .map(|url| Message::OpenUrl(url.to_string())),
         )
-        .padding(8)
+        .padding(SP)
         .width(Fill)
         .style(|_theme| container::Style {
             background: Some(Background::Color(Color {
@@ -5696,14 +5793,14 @@ fn artifact_body<'a>(
         Some(_) if is_diff => diff_row_targets(body),
         _ => Vec::new(),
     };
-    let mut col = column![].spacing(1);
+    let mut col = column![].spacing(SP_TIGHT);
     for (i, line) in lines.iter().enumerate().take(MAX_DIFF_ROWS) {
         let color = if is_diff { diff_line_color(line) } else { TEXT };
         let Some(aim) = aim else {
             col = col.push(
                 text((*line).to_string())
                     .font(iced::Font::MONOSPACE)
-                    .size(12)
+                    .size(TEXT_BODY)
                     .color(color),
             );
             continue;
@@ -5754,7 +5851,7 @@ fn artifact_body<'a>(
                 "… ({} more lines — open in the web view for the full content)",
                 lines.len() - MAX_DIFF_ROWS
             ))
-            .size(11)
+            .size(TEXT_META)
             .color(MUTED),
         );
     }
@@ -5771,7 +5868,7 @@ fn artifact_body<'a>(
         col.into()
     };
     container(body)
-        .padding(8)
+        .padding(SP)
         .width(Fill)
         .style(|_theme| container::Style {
             background: Some(Background::Color(Color {
@@ -5839,11 +5936,11 @@ fn anchor_row<'a>(
     let row = container(
         text(body.to_string())
             .font(iced::Font::MONOSPACE)
-            .size(12)
+            .size(TEXT_BODY)
             .color(color),
     )
     .width(Fill)
-    .padding([0, 4])
+    .padding([0.0, SP_TIGHT])
     .style(move |_theme| container::Style {
         background: (lit || hovered).then_some(Background::Color(Color {
             a: if lit { 0.28 } else { 0.14 },
@@ -5866,9 +5963,9 @@ fn anchor_row<'a>(
 /// A small "copy" button that writes `text` to the clipboard (Iced static text
 /// isn't mouse-selectable, so copy buttons are how you grab content).
 fn copy_button(text_to_copy: String) -> Element<'static, Message> {
-    button(text("copy").size(10))
+    button(text("copy").size(TEXT_META))
         .on_press(Message::Copy(text_to_copy))
-        .padding([1, 6])
+        .padding([SP_TIGHT, SP])
         .style(|_t, _s| chip_style(MUTED, false))
         .into()
 }
@@ -5880,20 +5977,20 @@ fn copy_button(text_to_copy: String) -> Element<'static, Message> {
 /// `Ephemeral` presence frames already deliver.
 fn watchers_chip(watchers: &[String]) -> Element<'static, Message> {
     const MAX_AVATARS: usize = 4;
-    let mut chip = row![].spacing(3).align_y(Center);
+    let mut chip = row![].spacing(SP_TIGHT).align_y(Center);
     for email in watchers.iter().take(MAX_AVATARS) {
         chip = chip.push(avatar(email));
     }
     if watchers.len() > MAX_AVATARS {
         chip = chip.push(
             text(format!("+{}", watchers.len() - MAX_AVATARS))
-                .size(10)
+                .size(TEXT_META)
                 .color(MUTED),
         );
     }
     chip.push(
         text(format!("{} watching", watchers.len()))
-            .size(11)
+            .size(TEXT_META)
             .color(TEAL),
     )
     .into()
@@ -5908,10 +6005,10 @@ fn avatar(email: &str) -> Element<'static, Message> {
     let tint = TINTS[email_tint(email) as usize % TINTS.len()];
     let pill = container(
         text(watcher_initials(email))
-            .size(9)
+            .size(TEXT_META)
             .color(Color::from_rgb(0.12, 0.12, 0.18)),
     )
-    .padding([1, 4])
+    .padding([SP_TIGHT, SP_TIGHT])
     .style(move |_theme| container::Style {
         background: Some(Background::Color(tint)),
         border: Border {
@@ -5922,8 +6019,8 @@ fn avatar(email: &str) -> Element<'static, Message> {
     });
     tooltip(
         pill,
-        container(text(email.to_string()).size(11).color(TEXT))
-            .padding([2, 6])
+        container(text(email.to_string()).size(TEXT_META).color(TEXT))
+            .padding([SP_TIGHT, SP])
             .style(|_theme| container::Style {
                 background: Some(Background::Color(SURFACE)),
                 border: Border {
@@ -5949,10 +6046,10 @@ fn email_tint(email: &str) -> u32 {
 fn badge(label: &str, color: Color) -> Element<'static, Message> {
     container(
         text(label.to_string())
-            .size(11)
+            .size(TEXT_META)
             .color(Color::from_rgb(0.12, 0.12, 0.18)),
     )
-    .padding([2, 7])
+    .padding([SP_TIGHT, SP])
     .style(move |_theme| container::Style {
         background: Some(Background::Color(color)),
         border: Border {
