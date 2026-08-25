@@ -74,8 +74,9 @@ const SP_SECTION: f32 = 16.0;
 /// Width of a blade's drag handle. Reserved even when the blade is collapsed
 /// so collapsing changes only the blade's own width, never the row's total.
 const DIVIDER_W: f32 = 5.0;
-/// Height of the bottom drawer (attention/sessions), with its content
-/// scrolling inside.
+/// Maximum height of the floating attention/sessions panel (`bottom_panel`)
+/// — content shorter than this hugs its own size; content taller than this
+/// scrolls inside via the panel's own scrollable, exactly as before.
 const DRAWER_H: f32 = 240.0;
 
 /// Every icon-only button is this square, so a row of them reads as a grid
@@ -935,7 +936,7 @@ enum Message {
     ToggleRightBlade,
     /// Switch the right blade's view.
     RightViewPicked(shell::RightView),
-    /// Press a footer drawer trigger: toggle that view open/closed.
+    /// Press a footer trigger chip: toggle that floating panel open/closed.
     BottomViewToggled(shell::BottomView),
     /// Press a blade-width divider handle: begin a resize drag.
     BladeDragStart(Side),
@@ -3065,11 +3066,7 @@ impl App {
         ]
         .spacing(0);
 
-        let mut root = column![top_bar, shell_row];
-        if let Some(view) = self.shell.bottom {
-            root = root.push(bottom_drawer(self, view));
-        }
-        root.push(footer(self)).into()
+        column![top_bar, shell_row, footer(self)].into()
     }
 }
 
@@ -3122,7 +3119,7 @@ fn footer(app: &App) -> Element<'_, Message> {
 
     let attention = app.focus_items.len();
     let attention_open = app.shell.bottom == Some(shell::BottomView::Attention);
-    let attention_trigger: Element<Message> = if attention > 0 {
+    let attention_chip: Element<Message> = if attention > 0 {
         let word = if attention == 1 { "needs" } else { "need" };
         button(
             row![
@@ -3146,10 +3143,26 @@ fn footer(app: &App) -> Element<'_, Message> {
         .align_y(Center)
         .into()
     };
+    // Floats over the workspace instead of displacing it — the "float
+    // over" metaphor Orca's own status-strip popovers use — anchored to
+    // THIS chip so it rises from the chip's own x-position, and dismisses
+    // on an outside click (`Popover::on_dismiss`) or a second press of the
+    // chip. 360px: wider than the 280px left-blade default
+    // (`shell::BladeWidth::LEFT_DEFAULT`) since a focus chip's label
+    // carries a tag, channel, author, and up to a 40-char summary;
+    // narrower than the annotate popup's 560 default, which sizes for
+    // typed comment text rather than a short chip list.
+    let attention_trigger: Element<Message> = Popover::new(
+        attention_chip,
+        attention_open.then(|| bottom_panel(app, shell::BottomView::Attention)),
+    )
+    .width(360.0)
+    .on_dismiss(Message::BottomViewToggled(shell::BottomView::Attention))
+    .into();
 
     let sessions = pane.map_or(0, |p| p.session_list().len());
     let sessions_open = app.shell.bottom == Some(shell::BottomView::Sessions);
-    let sessions_trigger: Element<Message> = if sessions > 0 {
+    let sessions_chip: Element<Message> = if sessions > 0 {
         button(
             row![
                 icon(ICON_BOT),
@@ -3171,6 +3184,13 @@ fn footer(app: &App) -> Element<'_, Message> {
         .align_y(Center)
         .into()
     };
+    let sessions_trigger: Element<Message> = Popover::new(
+        sessions_chip,
+        sessions_open.then(|| bottom_panel(app, shell::BottomView::Sessions)),
+    )
+    .width(360.0)
+    .on_dismiss(Message::BottomViewToggled(shell::BottomView::Sessions))
+    .into();
 
     let dot = || text("·").size(TEXT_META).color(MUTED);
     let strip = row![
@@ -3209,32 +3229,32 @@ fn footer(app: &App) -> Element<'_, Message> {
         .into()
 }
 
-/// The bottom drawer: attention or sessions content, opened from one of the
-/// footer's trigger chips. Rendered full width above the footer at a fixed
-/// height (`DRAWER_H`) — its content scrolls inside via the same
-/// `scrollable(..).height(Fill)` `attention_view`/`sessions_view` already
-/// wrap their lists in, unchanged by living inside a fixed-height parent.
-fn bottom_drawer(app: &App, view: shell::BottomView) -> Element<'_, Message> {
+/// The floating attention/sessions panel: opened by pressing one of the
+/// footer's trigger chips, which anchors it via `Popover` so it rises from
+/// THAT chip's x-position and floats over the workspace instead of
+/// displacing it. `DRAWER_H` caps its height rather than fixing it, so a
+/// short list hugs its own size; a longer one is capped and scrolls inside
+/// via the same `scrollable(..)` `attention_view`/`sessions_view` already
+/// wrap their lists in.
+fn bottom_panel(app: &App, view: shell::BottomView) -> Element<'_, Message> {
     let (title, body) = match view {
         shell::BottomView::Attention => ("attention", attention_view(app)),
         shell::BottomView::Sessions => ("sessions", sessions_view(app)),
     };
 
-    // No close button: the footer chip that opened this drawer toggles it
-    // shut, so a second dismiss control here is a redundant target in the
-    // one strip whose whole purpose is reducing clutter.
+    // No close button: the chip that opened this panel toggles it shut,
+    // and `Popover::on_dismiss` closes it on an outside click too.
     let header = text(title).size(TEXT_BODY).font(semibold());
 
-    container(column![header, body].spacing(SP).height(Fill))
-        .width(Fill)
-        .height(Length::Fixed(DRAWER_H))
+    container(column![header, body].spacing(SP))
+        .max_height(DRAWER_H)
         .padding(SP)
         .style(|_theme| container::Style {
-            background: Some(Background::Color(Color { a: 0.4, ..SURFACE })),
+            background: Some(Background::Color(SURFACE)),
             border: Border {
                 color: BORDER,
                 width: 1.0,
-                radius: 0.0.into(),
+                radius: 6.0.into(),
             },
             ..container::Style::default()
         })
@@ -3445,12 +3465,12 @@ fn attention_view(app: &App) -> Element<'_, Message> {
     for item in &app.focus_items {
         items = items.push(focus_chip(item));
     }
-    scrollable(items).height(Fill).into()
+    scrollable(items).into()
 }
 
 /// The left blade: pinned channel navigation, and nothing else — the
 /// former switchable Attention/Sessions view beneath it now lives in the
-/// footer-triggered bottom drawer (`bottom_drawer`), so nothing is left to
+/// footer-triggered floating panel (`bottom_panel`), so nothing is left to
 /// switch.
 fn left_blade(app: &App) -> Element<'_, Message> {
     // The toggle sits OUTSIDE the blade's padding, flush to the window's
@@ -3623,7 +3643,7 @@ fn sessions_view(app: &App) -> Element<'_, Message> {
     for session in pane.session_list() {
         items = items.push(session_row(id, pane, session));
     }
-    scrollable(items).height(Fill).into()
+    scrollable(items).into()
 }
 
 /// One artifact entry in the right blade's Artifacts view: the same kind
@@ -8934,11 +8954,15 @@ diff --git a/lib.rs b/lib.rs
         );
     }
 
-    /// A 240px fixed-height bottom drawer is the most plausible way to
-    /// accidentally squeeze the center workspace — this settles it the same
-    /// way as the guard above, with the drawer open instead of closed.
+    /// A floating panel must never reserve layout space — `Popover`'s
+    /// overlay draws over the workspace without participating in ordinary
+    /// layout, so the center pane grid keeps its full height whether or
+    /// not a panel is open. Guards against ever reintroducing a docked
+    /// drawer that squeezes it — the pre-`Popover` regression this test
+    /// used to catch when a 240px fixed-height drawer sat in the root
+    /// column.
     #[test]
-    fn the_center_pane_grid_still_gets_real_height_with_the_bottom_drawer_open() {
+    fn the_center_pane_grid_keeps_real_height_with_a_bottom_panel_open() {
         let (mut app, _) = App::new();
         app.shell = shell::ShellState::default();
         app.shell.bottom = Some(shell::BottomView::Attention);
@@ -8952,9 +8976,8 @@ diff --git a/lib.rs b/lib.rs
         assert!(
             outer.height > 100.0,
             "expected the center pane grid to keep real height in a \
-             768px-tall window even with the 240px bottom drawer open, got \
-             {outer:?} — a fixed-height drawer is the most plausible way to \
-             accidentally squeeze the workspace",
+             768px-tall window with the attention panel open, got \
+             {outer:?} — a docked/reserved-space panel would squeeze it",
         );
     }
 

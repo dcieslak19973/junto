@@ -30,6 +30,9 @@ pub struct Popover<'a, Message, Theme, Renderer> {
     /// Panel width. A comment box wants a stable width, not one that shrinks to
     /// its content, so the caller sets it.
     width: f32,
+    /// Message published when a left click lands outside the open panel.
+    /// `None` (the default) means no outside-click dismissal at all.
+    on_dismiss: Option<Message>,
 }
 
 impl<'a, Message, Theme, Renderer> Popover<'a, Message, Theme, Renderer> {
@@ -43,6 +46,7 @@ impl<'a, Message, Theme, Renderer> Popover<'a, Message, Theme, Renderer> {
             popup,
             gap: 4.0,
             width: 560.0,
+            on_dismiss: None,
         }
     }
 
@@ -50,6 +54,14 @@ impl<'a, Message, Theme, Renderer> Popover<'a, Message, Theme, Renderer> {
     #[must_use]
     pub fn width(mut self, width: f32) -> Self {
         self.width = width;
+        self
+    }
+
+    /// Publish `message` when a left click lands outside the open panel.
+    /// Opt-in: the annotate popup leaves this unset and is unaffected.
+    #[must_use]
+    pub fn on_dismiss(mut self, message: Message) -> Self {
+        self.on_dismiss = Some(message);
         self
     }
 }
@@ -186,12 +198,14 @@ where
         let anchor_bounds = layout.bounds() + translation;
         let popup = self.popup.as_mut()?;
         let popup_tree = tree.children.get_mut(1)?;
+        let on_dismiss = self.on_dismiss.take();
         Some(overlay::Element::new(Box::new(Floating {
             popup,
             tree: popup_tree,
             anchor_bounds,
             gap: self.gap,
             width: self.width,
+            on_dismiss,
         })))
     }
 }
@@ -216,6 +230,9 @@ struct Floating<'a, 'b, Message, Theme, Renderer> {
     anchor_bounds: Rectangle,
     gap: f32,
     width: f32,
+    /// Taken from `Popover` for this frame's overlay; published on an
+    /// outside left click and then consumed.
+    on_dismiss: Option<Message>,
 }
 
 impl<Message, Theme, Renderer> overlay::Overlay<Message, Theme, Renderer>
@@ -285,6 +302,18 @@ where
         self.popup.as_widget_mut().update(
             self.tree, event, inner, cursor, renderer, clipboard, shell, &bounds,
         );
+
+        // Outside-click dismissal: only a left press that lands off the
+        // panel counts, so a drag that starts inside and ends outside (e.g.
+        // text selection) does not close it.
+        if matches!(
+            event,
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+        ) && !cursor.is_over(bounds)
+            && let Some(message) = self.on_dismiss.take()
+        {
+            shell.publish(message);
+        }
     }
 
     fn mouse_interaction(
