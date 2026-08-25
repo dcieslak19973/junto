@@ -3389,32 +3389,114 @@ fn blade_divider<'a>(side: Side) -> Element<'a, Message> {
         .into()
 }
 
+/// The adder's recessed field style, shared by the channel combo box and
+/// the new-channel name field: `ComboBox::input_style` (iced_widget
+/// 0.14.2, `combo_box.rs`) forwards straight to its inner `TextInput`'s
+/// own `style`, so one function styles both — a muted fill and hairline
+/// border, matching the file's other recessed surfaces (`admin_card`),
+/// instead of the default theme's raised, high-contrast text-input chrome.
+fn field_style(_theme: &Theme, _status: text_input::Status) -> text_input::Style {
+    text_input::Style {
+        background: Background::Color(Color { a: 0.4, ..SURFACE }),
+        border: Border {
+            color: BORDER,
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+        icon: MUTED,
+        placeholder: MUTED,
+        value: TEXT,
+        selection: Color { a: 0.35, ..BLUE },
+    }
+}
+
+/// The substrate picker's recessed style, matching `field_style` — `pick_list`
+/// has its own `Catalog` rather than forwarding to `text_input`'s, so it needs
+/// its own (smaller) style function to read as the same quiet field.
+fn field_pick_list_style(_theme: &Theme, _status: pick_list::Status) -> pick_list::Style {
+    pick_list::Style {
+        text_color: TEXT,
+        placeholder_color: MUTED,
+        handle_color: MUTED,
+        background: Background::Color(Color { a: 0.4, ..SURFACE }),
+        border: Border {
+            color: BORDER,
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+    }
+}
+
+/// The create button's recessed style: the same muted fill and hairline as
+/// `field_style`'s fields (a touch brighter on hover/press, matching
+/// `ghost_style`'s tint step), so it reads as part of the quiet field row
+/// rather than the default theme's raised, accented button.
+fn field_button_style(status: button::Status) -> button::Style {
+    let hot = matches!(status, button::Status::Hovered | button::Status::Pressed);
+    button::Style {
+        background: Some(Background::Color(Color {
+            a: if hot { 0.6 } else { 0.4 },
+            ..SURFACE
+        })),
+        text_color: if status == button::Status::Disabled {
+            MUTED
+        } else {
+            TEXT
+        },
+        border: Border {
+            color: BORDER,
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+        ..button::Style::default()
+    }
+}
+
+/// A glyph set inside a recessed field's left edge (`field_style`), in place
+/// of a separate icon glyph beside the field — folding the search/create
+/// affordance into the quiet control itself instead of an extra loud
+/// element next to it.
+fn field_icon(code_point: char) -> text_input::Icon<iced::Font> {
+    text_input::Icon {
+        font: ICON_FONT,
+        code_point,
+        size: Some(TEXT_META.into()),
+        spacing: SP_TIGHT,
+        side: text_input::Side::Left,
+    }
+}
+
 /// The open/create channel controls: a type-ahead picker for existing
 /// channels plus a name field, substrate picker, and error display for a
-/// new one.
+/// new one. Every control is styled recessed (`field_style`/
+/// `field_pick_list_style`/`field_button_style`) so this reads as a row of
+/// quiet fields beside the muted channel chips above it, not the loudest
+/// thing in the blade.
 fn adder(app: &App) -> Element<'_, Message> {
-    let open_row = row![
-        icon(ICON_SEARCH).color(MUTED),
-        combo_box(
-            &app.channels,
-            "type to search channels…",
-            None,
-            Message::ChannelPicked,
-        )
-        .width(Fill),
-    ]
-    .spacing(SP)
-    .align_y(Center);
+    let open_row = combo_box(
+        &app.channels,
+        "type to search channels…",
+        None,
+        Message::ChannelPicked,
+    )
+    .icon(field_icon(ICON_SEARCH))
+    .size(TEXT_META)
+    .padding(SP)
+    .input_style(field_style)
+    .width(Fill);
     let new_row = row![
-        icon(ICON_PLUS).color(MUTED),
         text_input("new channel name…", &app.new_channel)
+            .icon(field_icon(ICON_PLUS))
             .on_input(Message::NewChannelChanged)
             .on_submit(Message::CreateChannel)
+            .size(TEXT_META)
+            .style(field_style)
             .width(Fill)
             .padding(SP),
-        button("create")
+        button(text("create").size(TEXT_META))
             .on_press(Message::CreateChannel)
-            .padding(SP),
+            .padding(SP)
+            .style(|_theme, status| field_button_style(status)),
     ]
     .spacing(SP)
     .align_y(Center);
@@ -3427,8 +3509,9 @@ fn adder(app: &App) -> Element<'_, Message> {
                 app.new_channel_repo.clone(),
                 Message::NewChannelRepoChanged,
             )
-            .text_size(TEXT_BODY)
-            .padding(SP),
+            .text_size(TEXT_META)
+            .padding(SP)
+            .style(field_pick_list_style),
         );
     }
     match &app.new_channel_error {
