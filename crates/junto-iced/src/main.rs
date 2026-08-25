@@ -72,6 +72,37 @@ const SP_LOOSE: f32 = 12.0;
 /// Section spacing: between major regions.
 const SP_SECTION: f32 = 16.0;
 
+/// The additional icon family loaded in `main` (`assets/lucide.ttf`, Lucide
+/// 0.469.0) — Segoe UI's own punctuation (`‹ › ▸ ▾ ↻ × → ↓ ⚠`) was standing
+/// in for icons at text metrics, with mismatched stroke weights and no
+/// shared grid; this gives the shell chrome a real icon set instead.
+const ICON_FONT: iced::Font = iced::Font::with_name("lucide");
+
+/// One icon glyph at the shell's single icon size (`TEXT_BODY`) — every
+/// icon in the chrome sits on the same grid, since inconsistent icon sizing
+/// was half of what made the old punctuation-as-icons look hand-drawn.
+fn icon(codepoint: char) -> iced::widget::Text<'static> {
+    text(codepoint.to_string()).font(ICON_FONT).size(TEXT_BODY)
+}
+
+/// Lucide codepoints for the shell-chrome icons `icon` renders above, taken
+/// from the font's own CSS (Lucide 0.469.0, `assets/LICENSE-lucide`).
+const ICON_PANEL_LEFT: char = '\u{e12d}';
+const ICON_PANEL_RIGHT: char = '\u{e435}';
+const ICON_X: char = '\u{e1b1}';
+const ICON_ROTATE_CW: char = '\u{e14c}';
+const ICON_COLUMNS_2: char = '\u{e09c}';
+const ICON_ROWS_2: char = '\u{e43d}';
+const ICON_CHEVRON_RIGHT: char = '\u{e073}';
+const ICON_CHEVRON_DOWN: char = '\u{e071}';
+const ICON_CIRCLE_ALERT: char = '\u{e07b}';
+const ICON_SEARCH: char = '\u{e154}';
+const ICON_PLUS: char = '\u{e140}';
+const ICON_BELL: char = '\u{e05d}';
+const ICON_BOT: char = '\u{e1ba}';
+const ICON_FILE_DIFF: char = '\u{e319}';
+const ICON_GIT_BRANCH: char = '\u{e0e5}';
+
 /// The default font at Semibold weight — the one hierarchy tool this pass
 /// introduces. Reserved for `TEXT_TITLE`-sized text and blade section
 /// labels; everything else stays Normal so the weight keeps meaning.
@@ -94,6 +125,9 @@ fn main() -> iced::Result {
         // Segoe UI (used by name at runtime — not bundled, so no redistribution).
         // Cross-platform parity later = bundle Inter (OFL, MIT-compatible).
         .default_font(iced::Font::with_name("Segoe UI"))
+        // The vendored Lucide icon font (ISC-licensed, assets/LICENSE-lucide)
+        // — an ADDITIONAL family alongside Segoe UI, not a replacement.
+        .font(include_bytes!("../assets/lucide.ttf").as_slice())
         .window(iced::window::Settings {
             icon,
             // Tall by default so more of a channel's bottom content is visible.
@@ -2900,12 +2934,14 @@ impl App {
                 )
                 .controls(Element::from(
                     row![
-                        button("↻").on_press(Message::Refresh(id)).padding(SP_TIGHT),
+                        button(icon(ICON_ROTATE_CW))
+                            .on_press(Message::Refresh(id))
+                            .padding(SP_TIGHT),
                         // `State::close` removes nothing and returns `None`
                         // when `pane` has no sibling (the single-pane case,
                         // which is also the app's startup state) — disable
                         // rather than publish a click that does nothing.
-                        button("×")
+                        button(icon(ICON_X))
                             .on_press_maybe((self.panes.len() > 1).then_some(Message::Close(id)))
                             .padding(SP_TIGHT),
                     ]
@@ -3025,16 +3061,12 @@ struct BladeDrag {
 /// not be able to hide that count entirely.
 fn blade_stub<'a>(side: Side, badge: Option<usize>) -> Element<'a, Message> {
     let (glyph, message) = match side {
-        Side::Left => ("›", Message::ToggleLeftBlade),
-        Side::Right => ("‹", Message::ToggleRightBlade),
+        Side::Left => (ICON_PANEL_LEFT, Message::ToggleLeftBlade),
+        Side::Right => (ICON_PANEL_RIGHT, Message::ToggleRightBlade),
     };
-    let mut rail = column![
-        button(text(glyph).size(TEXT_BODY))
-            .on_press(message)
-            .padding(SP_TIGHT)
-    ]
-    .spacing(SP)
-    .align_x(Center);
+    let mut rail = column![button(icon(glyph)).on_press(message).padding(SP_TIGHT)]
+        .spacing(SP)
+        .align_x(Center);
     if let Some(count) = badge.filter(|count| *count > 0) {
         rail = rail.push(text(count.to_string()).size(TEXT_META).color(RED));
     }
@@ -3068,7 +3100,7 @@ fn blade_divider<'a>(side: Side) -> Element<'a, Message> {
 /// new one.
 fn adder(app: &App) -> Element<'_, Message> {
     let open_row = row![
-        text("open ▸").size(TEXT_META).color(MUTED),
+        icon(ICON_SEARCH).color(MUTED),
         combo_box(
             &app.channels,
             "type to search channels…",
@@ -3080,7 +3112,7 @@ fn adder(app: &App) -> Element<'_, Message> {
     .spacing(SP)
     .align_y(Center);
     let new_row = row![
-        text("· new ▸").size(TEXT_META).color(MUTED),
+        icon(ICON_PLUS).color(MUTED),
         text_input("new channel name…", &app.new_channel)
             .on_input(Message::NewChannelChanged)
             .on_submit(Message::CreateChannel)
@@ -3130,11 +3162,11 @@ fn channel_nav(app: &App) -> Element<'_, Message> {
     // Axis-aware splitting of the focused pane — the workspace-level
     // counterpart to `adder`'s "open a channel into a pane".
     let split_row = row![
-        button(text("split →").size(TEXT_BODY))
+        button(icon(ICON_COLUMNS_2))
             .on_press(Message::SplitPane(pane_grid::Axis::Vertical))
             .width(Fill)
             .padding(SP_TIGHT),
-        button(text("split ↓").size(TEXT_BODY))
+        button(icon(ICON_ROWS_2))
             .on_press(Message::SplitPane(pane_grid::Axis::Horizontal))
             .width(Fill)
             .padding(SP_TIGHT),
@@ -3208,14 +3240,22 @@ fn attention_view(app: &App) -> Element<'_, Message> {
 /// channels never costs a round trip through a view switcher.
 fn left_blade(app: &App) -> Element<'_, Message> {
     let switcher = row![
-        button(text("attention").size(TEXT_BODY))
-            .on_press(Message::LeftViewPicked(shell::LeftView::Attention))
-            .padding(SP_TIGHT)
-            .style(move |_t, _s| tab_style(app.shell.left_view == shell::LeftView::Attention)),
-        button(text("sessions").size(TEXT_BODY))
-            .on_press(Message::LeftViewPicked(shell::LeftView::Sessions))
-            .padding(SP_TIGHT)
-            .style(move |_t, _s| tab_style(app.shell.left_view == shell::LeftView::Sessions)),
+        button(
+            row![icon(ICON_BELL), text("attention").size(TEXT_BODY)]
+                .spacing(SP_TIGHT)
+                .align_y(Center),
+        )
+        .on_press(Message::LeftViewPicked(shell::LeftView::Attention))
+        .padding(SP_TIGHT)
+        .style(move |_t, _s| tab_style(app.shell.left_view == shell::LeftView::Attention)),
+        button(
+            row![icon(ICON_BOT), text("sessions").size(TEXT_BODY)]
+                .spacing(SP_TIGHT)
+                .align_y(Center),
+        )
+        .on_press(Message::LeftViewPicked(shell::LeftView::Sessions))
+        .padding(SP_TIGHT)
+        .style(move |_t, _s| tab_style(app.shell.left_view == shell::LeftView::Sessions)),
     ]
     .spacing(SP_TIGHT);
 
@@ -3225,7 +3265,7 @@ fn left_blade(app: &App) -> Element<'_, Message> {
     };
 
     column![
-        button(text("‹").size(TEXT_BODY))
+        button(icon(ICON_PANEL_LEFT))
             .on_press(Message::ToggleLeftBlade)
             .padding(SP_TIGHT),
         container(channel_nav(app))
@@ -3248,14 +3288,22 @@ fn left_blade(app: &App) -> Element<'_, Message> {
 /// The right blade: a switchable Artifacts/Lineage view.
 fn right_blade(app: &App) -> Element<'_, Message> {
     let switcher = row![
-        button(text("artifacts").size(TEXT_BODY))
-            .on_press(Message::RightViewPicked(shell::RightView::Artifacts))
-            .padding(SP_TIGHT)
-            .style(move |_t, _s| tab_style(app.shell.right_view == shell::RightView::Artifacts)),
-        button(text("lineage").size(TEXT_BODY))
-            .on_press(Message::RightViewPicked(shell::RightView::Lineage))
-            .padding(SP_TIGHT)
-            .style(move |_t, _s| tab_style(app.shell.right_view == shell::RightView::Lineage)),
+        button(
+            row![icon(ICON_FILE_DIFF), text("artifacts").size(TEXT_BODY)]
+                .spacing(SP_TIGHT)
+                .align_y(Center),
+        )
+        .on_press(Message::RightViewPicked(shell::RightView::Artifacts))
+        .padding(SP_TIGHT)
+        .style(move |_t, _s| tab_style(app.shell.right_view == shell::RightView::Artifacts)),
+        button(
+            row![icon(ICON_GIT_BRANCH), text("lineage").size(TEXT_BODY)]
+                .spacing(SP_TIGHT)
+                .align_y(Center),
+        )
+        .on_press(Message::RightViewPicked(shell::RightView::Lineage))
+        .padding(SP_TIGHT)
+        .style(move |_t, _s| tab_style(app.shell.right_view == shell::RightView::Lineage)),
     ]
     .spacing(SP_TIGHT);
 
@@ -3267,7 +3315,7 @@ fn right_blade(app: &App) -> Element<'_, Message> {
     column![
         row![
             switcher,
-            button(text("›").size(TEXT_BODY))
+            button(icon(ICON_PANEL_RIGHT))
                 .on_press(Message::ToggleRightBlade)
                 .padding(SP_TIGHT)
         ]
@@ -3336,7 +3384,15 @@ fn artifacts_view(app: &App) -> Element<'_, Message> {
     };
     match &pane.content {
         Content::Loading => return text("loading…").size(TEXT_BODY).color(MUTED).into(),
-        Content::Error(err) => return text(format!("⚠ {err}")).size(TEXT_BODY).color(RED).into(),
+        Content::Error(err) => {
+            return row![
+                icon(ICON_CIRCLE_ALERT).color(RED),
+                text(err).size(TEXT_BODY).color(RED)
+            ]
+            .spacing(SP_TIGHT)
+            .align_y(Center)
+            .into();
+        }
         Content::Loaded(_) => {}
     }
     let mut items = column![].spacing(SP_TIGHT);
@@ -3362,7 +3418,15 @@ fn sessions_view(app: &App) -> Element<'_, Message> {
     };
     match &pane.content {
         Content::Loading => return text("loading…").size(TEXT_BODY).color(MUTED).into(),
-        Content::Error(err) => return text(format!("⚠ {err}")).size(TEXT_BODY).color(RED).into(),
+        Content::Error(err) => {
+            return row![
+                icon(ICON_CIRCLE_ALERT).color(RED),
+                text(err).size(TEXT_BODY).color(RED)
+            ]
+            .spacing(SP_TIGHT)
+            .align_y(Center)
+            .into();
+        }
         Content::Loaded(_) => {}
     }
     let mut items = column![].spacing(SP_TIGHT);
@@ -3383,10 +3447,10 @@ fn artifact_row<'a>(
     entry: &'a EntryDto,
 ) -> Element<'a, Message> {
     let expanded = pane.artifacts.get(&entry.id);
-    let toggle_label = if expanded.is_some() {
-        "hide content ▾"
+    let (toggle_icon, toggle_text) = if expanded.is_some() {
+        (ICON_CHEVRON_DOWN, "hide content")
     } else {
-        "show content ▸"
+        (ICON_CHEVRON_RIGHT, "show content")
     };
     let mut card = column![
         row![
@@ -3396,10 +3460,14 @@ fn artifact_row<'a>(
                 .color(MUTED),
         ]
         .spacing(SP),
-        button(text(toggle_label).size(TEXT_META))
-            .on_press(Message::ToggleArtifact(id, entry.id.clone()))
-            .padding([SP_TIGHT, SP])
-            .style(|_t, _s| chip_style(TEAL, false)),
+        button(
+            row![icon(toggle_icon), text(toggle_text).size(TEXT_META)]
+                .spacing(SP_TIGHT)
+                .align_y(Center),
+        )
+        .on_press(Message::ToggleArtifact(id, entry.id.clone()))
+        .padding([SP_TIGHT, SP])
+        .style(|_t, _s| chip_style(TEAL, false)),
     ]
     .spacing(SP);
     match expanded {
