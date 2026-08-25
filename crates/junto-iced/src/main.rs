@@ -20,8 +20,8 @@ use iced::futures::channel::mpsc;
 use iced::widget::canvas::{self, Canvas, Frame, Geometry, Path, Stroke};
 use iced::widget::pane_grid;
 use iced::widget::{
-    Space, button, checkbox, column, combo_box, container, markdown, mouse_area, pick_list, row,
-    scrollable, text, text_input, tooltip,
+    Space, button, checkbox, column, container, markdown, mouse_area, pick_list, row, scrollable,
+    text, text_input, tooltip,
 };
 use iced::{
     Background, Border, Center, Color, Element, Fill, Length, Padding, Point, Rectangle, Renderer,
@@ -252,13 +252,14 @@ struct App {
     /// Transient like `blade_drag`: a half-made placement choice is not
     /// layout worth persisting, so this lives on `App`, not `ShellState`.
     pending: Option<PendingOpen>,
-    /// Available channel names for the type-ahead picker.
-    channels: combo_box::State<String>,
-    /// The same names as a plain list, for widgets that need to OFFER them
-    /// rather than type-ahead them — the converge target picker. Kept beside
-    /// `channels` because `combo_box::State` consumes its options and two
-    /// `combo_box`es sharing one `State` would share its filter text too.
+    /// The same names as a plain list — the source both the channel chips
+    /// and the filter over them (`channel_nav`) render from.
     channel_names: Vec<String>,
+    /// The left blade's channel-list filter — a case-insensitive substring
+    /// match over `channel_names` (`channel_nav`, `channel_matches`).
+    /// Transient like `pending`/`blade_drag`: a half-typed filter is not
+    /// layout worth persisting, so this lives on `App`, not `ShellState`.
+    channel_filter: String,
     /// The whole lineage DAG, drawn as the always-visible top branch graph.
     lineage: Option<LineageGraphDto>,
     /// Cross-channel "needs you" items — the focus board.
@@ -267,6 +268,10 @@ struct App {
     agents: Vec<AgentDto>,
     /// Distinct workspace repos, most-recent first — the inferred launch default.
     recent_workspaces: Vec<String>,
+    /// Whether the left blade's create-channel form is open — toggled by
+    /// the header's `plus` (`Message::ToggleCreating`). Transient like
+    /// `channel_filter`: not part of `ShellState`.
+    creating: bool,
     /// The name typed into the "new channel" box.
     new_channel: String,
     /// The last create-channel error, if any.
@@ -1029,8 +1034,12 @@ impl Placement {
 #[derive(Debug, Clone)]
 enum Message {
     ChannelsLoaded(Vec<String>),
-    /// Pick a channel from the search combo box: open or focus it.
-    ChannelPicked(String),
+    /// Type into the left blade's channel filter — a case-insensitive
+    /// substring match over the chip list (`channel_matches`).
+    ChannelFilterChanged(String),
+    /// Press the left blade header's `plus`: open or close the
+    /// create-channel form beneath it.
+    ToggleCreating,
     /// Press a channel chip: close its pane if the channel is open; else
     /// open (or, pressed again, close) that channel's placement menu.
     ChannelToggled(String),
@@ -1274,12 +1283,13 @@ impl App {
         let app = App {
             panes,
             focus: Some(first),
-            channels: combo_box::State::new(Vec::new()),
             channel_names: Vec::new(),
+            channel_filter: String::new(),
             lineage: None,
             focus_items: Vec::new(),
             agents: Vec::new(),
             recent_workspaces: Vec::new(),
+            creating: false,
             new_channel: String::new(),
             new_channel_error: None,
             substrates: Vec::new(),
@@ -1465,8 +1475,7 @@ impl App {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::ChannelsLoaded(names) => {
-                self.channel_names = names.clone();
-                self.channels = combo_box::State::new(names);
+                self.channel_names = names;
                 Task::none()
             }
             Message::LineageGraphLoaded(graph) => {
@@ -1499,9 +1508,13 @@ impl App {
                 self.recent_workspaces = workspaces;
                 Task::none()
             }
-            Message::ChannelPicked(name) => {
-                let (_, task) = self.open_or_focus(&name);
-                task
+            Message::ChannelFilterChanged(filter) => {
+                self.channel_filter = filter;
+                Task::none()
+            }
+            Message::ToggleCreating => {
+                self.creating = !self.creating;
+                Task::none()
             }
             Message::ChannelToggled(name) => {
                 let existing = self
@@ -1537,7 +1550,7 @@ impl App {
                 } = pending;
                 // Every placement here is meaningless with nothing focused
                 // to split or replace — degrade all three to the plain
-                // open/focus path (`ChannelPicked`'s own behaviour) rather
+                // open/focus path (`open_or_focus`'s own behaviour) rather
                 // than presenting a choice that has nothing to act on.
                 let Some(focused) = self.focus else {
                     let (pane, task) = self.open_or_focus(&name);
@@ -2574,7 +2587,7 @@ impl App {
                 Task::none()
             }
             Message::IdentitySelect(pane, form) => {
-                let all_channels: Vec<String> = self.channels.options().to_vec();
+                let all_channels: Vec<String> = self.channel_names.clone();
                 let Some(state) = self.panes.get_mut(pane) else {
                     return Task::none();
                 };
@@ -3662,12 +3675,10 @@ fn blade_divider<'a>(side: Side) -> Element<'a, Message> {
         .into()
 }
 
-/// The adder's recessed field style, shared by the channel combo box and
-/// the new-channel name field: `ComboBox::input_style` (iced_widget
-/// 0.14.2, `combo_box.rs`) forwards straight to its inner `TextInput`'s
-/// own `style`, so one function styles both — a muted fill and hairline
-/// border, matching the file's other recessed surfaces (`admin_card`),
-/// instead of the default theme's raised, high-contrast text-input chrome.
+/// The blade's recessed field style, shared by the channel filter and the
+/// new-channel name field: a muted fill and hairline border, matching the
+/// file's other recessed surfaces (`admin_card`), instead of the default
+/// theme's raised, high-contrast text-input chrome.
 fn field_style(_theme: &Theme, _status: text_input::Status) -> text_input::Style {
     text_input::Style {
         background: Background::Color(Color { a: 0.4, ..SURFACE }),
@@ -3739,24 +3750,13 @@ fn field_icon(code_point: char) -> text_input::Icon<iced::Font> {
     }
 }
 
-/// The open/create channel controls: a type-ahead picker for existing
-/// channels plus a name field, substrate picker, and error display for a
-/// new one. Every control is styled recessed (`field_style`/
+/// The create-channel controls: a name field, substrate picker, and error
+/// display for a new one. Shown beneath the left blade's header only
+/// while `App::creating` is true (`channel_nav`, toggled by the header's
+/// `plus`). Every control is styled recessed (`field_style`/
 /// `field_pick_list_style`/`field_button_style`) so this reads as a row of
-/// quiet fields beside the muted channel chips above it, not the loudest
-/// thing in the blade.
+/// quiet fields, not the loudest thing in the blade.
 fn adder(app: &App) -> Element<'_, Message> {
-    let open_row = combo_box(
-        &app.channels,
-        "type to search channels…",
-        None,
-        Message::ChannelPicked,
-    )
-    .icon(field_icon(ICON_SEARCH))
-    .size(TEXT_META)
-    .padding(SP)
-    .input_style(field_style)
-    .width(Fill);
     let new_row = row![
         text_input("new channel name…", &app.new_channel)
             .icon(field_icon(ICON_PLUS))
@@ -3773,7 +3773,7 @@ fn adder(app: &App) -> Element<'_, Message> {
     ]
     .spacing(SP)
     .align_y(Center);
-    let mut adder_col = column![open_row, new_row].spacing(SP);
+    let mut adder_col = column![new_row].spacing(SP);
     // When several substrates are registered, the host needs to know which.
     if app.substrates.len() > 1 {
         adder_col = adder_col.push(
@@ -3868,8 +3868,26 @@ fn placement_menu(pending: &PendingOpen) -> Element<'static, Message> {
         .into()
 }
 
-/// Pinned navigation: the open channels, then the controls to open or create
-/// one. Lives at the top of the left blade and never toggles away.
+/// Whether `name` belongs in the filtered channel list for `filter` — a
+/// case-insensitive substring match. An empty filter matches everything:
+/// finding a channel is the filter's job, not hiding the list until you
+/// type (`channel_nav`).
+fn channel_matches(name: &str, filter: &str) -> bool {
+    filter.is_empty() || name.to_lowercase().contains(&filter.to_lowercase())
+}
+
+/// Pinned navigation: a header (the section label plus a `plus` toggling
+/// the create-channel form), an always-visible filter over the channel
+/// list, and the filtered chips themselves. Lives at the top of the left
+/// blade and never toggles away.
+///
+/// The filter replaces what used to be a second, redundant control — a
+/// type-ahead combo box duplicating the exact list already rendered as
+/// chips right above it — with one fewer widget doing the same job.
+/// Create used to sit inline and always visible; it now lives behind the
+/// header's `plus` (`App::creating`), rendered directly beneath the
+/// header when open, so the common case — finding and opening an
+/// existing channel — isn't sharing space with the rare one.
 ///
 /// An open channel's chip closes its pane on press (`Message::ChannelToggled`),
 /// guarded exactly like the pane title bar's own `×` (`panes.len() > 1`) so a
@@ -3879,43 +3897,79 @@ fn placement_menu(pending: &PendingOpen) -> Element<'static, Message> {
 /// "float over the workspace" machinery the footer's trigger chips use —
 /// dismissible by an outside click or a second press of the chip.
 fn channel_nav(app: &App) -> Element<'_, Message> {
-    let mut list = column![].spacing(SP_TIGHT);
-    for name in &app.channel_names {
-        let active = app.panes.iter().any(|(_, state)| state.channel == *name);
-        let can_press = !active || app.panes.len() > 1;
-        let chip: Element<Message> = button(text(name.as_str()).size(TEXT_BODY))
-            .on_press_maybe(can_press.then(|| Message::ChannelToggled(name.clone())))
-            .padding([SP_TIGHT, SP])
-            .width(Fill)
-            .style(move |_t, _s| chip_style(MUTED, active))
-            .into();
-        let row: Element<Message> = if active {
-            chip
-        } else {
-            let pending = app.pending.as_ref().filter(|pending| {
-                matches!(&pending.target, PendingTarget::Channel) && pending.channel == *name
-            });
-            // 170px: enough for an icon plus the longest row label ("use
-            // this pane") at `TEXT_META` with room to breathe — this menu
-            // has no list to grow, just three fixed rows, so it needs
-            // nothing near the footer's 360px list panels.
-            Popover::new(chip, pending.map(placement_menu))
-                .width(170.0)
-                .on_dismiss(Message::ChannelToggled(name.clone()))
-                .into()
-        };
-        list = list.push(row);
-    }
-    column![
+    let header = row![
         text("channels")
             .size(TEXT_META)
             .color(MUTED)
             .font(semibold()),
-        scrollable(list).height(Fill),
-        adder(app),
+        Space::new().width(Fill),
+        icon_button(
+            ICON_PLUS,
+            if app.creating {
+                "cancel creating a channel"
+            } else {
+                "create a channel"
+            },
+            tooltip::Position::Bottom,
+            Message::ToggleCreating,
+        ),
     ]
-    .spacing(SP)
-    .into()
+    .align_y(Center);
+
+    let filter_field = text_input("filter channels…", &app.channel_filter)
+        .icon(field_icon(ICON_SEARCH))
+        .on_input(Message::ChannelFilterChanged)
+        .size(TEXT_META)
+        .style(field_style)
+        .width(Fill)
+        .padding(SP);
+
+    let filter = app.channel_filter.trim();
+    let filtered: Vec<&String> = app
+        .channel_names
+        .iter()
+        .filter(|name| channel_matches(name, filter))
+        .collect();
+    let mut list = column![].spacing(SP_TIGHT);
+    if filtered.is_empty() && !filter.is_empty() {
+        list = list.push(text("no channels match").size(TEXT_META).color(MUTED));
+    } else {
+        for name in filtered {
+            let active = app.panes.iter().any(|(_, state)| state.channel == *name);
+            let can_press = !active || app.panes.len() > 1;
+            let chip: Element<Message> = button(text(name.as_str()).size(TEXT_BODY))
+                .on_press_maybe(can_press.then(|| Message::ChannelToggled(name.clone())))
+                .padding([SP_TIGHT, SP])
+                .width(Fill)
+                .style(move |_t, _s| chip_style(MUTED, active))
+                .into();
+            let row: Element<Message> = if active {
+                chip
+            } else {
+                let pending = app.pending.as_ref().filter(|pending| {
+                    matches!(&pending.target, PendingTarget::Channel) && pending.channel == *name
+                });
+                // 170px: enough for an icon plus the longest row label ("use
+                // this pane") at `TEXT_META` with room to breathe — this menu
+                // has no list to grow, just three fixed rows, so it needs
+                // nothing near the footer's 360px list panels.
+                Popover::new(chip, pending.map(placement_menu))
+                    .width(170.0)
+                    .on_dismiss(Message::ChannelToggled(name.clone()))
+                    .into()
+            };
+            list = list.push(row);
+        }
+    }
+
+    let mut nav = column![header];
+    if app.creating {
+        nav = nav.push(adder(app));
+    }
+    nav.push(filter_field)
+        .push(scrollable(list).height(Fill))
+        .spacing(SP)
+        .into()
 }
 
 /// One focus-board chip: a tagged, coloured summary of a cross-channel
@@ -7880,7 +7934,7 @@ fn fetch_agents() -> Task<Message> {
     )
 }
 
-/// Fetch the list of channel names for the type-ahead picker.
+/// Fetch the list of channel names for the chip list and its filter.
 fn fetch_channels() -> Task<Message> {
     #[derive(Deserialize)]
     struct Item {
@@ -10107,5 +10161,108 @@ mod session_chip_tests {
             app.pending, None,
             "a pending session must clear once it leaves the focused pane's session list"
         );
+    }
+}
+
+#[cfg(test)]
+mod channel_filter_tests {
+    use super::*;
+
+    #[test]
+    fn a_filter_matches_a_channel_whose_name_contains_it() {
+        assert!(channel_matches("junto-dev", "dev"));
+    }
+
+    #[test]
+    fn a_filter_that_is_not_a_substring_does_not_match() {
+        assert!(!channel_matches("junto-dev", "xyz"));
+    }
+
+    #[test]
+    fn filtering_is_case_insensitive() {
+        assert!(channel_matches("Junto-Dev", "DEV"));
+    }
+
+    #[test]
+    fn an_empty_filter_matches_every_channel() {
+        assert!(channel_matches("anything-at-all", ""));
+    }
+
+    #[test]
+    fn an_empty_filter_shows_every_channel_as_chips() {
+        let (mut app, _) = App::new();
+        app.channel_names = vec!["junto-dev".to_string(), "other".to_string()];
+
+        let mut ui = iced_test::simulator(channel_nav(&app));
+        ui.find("junto-dev").expect("junto-dev must be listed");
+        ui.find("other").expect("other must be listed");
+        assert!(
+            ui.find("no channels match").is_err(),
+            "an empty filter must never show the quiet message"
+        );
+    }
+
+    #[test]
+    fn a_filter_shows_only_the_channels_that_match_it() {
+        let (mut app, _) = App::new();
+        app.channel_names = vec!["junto-dev".to_string(), "other".to_string()];
+        app.channel_filter = "junto".to_string();
+
+        let mut ui = iced_test::simulator(channel_nav(&app));
+        ui.find("junto-dev")
+            .expect("a matching channel must still be listed");
+        assert!(
+            ui.find("other").is_err(),
+            "a non-matching channel must be filtered out"
+        );
+    }
+
+    #[test]
+    fn a_filter_matching_nothing_shows_the_quiet_message_instead_of_an_empty_list() {
+        let (mut app, _) = App::new();
+        app.channel_names = vec!["junto-dev".to_string(), "other".to_string()];
+        app.channel_filter = "nope".to_string();
+
+        let mut ui = iced_test::simulator(channel_nav(&app));
+        ui.find("no channels match")
+            .expect("a non-matching filter must show the quiet message");
+        assert!(
+            ui.find("junto-dev").is_err(),
+            "a non-matching filter must hide every chip"
+        );
+    }
+
+    #[test]
+    fn the_create_form_is_absent_until_the_header_plus_is_pressed() {
+        let (app, _) = App::new();
+        assert!(!app.creating, "App::new must not start in create mode");
+
+        let mut ui = iced_test::simulator(channel_nav(&app));
+        assert!(
+            ui.find("create").is_err(),
+            "the create form must not render until `creating` is true"
+        );
+    }
+
+    #[test]
+    fn the_create_form_appears_once_creating_is_true() {
+        let (mut app, _) = App::new();
+        app.creating = true;
+
+        let mut ui = iced_test::simulator(channel_nav(&app));
+        ui.find("create")
+            .expect("the create form must render while `creating` is true");
+    }
+
+    #[test]
+    fn pressing_the_header_plus_toggles_creating() {
+        let (mut app, _) = App::new();
+        assert!(!app.creating);
+
+        let _ = app.update(Message::ToggleCreating);
+        assert!(app.creating, "the first press must open the create form");
+
+        let _ = app.update(Message::ToggleCreating);
+        assert!(!app.creating, "the second press must close it again");
     }
 }
