@@ -75,10 +75,18 @@ const SP_SECTION: f32 = 16.0;
 /// so collapsing changes only the blade's own width, never the row's total.
 const DIVIDER_W: f32 = 5.0;
 
+/// Width of the tab a collapsed blade leaves on the window edge — just enough
+/// to be a click target for the chevron that reopens it.
+///
+/// Design spec §5 called for collapsing to a ~24px stub rather than to nothing,
+/// so a collapsed left blade could still show its attention badge. That reason
+/// is gone: attention now lives in the footer's `bell N need you` chip, which
+/// is visible whatever either blade is doing, so nothing is hidden by
+/// collapsing to an edge tab instead.
+const EDGE_TAB_W: f32 = 12.0;
+
 /// Every icon-only button is this square, so a row of them reads as a grid
 /// rather than as boxes that each shrank to their own glyph plus padding.
-/// Also the width of a collapsed blade's stub rail — the rail is exactly one
-/// icon button wide, which is why the two share a constant.
 const ICON_BTN: f32 = 24.0;
 
 /// The additional icon family loaded in `main` (`assets/lucide.ttf`, Lucide
@@ -115,7 +123,9 @@ fn icon_button_raw<'a>(
 /// Wrap `content` with a tip styled like the file's other elevated surfaces
 /// (`SURFACE`/`BORDER`). A tip that renders off the edge of the window is
 /// worse than none, so callers near the top of the chrome pass
-/// `Position::Bottom` and callers near the bottom pass `Position::Top`.
+/// `Position::Bottom` and callers near the bottom pass `Position::Top` — and,
+/// the same rule turned sideways, a control flush to the window's left or
+/// right edge (`blade_edge_tab`) passes `Position::Right`/`Position::Left`.
 fn with_tip<'a>(
     content: impl Into<Element<'a, Message>>,
     tip: &'a str,
@@ -3337,21 +3347,38 @@ impl App {
             .into();
 
         // The three-pane shell: collapsible blades either side of the channel
-        // workspace. Each blade collapses to a stub rather than to zero so the
-        // attention badge stays legible even when the blade is put away
-        // (docs/attention.md — attention is the spine).
+        // workspace. A collapsed blade shrinks to a thin `EDGE_TAB_W` tab on
+        // the window's outer edge (`blade_edge_tab`) instead of a full-width
+        // stub — `EDGE_TAB_W`'s doc comment covers why that no longer risks
+        // hiding anything.
         let left: Element<Message> = if self.shell.left_collapsed {
-            blade_stub(Some(self.focus_items.len()))
+            blade_edge_tab(
+                ICON_CHEVRON_RIGHT,
+                "open channels · ctrl+b",
+                tooltip::Position::Right,
+                Message::ToggleLeftBlade,
+            )
+            .id(iced::widget::Id::new("left-edge-tab"))
+            .into()
         } else {
             container(left_blade(self))
+                .id(iced::widget::Id::new("left-blade"))
                 .width(Length::Fixed(self.shell.left_width.get()))
                 .height(Fill)
                 .into()
         };
         let right: Element<Message> = if self.shell.right_collapsed {
-            blade_stub(None)
+            blade_edge_tab(
+                ICON_CHEVRON_LEFT,
+                "open artifacts & lineage · ctrl+r",
+                tooltip::Position::Left,
+                Message::ToggleRightBlade,
+            )
+            .id(iced::widget::Id::new("right-edge-tab"))
+            .into()
         } else {
             container(right_blade(self))
+                .id(iced::widget::Id::new("right-blade"))
                 .width(Length::Fixed(self.shell.right_width.get()))
                 .height(Fill)
                 .into()
@@ -3608,22 +3635,33 @@ struct BladeDrag {
     origin_x: Option<f32>,
 }
 
-/// The collapsed form of a blade: a narrow rail carrying, on the left, the
-/// count of items wanting attention. Collapsing must not be able to hide
-/// that count entirely. No longer carries its own reopen toggle — both
-/// blades' toggles now live in the top bar's corners (`App::view`), the
-/// one place a toggle can sit and never move when the blade it controls
-/// resizes or collapses; a second copy here would just be the same
-/// message behind a second control.
-fn blade_stub<'a>(badge: Option<usize>) -> Element<'a, Message> {
-    let mut rail = column![].spacing(SP).align_x(Center);
-    if let Some(count) = badge.filter(|count| *count > 0) {
-        rail = rail.push(text(count.to_string()).size(TEXT_META).color(RED));
-    }
-    container(rail)
-        .width(Length::Fixed(ICON_BTN))
-        .height(Fill)
-        .into()
+/// The collapsed form of a blade: a thin click target flush to the
+/// window's outer edge, carrying only the chevron that reopens the blade
+/// — centred vertically, ghost-styled, `EDGE_TAB_W` wide rather than a
+/// full-width rail. It carries no attention badge, unlike the stub this
+/// replaced; see `EDGE_TAB_W`'s doc comment for why that is now safe.
+///
+/// `EDGE_TAB_W` is narrower than `ICON_BTN`, so the reopen chevron can't
+/// be a plain `icon_button` (a fixed `ICON_BTN` square) — this builds it
+/// directly from `icon_button_raw` (overriding its geometry to
+/// `EDGE_TAB_W`) plus `with_tip`, the same pair `icon_button` itself
+/// composes. Returns the bare `Container` rather than an `Element` so a
+/// caller can tag it with an `.id(...)` (`App::view`), matching
+/// `blade_divider`'s and `icon_button_raw`'s own precedent of leaving the
+/// final `.into()` to the caller.
+fn blade_edge_tab<'a>(
+    codepoint: char,
+    tip: &'a str,
+    position: tooltip::Position,
+    message: Message,
+) -> iced::widget::Container<'a, Message> {
+    let chevron = icon_button_raw(codepoint, Some(message))
+        .width(Length::Fixed(EDGE_TAB_W))
+        .height(Length::Fixed(EDGE_TAB_W))
+        .style(|_theme, status| ghost_style(status));
+    container(with_tip(chevron, tip, position))
+        .width(Length::Fixed(EDGE_TAB_W))
+        .center_y(Fill)
 }
 
 /// A thin draggable handle between a blade and the center: press-drag to
@@ -9603,6 +9641,155 @@ diff --git a/lib.rs b/lib.rs
             .expect("the singular pane count must still be on the footer");
         ui.find("local")
             .expect("the default host must still be on the footer");
+    }
+
+    /// The footer toggle placement this task landed: xum puts the collapse
+    /// chevron in the blade's own footer, not the top bar. An expanded
+    /// blade must show that footer toggle; a collapsed one must show the
+    /// edge tab instead — never both, never neither.
+    #[test]
+    fn an_expanded_blade_shows_its_footer_toggle_and_a_collapsed_one_shows_the_edge_tab() {
+        let (mut app, _) = App::new();
+        app.shell = shell::ShellState::default();
+
+        {
+            let mut both_expanded = iced_test::simulator(app.view());
+            both_expanded
+                .find(iced::widget::Id::new("left-blade-toggle"))
+                .expect("the expanded left blade must show its footer toggle");
+            both_expanded
+                .find(iced::widget::Id::new("right-blade-toggle"))
+                .expect("the expanded right blade must show its footer toggle");
+            assert!(
+                both_expanded
+                    .find(iced::widget::Id::new("left-edge-tab"))
+                    .is_err(),
+                "an expanded left blade must not also render the collapsed edge tab"
+            );
+            assert!(
+                both_expanded
+                    .find(iced::widget::Id::new("right-edge-tab"))
+                    .is_err(),
+                "an expanded right blade must not also render the collapsed edge tab"
+            );
+        }
+
+        app.shell.left_collapsed = true;
+        app.shell.right_collapsed = true;
+        let mut both_collapsed = iced_test::simulator(app.view());
+        both_collapsed
+            .find(iced::widget::Id::new("left-edge-tab"))
+            .expect("the collapsed left blade must show its edge tab");
+        both_collapsed
+            .find(iced::widget::Id::new("right-edge-tab"))
+            .expect("the collapsed right blade must show its edge tab");
+        assert!(
+            both_collapsed
+                .find(iced::widget::Id::new("left-blade-toggle"))
+                .is_err(),
+            "a collapsed left blade must not render its footer toggle — it has no footer"
+        );
+        assert!(
+            both_collapsed
+                .find(iced::widget::Id::new("right-blade-toggle"))
+                .is_err(),
+            "a collapsed right blade must not render its footer toggle — it has no footer"
+        );
+    }
+
+    /// The point of the edge tab: it must be `EDGE_TAB_W` wide, not the full
+    /// `ICON_BTN` rail the previous `blade_stub` rendered — the visible
+    /// difference between "the sidebar is gone but for a sliver" and "the
+    /// sidebar is still a full column, just badge-only".
+    #[test]
+    fn a_collapsed_blades_edge_tab_is_edge_tab_wide_not_icon_button_wide() {
+        let (mut app, _) = App::new();
+        app.shell = shell::ShellState::default();
+        app.shell.left_collapsed = true;
+
+        let mut ui = iced_test::simulator(app.view());
+        let tab = ui
+            .find(iced::widget::Id::new("left-edge-tab"))
+            .expect("the collapsed left blade's edge tab must be laid out")
+            .bounds();
+
+        assert!(
+            (tab.width - EDGE_TAB_W).abs() < 1.0,
+            "expected the edge tab to be EDGE_TAB_W ({EDGE_TAB_W}) wide, got {}",
+            tab.width
+        );
+        assert!(
+            tab.width < ICON_BTN,
+            "the edge tab ({}) must be narrower than a full ICON_BTN ({ICON_BTN}) — \
+             otherwise it is `blade_stub`'s rail again, not a thin tab",
+            tab.width
+        );
+    }
+
+    /// The footer toggle is the LAST child of the blade's own column, with
+    /// the blade's content given `.height(Fill)` above it — so it sits
+    /// flush to the blade's bottom edge no matter how short that content
+    /// is, rather than floating directly under it.
+    #[test]
+    fn the_footer_toggle_sits_at_the_blades_bottom_edge_not_floating_under_its_content() {
+        let (mut app, _) = App::new();
+        app.shell = shell::ShellState::default();
+
+        let mut ui = iced_test::simulator(app.view());
+        let blade = ui
+            .find(iced::widget::Id::new("left-blade"))
+            .expect("the expanded left blade must be laid out")
+            .bounds();
+        let toggle = ui
+            .find(iced::widget::Id::new("left-blade-toggle"))
+            .expect("the expanded left blade's footer toggle must be laid out")
+            .bounds();
+
+        let gap = (blade.y + blade.height) - (toggle.y + toggle.height);
+        assert!(
+            (0.0..20.0).contains(&gap),
+            "expected the footer toggle's bottom to sit within the blade's own \
+             padding of the blade's bottom edge, got a gap of {gap} — blade {blade:?}, \
+             toggle {toggle:?}; a large gap means the footer floated under a short \
+             channel list instead of pinning to the bottom"
+        );
+    }
+
+    /// Collapsing either blade to its thin edge tab must not squeeze the
+    /// center pane grid — the same `Popover`-era regression
+    /// `the_center_pane_grid_keeps_real_height_with_a_bottom_panel_open`
+    /// guards for the bottom drawer, now for the edge tab.
+    #[test]
+    fn the_center_pane_grid_keeps_real_height_with_either_blade_collapsed() {
+        let (mut app, _) = App::new();
+        app.shell = shell::ShellState::default();
+        app.shell.left_collapsed = true;
+
+        {
+            let mut left_collapsed = iced_test::simulator(app.view());
+            let outer = left_collapsed
+                .find(iced::widget::Id::new("center-pane-grid"))
+                .expect("the center container must be laid out")
+                .bounds();
+            assert!(
+                outer.height > 100.0,
+                "expected the center pane grid to keep real height with the left \
+                 blade collapsed to its edge tab, got {outer:?}"
+            );
+        }
+
+        app.shell.left_collapsed = false;
+        app.shell.right_collapsed = true;
+        let mut right_collapsed = iced_test::simulator(app.view());
+        let outer = right_collapsed
+            .find(iced::widget::Id::new("center-pane-grid"))
+            .expect("the center container must be laid out")
+            .bounds();
+        assert!(
+            outer.height > 100.0,
+            "expected the center pane grid to keep real height with the right \
+             blade collapsed to its edge tab, got {outer:?}"
+        );
     }
 }
 
