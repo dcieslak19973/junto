@@ -4876,15 +4876,43 @@ impl canvas::Program<Message> for LineageRailCanvas {
             );
         }
 
-        // Reconnect: this row's own outgoing converge curves from its
-        // lane at the centre out to the target lane by the bottom edge.
+        // Reconnect: a short tail from the marker angled toward the lane this
+        // channel converged into, deliberately stopping short of reaching it.
+        //
+        // Drawing the full traverse — marker to target lane at the cell's
+        // bottom edge — is geometrically honest but unreadable in a list: a
+        // channel occupies exactly ONE row, so peeling in from the parent lane
+        // and reconnecting to it in that same row draws `\` immediately
+        // followed by `/`, and a run of sibling channels becomes a lightning
+        // bolt down the rail. `git log --graph` avoids this by giving each
+        // connector its own row (`|\`, `| *`, `|/`), which here would take 20
+        // channels to roughly 40 rows — too much scrolling in a 211px blade to
+        // buy back the geometry. The tail keeps the direction legible; the
+        // expansion states the target by name.
         if let Some(target_lane) = self.rail.converge_to {
+            let target_x = lane_x(target_lane);
+            let own_x = lane_x(self.rail.lane);
             frame.stroke(
-                &lineage_connector(
-                    Point::new(lane_x(self.rail.lane), mid),
-                    Point::new(lane_x(target_lane), height),
+                &Path::line(
+                    Point::new(own_x, mid),
+                    Point::new(own_x + (target_x - own_x) * 0.45, height * 0.85),
                 ),
                 connector_stroke,
+            );
+        }
+
+        // A short vertical stub through the marker in its OWN lane, so a
+        // branched node reads as sitting on a lane rather than dangling off
+        // the end of the diagonal that reached it. Only needed where no
+        // through-line already occupies this lane.
+        if !self.rail.through.lanes().any(|lane| lane == self.rail.lane) {
+            let x = lane_x(self.rail.lane);
+            frame.stroke(
+                &Path::line(
+                    Point::new(x, mid - LANE_W * 0.35),
+                    Point::new(x, mid + LANE_W * 0.35),
+                ),
+                Stroke::default().with_color(BORDER).with_width(1.5),
             );
         }
 
