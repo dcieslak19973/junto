@@ -17,15 +17,14 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use iced::futures::channel::mpsc;
-use iced::widget::canvas::{self, Canvas, Frame, Geometry, Path, Stroke};
 use iced::widget::pane_grid;
 use iced::widget::{
     Space, button, checkbox, column, container, markdown, mouse_area, pick_list, row, scrollable,
     text, text_input, tooltip,
 };
 use iced::{
-    Background, Border, Center, Color, Element, Fill, Length, Padding, Point, Rectangle, Renderer,
-    Size, Task, Theme, mouse,
+    Background, Border, Center, Color, Element, Fill, Length, Padding, Point, Size, Task, Theme,
+    mouse,
 };
 use junto_kernel::{
     Anchor, Annotation, AnnotationId, CodeAnchor, CommitOid, ContentDigest, EntryId, Member,
@@ -565,7 +564,6 @@ struct LineageGraphDto {
 struct GNode {
     id: String,
     name: String,
-    first_ms: Option<i64>,
     last_ms: Option<i64>,
     #[serde(default)]
     milestones: Vec<MilestoneDto>,
@@ -4375,15 +4373,17 @@ fn lineage_view(app: &App) -> Element<'_, Message> {
         } else {
             MUTED
         };
-        let expanded = app.lineage_expanded.contains(&node.id);
+        let state = LineageRowState {
+            glyph: lineage_glyph(role, is_focused),
+            color,
+            is_open,
+            expanded: app.lineage_expanded.contains(&node.id),
+        };
         list = list.push(lineage_row(
             node,
             &by_id,
             &relations,
-            lineage_glyph(role, is_focused),
-            color,
-            is_open,
-            expanded,
+            state,
             app.pending.as_ref(),
         ));
     }
@@ -4448,8 +4448,21 @@ fn lineage_glyph(role: LineageRole, focused: bool) -> char {
     }
 }
 
+/// A lineage row's presentation state, computed once per node in
+/// `lineage_view`'s loop from its role, focus, and open-ness — bundled
+/// into one argument (rather than four) since all four travel together
+/// from that loop into `lineage_row`. `Copy`: every field is a plain
+/// value, cheaper to copy than to borrow.
+#[derive(Debug, Clone, Copy)]
+struct LineageRowState {
+    glyph: char,
+    color: Color,
+    is_open: bool,
+    expanded: bool,
+}
+
 /// One lineage row: the fixed-width rail, a per-row disclosure chevron,
-/// and the channel name, plus — while `expanded` — that node's relations
+/// and the channel name, plus — while expanded — that node's relations
 /// and milestones underneath. Clicking the name behaves like a channel
 /// chip (`channel_nav`): an unopened channel offers the same
 /// `placement_choices` menu (`placement_menu`, reused verbatim, not
@@ -4459,12 +4472,15 @@ fn lineage_row<'a>(
     node: &'a GNode,
     by_id: &HashMap<&'a str, &'a GNode>,
     relations: &LineageRelations<'a>,
-    glyph: char,
-    color: Color,
-    is_open: bool,
-    expanded: bool,
+    state: LineageRowState,
     pending: Option<&PendingOpen>,
 ) -> Element<'a, Message> {
+    let LineageRowState {
+        glyph,
+        color,
+        is_open,
+        expanded,
+    } = state;
     let disclosure = icon_button(
         if expanded {
             ICON_CHEVRON_DOWN
@@ -7659,271 +7675,6 @@ impl Pane {
     }
 }
 
-// ---- the branch graph: a horizontal time-axis lineage strip, matching the
-// web's `lineage_strip` (newest on the right, log-scaled by age; each channel a
-// track from its first to last activity; diverge/converge as connectors). ----
-
-const ROWH: f32 = 24.0;
-const TOP: f32 = 12.0;
-const LABEL_W: f32 = 150.0;
-/// Minimum drawn track length, so a short side-quest's diverge (at its start)
-/// and converge (at its end) keep a visible horizontal gap.
-const MIN_TRACK: f32 = 56.0;
-
-#[derive(Clone)]
-struct Track {
-    name: String,
-    row: usize,
-    first_ms: i64,
-    last_ms: i64,
-    root: bool,
-    /// This channel is currently open as a pane (highlighted in the graph).
-    open: bool,
-    /// Labelled points along the track: (timestamp, explanatory text).
-    milestones: Vec<(i64, String)>,
-}
-
-#[derive(Clone)]
-struct LineageCanvas {
-    tracks: Vec<Track>,
-    /// (parent_row, child_row, divergence_ms, is_diverge)
-    links: Vec<(usize, usize, i64, bool)>,
-    now_ms: i64,
-    span_ms: i64,
-    height: f32,
-}
-
-impl LineageCanvas {
-    fn layout(graph: &LineageGraphDto, open: &HashSet<String>) -> Self {
-        let mut is_child: HashSet<&str> = HashSet::new();
-        for edge in &graph.edges {
-            if edge.relation == "diverge" {
-                is_child.insert(edge.to.as_str());
-            }
-        }
-
-        // Stack tracks oldest-first (root spines near the top).
-        let now_ms = graph
-            .nodes
-            .iter()
-            .filter_map(|n| n.last_ms)
-            .max()
-            .unwrap_or(0);
-        let min_ms = graph
-            .nodes
-            .iter()
-            .filter_map(|n| n.first_ms)
-            .min()
-            .unwrap_or(0);
-
-        let mut ordered: Vec<&GNode> = graph.nodes.iter().collect();
-        ordered.sort_by_key(|n| n.first_ms.unwrap_or(min_ms));
-        // The oldest root is the mainline spine — keep it at row 0 (the sticky
-        // pinned ambient). Show the remaining tracks newest-first, so the most
-        // recent channels appear at the top of the timeline.
-        if ordered.len() > 1 {
-            ordered[1..].reverse();
-        }
-
-        let mut row_of: HashMap<&str, usize> = HashMap::new();
-        let mut tracks = Vec::new();
-        for (row, n) in ordered.iter().enumerate() {
-            row_of.insert(n.id.as_str(), row);
-            tracks.push(Track {
-                name: n.name.clone(),
-                row,
-                first_ms: n.first_ms.unwrap_or(min_ms),
-                last_ms: n.last_ms.unwrap_or(now_ms),
-                root: !is_child.contains(n.id.as_str()),
-                open: open.contains(&n.name),
-                milestones: n
-                    .milestones
-                    .iter()
-                    .map(|m| (m.ms, m.label.clone()))
-                    .collect(),
-            });
-        }
-        let first_of: HashMap<&str, i64> = graph
-            .nodes
-            .iter()
-            .map(|n| (n.id.as_str(), n.first_ms.unwrap_or(min_ms)))
-            .collect();
-        let last_of: HashMap<&str, i64> = graph
-            .nodes
-            .iter()
-            .map(|n| (n.id.as_str(), n.last_ms.unwrap_or(now_ms)))
-            .collect();
-
-        let links = graph
-            .edges
-            .iter()
-            .filter_map(|e| {
-                let parent = *row_of.get(e.from.as_str())?;
-                let child = *row_of.get(e.to.as_str())?;
-                let diverge = e.relation == "diverge";
-                // Diverge happens at the child's start; convergence happens at the
-                // source's end (when the side-quest merged back).
-                let at = if diverge {
-                    *first_of.get(e.to.as_str())?
-                } else {
-                    *last_of.get(e.from.as_str())?
-                };
-                Some((parent, child, at, diverge))
-            })
-            .collect();
-
-        let height = TOP * 2.0 + tracks.len() as f32 * ROWH;
-        LineageCanvas {
-            tracks,
-            links,
-            now_ms,
-            span_ms: (now_ms - min_ms).max(1),
-            height,
-        }
-    }
-
-    /// Log-scaled age → x, newest on the right (matches the web's `strip_age_x`).
-    fn x_of(&self, ms: i64, left: f32, right: f32) -> f32 {
-        let age = (self.now_ms - ms).max(0) as f64;
-        let frac = ((age + 1.0).ln() / (self.span_ms as f64 + 1.0).ln()).clamp(0.0, 1.0) as f32;
-        right - frac * (right - left)
-    }
-
-    fn y_of(row: usize) -> f32 {
-        TOP + row as f32 * ROWH + ROWH / 2.0
-    }
-}
-
-impl canvas::Program<Message> for LineageCanvas {
-    type State = ();
-
-    fn draw(
-        &self,
-        _state: &(),
-        renderer: &Renderer,
-        _theme: &Theme,
-        bounds: Rectangle,
-        cursor: mouse::Cursor,
-    ) -> Vec<Geometry> {
-        let mut frame = Frame::new(renderer, bounds.size());
-        let left = LABEL_W;
-        let right = (bounds.width - 24.0).max(left + 60.0);
-        let hover = cursor.position_in(bounds);
-        let mut tooltip: Option<(Point, String)> = None;
-
-        // Per-track x-range with a minimum length so diverge/converge keep a gap.
-        let mut ranges = vec![(0.0_f32, 0.0_f32); self.tracks.len()];
-        for t in &self.tracks {
-            let x0 = self.x_of(t.first_ms, left, right);
-            let x1 = self.x_of(t.last_ms, left, right).max(x0 + MIN_TRACK);
-            ranges[t.row] = (x0, x1);
-        }
-
-        // Diverge/converge connectors: straight vertical links, distinguished by
-        // style so they read even when close — diverge solid (mauve) anchored at
-        // the child's start, converge dashed (green) anchored at the source's end.
-        for (parent_row, child_row, _at_ms, diverge) in &self.links {
-            let x = if *diverge {
-                ranges[*child_row].0
-            } else {
-                ranges[*parent_row].1
-            };
-            let y0 = Self::y_of(*parent_row);
-            let y1 = Self::y_of(*child_row);
-            let color = if *diverge { MAUVE } else { GREEN };
-            let base = Stroke::default().with_color(color).with_width(1.6);
-            let stroke = if *diverge {
-                base
-            } else {
-                canvas::Stroke {
-                    line_dash: canvas::LineDash {
-                        segments: &[4.0, 3.0],
-                        offset: 0,
-                    },
-                    ..base
-                }
-            };
-            frame.stroke(&Path::line(Point::new(x, y0), Point::new(x, y1)), stroke);
-        }
-
-        // Tracks: a horizontal line from first to last activity + an end cap,
-        // plus a labelled dot per milestone (label shown on hover).
-        for track in &self.tracks {
-            let y = Self::y_of(track.row);
-            let (x0, x1) = ranges[track.row];
-            let base = if track.root { TEAL } else { MAUVE };
-            let color = if track.open {
-                base
-            } else {
-                Color { a: 0.45, ..base }
-            };
-            frame.stroke(
-                &Path::line(Point::new(x0, y), Point::new(x1, y)),
-                Stroke::default()
-                    .with_color(color)
-                    .with_width(if track.open { 3.0 } else { 2.0 }),
-            );
-            frame.fill(
-                &Path::circle(Point::new(x1, y), if track.open { 5.0 } else { 4.0 }),
-                color,
-            );
-
-            // Milestone points along the track (clamped onto the drawn span).
-            for (ms, label) in &track.milestones {
-                let mx = self.x_of(*ms, left, right).clamp(x0, x1);
-                let dot = Point::new(mx, y);
-                frame.fill(
-                    &Path::circle(dot, 2.5),
-                    Color {
-                        a: if track.open { 0.95 } else { 0.55 },
-                        ..TEXT
-                    },
-                );
-                if let Some(h) = hover
-                    && (h.x - mx).abs() < 5.0
-                    && (h.y - y).abs() < 5.0
-                {
-                    tooltip = Some((dot, label.clone()));
-                }
-            }
-
-            frame.fill_text(canvas::Text {
-                content: truncate(&track.name, 20),
-                position: Point::new(8.0, y - 8.0),
-                color: if track.open {
-                    TEXT
-                } else {
-                    Color { a: 0.7, ..TEXT }
-                },
-                size: 13.0.into(),
-                ..canvas::Text::default()
-            });
-        }
-
-        draw_tooltip(&mut frame, tooltip, bounds);
-        vec![frame.into_geometry()]
-    }
-}
-
-/// Draw a milestone hover tooltip (a labelled box near the hovered point).
-fn draw_tooltip(frame: &mut Frame, tooltip: Option<(Point, String)>, bounds: Rectangle) {
-    let Some((dot, label)) = tooltip else { return };
-    let w = (label.chars().count() as f32 * 6.3 + 14.0).min(bounds.width - 8.0);
-    let tx = (dot.x + 8.0).min(bounds.width - w - 4.0).max(4.0);
-    let ty = (dot.y - 24.0).max(2.0);
-    frame.fill(
-        &Path::rectangle(Point::new(tx, ty), Size::new(w, 19.0)),
-        Color { a: 0.97, ..SURFACE },
-    );
-    frame.fill_text(canvas::Text {
-        content: label,
-        position: Point::new(tx + 7.0, ty + 3.0),
-        color: TEXT,
-        size: 11.0.into(),
-        ..canvas::Text::default()
-    });
-}
-
 /// Fetch a channel's structured view from `base` (the pane's effective host,
 /// `Pane::base`) into `pane`.
 fn fetch(pane: pane_grid::Pane, base: String, channel: &str) -> Task<Message> {
@@ -7953,7 +7704,7 @@ fn fetch_keys(pane: pane_grid::Pane, base: String, channel: &str) -> Task<Messag
     )
 }
 
-/// Fetch the whole lineage DAG for the always-visible top branch graph.
+/// Fetch the whole lineage DAG rendered by `lineage_view`'s vertical list.
 fn fetch_lineage_graph() -> Task<Message> {
     let url = format!("{HOST}/lineage.json");
     Task::perform(
@@ -10896,7 +10647,6 @@ mod lineage_tests {
         let node = |id: &str, last_ms: Option<i64>| GNode {
             id: id.to_string(),
             name: id.to_string(),
-            first_ms: last_ms,
             last_ms,
             milestones: Vec::new(),
         };
@@ -10956,7 +10706,6 @@ mod lineage_tests {
         graph.nodes.push(GNode {
             id: "aardvark".to_string(),
             name: "aardvark".to_string(),
-            first_ms: Some(1000),
             last_ms: Some(1000),
             milestones: Vec::new(),
         });
@@ -11052,7 +10801,6 @@ mod lineage_view_tests {
             nodes: vec![GNode {
                 id: "n1".to_string(),
                 name: name.to_string(),
-                first_ms: Some(1),
                 last_ms: Some(1),
                 milestones: Vec::new(),
             }],
@@ -11086,14 +10834,12 @@ mod lineage_view_tests {
                 GNode {
                     id: "a".into(),
                     name: "a".into(),
-                    first_ms: None,
                     last_ms: None,
                     milestones: Vec::new(),
                 },
                 GNode {
                     id: "b".into(),
                     name: "b".into(),
-                    first_ms: None,
                     last_ms: None,
                     milestones: Vec::new(),
                 },
@@ -11149,14 +10895,12 @@ mod lineage_view_tests {
                 GNode {
                     id: "hub".into(),
                     name: "hub".into(),
-                    first_ms: Some(1),
                     last_ms: Some(1),
                     milestones: Vec::new(),
                 },
                 GNode {
                     id: "child".into(),
                     name: "child".into(),
-                    first_ms: Some(2),
                     last_ms: Some(2),
                     milestones: vec![MilestoneDto {
                         ms: 1,
@@ -11194,14 +10938,12 @@ mod lineage_view_tests {
                 GNode {
                     id: "hub".into(),
                     name: "hub".into(),
-                    first_ms: Some(1),
                     last_ms: Some(2),
                     milestones: Vec::new(),
                 },
                 GNode {
                     id: "child".into(),
                     name: "child".into(),
-                    first_ms: Some(1),
                     last_ms: Some(1),
                     milestones: Vec::new(),
                 },
