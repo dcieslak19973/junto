@@ -10747,6 +10747,377 @@ diff --git a/lib.rs b/lib.rs
 }
 
 #[cfg(test)]
+mod resume_and_comment_tests {
+    use super::*;
+
+    // --- `pending_comment_text`: the only place the clicked file+lines survive a resume ---
+
+    #[test]
+    fn a_comment_aimed_at_a_file_span_is_prefixed_with_the_path_and_lines() {
+        assert_eq!(
+            pending_comment_text("lib.rs", "12-14", "looks off"),
+            "about lib.rs:12-14 — looks off"
+        );
+    }
+
+    #[test]
+    fn a_comment_aimed_at_the_stream_carries_no_prefix() {
+        assert_eq!(pending_comment_text("", "", "just a note"), "just a note");
+    }
+
+    #[test]
+    fn a_blank_path_is_treated_as_a_stream_aim_even_with_stray_whitespace() {
+        assert_eq!(pending_comment_text("   ", "3-5", "note"), "note");
+    }
+
+    // --- COMMIT 1: a diff row is aimable even when the session is not live ---
+
+    /// A pane watching finished session "s1", whose record holds one diff
+    /// artifact with its content already fetched — deliberately never sets
+    /// `annotate_tx`, so this pane IS the "finished session" case.
+    fn finished_session_diff_pane() -> (pane_grid::State<Pane>, pane_grid::Pane) {
+        const DIFF: &str = "\
+diff --git a/lib.rs b/lib.rs
++++ b/lib.rs
+@@ -1,3 +1,4 @@
+ fn one() {}
++fn two() { println!(\"two\"); }
+";
+        let entry = |id: &str, kind: &str, summary: &str| EntryDto {
+            id: id.into(),
+            author: "omp@oh-my-pi.dev".into(),
+            kind: kind.into(),
+            summary: summary.into(),
+            status: None,
+            unrecognized: false,
+            unverified: false,
+            target: Some("s1".into()),
+            frame: Vec::new(),
+        };
+        let (mut panes, id) = pane_grid::State::new(Pane::loading("c"));
+        let pane = panes.get_mut(id).expect("the pane just created");
+        pane.watched = Some("s1".into());
+        pane.content = Content::Loaded(ChannelDto {
+            id: "c".into(),
+            name: Some("c".into()),
+            closed: false,
+            party: Vec::new(),
+            workspace: None,
+            sessions: Vec::new(),
+            entries: vec![
+                entry("s1", "session", "did a thing"),
+                entry("a1", "artifact", "diff: lib.rs"),
+            ],
+        });
+        pane.artifacts.insert(
+            "a1".into(),
+            ArtifactContent::Loaded {
+                format: "diff".into(),
+                body: DIFF.into(),
+                md: None,
+                digest: ContentDigest::sha256_of(DIFF.as_bytes())
+                    .as_str()
+                    .to_string(),
+            },
+        );
+        (panes, id)
+    }
+
+    #[test]
+    fn a_diff_row_on_a_finished_session_is_still_a_click_target() {
+        let (panes, id) = finished_session_diff_pane();
+        let pane = panes.get(id).expect("the pane just built");
+        assert!(
+            pane.annotate_tx.is_none(),
+            "precondition: this session is not live"
+        );
+
+        let mut ui = iced_test::simulator(pane_body(id, pane, &[], &[]));
+        ui.click("+fn two() { println!(\"two\"); }")
+            .expect("a finished session's diff row must still be a click target");
+        let messages: Vec<Message> = ui.into_messages().collect();
+
+        assert!(
+            messages.iter().any(|m| matches!(
+                m,
+                Message::AnchorPress(_, AnchorTarget::Code(path), _) if path == "lib.rs"
+            )),
+            "expected a code anchor press on the finished session's diff, got {messages:?}"
+        );
+    }
+
+    #[test]
+    fn the_stale_needs_a_live_turn_hint_is_replaced() {
+        let (panes, id) = finished_session_diff_pane();
+        let pane = panes.get(id).expect("the pane just built");
+        let mut ui = iced_test::simulator(pane_body(id, pane, &[], &[]));
+        assert!(
+            ui.find("commenting needs a live turn").is_err(),
+            "the old, now-false hint must not still be on screen"
+        );
+        ui.find(
+            "not live — click a diff line to comment; submitting resumes the session with that note",
+        )
+            .expect("the replacement hint must be on screen for a finished session");
+    }
+
+    // --- COMMIT 2: `AnnotateSubmit` with no socket resumes + holds a pending comment ---
+
+    /// A fresh `App` whose one pane watches a freshly minted session id.
+    fn app_with_watched_session() -> (App, pane_grid::Pane, String) {
+        let (mut app, _) = App::new();
+        let focused = app.focus.expect("App::new focuses its one pane");
+        let session = EntryId::new().to_string();
+        let state = app
+            .panes
+            .get_mut(focused)
+            .expect("the pane App::new just created");
+        state.watched = Some(session.clone());
+        (app, focused, session)
+    }
+
+    #[test]
+    fn submitting_with_no_socket_holds_a_pending_comment_and_steers_instead_of_sending() {
+        let (mut app, focused, session) = app_with_watched_session();
+        {
+            let state = app.panes.get_mut(focused).expect("pane exists");
+            state.annotate_path = "lib.rs".to_string();
+            state.annotate_lines = "12-14".to_string();
+            state.annotate_body = "looks off".to_string();
+        }
+
+        let _ = app.update(Message::AnnotateSubmit(focused));
+
+        let state = app.panes.get(focused).expect("pane still exists");
+        let pending = state
+            .pending_comment
+            .as_ref()
+            .expect("no socket to send over — the comment must be held instead");
+        assert_eq!(pending.session, session);
+        assert_eq!(pending.text, "about lib.rs:12-14 — looks off");
+        assert!(
+            state.annotate_body.is_empty(),
+            "the composer's body must clear"
+        );
+        assert!(
+            state.annotate_path.is_empty(),
+            "the composer must close (path)"
+        );
+        assert!(
+            state.annotate_lines.is_empty(),
+            "the composer must close (lines)"
+        );
+        let feed_texts: Vec<&str> = state
+            .feed
+            .iter()
+            .map(|item| item.event.text.as_str())
+            .collect();
+        assert!(
+            feed_texts.contains(&pending.text.as_str()),
+            "the pending text must also have been echoed as the steer, got {feed_texts:?}"
+        );
+    }
+
+    /// Builds on `app_with_watched_session`: also aims at a file span and
+    /// submits, so the pane already holds a pending comment.
+    fn app_with_pending_comment() -> (App, pane_grid::Pane, String) {
+        let (mut app, focused, session) = app_with_watched_session();
+        {
+            let state = app.panes.get_mut(focused).expect("pane exists");
+            state.annotate_path = "lib.rs".to_string();
+            state.annotate_lines = "3".to_string();
+            state.annotate_body = "note".to_string();
+        }
+        let _ = app.update(Message::AnnotateSubmit(focused));
+        assert!(
+            app.panes
+                .get(focused)
+                .expect("pane exists")
+                .pending_comment
+                .is_some(),
+            "precondition: a pending comment is held"
+        );
+        (app, focused, session)
+    }
+
+    #[test]
+    fn a_live_connect_for_the_same_session_flushes_the_pending_comment() {
+        let (mut app, focused, session) = app_with_pending_comment();
+        // `conversation_len` is what names a real op to anchor the flushed
+        // `StreamAnchor` at; `LiveConnected` fires before the resumed doc's
+        // first sync, so this simulates that sync having already landed
+        // (`Pane::try_flush_pending_comment`'s own docs cover the race this
+        // sidesteps).
+        app.panes
+            .get_mut(focused)
+            .expect("pane exists")
+            .conversation_len = 3;
+        let (tx, _rx) = mpsc::channel::<WireFrame>(4);
+        let _ = app.update(Message::LiveConnected(
+            session,
+            tx,
+            "reviewer@example.com".to_string(),
+        ));
+
+        assert!(
+            app.panes
+                .get(focused)
+                .expect("pane exists")
+                .pending_comment
+                .is_none(),
+            "a LiveConnected for the same session must consume the pending comment"
+        );
+    }
+
+    #[test]
+    fn a_live_connect_for_a_different_session_leaves_the_pending_comment_untouched() {
+        let (mut app, focused, _session) = app_with_pending_comment();
+        let pending_text = app
+            .panes
+            .get(focused)
+            .expect("pane exists")
+            .pending_comment
+            .as_ref()
+            .expect("precondition: a pending comment is held")
+            .text
+            .clone();
+        app.panes
+            .get_mut(focused)
+            .expect("pane exists")
+            .conversation_len = 3;
+        let (tx, _rx) = mpsc::channel::<WireFrame>(4);
+        let _ = app.update(Message::LiveConnected(
+            EntryId::new().to_string(),
+            tx,
+            "reviewer@example.com".to_string(),
+        ));
+
+        let pending = app
+            .panes
+            .get(focused)
+            .expect("pane exists")
+            .pending_comment
+            .as_ref()
+            .expect(
+                "a different session's LiveConnected must not touch this pane's pending comment",
+            );
+        assert_eq!(pending.text, pending_text);
+    }
+
+    #[test]
+    fn closing_the_session_drops_a_pending_comment_that_never_got_to_flush() {
+        let (mut app, focused, _session) = app_with_pending_comment();
+
+        let _ = app.update(Message::CloseSession(focused));
+
+        assert!(
+            app.panes
+                .get(focused)
+                .expect("pane exists")
+                .pending_comment
+                .is_none(),
+            "closing the session must not leave a pending comment to flush later"
+        );
+    }
+
+    #[test]
+    fn a_resume_that_never_connects_is_cleaned_up_when_its_live_view_ends() {
+        let (mut app, focused, session) = app_with_pending_comment();
+
+        // The resumed socket never authenticated — no `LiveConnected` ever
+        // arrived — and its subscription simply ended.
+        let _ = app.update(Message::LiveEnded(session));
+
+        assert!(
+            app.panes
+                .get(focused)
+                .expect("pane exists")
+                .pending_comment
+                .is_none(),
+            "a resume that never connects must not leave the comment pending forever"
+        );
+    }
+
+    #[test]
+    fn a_live_panes_submit_still_takes_the_immediate_signed_path_not_the_resume_path() {
+        let (mut app, focused, _session) = app_with_watched_session();
+        let (tx, _rx) = mpsc::channel::<WireFrame>(4);
+        {
+            let state = app.panes.get_mut(focused).expect("pane exists");
+            state.annotate_tx = Some(tx);
+            state.annotate_email = Some("reviewer@example.com".to_string());
+            state.annotate_body = "looks off".to_string();
+            state.steer_text = "unrelated draft".to_string();
+        }
+
+        let _ = app.update(Message::AnnotateSubmit(focused));
+
+        let state = app.panes.get(focused).expect("pane exists");
+        assert!(
+            state.pending_comment.is_none(),
+            "a live pane must never create a pending comment"
+        );
+        assert_eq!(
+            state.steer_text, "unrelated draft",
+            "the live path must never touch the steer box — only the no-socket path steers"
+        );
+        assert!(
+            !state.feed.iter().any(|item| item.event.kind == "you"),
+            "the live path must never echo a steer — it signs and sends directly"
+        );
+    }
+
+    // --- `Pane::try_flush_pending_comment` in isolation ---
+
+    #[test]
+    fn try_flush_pending_comment_ignores_a_session_it_does_not_belong_to() {
+        let mut pane = Pane::loading("c");
+        pane.conversation_len = 5;
+        pane.annotate_tx = Some(mpsc::channel::<WireFrame>(4).0);
+        pane.annotate_email = Some("reviewer@example.com".to_string());
+        pane.pending_comment = Some(PendingComment {
+            session: "session-a".to_string(),
+            text: "about lib.rs:1 — note".to_string(),
+            urgent: false,
+        });
+
+        pane.try_flush_pending_comment("session-b");
+
+        assert!(
+            pane.pending_comment.is_some(),
+            "a mismatched session must never consume or flush the pending comment"
+        );
+    }
+
+    #[test]
+    fn try_flush_pending_comment_waits_for_a_known_conversation_length_then_consumes_it() {
+        let mut pane = Pane::loading("c");
+        pane.annotate_tx = Some(mpsc::channel::<WireFrame>(4).0);
+        pane.annotate_email = Some("reviewer@example.com".to_string());
+        pane.pending_comment = Some(PendingComment {
+            session: "session-a".to_string(),
+            text: "note".to_string(),
+            urgent: false,
+        });
+
+        // `conversation_len` is still 0 — `LiveConnected` fires before the
+        // resumed doc's first sync, so there is no real op to anchor yet.
+        pane.try_flush_pending_comment("session-a");
+        assert!(
+            pane.pending_comment.is_some(),
+            "must not discard the comment before a real op is known"
+        );
+
+        pane.conversation_len = 4;
+        pane.try_flush_pending_comment("session-a");
+        assert!(
+            pane.pending_comment.is_none(),
+            "once a real conversation length is known, the retry must consume it"
+        );
+    }
+}
+
+#[cfg(test)]
 mod placement_tests {
     use super::{Placement, pane_grid};
 
