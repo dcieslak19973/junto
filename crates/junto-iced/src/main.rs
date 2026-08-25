@@ -1438,6 +1438,11 @@ enum Message {
     SessionToggled(String, String),
     /// Dismiss the pinned attention card in a pane.
     ClearHighlight(pane_grid::Pane),
+    /// Escape: shed one layer of transient UI — a placement menu, then a
+    /// lineage detail panel, then a footer panel, then the create form.
+    /// One layer per press, innermost first, so Escape never wipes more
+    /// context than the user was looking at.
+    DismissTransient,
     /// Collapse or expand the left blade.
     ToggleLeftBlade,
     /// Collapse or expand the right blade.
@@ -2104,6 +2109,22 @@ impl App {
             Message::ClearHighlight(pane) => {
                 if let Some(state) = self.panes.get_mut(pane) {
                     state.highlight_entry = None;
+                }
+                Task::none()
+            }
+            Message::DismissTransient => {
+                // One layer per press, innermost first. `&&` short-circuits, so
+                // an open placement menu is taken and nothing further is —
+                // which is the layering, expressed as evaluation order rather
+                // than as a chain of empty branches.
+                if self.pending.take().is_none() && self.lineage_detail.take().is_none() {
+                    if self.shell.bottom.take().is_some() {
+                        // The only transient here that persists, so the only
+                        // one whose dismissal is worth saving.
+                        self.persist_shell();
+                    } else {
+                        self.creating = false;
+                    }
                 }
                 Task::none()
             }
@@ -3705,6 +3726,16 @@ impl App {
             let iced::keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
                 return None;
             };
+            // Escape before the modifier guard: dismissing a floating panel is
+            // the one binding that must NOT need a modifier, and without it the
+            // only way out of a pop-out is finding somewhere neutral to click,
+            // which a near-full-height panel leaves little of.
+            if matches!(
+                key.as_ref(),
+                iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape)
+            ) {
+                return Some(Message::DismissTransient);
+            }
             if !(modifiers.command() || modifiers.control()) {
                 return None;
             }
