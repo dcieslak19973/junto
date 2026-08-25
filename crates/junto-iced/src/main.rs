@@ -106,6 +106,32 @@ fn icon_button<'a>(codepoint: char, message: Message) -> iced::widget::Button<'a
         .width(Length::Fixed(ICON_BTN))
         .height(Length::Fixed(ICON_BTN))
         .padding(0)
+        .style(|_theme, status| ghost_style(status))
+}
+
+/// A chrome affordance that sits ON the background rather than looking like a
+/// button: no fill, no border, the icon muted, and a tint only under the
+/// cursor. Orca and xum both render panel toggles and per-pane controls this
+/// way — a filled button reads as the most important thing on the strip,
+/// which a collapse chevron never is.
+fn ghost_style(status: button::Status) -> button::Style {
+    let tint = |a: f32| Some(Background::Color(Color { a, ..SURFACE }));
+    let (background, text_color) = match status {
+        button::Status::Active => (None, MUTED),
+        button::Status::Hovered => (tint(0.4), TEXT),
+        button::Status::Pressed => (tint(0.6), TEXT),
+        button::Status::Disabled => (None, Color { a: 0.4, ..MUTED }),
+    };
+    button::Style {
+        background,
+        text_color,
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: 4.0.into(),
+        },
+        ..button::Style::default()
+    }
 }
 
 /// Lucide codepoints for the shell-chrome icons `icon` renders above, taken
