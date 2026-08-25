@@ -25,7 +25,7 @@ use iced::widget::{
 };
 use iced::{
     Background, Border, Center, Color, Element, Fill, Length, Padding, Point, Rectangle, Renderer,
-    Size, Task, Theme, mouse,
+    Right, Size, Task, Theme, mouse,
 };
 use junto_kernel::{
     Anchor, Annotation, AnnotationId, CodeAnchor, CommitOid, ContentDigest, EntryId, Member,
@@ -71,6 +71,12 @@ const SP: f32 = 8.0;
 const SP_LOOSE: f32 = 12.0;
 /// Section spacing: between major regions.
 const SP_SECTION: f32 = 16.0;
+/// Width of a blade's drag handle. Reserved even when the blade is collapsed
+/// so collapsing changes only the blade's own width, never the row's total.
+const DIVIDER_W: f32 = 5.0;
+/// Height of the bottom drawer (attention/sessions), with its content
+/// scrolling inside.
+const DRAWER_H: f32 = 240.0;
 
 /// Every icon-only button is this square, so a row of them reads as a grid
 /// rather than as boxes that each shrank to their own glyph plus padding.
@@ -3003,21 +3009,37 @@ impl App {
                 .into()
         };
 
-        let mut shell_row = row![left];
-        if !self.shell.left_collapsed {
-            shell_row = shell_row.push(blade_divider(Side::Left));
-        }
-        shell_row = shell_row.push(
+        let left_gap: Element<Message> = if self.shell.left_collapsed {
+            Space::new()
+                .width(Length::Fixed(DIVIDER_W))
+                .height(Fill)
+                .into()
+        } else {
+            blade_divider(Side::Left)
+        };
+        let right_gap: Element<Message> = if self.shell.right_collapsed {
+            Space::new()
+                .width(Length::Fixed(DIVIDER_W))
+                .height(Fill)
+                .into()
+        } else {
+            blade_divider(Side::Right)
+        };
+        // Always five children: the divider gap is reserved even collapsed,
+        // so collapsing changes only the blade's own width, never the row's
+        // total (`DIVIDER_W`'s doc comment).
+        let shell_row = row![
+            left,
+            left_gap,
             container(center)
                 .id(iced::widget::Id::new("center-pane-grid"))
                 .width(Fill),
-        );
-        if !self.shell.right_collapsed {
-            shell_row = shell_row.push(blade_divider(Side::Right));
-        }
-        shell_row = shell_row.push(right);
+            right_gap,
+            right,
+        ]
+        .spacing(0);
 
-        column![top_bar, shell_row.spacing(0), footer(self)].into()
+        column![top_bar, shell_row, footer(self)].into()
     }
 }
 
@@ -3149,11 +3171,12 @@ fn blade_stub<'a>(side: Side, badge: Option<usize>) -> Element<'a, Message> {
 
 /// A thin draggable handle between a blade and the center: press-drag to
 /// resize that blade, double-click to reset it to its default width.
-/// Rendered only beside an EXPANDED blade (`App::view`) — a collapsed blade
-/// is a 24px stub with nothing to resize.
+/// Rendered only beside an EXPANDED blade (`App::view`); a collapsed blade
+/// gets a plain `Space` of the same width instead (`App::view`), so the row
+/// always has five children and collapsing changes only the blade's width.
 fn blade_divider<'a>(side: Side) -> Element<'a, Message> {
     let handle = container(Space::new())
-        .width(Length::Fixed(5.0))
+        .width(Length::Fixed(DIVIDER_W))
         .height(Fill)
         .style(|_theme| container::Style {
             background: Some(Background::Color(BORDER)),
@@ -3347,8 +3370,7 @@ fn left_blade(app: &App) -> Element<'_, Message> {
         shell::LeftView::Sessions => sessions_view(app),
     };
 
-    column![
-        icon_button(ICON_PANEL_LEFT, Message::ToggleLeftBlade),
+    let rest = column![
         container(channel_nav(app))
             .id(iced::widget::Id::new("left-blade-nav"))
             .height(Length::FillPortion(
@@ -3361,8 +3383,17 @@ fn left_blade(app: &App) -> Element<'_, Message> {
                 ((1.0 - app.shell.left_split.get()) * 100.0) as u16
             )),
     ]
-    .spacing(SP)
-    .padding(SP)
+    .spacing(SP);
+
+    // The toggle sits OUTSIDE the blade's padding, flush to the window's
+    // left edge — the same x it occupies collapsed, in `blade_stub`'s
+    // unpadded rail. Padding it in with the rest would put it SP in from
+    // the edge expanded but flush at 0 collapsed, jumping under the cursor
+    // on every collapse.
+    column![
+        icon_button(ICON_PANEL_LEFT, Message::ToggleLeftBlade),
+        container(rest).padding(SP).width(Fill).height(Fill),
+    ]
     .into()
 }
 
@@ -3401,16 +3432,17 @@ fn right_blade(app: &App) -> Element<'_, Message> {
         shell::RightView::Lineage => lineage_view(app),
     };
 
+    let rest = column![switcher, body].spacing(SP);
+
+    // Mirrors `left_blade`: the toggle sits outside the padding, flush to
+    // the window's right edge — `align_x(Right)` positions the unpadded
+    // toggle there while the full-width padded container beneath it keeps
+    // its content inset as before.
     column![
-        row![
-            switcher,
-            icon_button(ICON_PANEL_RIGHT, Message::ToggleRightBlade)
-        ]
-        .spacing(SP),
-        body,
+        icon_button(ICON_PANEL_RIGHT, Message::ToggleRightBlade),
+        container(rest).padding(SP).width(Fill).height(Fill),
     ]
-    .spacing(SP)
-    .padding(SP)
+    .align_x(Right)
     .into()
 }
 
