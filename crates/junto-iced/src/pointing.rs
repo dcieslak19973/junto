@@ -55,6 +55,57 @@ pub fn popover_position(
     (x, y)
 }
 
+/// Where a floating panel of `panel` (width, height) should sit BESIDE
+/// `anchor` — to its LEFT by default — without leaving `viewport` (width,
+/// height).
+///
+/// Prefers the left side (`anchor.x - panel_w - gap`); flips to the RIGHT
+/// (`anchor.x + anchor.width + gap`) when the left would run off the
+/// viewport's left edge; when neither side fits, clamps to whichever edge
+/// leaves the panel more room rather than always preferring one. Vertically
+/// centred on the anchor, then clamped so a row near the top or bottom of a
+/// tall list still gets a panel fully on screen. Same 8px viewport inset as
+/// `popover_position`, so the two rules agree at the edges.
+///
+/// A sibling to `popover_position`, not a mode on it: that function's four
+/// existing callers (the footer's two chips, the channel-chip and
+/// lineage-name placement menus, and the diff annotate popup) all want
+/// below-or-above and are untouched by this. This exists for a panel that
+/// must not move the row it hangs off — inline expansion pushed every
+/// sibling row down the list, which is what this was built to stop.
+#[must_use]
+pub fn popover_position_side(
+    anchor: Rect,
+    panel: (f32, f32),
+    viewport: (f32, f32),
+    gap: f32,
+) -> (f32, f32) {
+    const INSET: f32 = 8.0;
+    let (panel_w, panel_h) = panel;
+    let (viewport_w, viewport_h) = viewport;
+
+    let left = anchor.x - panel_w - gap;
+    let right = anchor.x + anchor.width + gap;
+    let room_left = anchor.x;
+    let room_right = viewport_w - (anchor.x + anchor.width);
+    let x = if left >= INSET {
+        left
+    } else if right + panel_w <= viewport_w - INSET {
+        right
+    } else if room_left >= room_right {
+        INSET
+    } else {
+        (viewport_w - panel_w - INSET).max(INSET)
+    };
+
+    let centered = anchor.y + anchor.height / 2.0 - panel_h / 2.0;
+    let y = centered
+        .min((viewport_h - panel_h - INSET).max(INSET))
+        .max(INSET);
+
+    (x, y)
+}
+
 /// The new-file line a floating comment panel should hang from: the aimed
 /// span's END — the row most recently clicked — but only when one of `diffs`
 /// actually renders that row within its first `max_rows` lines.
@@ -201,6 +252,100 @@ diff --git a/lib.rs b/lib.rs
                 500
             ),
             Some(7)
+        );
+    }
+}
+
+#[cfg(test)]
+mod side_placement_tests {
+    use super::{Rect, popover_position_side};
+
+    // A mid-list anchor with generous room on both sides and above/below,
+    // so each test only has to change the one dimension it's exercising.
+    const ANCHOR: Rect = Rect {
+        x: 500.0,
+        y: 300.0,
+        width: 100.0,
+        height: 20.0,
+    };
+    const VIEWPORT: (f32, f32) = (1000.0, 800.0);
+
+    #[test]
+    fn a_panel_prefers_the_left_of_its_anchor_when_there_is_room() {
+        let (x, y) = popover_position_side(ANCHOR, (300.0, 200.0), VIEWPORT, 8.0);
+        assert_eq!(
+            x, 192.0,
+            "anchor.x (500) minus the panel width (300) minus the gap (8)"
+        );
+        assert_eq!(
+            y, 210.0,
+            "centred: anchor mid-y (310) minus half the panel height (100)"
+        );
+    }
+
+    #[test]
+    fn a_panel_flips_right_when_its_anchor_is_near_the_left_edge() {
+        let anchor = Rect { x: 20.0, ..ANCHOR };
+        let (x, _) = popover_position_side(anchor, (300.0, 200.0), VIEWPORT, 8.0);
+        assert_eq!(
+            x, 128.0,
+            "left would run off the viewport (20 - 300 - 8 < 0), so it flips to anchor.x + anchor.width + gap"
+        );
+    }
+
+    #[test]
+    fn a_panel_is_vertically_centred_on_a_mid_list_anchor() {
+        let (_, y) = popover_position_side(ANCHOR, (150.0, 400.0), VIEWPORT, 8.0);
+        assert_eq!(
+            y, 110.0,
+            "anchor mid-y (310) minus half the panel height (200)"
+        );
+    }
+
+    #[test]
+    fn a_panel_is_clamped_to_the_top_for_an_anchor_at_the_very_top_of_the_list() {
+        let anchor = Rect { y: 0.0, ..ANCHOR };
+        let (_, y) = popover_position_side(anchor, (150.0, 300.0), VIEWPORT, 8.0);
+        assert_eq!(
+            y, 8.0,
+            "centring would push the panel above y = 0 (0 + 10 - 150 = -140); clamped to the top inset instead"
+        );
+    }
+
+    #[test]
+    fn a_panel_is_clamped_to_the_bottom_for_an_anchor_at_the_very_bottom_of_the_list() {
+        let anchor = Rect { y: 780.0, ..ANCHOR };
+        let (_, y) = popover_position_side(anchor, (150.0, 300.0), VIEWPORT, 8.0);
+        assert_eq!(
+            y, 492.0,
+            "centring would push the panel past the bottom edge; clamped to viewport_h - panel_h - 8 (800 - 300 - 8)"
+        );
+    }
+
+    #[test]
+    fn a_panel_wider_than_the_viewport_still_starts_on_screen() {
+        // Neither side fits (left runs negative, right plus the panel
+        // overruns the viewport), so this also exercises the "more room"
+        // tie-break: with the anchor at x = 500 in a 1000-wide viewport,
+        // the left side (500px) has more room than the right (400px).
+        let (x, _) = popover_position_side(ANCHOR, (2000.0, 200.0), VIEWPORT, 8.0);
+        assert_eq!(x, 8.0, "clamped to the left margin, never negative");
+    }
+
+    #[test]
+    fn neither_side_fits_and_the_right_has_more_room_it_clamps_there_instead() {
+        // Anchor near the left edge of a viewport too narrow for the panel
+        // on either side: the right (830px of room) beats the left
+        // (150px), so the panel clamps to the right edge, not the left.
+        let anchor = Rect {
+            x: 150.0,
+            width: 20.0,
+            ..ANCHOR
+        };
+        let (x, _) = popover_position_side(anchor, (900.0, 200.0), (1000.0, 800.0), 8.0);
+        assert_eq!(
+            x, 92.0,
+            "clamped to the right edge (viewport_w - panel_w - 8 = 1000 - 900 - 8)"
         );
     }
 }
