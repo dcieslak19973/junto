@@ -243,12 +243,14 @@ struct App {
     /// `ShellState`, since a half-finished gesture is not layout worth
     /// saving.
     blade_drag: Option<BladeDrag>,
-    /// The channel whose placement menu is open, if any — set by pressing
-    /// an unopened channel's chip, cleared by pressing it again or by an
-    /// outside click. Transient like `blade_drag`: a half-made placement
-    /// choice is not layout worth persisting, so this lives on `App`, not
+    /// The channel whose placement is pending, if any — set by pressing
+    /// an unopened channel's chip (no entry) or an unopened attention
+    /// chip (with the entry to jump to once it lands), cleared by
+    /// choosing a placement, pressing the chip again, or an outside
+    /// click. Transient like `blade_drag`: a half-made placement choice
+    /// is not layout worth persisting, so this lives on `App`, not
     /// `ShellState`.
-    placing: Option<String>,
+    pending: Option<PendingOpen>,
     /// Available channel names for the type-ahead picker.
     channels: combo_box::State<String>,
     /// The same names as a plain list, for widgets that need to OFFER them
@@ -971,6 +973,17 @@ impl AnchorTarget {
     }
 }
 
+/// A channel the user has chosen to open but not yet placed, plus the entry
+/// to jump to once it lands (attention chips carry one; channel chips
+/// don't) — the one mechanism `App::pending` uses for both an unopened
+/// channel chip's floating menu and an unopened attention chip's inline
+/// placement row, rather than two parallel fields.
+#[derive(Debug, Clone, PartialEq)]
+struct PendingOpen {
+    channel: String,
+    entry: Option<String>,
+}
+
 /// Where an unopened channel's chip should dock when pressed — the explicit
 /// placement choice `Message::ChannelToggled` offers via a floating menu
 /// (`placement_menu`) instead of always splitting the focused pane
@@ -1005,10 +1018,17 @@ enum Message {
     /// Press a channel chip: close its pane if the channel is open; else
     /// open (or, pressed again, close) that channel's placement menu.
     ChannelToggled(String),
-    /// Pick a placement from an unopened channel's floating menu.
-    ChannelPlaced(String, Placement),
-    /// A focus-board chip: open/focus the channel and jump to the entry.
+    /// Pick a placement for a pending channel — from an unopened
+    /// channel's floating menu, or an unopened attention chip's inline
+    /// row.
+    ChannelPlaced(PendingOpen, Placement),
+    /// A focus-board chip whose channel is already open: focus that pane
+    /// and jump to the entry. Unlike a channel chip this never toggles a
+    /// pane closed — an attention item always means "take me there".
     FocusChipPicked(String, String),
+    /// A focus-board chip whose channel isn't open yet: open (or, pressed
+    /// again, close) its inline placement row.
+    FocusChipToggled(String, String),
     /// Dismiss the pinned attention card in a pane.
     ClearHighlight(pane_grid::Pane),
     /// Collapse or expand the left blade.
@@ -1268,7 +1288,7 @@ impl App {
             device_key_fingerprint: None,
             shell: shell::load(&shell_state_path()),
             blade_drag: None,
-            placing: None,
+            pending: None,
         };
         (
             app,
@@ -1330,6 +1350,18 @@ impl App {
         (None, Task::none())
     }
 
+    /// Show the timeline (not a live feed) so a jump-to entry's card is
+    /// visible, and pin it to the top of `pane` — the two steps
+    /// `FocusChipPicked` (channel already open) and `Message::ChannelPlaced`
+    /// (once an attention chip's pending channel lands) both need, factored
+    /// once rather than repeated at each call site.
+    fn pin_entry(&mut self, pane: pane_grid::Pane, entry: String) {
+        if let Some(state) = self.panes.get_mut(pane) {
+            state.watched = None;
+            state.highlight_entry = Some(entry);
+        }
+    }
+
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::ChannelsLoaded(names) => {
@@ -1343,6 +1375,20 @@ impl App {
             }
             Message::FocusLoaded(items) => {
                 self.focus_items = items;
+                // An attention-originated pending (one carrying an entry)
+                // whose channel has scrolled off the board would otherwise
+                // render an orphaned inline placement row with nothing left
+                // to explain it; a channel chip's pending (no entry) is
+                // unrelated to the board and is left alone.
+                if let Some(pending) = &self.pending
+                    && pending.entry.is_some()
+                    && !self
+                        .focus_items
+                        .iter()
+                        .any(|item| item.channel_name.as_deref() == Some(pending.channel.as_str()))
+                {
+                    self.pending = None;
+                }
                 Task::none()
             }
             Message::AgentsLoaded(agents) => {
@@ -1371,26 +1417,43 @@ impl App {
                     if let Some((_, sibling)) = self.panes.close(pane) {
                         self.focus = Some(sibling);
                     }
-                } else if self.placing.as_deref() == Some(name.as_str()) {
-                    self.placing = None;
+                } else if self
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.entry.is_none() && pending.channel == name)
+                {
+                    self.pending = None;
                 } else {
-                    self.placing = Some(name);
+                    self.pending = Some(PendingOpen {
+                        channel: name,
+                        entry: None,
+                    });
                 }
                 Task::none()
             }
-            Message::ChannelPlaced(name, placement) => {
-                self.placing = None;
+            Message::ChannelPlaced(pending, placement) => {
+                self.pending = None;
+                let PendingOpen {
+                    channel: name,
+                    entry,
+                } = pending;
                 // Every placement here is meaningless with nothing focused
                 // to split or replace — degrade all three to the plain
                 // open/focus path (`ChannelPicked`'s own behaviour) rather
                 // than presenting a choice that has nothing to act on.
                 let Some(target) = self.focus else {
-                    let (_, task) = self.open_or_focus(&name);
+                    let (pane, task) = self.open_or_focus(&name);
+                    if let (Some(pane), Some(entry)) = (pane, entry) {
+                        self.pin_entry(pane, entry);
+                    }
                     return task;
                 };
                 match placement.axis() {
                     Some(axis) => {
-                        let (_, task) = self.split_channel(axis, target, &name);
+                        let (pane, task) = self.split_channel(axis, target, &name);
+                        if let (Some(pane), Some(entry)) = (pane, entry) {
+                            self.pin_entry(pane, entry);
+                        }
                         task
                     }
                     None => {
@@ -1408,21 +1471,34 @@ impl App {
                         let base = state.base().to_string();
                         *state = Pane::loading(&name);
                         state.remote = remote;
+                        if let Some(entry) = entry {
+                            self.pin_entry(target, entry);
+                        }
                         fetch(target, base, &name)
                     }
                 }
             }
             Message::FocusChipPicked(name, entry_id) => {
                 let (pane, task) = self.open_or_focus(&name);
-                if let Some(pane) = pane
-                    && let Some(state) = self.panes.get_mut(pane)
-                {
-                    // Show the timeline (not a live feed) so the card is visible,
-                    // and pin the attention entry to the top.
-                    state.watched = None;
-                    state.highlight_entry = Some(entry_id);
+                if let Some(pane) = pane {
+                    self.pin_entry(pane, entry_id);
                 }
                 task
+            }
+            Message::FocusChipToggled(name, entry_id) => {
+                if self
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.entry.as_deref() == Some(entry_id.as_str()))
+                {
+                    self.pending = None;
+                } else {
+                    self.pending = Some(PendingOpen {
+                        channel: name,
+                        entry: Some(entry_id),
+                    });
+                }
+                Task::none()
             }
             Message::ClearHighlight(pane) => {
                 if let Some(state) = self.panes.get_mut(pane) {
@@ -3647,7 +3723,13 @@ fn placement_menu(name: &str) -> Element<'_, Message> {
                 .spacing(SP_TIGHT)
                 .align_y(Center),
         )
-        .on_press(Message::ChannelPlaced(name.to_string(), placement))
+        .on_press(Message::ChannelPlaced(
+            PendingOpen {
+                channel: name.to_string(),
+                entry: None,
+            },
+            placement,
+        ))
         .padding([SP_TIGHT, SP])
         .width(Fill)
         .style(|_theme, status| ghost_style(status))
@@ -3697,7 +3779,10 @@ fn channel_nav(app: &App) -> Element<'_, Message> {
         let row: Element<Message> = if active {
             chip
         } else {
-            let open = app.placing.as_deref() == Some(name.as_str());
+            let open = app
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.entry.is_none() && pending.channel == *name);
             // 170px: enough for an icon plus the longest row label ("use
             // this pane") at `TEXT_META` with room to breathe — this menu
             // has no list to grow, just three fixed rows, so it needs
@@ -9445,7 +9530,13 @@ mod channel_chip_tests {
         for message in messages {
             let _ = app.update(message);
         }
-        assert_eq!(app.placing.as_deref(), Some("unopened"));
+        assert_eq!(
+            app.pending,
+            Some(PendingOpen {
+                channel: "unopened".to_string(),
+                entry: None,
+            })
+        );
 
         let mut menu = iced_test::simulator(channel_nav(&app));
         menu.find("split right")
@@ -9460,11 +9551,14 @@ mod channel_chip_tests {
     fn pressing_an_unopened_chips_placement_menu_open_again_closes_it() {
         let mut app = two_pane_app();
         app.channel_names.push("unopened".to_string());
-        app.placing = Some("unopened".to_string());
+        app.pending = Some(PendingOpen {
+            channel: "unopened".to_string(),
+            entry: None,
+        });
 
         let _ = app.update(Message::ChannelToggled("unopened".to_string()));
 
-        assert_eq!(app.placing, None, "a second press must clear the menu");
+        assert_eq!(app.pending, None, "a second press must clear the menu");
     }
 
     #[test]
@@ -9473,7 +9567,10 @@ mod channel_chip_tests {
         app.focus = None;
 
         let _ = app.update(Message::ChannelPlaced(
-            "new-channel".to_string(),
+            PendingOpen {
+                channel: "new-channel".to_string(),
+                entry: None,
+            },
             Placement::Here,
         ));
 
@@ -9491,7 +9588,10 @@ mod channel_chip_tests {
         let focused = app.focus.expect("App::new focuses its one pane");
 
         let _ = app.update(Message::ChannelPlaced(
-            "replacement".to_string(),
+            PendingOpen {
+                channel: "replacement".to_string(),
+                entry: None,
+            },
             Placement::Here,
         ));
 
@@ -9508,7 +9608,10 @@ mod channel_chip_tests {
         let (mut app, _) = App::new();
 
         let _ = app.update(Message::ChannelPlaced(
-            "sibling".to_string(),
+            PendingOpen {
+                channel: "sibling".to_string(),
+                entry: None,
+            },
             Placement::Right,
         ));
 
