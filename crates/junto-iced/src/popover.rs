@@ -330,13 +330,21 @@ where
             self.tree, event, inner, cursor, renderer, clipboard, shell, &bounds,
         );
 
-        // Outside-click dismissal: only a left press that lands off the
-        // panel counts, so a drag that starts inside and ends outside (e.g.
-        // text selection) does not close it.
+        // Outside-click dismissal: only a left press that lands off the panel
+        // counts, so a drag that starts inside and ends outside (e.g. text
+        // selection) does not close it.
+        //
+        // The anchor is deliberately NOT "outside". This overlay does not
+        // capture the event, so the press still reaches the anchor's own
+        // `on_press` underneath. If it ALSO dismissed here, a trigger whose
+        // press toggles the panel would get two messages in one input cycle —
+        // close, then open — and look unable to close itself. Pressing a
+        // trigger is the trigger's business.
         if matches!(
             event,
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
         ) && !cursor.is_over(bounds)
+            && !cursor.is_over(self.anchor_bounds)
             && let Some(message) = self.on_dismiss.take()
         {
             shell.publish(message);
