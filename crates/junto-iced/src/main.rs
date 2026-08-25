@@ -243,11 +243,12 @@ struct App {
     /// `ShellState`, since a half-finished gesture is not layout worth
     /// saving.
     blade_drag: Option<BladeDrag>,
-    /// The channel whose placement is pending, if any — set by pressing an
-    /// unopened channel's chip (`PendingTarget::Channel`), an unopened
+    /// The channel whose placement is pending, if any — set by pressing
+    /// an unopened channel's chip (`PendingTarget::Channel`), an unopened
     /// attention chip (`Entry`, the entry to jump to), or an unwatched
-    /// session chip (`Session`, the session to watch), cleared by choosing
-    /// a placement, pressing the chip again, or an outside click.
+    /// session chip (`Session`, the session to watch), cleared by
+    /// choosing a placement, pressing the chip again, an outside click,
+    /// or the target going stale (`clear_stale_session_pending`).
     /// Transient like `blade_drag`: a half-made placement choice is not
     /// layout worth persisting, so this lives on `App`, not `ShellState`.
     pending: Option<PendingOpen>,
@@ -1034,8 +1035,8 @@ enum Message {
     /// open (or, pressed again, close) that channel's placement menu.
     ChannelToggled(String),
     /// Pick a placement for a pending channel — from an unopened
-    /// channel's floating menu, or an unopened attention chip's inline
-    /// row.
+    /// channel's floating menu, an unopened attention chip's inline row,
+    /// or an unwatched session chip's inline row.
     ChannelPlaced(PendingOpen, Placement),
     /// A focus-board chip whose channel is already open: focus that pane
     /// and jump to the entry. Unlike a channel chip this never toggles a
@@ -1044,6 +1045,9 @@ enum Message {
     /// A focus-board chip whose channel isn't open yet: open (or, pressed
     /// again, close) its inline placement row.
     FocusChipToggled(String, String),
+    /// A session chip whose session isn't watched yet: open (or, pressed
+    /// again, close) its inline placement row (channel, session id).
+    SessionToggled(String, String),
     /// Dismiss the pinned attention card in a pane.
     ClearHighlight(pane_grid::Pane),
     /// Collapse or expand the left blade.
@@ -1323,13 +1327,13 @@ impl App {
     /// Focus the existing pane for `name`, or split a new one. Returns the pane
     /// (when resolved) and the fetch task for a freshly-opened pane.
     fn open_or_focus(&mut self, name: &str) -> (Option<pane_grid::Pane>, Task<Message>) {
-        if let Some(existing) = self
+        let existing = self
             .panes
             .iter()
             .find(|(_, state)| state.channel == name)
-            .map(|(id, _)| *id)
-        {
-            self.focus = Some(existing);
+            .map(|(id, _)| *id);
+        if let Some(existing) = existing {
+            self.focus_pane(existing);
             return (Some(existing), Task::none());
         }
         // `focus` is set at startup and only ever reassigned to `Some`, so this
@@ -1359,7 +1363,7 @@ impl App {
         name: &str,
     ) -> (Option<pane_grid::Pane>, Task<Message>) {
         if let Some((new_pane, _)) = self.panes.split(axis, target, Pane::loading(name)) {
-            self.focus = Some(new_pane);
+            self.focus_pane(new_pane);
             return (Some(new_pane), fetch(new_pane, HOST.to_string(), name));
         }
         (None, Task::none())
@@ -1379,20 +1383,84 @@ impl App {
 
     /// Apply a placed pending's post-open step to the pane it landed in:
     /// pin an attention chip's entry (`pin_entry`), or start watching a
-    /// session chip's session. A bare channel-chip target needs nothing
-    /// further — placing it already put the right channel on screen.
-    /// Shared by `Message::ChannelPlaced`'s three landing branches (no
-    /// focus yet, a split, or "here"), so the step exists once rather
-    /// than duplicated per branch.
+    /// session chip's session (`watch`) so a freshly split pane opens
+    /// straight into its live view. A bare channel-chip target needs
+    /// nothing further — placing it already put the right channel on
+    /// screen. Shared by `Message::ChannelPlaced`'s no-focus fallback and
+    /// its right/below split; its "here" placement takes a separate path
+    /// for a `Session` target (see that arm), since reusing the focused
+    /// pane needs no split or refetch to begin with.
     fn apply_pending_target(&mut self, pane: pane_grid::Pane, target: PendingTarget) {
         match target {
             PendingTarget::Channel => {}
             PendingTarget::Entry(entry) => self.pin_entry(pane, entry),
-            PendingTarget::Session(session) => {
-                if let Some(state) = self.panes.get_mut(pane) {
-                    state.watched = Some(session);
-                }
-            }
+            PendingTarget::Session(session) => self.watch(pane, session),
+        }
+    }
+
+    /// Start watching `session` in `pane`: `Message::Watch`'s own reset
+    /// (new turn, cleared feed/composer state) rather than merely setting
+    /// `watched` — `App::subscription` gates the live socket on BOTH
+    /// `watched` AND `streaming`, so a bare field set would show the
+    /// session but never actually stream it. Shared by the message
+    /// handler itself and by a session pending's placement
+    /// (`apply_pending_target`, and `Message::ChannelPlaced`'s "here"
+    /// case directly), so a freshly split or reused pane opens straight
+    /// into a real live view, not a static one.
+    fn watch(&mut self, pane: pane_grid::Pane, session: String) {
+        if let Some(state) = self.panes.get_mut(pane) {
+            state.watched = Some(session);
+            state.streaming = true; // try to stream; ends fast if not live
+            state.stream_nonce += 1;
+            state.feed.clear();
+            state.watchers.clear();
+            state.annotate_tx = None;
+            state.annotate_email = None;
+            state.conversation_len = 0;
+            state.worktree_commit = None;
+            // A block index belongs to the document being left; the feed
+            // is cleared here, so keeping it would aim at an op from a
+            // different session.
+            state.annotate_op = None;
+            // A different session has a different newest diff.
+            state.auto_expanded = false;
+        }
+    }
+
+    /// Focus `pane`, clearing a session `pending` the new focus makes
+    /// stale (`clear_stale_session_pending`). Every `self.focus = Some(…)`
+    /// assignment in the file routes through this, so a session's inline
+    /// placement row can never survive on screen for a pane the user has
+    /// since looked away from.
+    fn focus_pane(&mut self, pane: pane_grid::Pane) {
+        self.focus = Some(pane);
+        self.clear_stale_session_pending();
+    }
+
+    /// Clears `pending` when it names a session no longer valid for the
+    /// focused pane: the session has left that pane's `session_list()`, or
+    /// focus has moved to a pane on a different channel altogether. A
+    /// session pending has no board of its own to recheck against (unlike
+    /// an attention pending, cleared in `FocusLoaded` when its channel
+    /// drops off the focus board) — the focused pane's own live session
+    /// list IS that check, so this reruns wherever it can change: a pane
+    /// refetch (`Message::Fetched`) and a focus change (`focus_pane`).
+    fn clear_stale_session_pending(&mut self) {
+        let Some(PendingOpen {
+            channel,
+            target: PendingTarget::Session(session),
+        }) = &self.pending
+        else {
+            return;
+        };
+        let still_valid = self
+            .focus
+            .and_then(|id| self.panes.get(id))
+            .is_some_and(|pane| {
+                &pane.channel == channel && pane.session_list().iter().any(|s| &s.id == session)
+            });
+        if !still_valid {
+            self.pending = None;
         }
     }
 
@@ -1449,7 +1517,7 @@ impl App {
                     // chip's press in that case (mirroring the title bar's
                     // own `×` guard) rather than reaching this dead end.
                     if let Some((_, sibling)) = self.panes.close(pane) {
-                        self.focus = Some(sibling);
+                        self.focus_pane(sibling);
                     }
                 } else if self.pending.as_ref().is_some_and(|pending| {
                     matches!(&pending.target, PendingTarget::Channel) && pending.channel == name
@@ -1489,6 +1557,15 @@ impl App {
                         task
                     }
                     None => {
+                        // A session pending's channel is always already
+                        // showing in the focused pane — sessions are only
+                        // ever listed for it — so "here" needs no pane
+                        // replace or refetch, just the same in-place watch
+                        // an ordinary session chip's press performs.
+                        if let PendingTarget::Session(session) = target {
+                            self.watch(focused, session);
+                            return Task::none();
+                        }
                         // "here": replace the focused pane's channel in
                         // place, keeping its remote-host override (a
                         // property of the pane's target machine, not of
@@ -1524,6 +1601,20 @@ impl App {
                     self.pending = Some(PendingOpen {
                         channel: name,
                         target: PendingTarget::Entry(entry_id),
+                    });
+                }
+                Task::none()
+            }
+            Message::SessionToggled(channel, session) => {
+                if self.pending.as_ref().is_some_and(|pending| {
+                    pending.channel == channel
+                        && matches!(&pending.target, PendingTarget::Session(id) if id == &session)
+                }) {
+                    self.pending = None;
+                } else {
+                    self.pending = Some(PendingOpen {
+                        channel,
+                        target: PendingTarget::Session(session),
                     });
                 }
                 Task::none()
@@ -1669,7 +1760,7 @@ impl App {
                 let Some(state) = self.panes.get_mut(pane) else {
                     return Task::none();
                 };
-                match result {
+                let task = match result {
                     Ok(dto) => {
                         // Pre-fill the workspace: the channel's remembered repo,
                         // else the most-recently-used one — so the user rarely
@@ -1738,7 +1829,9 @@ impl App {
                         state.content = Content::Error(err);
                         Task::none()
                     }
-                }
+                };
+                self.clear_stale_session_pending();
+                task
             }
             Message::Refresh(pane) => {
                 if let Some(state) = self.panes.get_mut(pane) {
@@ -1751,7 +1844,7 @@ impl App {
             }
             Message::Close(pane) => {
                 if let Some((_, sibling)) = self.panes.close(pane) {
-                    self.focus = Some(sibling);
+                    self.focus_pane(sibling);
                 }
                 Task::none()
             }
@@ -1765,7 +1858,7 @@ impl App {
             }
             Message::PaneDragged(_) => Task::none(),
             Message::PaneClicked(pane) => {
-                self.focus = Some(pane);
+                self.focus_pane(pane);
                 Task::none()
             }
             Message::SplitPane(axis) => {
@@ -1795,29 +1888,13 @@ impl App {
                 let mut new_state = Pane::loading(&channel);
                 new_state.remote = remote;
                 if let Some((new_pane, _)) = self.panes.split(axis, focus, new_state) {
-                    self.focus = Some(new_pane);
+                    self.focus_pane(new_pane);
                     return fetch(new_pane, base, &channel);
                 }
                 Task::none()
             }
             Message::Watch(pane, session) => {
-                if let Some(state) = self.panes.get_mut(pane) {
-                    state.watched = Some(session);
-                    state.streaming = true; // try to stream; ends fast if not live
-                    state.stream_nonce += 1;
-                    state.feed.clear();
-                    state.watchers.clear();
-                    state.annotate_tx = None;
-                    state.annotate_email = None;
-                    state.conversation_len = 0;
-                    state.worktree_commit = None;
-                    // A block index belongs to the document being left; the
-                    // feed is cleared here, so keeping it would aim at an op
-                    // from a different session.
-                    state.annotate_op = None;
-                    // A different session has a different newest diff.
-                    state.auto_expanded = false;
-                }
+                self.watch(pane, session);
                 Task::none()
             }
             Message::CloseSession(pane) => {
@@ -3750,13 +3827,14 @@ enum PlacementLayout {
     Inline,
 }
 
-/// The three ways to dock a pending channel — split right, split below, or
-/// reuse the focused pane — in the file's ghost-row vocabulary
-/// (`ghost_style`) rather than a filled control, since this is a transient
-/// pick, not a persistent toggle. Shared by the channel chips' floating
-/// menu (`placement_menu`) and the attention panel's inline placement row
-/// (`attention_placement_row`), so the three controls and their labels
-/// exist in exactly one place rather than duplicated per call site.
+/// The three ways to dock a pending channel or session — split right,
+/// split below, or reuse the focused pane — in the file's ghost-row
+/// vocabulary (`ghost_style`) rather than a filled control, since this is
+/// a transient pick, not a persistent toggle. Shared by the channel
+/// chips' floating menu (`placement_menu`) and the attention/sessions
+/// panels' shared inline placement row (`inline_placement_row`), so the
+/// three controls and their labels exist in exactly one place rather than
+/// duplicated per call site.
 fn placement_choices(pending: &PendingOpen, layout: PlacementLayout) -> Element<'static, Message> {
     let width = match layout {
         PlacementLayout::Menu => Fill,
@@ -3904,15 +3982,17 @@ fn focus_chip<'a>(app: &App, item: &'a FocusItem) -> Element<'a, Message> {
     chip.into()
 }
 
-/// The inline placement row beneath an attention chip whose channel isn't
-/// open yet: `placement_choices` laid out horizontally (`PlacementLayout::
-/// Inline`) rather than inside another `Popover` — the attention panel is
-/// itself a `Popover` popup, and `Popover`'s `Floating` overlay never
-/// implements `overlay::Overlay::overlay`, so a nested one would silently
-/// never render. Indented under its chip so the association is obvious;
-/// pressing the chip again (`Message::FocusChipToggled`) backs out without
+/// The inline placement row beneath a chip whose target isn't placed yet
+/// — an attention chip's channel or a session chip's session:
+/// `placement_choices` laid out horizontally (`PlacementLayout::Inline`)
+/// rather than inside another `Popover` — the attention and sessions
+/// panels are both themselves `Popover` popups, and `Popover`'s
+/// `Floating` overlay never implements `overlay::Overlay::overlay`, so a
+/// nested one would silently never render. Indented under its chip so the
+/// association is obvious; pressing the chip again (`Message::
+/// FocusChipToggled` / `Message::SessionToggled`) backs out without
 /// choosing.
-fn attention_placement_row(pending: &PendingOpen) -> Element<'static, Message> {
+fn inline_placement_row(pending: &PendingOpen) -> Element<'static, Message> {
     row![
         Space::new().width(SP_LOOSE),
         placement_choices(pending, PlacementLayout::Inline),
@@ -3946,7 +4026,7 @@ fn attention_view(app: &App) -> Element<'_, Message> {
         if let Some(pending) = &app.pending
             && matches!(&pending.target, PendingTarget::Entry(id) if id == &item.entry_id)
         {
-            items = items.push(attention_placement_row(pending));
+            items = items.push(inline_placement_row(pending));
         }
     }
     scrollable(items).into()
@@ -4136,6 +4216,15 @@ fn sessions_view(app: &App) -> Element<'_, Message> {
     let mut items = column![].spacing(SP_TIGHT);
     for session in pane.session_list() {
         items = items.push(session_row(id, pane, session));
+        // Only one inline row at a time, for whichever chip is pending —
+        // matched by channel and session id, the sessions-panel analogue
+        // of `attention_view`'s own entry-id match.
+        if let Some(pending) = &app.pending
+            && pending.channel == pane.channel
+            && matches!(&pending.target, PendingTarget::Session(session_id) if session_id == &session.id)
+        {
+            items = items.push(inline_placement_row(pending));
+        }
     }
     scrollable(items).into()
 }
@@ -4222,10 +4311,15 @@ fn artifact_row<'a>(
         .into()
 }
 
-/// One session chip in the left blade's Sessions view: the same intent/state
-/// label, colour, and `Message::Watch` wiring as the pane's own inline
-/// session-chip row, stacked full-width instead of run inline so it fits the
-/// blade rather than overflowing it.
+/// One session chip in the left blade's Sessions view: the same
+/// intent/state label and colour as the pane's own inline session-chip
+/// row, stacked full-width instead of run inline so it fits the blade
+/// rather than overflowing it. The watched session's chip closes the
+/// session view on press (`Message::CloseSession`) — the toggle-off a
+/// channel chip's own press already performs, matching `chip_style`'s
+/// active flag so the watched one reads as selected. An unwatched
+/// session's chip instead opens (or, pressed again, closes) an inline
+/// placement row (`Message::SessionToggled`, `sessions_view`).
 fn session_row<'a>(
     id: pane_grid::Pane,
     pane: &Pane,
@@ -4233,8 +4327,13 @@ fn session_row<'a>(
 ) -> Element<'a, Message> {
     let watching = pane.watched.as_deref() == Some(session.id.as_str());
     let label = format!("{} · {}", truncate(&session.intent, 22), session.state);
+    let message = if watching {
+        Message::CloseSession(id)
+    } else {
+        Message::SessionToggled(pane.channel.clone(), session.id.clone())
+    };
     button(text(label).size(TEXT_META))
-        .on_press(Message::Watch(id, session.id.clone()))
+        .on_press(message)
         .width(Fill)
         .padding([SP_TIGHT, SP])
         .style(move |_t, _s| chip_style(status_color(&session.state), watching))
@@ -9850,6 +9949,212 @@ mod attention_chip_tests {
         assert_eq!(
             app.pending, None,
             "a pending attention placement must clear once its channel drops off the board"
+        );
+    }
+}
+
+#[cfg(test)]
+mod session_chip_tests {
+    use super::*;
+
+    fn session(id: &str, intent: &str) -> SessionDto {
+        SessionDto {
+            id: id.to_string(),
+            state: "running".to_string(),
+            intent: intent.to_string(),
+        }
+    }
+
+    /// A one-pane app focused on "junto-dev", its channel already loaded
+    /// with two sessions ("s1"/"alpha", "s2"/"beta") — the shape
+    /// `sessions_view` needs to render session chips at all.
+    fn app_with_sessions() -> App {
+        let (mut app, _) = App::new();
+        let focused = app.focus.expect("App::new focuses its one pane");
+        let pane = app
+            .panes
+            .get_mut(focused)
+            .expect("the pane App::new just created");
+        pane.content = Content::Loaded(ChannelDto {
+            id: "junto-dev".to_string(),
+            name: Some("junto-dev".to_string()),
+            closed: false,
+            party: Vec::new(),
+            workspace: None,
+            sessions: vec![session("s1", "alpha"), session("s2", "beta")],
+            entries: Vec::new(),
+        });
+        app
+    }
+
+    #[test]
+    fn pressing_the_watched_sessions_chip_clears_watched_and_shows_no_placement_row() {
+        let mut app = app_with_sessions();
+        let focused = app.focus.expect("App::new focuses its one pane");
+        app.panes
+            .get_mut(focused)
+            .expect("the pane just built")
+            .watched = Some("s1".to_string());
+
+        let mut ui = iced_test::simulator(sessions_view(&app));
+        ui.click("alpha · running")
+            .expect("the watched session's chip is a click target");
+        let messages: Vec<Message> = ui.into_messages().collect();
+        assert!(
+            matches!(&messages[..], [Message::CloseSession(pane)] if *pane == focused),
+            "the watched chip must publish exactly one CloseSession, got {messages:?}"
+        );
+
+        for message in messages {
+            let _ = app.update(message);
+        }
+        assert_eq!(
+            app.panes
+                .get(focused)
+                .and_then(|state| state.watched.clone()),
+            None,
+            "pressing the watched chip must clear watched"
+        );
+
+        let mut ui = iced_test::simulator(sessions_view(&app));
+        assert!(
+            ui.find("split right").is_err(),
+            "clearing watched must not leave a placement row behind"
+        );
+    }
+
+    #[test]
+    fn pressing_an_unwatched_sessions_chip_shows_the_placement_row_without_changing_watched() {
+        let mut app = app_with_sessions();
+        let focused = app.focus.expect("App::new focuses its one pane");
+
+        let mut ui = iced_test::simulator(sessions_view(&app));
+        ui.click("beta · running")
+            .expect("an unwatched session's chip is a click target");
+        let messages: Vec<Message> = ui.into_messages().collect();
+        assert!(
+            matches!(
+                &messages[..],
+                [Message::SessionToggled(channel, session)]
+                    if channel == "junto-dev" && session == "s2"
+            ),
+            "an unwatched chip must publish exactly one SessionToggled, got {messages:?}"
+        );
+
+        for message in messages {
+            let _ = app.update(message);
+        }
+        assert_eq!(
+            app.panes
+                .get(focused)
+                .and_then(|state| state.watched.clone()),
+            None,
+            "showing the placement row must not itself start watching"
+        );
+
+        let mut ui = iced_test::simulator(sessions_view(&app));
+        ui.find("split right")
+            .expect("the right placement is offered inline");
+        ui.find("split below")
+            .expect("the below placement is offered inline");
+        ui.find("use this pane")
+            .expect("the here placement is offered inline");
+    }
+
+    #[test]
+    fn choosing_here_watches_the_session_in_the_focused_pane_with_no_new_pane() {
+        let mut app = app_with_sessions();
+        let focused = app.focus.expect("App::new focuses its one pane");
+        app.pending = Some(PendingOpen {
+            channel: "junto-dev".to_string(),
+            target: PendingTarget::Session("s2".to_string()),
+        });
+
+        let mut ui = iced_test::simulator(sessions_view(&app));
+        ui.click("use this pane")
+            .expect("the inline here placement is a click target");
+        let messages: Vec<Message> = ui.into_messages().collect();
+        for message in messages {
+            let _ = app.update(message);
+        }
+
+        assert_eq!(app.panes.len(), 1, "'here' must not open a new pane");
+        let state = app
+            .panes
+            .get(focused)
+            .expect("the focused pane must still exist");
+        assert_eq!(
+            state.watched.as_deref(),
+            Some("s2"),
+            "'here' must start watching the pending session in the focused pane"
+        );
+        assert!(
+            state.streaming,
+            "'here' must actually start streaming, not just record `watched`"
+        );
+        assert_eq!(app.pending, None, "choosing a placement must clear pending");
+    }
+
+    #[test]
+    fn choosing_right_splits_a_new_pane_on_the_same_channel_already_watching_the_session() {
+        let mut app = app_with_sessions();
+        let focused = app.focus.expect("App::new focuses its one pane");
+        app.pending = Some(PendingOpen {
+            channel: "junto-dev".to_string(),
+            target: PendingTarget::Session("s2".to_string()),
+        });
+
+        let mut ui = iced_test::simulator(sessions_view(&app));
+        ui.click("split right")
+            .expect("the inline right placement is a click target");
+        let messages: Vec<Message> = ui.into_messages().collect();
+        for message in messages {
+            let _ = app.update(message);
+        }
+
+        assert_eq!(app.panes.len(), 2, "'right' must split off a new pane");
+        let (_, new_pane) = app
+            .panes
+            .iter()
+            .find(|(id, state)| **id != focused && state.channel == "junto-dev")
+            .expect("the split must open a new pane on the same channel");
+        assert_eq!(
+            new_pane.watched.as_deref(),
+            Some("s2"),
+            "the new pane must already be watching the placed session"
+        );
+        assert!(
+            new_pane.streaming,
+            "the new pane must actually start streaming, not just record `watched`"
+        );
+        assert_eq!(app.pending, None, "choosing a placement must clear pending");
+    }
+
+    #[test]
+    fn a_pending_session_that_leaves_the_panes_session_list_is_cleared() {
+        let mut app = app_with_sessions();
+        let focused = app.focus.expect("App::new focuses its one pane");
+        app.pending = Some(PendingOpen {
+            channel: "junto-dev".to_string(),
+            target: PendingTarget::Session("s2".to_string()),
+        });
+
+        let _ = app.update(Message::Fetched(
+            focused,
+            Ok(ChannelDto {
+                id: "junto-dev".to_string(),
+                name: Some("junto-dev".to_string()),
+                closed: false,
+                party: Vec::new(),
+                workspace: None,
+                sessions: vec![session("s1", "alpha")],
+                entries: Vec::new(),
+            }),
+        ));
+
+        assert_eq!(
+            app.pending, None,
+            "a pending session must clear once it leaves the focused pane's session list"
         );
     }
 }
