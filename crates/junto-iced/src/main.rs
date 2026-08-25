@@ -243,6 +243,12 @@ struct App {
     /// `ShellState`, since a half-finished gesture is not layout worth
     /// saving.
     blade_drag: Option<BladeDrag>,
+    /// The channel whose placement menu is open, if any — set by pressing
+    /// an unopened channel's chip, cleared by pressing it again or by an
+    /// outside click. Transient like `blade_drag`: a half-made placement
+    /// choice is not layout worth persisting, so this lives on `App`, not
+    /// `ShellState`.
+    placing: Option<String>,
     /// Available channel names for the type-ahead picker.
     channels: combo_box::State<String>,
     /// The same names as a plain list, for widgets that need to OFFER them
@@ -965,14 +971,42 @@ impl AnchorTarget {
     }
 }
 
+/// Where an unopened channel's chip should dock when pressed — the explicit
+/// placement choice `Message::ChannelToggled` offers via a floating menu
+/// (`placement_menu`) instead of always splitting the focused pane
+/// vertically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    /// Split the focused pane to the right.
+    Right,
+    /// Split the focused pane downward.
+    Below,
+    /// Reuse the focused pane, replacing the channel it shows.
+    Here,
+}
+
+impl Placement {
+    /// The split axis for this placement, or `None` for `Here` — which
+    /// reuses the focused pane in place rather than splitting it.
+    fn axis(self) -> Option<pane_grid::Axis> {
+        match self {
+            Placement::Right => Some(pane_grid::Axis::Vertical),
+            Placement::Below => Some(pane_grid::Axis::Horizontal),
+            Placement::Here => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum Message {
     ChannelsLoaded(Vec<String>),
     /// Pick a channel from the search combo box: open or focus it.
     ChannelPicked(String),
     /// Press a channel chip: close its pane if the channel is open; else
-    /// open (or focus) it.
+    /// open (or, pressed again, close) that channel's placement menu.
     ChannelToggled(String),
+    /// Pick a placement from an unopened channel's floating menu.
+    ChannelPlaced(String, Placement),
     /// A focus-board chip: open/focus the channel and jump to the entry.
     FocusChipPicked(String, String),
     /// Dismiss the pinned attention card in a pane.
@@ -1234,6 +1268,7 @@ impl App {
             device_key_fingerprint: None,
             shell: shell::load(&shell_state_path()),
             blade_drag: None,
+            placing: None,
         };
         (
             app,
@@ -1273,10 +1308,22 @@ impl App {
         else {
             return (None, Task::none());
         };
-        if let Some((new_pane, _)) =
-            self.panes
-                .split(pane_grid::Axis::Vertical, target, Pane::loading(name))
-        {
+        self.split_channel(pane_grid::Axis::Vertical, target, name)
+    }
+
+    /// Split `target` on `axis`, adding a fresh pane for `name` and fetching
+    /// its view. Returns the new pane (when the split succeeded) and its
+    /// fetch task — the "make a pane for this channel and fetch it" step
+    /// shared by `open_or_focus` (always `Axis::Vertical`) and
+    /// `Message::ChannelPlaced`'s right/below placements (whichever axis the
+    /// menu picked), so it exists exactly once rather than copy-pasted.
+    fn split_channel(
+        &mut self,
+        axis: pane_grid::Axis,
+        target: pane_grid::Pane,
+        name: &str,
+    ) -> (Option<pane_grid::Pane>, Task<Message>) {
+        if let Some((new_pane, _)) = self.panes.split(axis, target, Pane::loading(name)) {
             self.focus = Some(new_pane);
             return (Some(new_pane), fetch(new_pane, HOST.to_string(), name));
         }
@@ -1324,10 +1371,45 @@ impl App {
                     if let Some((_, sibling)) = self.panes.close(pane) {
                         self.focus = Some(sibling);
                     }
-                    Task::none()
+                } else if self.placing.as_deref() == Some(name.as_str()) {
+                    self.placing = None;
                 } else {
+                    self.placing = Some(name);
+                }
+                Task::none()
+            }
+            Message::ChannelPlaced(name, placement) => {
+                self.placing = None;
+                // Every placement here is meaningless with nothing focused
+                // to split or replace — degrade all three to the plain
+                // open/focus path (`ChannelPicked`'s own behaviour) rather
+                // than presenting a choice that has nothing to act on.
+                let Some(target) = self.focus else {
                     let (_, task) = self.open_or_focus(&name);
-                    task
+                    return task;
+                };
+                match placement.axis() {
+                    Some(axis) => {
+                        let (_, task) = self.split_channel(axis, target, &name);
+                        task
+                    }
+                    None => {
+                        // "here": replace the focused pane's channel in
+                        // place, keeping its remote-host override (a
+                        // property of the pane's target machine, not of
+                        // what it shows) but resetting every other
+                        // per-pane view/form field to a fresh
+                        // `Pane::loading`, since none of it describes the
+                        // new channel.
+                        let Some(state) = self.panes.get_mut(target) else {
+                            return Task::none();
+                        };
+                        let remote = state.remote.clone();
+                        let base = state.base().to_string();
+                        *state = Pane::loading(&name);
+                        state.remote = remote;
+                        fetch(target, base, &name)
+                    }
                 }
             }
             Message::FocusChipPicked(name, entry_id) => {
@@ -3553,25 +3635,79 @@ fn adder(app: &App) -> Element<'_, Message> {
     }
 }
 
+/// The floating menu an unopened channel's chip opens (`channel_nav`,
+/// `Message::ChannelToggled`): the three placements `Message::ChannelPlaced`
+/// can act on, in the file's ghost-row vocabulary (`ghost_style`) rather
+/// than a filled control, since this is a transient pick, not a persistent
+/// toggle.
+fn placement_menu(name: &str) -> Element<'_, Message> {
+    let row_button = |code_point: char, label: &'static str, placement: Placement| {
+        button(
+            row![icon(code_point).color(MUTED), text(label).size(TEXT_META)]
+                .spacing(SP_TIGHT)
+                .align_y(Center),
+        )
+        .on_press(Message::ChannelPlaced(name.to_string(), placement))
+        .padding([SP_TIGHT, SP])
+        .width(Fill)
+        .style(|_theme, status| ghost_style(status))
+    };
+    container(
+        column![
+            row_button(ICON_COLUMNS_2, "split right", Placement::Right),
+            row_button(ICON_ROWS_2, "split below", Placement::Below),
+            row_button(ICON_PANEL_LEFT, "use this pane", Placement::Here),
+        ]
+        .spacing(SP_TIGHT),
+    )
+    .padding(SP_TIGHT)
+    .style(|_theme| container::Style {
+        background: Some(Background::Color(SURFACE)),
+        border: Border {
+            color: BORDER,
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+        ..container::Style::default()
+    })
+    .into()
+}
+
 /// Pinned navigation: the open channels, then the controls to open or create
 /// one. Lives at the top of the left blade and never toggles away.
 ///
 /// An open channel's chip closes its pane on press (`Message::ChannelToggled`),
 /// guarded exactly like the pane title bar's own `×` (`panes.len() > 1`) so a
 /// chip that cannot close renders disabled instead of publishing a press that
-/// does nothing.
+/// does nothing. An unopened channel's chip instead opens a floating
+/// placement menu (`placement_menu`), anchored via `Popover` — the same
+/// "float over the workspace" machinery the footer's trigger chips use —
+/// dismissible by an outside click or a second press of the chip.
 fn channel_nav(app: &App) -> Element<'_, Message> {
     let mut list = column![].spacing(SP_TIGHT);
     for name in &app.channel_names {
         let active = app.panes.iter().any(|(_, state)| state.channel == *name);
         let can_press = !active || app.panes.len() > 1;
-        list = list.push(
-            button(text(name.as_str()).size(TEXT_BODY))
-                .on_press_maybe(can_press.then(|| Message::ChannelToggled(name.clone())))
-                .padding([SP_TIGHT, SP])
-                .width(Fill)
-                .style(move |_t, _s| chip_style(MUTED, active)),
-        );
+        let chip: Element<Message> = button(text(name.as_str()).size(TEXT_BODY))
+            .on_press_maybe(can_press.then(|| Message::ChannelToggled(name.clone())))
+            .padding([SP_TIGHT, SP])
+            .width(Fill)
+            .style(move |_t, _s| chip_style(MUTED, active))
+            .into();
+        let row: Element<Message> = if active {
+            chip
+        } else {
+            let open = app.placing.as_deref() == Some(name.as_str());
+            // 170px: enough for an icon plus the longest row label ("use
+            // this pane") at `TEXT_META` with room to breathe — this menu
+            // has no list to grow, just three fixed rows, so it needs
+            // nothing near the footer's 360px list panels.
+            Popover::new(chip, open.then(|| placement_menu(name)))
+                .width(170.0)
+                .on_dismiss(Message::ChannelToggled(name.clone()))
+                .into()
+        };
+        list = list.push(row);
     }
     // Axis-aware splitting of the focused pane — the workspace-level
     // counterpart to `adder`'s "open a channel into a pane".
@@ -9216,6 +9352,26 @@ diff --git a/lib.rs b/lib.rs
 }
 
 #[cfg(test)]
+mod placement_tests {
+    use super::{Placement, pane_grid};
+
+    #[test]
+    fn placing_right_splits_on_the_vertical_axis() {
+        assert_eq!(Placement::Right.axis(), Some(pane_grid::Axis::Vertical));
+    }
+
+    #[test]
+    fn placing_below_splits_on_the_horizontal_axis() {
+        assert_eq!(Placement::Below.axis(), Some(pane_grid::Axis::Horizontal));
+    }
+
+    #[test]
+    fn placing_here_has_no_axis_since_it_reuses_the_focused_pane_instead_of_splitting() {
+        assert_eq!(Placement::Here.axis(), None);
+    }
+}
+
+#[cfg(test)]
 mod channel_chip_tests {
     use super::*;
 
@@ -9274,6 +9430,100 @@ mod channel_chip_tests {
         assert!(
             messages.is_empty(),
             "a chip for the only remaining pane must not be pressable, got {messages:?}"
+        );
+    }
+
+    #[test]
+    fn pressing_an_unopened_channels_chip_opens_its_placement_menu() {
+        let mut app = two_pane_app();
+        app.channel_names.push("unopened".to_string());
+
+        let mut ui = iced_test::simulator(channel_nav(&app));
+        ui.click("unopened")
+            .expect("an unopened channel's chip is a click target");
+        let messages: Vec<Message> = ui.into_messages().collect();
+        for message in messages {
+            let _ = app.update(message);
+        }
+        assert_eq!(app.placing.as_deref(), Some("unopened"));
+
+        let mut menu = iced_test::simulator(channel_nav(&app));
+        menu.find("split right")
+            .expect("the right placement is offered");
+        menu.find("split below")
+            .expect("the below placement is offered");
+        menu.find("use this pane")
+            .expect("the here placement is offered");
+    }
+
+    #[test]
+    fn pressing_an_unopened_chips_placement_menu_open_again_closes_it() {
+        let mut app = two_pane_app();
+        app.channel_names.push("unopened".to_string());
+        app.placing = Some("unopened".to_string());
+
+        let _ = app.update(Message::ChannelToggled("unopened".to_string()));
+
+        assert_eq!(app.placing, None, "a second press must clear the menu");
+    }
+
+    #[test]
+    fn placing_a_channel_with_no_focused_pane_falls_back_to_opening_it() {
+        let (mut app, _) = App::new();
+        app.focus = None;
+
+        let _ = app.update(Message::ChannelPlaced(
+            "new-channel".to_string(),
+            Placement::Here,
+        ));
+
+        assert!(
+            app.panes
+                .iter()
+                .any(|(_, state)| state.channel == "new-channel"),
+            "with nothing focused, every placement must degrade to opening the channel"
+        );
+    }
+
+    #[test]
+    fn placing_a_channel_here_replaces_the_focused_panes_channel() {
+        let (mut app, _) = App::new();
+        let focused = app.focus.expect("App::new focuses its one pane");
+
+        let _ = app.update(Message::ChannelPlaced(
+            "replacement".to_string(),
+            Placement::Here,
+        ));
+
+        assert_eq!(app.panes.len(), 1, "'here' must not open a new pane");
+        assert_eq!(
+            app.panes.get(focused).map(|state| state.channel.as_str()),
+            Some("replacement"),
+            "the focused pane must now show the placed channel"
+        );
+    }
+
+    #[test]
+    fn placing_a_channel_to_the_right_splits_the_focused_pane() {
+        let (mut app, _) = App::new();
+
+        let _ = app.update(Message::ChannelPlaced(
+            "sibling".to_string(),
+            Placement::Right,
+        ));
+
+        assert_eq!(app.panes.len(), 2, "'right' must split off a new pane");
+        assert!(
+            app.panes
+                .iter()
+                .any(|(_, state)| state.channel == "junto-dev"),
+            "the original pane must survive the split"
+        );
+        assert!(
+            app.panes
+                .iter()
+                .any(|(_, state)| state.channel == "sibling"),
+            "the new pane must show the placed channel"
         );
     }
 }
