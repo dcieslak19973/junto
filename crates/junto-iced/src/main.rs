@@ -181,12 +181,12 @@ fn ghost_style(status: button::Status) -> button::Style {
 /// Lucide codepoints for the shell-chrome icons `icon` renders above, taken
 /// from the font's own CSS (Lucide 0.469.0, `assets/LICENSE-lucide`).
 const ICON_PANEL_LEFT: char = '\u{e12d}';
-const ICON_PANEL_RIGHT: char = '\u{e435}';
 const ICON_X: char = '\u{e1b1}';
 const ICON_ROTATE_CW: char = '\u{e14c}';
 const ICON_COLUMNS_2: char = '\u{e09c}';
 const ICON_ROWS_2: char = '\u{e43d}';
 const ICON_CHEVRON_RIGHT: char = '\u{e073}';
+const ICON_CHEVRON_LEFT: char = '\u{e072}';
 const ICON_CHEVRON_DOWN: char = '\u{e071}';
 const ICON_CIRCLE_ALERT: char = '\u{e07b}';
 const ICON_SEARCH: char = '\u{e154}';
@@ -3326,36 +3326,7 @@ impl App {
         .height(Fill)
         .spacing(SP);
 
-        // Both blades' collapse toggles live in the top bar's corners, not
-        // pinned to their blade's own edge — a toggle here can never jump
-        // when its blade resizes or collapses, since it isn't part of the
-        // blade at all (`left_blade`/`right_blade`/`blade_stub`).
-        let left_toggle = icon_button(
-            ICON_PANEL_LEFT,
-            if self.shell.left_collapsed {
-                "open channels · ctrl+b"
-            } else {
-                "close channels · ctrl+b"
-            },
-            tooltip::Position::Bottom,
-            Message::ToggleLeftBlade,
-        );
-        let right_toggle = icon_button(
-            ICON_PANEL_RIGHT,
-            if self.shell.right_collapsed {
-                "open artifacts & lineage · ctrl+r"
-            } else {
-                "close artifacts & lineage · ctrl+r"
-            },
-            tooltip::Position::Bottom,
-            Message::ToggleRightBlade,
-        );
-        let top_bar = container(
-            row![left_toggle, admin_toolbar(self.admin), right_toggle]
-                .spacing(SP)
-                .align_y(Center),
-        )
-        .padding(Padding {
+        let top_bar = container(admin_toolbar(self.admin)).padding(Padding {
             top: SP_LOOSE,
             right: SP_LOOSE,
             bottom: 0.0,
@@ -4054,24 +4025,35 @@ fn attention_view(app: &App) -> Element<'_, Message> {
     scrollable(items).into()
 }
 
-/// The left blade: pinned channel navigation, and nothing else — the
-/// former switchable Attention/Sessions view beneath it now lives in the
-/// footer-triggered floating panel (`bottom_panel`), so nothing is left to
-/// switch. Its own collapse toggle used to sit here, outside this
-/// function's padding and flush to the window's left edge, pinned there
-/// only to stop it jumping under the cursor on collapse. That toggle now
-/// lives in the top bar instead (`App::view`), where it can't move when
-/// this blade resizes or collapses, so the pinning — and the outer column
-/// it required — is gone; this is a straightforward padded container.
+/// The left blade: pinned channel navigation, with its own collapse toggle
+/// pinned to the blade's own bottom-left corner — a footer row, the last
+/// child of the blade's column, rather than the top bar corner an earlier
+/// pass moved it to. A toggle at the blade's own outer edge reads as part
+/// of THAT blade and can't be mistaken for a control over the other one or
+/// the center; xum places its sidebar's collapse chevron the same way. The
+/// channel nav is given `.height(Fill)` so it — not the footer — absorbs
+/// any extra space, keeping the toggle flush to the bottom regardless of
+/// how short the channel list is.
 fn left_blade(app: &App) -> Element<'_, Message> {
-    container(channel_nav(app))
+    let content = container(channel_nav(app)).height(Fill);
+    let toggle = container(icon_button(
+        ICON_CHEVRON_LEFT,
+        "close channels · ctrl+b",
+        tooltip::Position::Top,
+        Message::ToggleLeftBlade,
+    ))
+    .id(iced::widget::Id::new("left-blade-toggle"));
+    let footer = row![toggle, Space::new().width(Fill)];
+    container(column![content, footer].spacing(SP))
         .padding(SP)
         .width(Fill)
         .height(Fill)
         .into()
 }
 
-/// The right blade: a switchable Artifacts/Lineage view.
+/// The right blade: a switchable Artifacts/Lineage view, with its own
+/// collapse toggle in a footer row pinned to the blade's bottom-right
+/// corner — mirrors `left_blade`'s bottom-left one.
 fn right_blade(app: &App) -> Element<'_, Message> {
     let switcher = row![
         button(
@@ -4106,14 +4088,20 @@ fn right_blade(app: &App) -> Element<'_, Message> {
         shell::RightView::Lineage => lineage_view(app),
     };
 
-    let rest = column![switcher, body].spacing(SP);
-
-    // Mirrors `left_blade`: the toggle used to sit outside the padding
-    // here, flush to the window's right edge, pinned so it wouldn't jump
-    // under the cursor on collapse. It now lives in the top bar instead
-    // (`App::view`), so `align_x(Right)` and the wrapping column it
-    // needed are both gone — this is a straightforward padded container.
-    container(rest).padding(SP).width(Fill).height(Fill).into()
+    let content = container(column![switcher, body].spacing(SP)).height(Fill);
+    let toggle = container(icon_button(
+        ICON_CHEVRON_RIGHT,
+        "close artifacts & lineage · ctrl+r",
+        tooltip::Position::Top,
+        Message::ToggleRightBlade,
+    ))
+    .id(iced::widget::Id::new("right-blade-toggle"));
+    let footer = row![Space::new().width(Fill), toggle];
+    container(column![content, footer].spacing(SP))
+        .padding(SP)
+        .width(Fill)
+        .height(Fill)
+        .into()
 }
 
 /// The whole lineage DAG, relocated from the always-visible top ribbon into
