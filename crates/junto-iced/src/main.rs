@@ -968,7 +968,11 @@ impl AnchorTarget {
 #[derive(Debug, Clone)]
 enum Message {
     ChannelsLoaded(Vec<String>),
+    /// Pick a channel from the search combo box: open or focus it.
     ChannelPicked(String),
+    /// Press a channel chip: close its pane if the channel is open; else
+    /// open (or focus) it.
+    ChannelToggled(String),
     /// A focus-board chip: open/focus the channel and jump to the entry.
     FocusChipPicked(String, String),
     /// Dismiss the pinned attention card in a pane.
@@ -1305,6 +1309,26 @@ impl App {
             Message::ChannelPicked(name) => {
                 let (_, task) = self.open_or_focus(&name);
                 task
+            }
+            Message::ChannelToggled(name) => {
+                let existing = self
+                    .panes
+                    .iter()
+                    .find(|(_, state)| state.channel == name)
+                    .map(|(id, _)| *id);
+                if let Some(pane) = existing {
+                    // `State::close` removes nothing and returns `None` for
+                    // the last remaining pane; `channel_nav` disables the
+                    // chip's press in that case (mirroring the title bar's
+                    // own `×` guard) rather than reaching this dead end.
+                    if let Some((_, sibling)) = self.panes.close(pane) {
+                        self.focus = Some(sibling);
+                    }
+                    Task::none()
+                } else {
+                    let (_, task) = self.open_or_focus(&name);
+                    task
+                }
             }
             Message::FocusChipPicked(name, entry_id) => {
                 let (pane, task) = self.open_or_focus(&name);
@@ -3531,13 +3555,19 @@ fn adder(app: &App) -> Element<'_, Message> {
 
 /// Pinned navigation: the open channels, then the controls to open or create
 /// one. Lives at the top of the left blade and never toggles away.
+///
+/// An open channel's chip closes its pane on press (`Message::ChannelToggled`),
+/// guarded exactly like the pane title bar's own `×` (`panes.len() > 1`) so a
+/// chip that cannot close renders disabled instead of publishing a press that
+/// does nothing.
 fn channel_nav(app: &App) -> Element<'_, Message> {
     let mut list = column![].spacing(SP_TIGHT);
     for name in &app.channel_names {
         let active = app.panes.iter().any(|(_, state)| state.channel == *name);
+        let can_press = !active || app.panes.len() > 1;
         list = list.push(
             button(text(name.as_str()).size(TEXT_BODY))
-                .on_press(Message::ChannelPicked(name.clone()))
+                .on_press_maybe(can_press.then(|| Message::ChannelToggled(name.clone())))
                 .padding([SP_TIGHT, SP])
                 .width(Fill)
                 .style(move |_t, _s| chip_style(MUTED, active)),
@@ -9182,5 +9212,68 @@ diff --git a/lib.rs b/lib.rs
             .expect("the singular pane count must still be on the footer");
         ui.find("local")
             .expect("the default host must still be on the footer");
+    }
+}
+
+#[cfg(test)]
+mod channel_chip_tests {
+    use super::*;
+
+    /// A two-pane app ("junto-dev" and "other") with both names known to
+    /// the nav list, matching the shape `App::new` plus a second open
+    /// channel takes once `ChannelsLoaded` has landed.
+    fn two_pane_app() -> App {
+        let (mut app, _) = App::new();
+        let first = app.focus.expect("App::new focuses its one pane");
+        app.panes
+            .split(pane_grid::Axis::Vertical, first, Pane::loading("other"))
+            .expect("splitting the only pane must succeed");
+        app.channel_names = vec!["junto-dev".to_string(), "other".to_string()];
+        app
+    }
+
+    #[test]
+    fn pressing_an_open_channels_chip_closes_its_pane() {
+        let mut app = two_pane_app();
+        assert_eq!(app.panes.len(), 2);
+
+        let mut ui = iced_test::simulator(channel_nav(&app));
+        ui.click("other").expect("the open chip is a click target");
+        let messages: Vec<Message> = ui.into_messages().collect();
+        assert!(
+            matches!(&messages[..], [Message::ChannelToggled(name)] if name.as_str() == "other"),
+            "clicking an open chip must publish exactly one ChannelToggled, got {messages:?}"
+        );
+
+        for message in messages {
+            let _ = app.update(message);
+        }
+        assert_eq!(
+            app.panes.len(),
+            1,
+            "closing the open chip's pane must leave only its sibling"
+        );
+        assert!(
+            app.panes
+                .iter()
+                .any(|(_, state)| state.channel == "junto-dev"),
+            "the remaining pane must be the sibling, not the closed channel"
+        );
+    }
+
+    #[test]
+    fn the_last_remaining_panes_chip_cannot_be_closed() {
+        let (mut app, _) = App::new();
+        assert_eq!(app.panes.len(), 1);
+        app.channel_names = vec!["junto-dev".to_string()];
+
+        let mut ui = iced_test::simulator(channel_nav(&app));
+        ui.click("junto-dev")
+            .expect("the chip itself is still on screen");
+        let messages: Vec<Message> = ui.into_messages().collect();
+        assert!(
+            messages.is_empty(),
+            "a chip for the only remaining pane must not be pressable, got {messages:?}"
+        );
     }
 }
