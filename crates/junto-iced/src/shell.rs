@@ -1,21 +1,10 @@
 //! Pure layout state for the three-pane shell — blade collapse, widths,
-//! active views, and the left blade's internal split.
+//! the right blade's active view, and the bottom drawer.
 //!
 //! Everything decidable about the shell lives here rather than in `view()`,
 //! which Iced gives no way to unit-test. `view()` is a projection over this.
 
 use serde::{Deserialize, Serialize};
-
-/// Which switchable view the left blade is showing beneath the pinned nav.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum LeftView {
-    /// Cross-channel "needs you" items — the focus board.
-    #[default]
-    Attention,
-    /// Agent sessions for the focused channel.
-    Sessions,
-}
 
 /// Which switchable view the right blade is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -97,53 +86,6 @@ impl From<BladeWidth> for f32 {
     }
 }
 
-/// The fraction of the left blade given to pinned navigation, the rest going
-/// to the switchable view beneath it.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(from = "f32", into = "f32")]
-pub struct NavSplit(f32);
-
-impl NavSplit {
-    /// Below this the channel list stops being usable.
-    pub const MIN: f32 = 0.2;
-    /// Above this the switchable view stops being usable.
-    pub const MAX: f32 = 0.8;
-    /// Nav takes a little over half by default.
-    pub const DEFAULT: f32 = 0.55;
-
-    /// Clamp `fraction` into the usable range; non-finite yields the default.
-    pub fn new(fraction: f32) -> Self {
-        if fraction.is_finite() {
-            Self(fraction.clamp(Self::MIN, Self::MAX))
-        } else {
-            Self(Self::DEFAULT)
-        }
-    }
-
-    /// The clamped fraction.
-    pub fn get(self) -> f32 {
-        self.0
-    }
-}
-
-impl Default for NavSplit {
-    fn default() -> Self {
-        Self(Self::DEFAULT)
-    }
-}
-
-impl From<f32> for NavSplit {
-    fn from(fraction: f32) -> Self {
-        Self::new(fraction)
-    }
-}
-
-impl From<NavSplit> for f32 {
-    fn from(split: NavSplit) -> Self {
-        split.0
-    }
-}
-
 /// The whole shell's layout state — what persists across runs.
 ///
 /// `#[serde(default)]` is what makes a partial file safe: a state file written
@@ -160,12 +102,8 @@ pub struct ShellState {
     pub left_width: BladeWidth,
     /// Right blade width when expanded.
     pub right_width: BladeWidth,
-    /// The left blade's active switchable view.
-    pub left_view: LeftView,
     /// The right blade's active switchable view.
     pub right_view: RightView,
-    /// Where the left blade divides pinned nav from its switchable view.
-    pub left_split: NavSplit,
     /// Which panel the bottom drawer is showing; `None` when it is closed.
     pub bottom: Option<BottomView>,
 }
@@ -184,9 +122,7 @@ impl Default for ShellState {
             right_collapsed: false,
             left_width: BladeWidth::new(BladeWidth::LEFT_DEFAULT),
             right_width: BladeWidth::new(BladeWidth::RIGHT_DEFAULT),
-            left_view: LeftView::default(),
             right_view: RightView::default(),
-            left_split: NavSplit::default(),
             bottom: None,
         }
     }
@@ -244,7 +180,7 @@ pub fn save(path: &Path, state: &ShellState) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod clamp_tests {
-    use super::{BladeWidth, BottomView, NavSplit, ShellState};
+    use super::{BladeWidth, BottomView, ShellState};
 
     #[test]
     fn a_width_inside_the_usable_range_is_kept_as_typed() {
@@ -266,12 +202,6 @@ mod clamp_tests {
     fn a_nan_width_falls_back_to_the_default_rather_than_propagating() {
         // f32::clamp returns NaN for NaN input, which would poison layout.
         assert_eq!(BladeWidth::new(f32::NAN).get(), BladeWidth::DEFAULT);
-    }
-
-    #[test]
-    fn the_nav_split_is_clamped_so_neither_half_of_the_left_blade_vanishes() {
-        assert_eq!(NavSplit::new(0.0).get(), NavSplit::MIN);
-        assert_eq!(NavSplit::new(1.0).get(), NavSplit::MAX);
     }
 
     #[test]
@@ -333,7 +263,7 @@ mod clamp_tests {
 
 #[cfg(test)]
 mod persistence_tests {
-    use super::{BladeWidth, LeftView, NavSplit, RightView, ShellState, load, save};
+    use super::{BladeWidth, RightView, ShellState, load, save};
 
     /// A unique temp path per test — these run in parallel, so a shared
     /// filename would make them flaky.
@@ -346,7 +276,6 @@ mod persistence_tests {
         let path = temp_path("round-trip");
         let written = ShellState {
             left_collapsed: true,
-            left_view: LeftView::Sessions,
             right_view: RightView::Lineage,
             right_width: BladeWidth::new(400.0),
             ..Default::default()
@@ -385,7 +314,6 @@ mod persistence_tests {
         assert!(loaded.left_collapsed);
         assert_eq!(loaded.left_width.get(), BladeWidth::LEFT_DEFAULT);
         assert_eq!(loaded.right_width.get(), BladeWidth::RIGHT_DEFAULT);
-        assert_eq!(loaded.left_view, LeftView::default());
         let _ = std::fs::remove_file(&path);
     }
 
@@ -395,14 +323,6 @@ mod persistence_tests {
         let path = temp_path("out-of-range");
         std::fs::write(&path, "left_width = 2.0\n").expect("write temp file");
         assert_eq!(load(&path).left_width.get(), BladeWidth::MIN);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn an_out_of_range_nav_split_on_disk_is_clamped_on_load() {
-        let path = temp_path("split-out-of-range");
-        std::fs::write(&path, "left_split = 0.99\n").expect("write temp file");
-        assert_eq!(load(&path).left_split.get(), NavSplit::MAX);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -423,7 +343,6 @@ mod persistence_tests {
         // must be able to fail.
         let state = ShellState {
             left_collapsed: true,
-            left_view: LeftView::Sessions,
             right_view: RightView::Lineage,
             right_width: BladeWidth::new(400.0),
             ..Default::default()
@@ -434,5 +353,33 @@ mod persistence_tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn stale_left_view_and_left_split_keys_from_an_older_build_still_load_to_defaults() {
+        // `left_view`/`left_split` existed before the left blade lost its
+        // switchable Attention/Sessions view. An old `ui.toml` still
+        // carrying those keys must not block startup: serde ignores
+        // unknown fields by default, and `#[serde(default)]` fills what is
+        // now missing — a stale or corrupt file is never a reason to
+        // refuse to launch.
+        let path = temp_path("stale-left-view-and-split-keys");
+        std::fs::write(
+            &path,
+            "left_collapsed = true\nleft_view = \"sessions\"\nleft_split = 0.99\n",
+        )
+        .expect("write temp file");
+
+        let loaded = load(&path);
+        assert_eq!(
+            loaded,
+            ShellState {
+                left_collapsed: true,
+                ..ShellState::default()
+            },
+            "unknown stale keys must be ignored and known fields must still load"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

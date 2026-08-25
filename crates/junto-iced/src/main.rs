@@ -907,8 +907,6 @@ enum Message {
     ToggleLeftBlade,
     /// Collapse or expand the right blade.
     ToggleRightBlade,
-    /// Switch the left blade's view beneath the pinned nav.
-    LeftViewPicked(shell::LeftView),
     /// Switch the right blade's view.
     RightViewPicked(shell::RightView),
     /// Press a footer drawer trigger: toggle that view open/closed.
@@ -1325,11 +1323,6 @@ impl App {
                             shell::BladeWidth::new(shell::BladeWidth::RIGHT_DEFAULT);
                     }
                 }
-                self.persist_shell();
-                Task::none()
-            }
-            Message::LeftViewPicked(view) => {
-                self.shell.left_view = view;
                 self.persist_shell();
                 Task::none()
             }
@@ -3432,58 +3425,11 @@ fn attention_view(app: &App) -> Element<'_, Message> {
     scrollable(items).height(Fill).into()
 }
 
-/// The left blade: pinned channel navigation above a switchable
-/// Attention/Sessions view. Nav is pinned rather than switchable so changing
-/// channels never costs a round trip through a view switcher.
+/// The left blade: pinned channel navigation, and nothing else — the
+/// former switchable Attention/Sessions view beneath it now lives in the
+/// footer-triggered bottom drawer (`bottom_drawer`), so nothing is left to
+/// switch.
 fn left_blade(app: &App) -> Element<'_, Message> {
-    let switcher = row![
-        button(
-            container(
-                row![icon(ICON_BELL), text("attention").size(TEXT_BODY)]
-                    .spacing(SP_TIGHT)
-                    .align_y(Center),
-            )
-            .center_x(Fill),
-        )
-        .on_press(Message::LeftViewPicked(shell::LeftView::Attention))
-        .width(Length::FillPortion(1))
-        .padding(SP_TIGHT)
-        .style(move |_t, _s| tab_style(app.shell.left_view == shell::LeftView::Attention)),
-        button(
-            container(
-                row![icon(ICON_BOT), text("sessions").size(TEXT_BODY)]
-                    .spacing(SP_TIGHT)
-                    .align_y(Center),
-            )
-            .center_x(Fill),
-        )
-        .on_press(Message::LeftViewPicked(shell::LeftView::Sessions))
-        .width(Length::FillPortion(1))
-        .padding(SP_TIGHT)
-        .style(move |_t, _s| tab_style(app.shell.left_view == shell::LeftView::Sessions)),
-    ]
-    .spacing(SP_TIGHT);
-
-    let body: Element<Message> = match app.shell.left_view {
-        shell::LeftView::Attention => attention_view(app),
-        shell::LeftView::Sessions => sessions_view(app),
-    };
-
-    let rest = column![
-        container(channel_nav(app))
-            .id(iced::widget::Id::new("left-blade-nav"))
-            .height(Length::FillPortion(
-                (app.shell.left_split.get() * 100.0) as u16
-            )),
-        switcher,
-        container(body)
-            .id(iced::widget::Id::new("left-blade-body"))
-            .height(Length::FillPortion(
-                ((1.0 - app.shell.left_split.get()) * 100.0) as u16
-            )),
-    ]
-    .spacing(SP);
-
     // The toggle sits OUTSIDE the blade's padding, flush to the window's
     // left edge — the same x it occupies collapsed, in `blade_stub`'s
     // unpadded rail. Padding it in with the rest would put it SP in from
@@ -3491,7 +3437,10 @@ fn left_blade(app: &App) -> Element<'_, Message> {
     // on every collapse.
     column![
         icon_button(ICON_PANEL_LEFT, Message::ToggleLeftBlade),
-        container(rest).padding(SP).width(Fill).height(Fill),
+        container(channel_nav(app))
+            .padding(SP)
+            .width(Fill)
+            .height(Fill),
     ]
     .into()
 }
@@ -8983,62 +8932,6 @@ diff --git a/lib.rs b/lib.rs
              768px-tall window even with the 240px bottom drawer open, got \
              {outer:?} — a fixed-height drawer is the most plausible way to \
              accidentally squeeze the workspace",
-        );
-    }
-
-    /// Settles whether `left_blade`'s `FillPortion`-split nav/body columns
-    /// actually observe the persisted `NavSplit` ratio, or whether — per the
-    /// review finding — the enclosing `column![...]` being `Shrink` in both
-    /// axes leaves `FillPortion` inert. Same method as the Fix-1 test:
-    /// `iced_test` real layout, read back through tagged container ids
-    /// rather than trusted from source.
-    ///
-    /// EMPIRICAL VERDICT: it is not inert. Measured ratio is exactly 0.55 —
-    /// `NavSplit::DEFAULT` — with the enclosing column left untouched. It is
-    /// NOT actually `Shrink` in both axes by the time it reaches layout,
-    /// though: by the same `Length::enclose` promotion the Fix-1 test's doc
-    /// comment traces (`column.rs:148-149`, `length.rs:61-66`), pushing a
-    /// `Length::FillPortion(55)` child promotes this column's declared
-    /// `Shrink` height straight to `FillPortion(55)`, and pushing the
-    /// `Fill`-width `switcher`/nav row promotes its width to `Fill` too. A
-    /// `FillPortion` main-axis child (height, for this `Column`) draws from
-    /// the ordinary `available` budget once compression is never armed —
-    /// which it is not here, for the same reason as Fix 1.
-    #[test]
-    fn the_left_blades_nav_and_body_observe_the_persisted_split() {
-        let (mut app, _) = App::new();
-        app.shell = shell::ShellState::default();
-        assert_eq!(
-            shell::NavSplit::DEFAULT,
-            0.55,
-            "this test's ratio assertion assumes the documented default"
-        );
-
-        let mut ui = iced_test::simulator(app.view());
-        let nav = ui
-            .find(iced::widget::Id::new("left-blade-nav"))
-            .expect("the left blade's nav container must be laid out")
-            .bounds();
-        let body = ui
-            .find(iced::widget::Id::new("left-blade-body"))
-            .expect("the left blade's body container must be laid out")
-            .bounds();
-
-        assert!(
-            nav.height > 20.0 && body.height > 20.0,
-            "expected both the nav and body halves to receive real, non-\
-             degenerate height, got nav {nav:?} and body {body:?}"
-        );
-        // `NavSplit::DEFAULT` (0.55) means the nav half should be
-        // moderately taller than the body half, not equal (which is what an
-        // inert `FillPortion` — both children falling back to their
-        // intrinsic content size — would produce instead by coincidence).
-        let ratio = nav.height / (nav.height + body.height);
-        assert!(
-            (ratio - shell::NavSplit::DEFAULT).abs() < 0.05,
-            "expected the nav/body height ratio to track NavSplit::DEFAULT \
-             (0.55), got {ratio} from nav {nav:?} and body {body:?} — a \
-             FillPortion that inert would not track it at all",
         );
     }
 
