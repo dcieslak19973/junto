@@ -98,16 +98,63 @@ fn icon(codepoint: char) -> iced::widget::Text<'static> {
     text(codepoint.to_string()).font(ICON_FONT).size(TEXT_BODY)
 }
 
-/// An icon-only button: fixed square, glyph centred. Owns geometry so no
-/// call site sets its own size or padding.
-fn icon_button<'a>(codepoint: char, message: Message) -> iced::widget::Button<'a, Message> {
+/// Bare icon-button geometry: fixed square, centred glyph, zero padding. No
+/// style or tip — `icon_button` layers `ghost_style` and a tooltip on top;
+/// the few call sites that need a different look (the config-row "remove"
+/// buttons, the annotate popup's "clear aim", the pane title bar's
+/// conditionally-disabled close) style themselves directly instead, since
+/// `icon_button`'s own return type no longer exposes `.style()`.
+fn icon_button_raw<'a>(
+    codepoint: char,
+    message: Option<Message>,
+) -> iced::widget::Button<'a, Message> {
     let glyph: Element<'a, Message> = Element::new(icon(codepoint));
     button(container(glyph).center(Length::Fill))
-        .on_press(message)
+        .on_press_maybe(message)
         .width(Length::Fixed(ICON_BTN))
         .height(Length::Fixed(ICON_BTN))
         .padding(0)
-        .style(|_theme, status| ghost_style(status))
+}
+
+/// Wrap `content` with a tip styled like the file's other elevated surfaces
+/// (`SURFACE`/`BORDER`). A tip that renders off the edge of the window is
+/// worse than none, so callers near the top of the chrome pass
+/// `Position::Bottom` and callers near the bottom pass `Position::Top`.
+fn with_tip<'a>(
+    content: impl Into<Element<'a, Message>>,
+    tip: &'a str,
+    position: tooltip::Position,
+) -> Element<'a, Message> {
+    tooltip(content, text(tip).size(TEXT_META), position)
+        .padding(SP_TIGHT)
+        .style(|_theme| container::Style {
+            background: Some(Background::Color(SURFACE)),
+            border: Border {
+                color: BORDER,
+                width: 1.0,
+                radius: 4.0.into(),
+            },
+            text_color: Some(TEXT),
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// An icon-only button: fixed square, glyph centred, `ghost_style`, and a
+/// tip — so a bare glyph can never ship without a label a user can read
+/// (unlike the split/search/plus controls an earlier pass stripped, ledger
+/// this task).
+fn icon_button<'a>(
+    codepoint: char,
+    tip: &'a str,
+    position: tooltip::Position,
+    message: Message,
+) -> Element<'a, Message> {
+    with_tip(
+        icon_button_raw(codepoint, Some(message)).style(|_theme, status| ghost_style(status)),
+        tip,
+        position,
+    )
 }
 
 /// A chrome affordance that sits ON the background rather than looking like a
@@ -2984,13 +3031,25 @@ impl App {
                 )
                 .controls(Element::from(
                     row![
-                        icon_button(ICON_ROTATE_CW, Message::Refresh(id)),
+                        icon_button(
+                            ICON_ROTATE_CW,
+                            "refreshing this channel",
+                            tooltip::Position::Bottom,
+                            Message::Refresh(id),
+                        ),
                         // `State::close` removes nothing and returns `None`
                         // when `pane` has no sibling (the single-pane case,
                         // which is also the app's startup state) — disable
                         // rather than publish a click that does nothing.
-                        icon_button(ICON_X, Message::Close(id))
-                            .on_press_maybe((self.panes.len() > 1).then_some(Message::Close(id))),
+                        with_tip(
+                            icon_button_raw(
+                                ICON_X,
+                                (self.panes.len() > 1).then_some(Message::Close(id)),
+                            )
+                            .style(|_theme, status| ghost_style(status)),
+                            "closing this pane",
+                            tooltip::Position::Bottom,
+                        ),
                     ]
                     .spacing(SP),
                 ))
@@ -3288,11 +3347,19 @@ struct BladeDrag {
 /// it and, on the left, the count of items wanting attention. Collapsing must
 /// not be able to hide that count entirely.
 fn blade_stub<'a>(side: Side, badge: Option<usize>) -> Element<'a, Message> {
-    let (glyph, message) = match side {
-        Side::Left => (ICON_PANEL_LEFT, Message::ToggleLeftBlade),
-        Side::Right => (ICON_PANEL_RIGHT, Message::ToggleRightBlade),
+    let (glyph, tip, message) = match side {
+        Side::Left => (
+            ICON_PANEL_LEFT,
+            "open channels · ctrl+b",
+            Message::ToggleLeftBlade,
+        ),
+        Side::Right => (
+            ICON_PANEL_RIGHT,
+            "open artifacts & lineage · ctrl+r",
+            Message::ToggleRightBlade,
+        ),
     };
-    let mut rail = column![icon_button(glyph, message)]
+    let mut rail = column![icon_button(glyph, tip, tooltip::Position::Bottom, message)]
         .spacing(SP)
         .align_x(Center);
     if let Some(count) = badge.filter(|count| *count > 0) {
@@ -3400,9 +3467,16 @@ fn channel_nav(app: &App) -> Element<'_, Message> {
     let split_row = row![
         icon_button(
             ICON_COLUMNS_2,
-            Message::SplitPane(pane_grid::Axis::Vertical)
+            "split this pane to the right",
+            tooltip::Position::Top,
+            Message::SplitPane(pane_grid::Axis::Vertical),
         ),
-        icon_button(ICON_ROWS_2, Message::SplitPane(pane_grid::Axis::Horizontal)),
+        icon_button(
+            ICON_ROWS_2,
+            "split this pane downward",
+            tooltip::Position::Top,
+            Message::SplitPane(pane_grid::Axis::Horizontal),
+        ),
     ]
     .spacing(SP_TIGHT);
     column![
@@ -3479,7 +3553,12 @@ fn left_blade(app: &App) -> Element<'_, Message> {
     // the edge expanded but flush at 0 collapsed, jumping under the cursor
     // on every collapse.
     column![
-        icon_button(ICON_PANEL_LEFT, Message::ToggleLeftBlade),
+        icon_button(
+            ICON_PANEL_LEFT,
+            "close channels · ctrl+b",
+            tooltip::Position::Bottom,
+            Message::ToggleLeftBlade,
+        ),
         container(channel_nav(app))
             .padding(SP)
             .width(Fill)
@@ -3530,7 +3609,12 @@ fn right_blade(app: &App) -> Element<'_, Message> {
     // toggle there while the full-width padded container beneath it keeps
     // its content inset as before.
     column![
-        icon_button(ICON_PANEL_RIGHT, Message::ToggleRightBlade),
+        icon_button(
+            ICON_PANEL_RIGHT,
+            "close artifacts & lineage · ctrl+r",
+            tooltip::Position::Bottom,
+            Message::ToggleRightBlade,
+        ),
         container(rest).padding(SP).width(Fill).height(Fill),
     ]
     .align_x(Right)
@@ -4034,7 +4118,13 @@ fn agents_panel(app: &App) -> Element<'_, Message> {
     );
 
     // --- advanced config: MCP servers, skills, local plugins ---
-    let remove_btn = |msg: Message| icon_button(ICON_X, msg).style(|_t, _s| chip_style(RED, false));
+    let remove_btn = |msg: Message| {
+        with_tip(
+            icon_button_raw(ICON_X, Some(msg)).style(|_t, _s| chip_style(RED, false)),
+            "remove this entry",
+            tooltip::Position::Top,
+        )
+    };
     let add_btn = |label: &'static str, msg: Message| {
         button(text(label).size(TEXT_META))
             .on_press(msg)
@@ -4847,7 +4937,12 @@ fn annotate_popup(id: pane_grid::Pane, pane: &Pane) -> Element<'_, Message> {
     let head = row![
         text(aim_label(pane)).size(TEXT_META).color(TEAL),
         Space::new().width(Fill),
-        icon_button(ICON_X, Message::AnchorClear(id)).style(|_t, _s| chip_style(MUTED, false)),
+        with_tip(
+            icon_button_raw(ICON_X, Some(Message::AnchorClear(id)))
+                .style(|_t, _s| chip_style(MUTED, false)),
+            "clear this aim",
+            tooltip::Position::Bottom,
+        ),
     ]
     .spacing(SP)
     .align_y(Center);
