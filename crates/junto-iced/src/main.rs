@@ -342,6 +342,29 @@ enum AdminView {
     Agents,
 }
 
+/// A comment written while resuming a finished session
+/// (`Message::AnnotateSubmit` with no `Pane::annotate_tx`): the text already
+/// carries `pending_comment_text`'s `about {path}:{lines} —` prefix, so it
+/// is both the steer message that resumes the session and, once the
+/// resumed socket authenticates, a `StreamAnchor` comment recording what
+/// the reviewer meant (`Pane::try_flush_pending_comment`). Never a
+/// `CodeAnchor`: there is no commit this could legitimately name.
+///
+/// Scoped to the ONE session it was written for and cleared the moment
+/// that scoping might go stale — a fresh `watch`, `CloseSession`, or
+/// `LiveEnded` for this pane, or the comment being flushed (successfully
+/// or not) — so it can never flush onto a session it was never about, and
+/// never lingers forever if the resume it rode in on never connects.
+struct PendingComment {
+    /// The session this comment steers and is about. A `Message::LiveConnected`
+    /// for any other session must never flush it.
+    session: String,
+    /// The already-prefixed steer/comment text (`pending_comment_text`).
+    text: String,
+    /// The composer's "urgent" checkbox at submit time.
+    urgent: bool,
+}
+
 struct Pane {
     channel: String,
     content: Content,
@@ -430,6 +453,11 @@ struct Pane {
     annotate_body: String,
     /// The annotation composer's "urgent" checkbox.
     annotate_urgent: bool,
+    /// A comment resuming this session with no live socket to send it over
+    /// yet — held until the resume connects (`Message::LiveConnected`) and
+    /// flushed as a `StreamAnchor` then. `None` most of the time; see
+    /// `PendingComment`'s own docs for exactly when this is set and cleared.
+    pending_comment: Option<PendingComment>,
     launch_intent: String,
     steer_text: String,
     /// Which configured Agent runs the next launch (None → host default).
@@ -1534,11 +1562,16 @@ enum Message {
     /// A live websocket authenticated and is ready to carry outbound frames
     /// (session, the write-half sender, the email it actually
     /// authenticated as) — stored as `Pane::annotate_tx`/`annotate_email`
-    /// for the annotation composer.
+    /// for the annotation composer. Also the trigger to flush a pending
+    /// comment left by a resume (`Pane::pending_comment`,
+    /// `Pane::try_flush_pending_comment`) for this same session.
     LiveConnected(String, mpsc::Sender<WireFrame>, String),
     /// The live doc's `conversation` container grew (session, new length) —
     /// mirrored into `Pane::conversation_len` so the composer's
-    /// `StreamAnchor` can point at a real CONTAINER index.
+    /// `StreamAnchor` can point at a real CONTAINER index. Also retries
+    /// `Pane::try_flush_pending_comment`: `LiveConnected` fires before the
+    /// resumed doc's first sync, so a pending comment's flush is deferred
+    /// to whichever of these two arrives with a nonzero length.
     ConversationLen(String, usize),
     /// A worktree `{"kind":"diff","commit":…}` event arrived (session,
     /// commit oid) — mirrored into `Pane::worktree_commit`, the only source
@@ -1845,9 +1878,55 @@ impl App {
             // is cleared here, so keeping it would aim at an op from a
             // different session.
             state.annotate_op = None;
+            // A pending comment belongs to the session it was written for;
+            // watching a session — even re-watching the same one — starts
+            // this pane's live view over, so a comment still waiting to
+            // flush is dropped rather than risk it landing on the wrong
+            // resume.
+            state.pending_comment = None;
             // A different session has a different newest diff.
             state.auto_expanded = false;
         }
+    }
+
+    /// Steers `pane`'s watched session with `text`: echoes it into the feed
+    /// and posts the resume — exactly what `Message::Steer` does for the
+    /// steer box's own submit. Shared with `AnnotateSubmit`'s no-socket
+    /// path (`Message::AnnotateSubmit`), so resuming with a comment steers
+    /// exactly the way pressing "steer" does — there is only one steer
+    /// request built anywhere in this file.
+    fn issue_steer(&mut self, pane: pane_grid::Pane, text: String) -> Task<Message> {
+        let Some(state) = self.panes.get_mut(pane) else {
+            return Task::none();
+        };
+        let Some(session) = state.watched.clone() else {
+            return Task::none();
+        };
+        if text.is_empty() {
+            return Task::none();
+        }
+        let base = state.base().to_string();
+        let channel = state.channel.clone();
+        state.steer_text.clear();
+        // Echo the message immediately so the exchange reads like a chat.
+        state.feed.push(FeedItem {
+            event: LiveEvent {
+                kind: "you".into(),
+                text: text.clone(),
+                seq: 0,
+                html: false,
+                markdown: None,
+            },
+            md: None,
+            // A local echo of your own steer — the host's own copy
+            // arrives separately, with a real index.
+            op: None,
+        });
+        let scroll = state.scroll_id.clone();
+        Task::batch([
+            post_steer(pane, base, channel, session, text),
+            iced::widget::operation::snap_to_end(scroll),
+        ])
     }
 
     /// Focus `pane`, clearing a session `pending` the new focus makes
@@ -2295,6 +2374,11 @@ impl App {
                                 state.annotate_email = None;
                                 state.conversation_len = 0;
                                 state.worktree_commit = None;
+                                // Same rationale as `watch`'s own reset: a
+                                // pending comment belongs to whatever
+                                // session it was written for, and this is a
+                                // brand new one.
+                                state.pending_comment = None;
                             }
                         }
                         // Put the code on screen without hunting for it: a
@@ -2380,6 +2464,10 @@ impl App {
                     state.conversation_len = 0;
                     state.worktree_commit = None;
                     state.annotate_op = None;
+                    // The user is done with this session — a comment still
+                    // waiting on its resume to connect is dropped rather
+                    // than flushed onto a session they have since closed.
+                    state.pending_comment = None;
                     // A different session has a different newest diff.
                     state.auto_expanded = false;
                 }
@@ -2427,6 +2515,13 @@ impl App {
                         // gone; a stale index would anchor at the wrong op
                         // on the next turn.
                         state.annotate_op = None;
+                        // This IS the backstop for "the resume never
+                        // connects": if the socket that was supposed to
+                        // carry a pending comment ends without ever
+                        // authenticating (`Message::LiveConnected` never
+                        // fired), there is no other event left to flush it
+                        // on — drop it here rather than hold it forever.
+                        state.pending_comment = None;
                         to_refresh = Some(*pane);
                         break;
                     }
@@ -2474,6 +2569,7 @@ impl App {
                     if state.watched.as_deref() == Some(session.as_str()) {
                         state.annotate_tx = Some(tx);
                         state.annotate_email = Some(email);
+                        state.try_flush_pending_comment(&session);
                         break;
                     }
                 }
@@ -2483,6 +2579,7 @@ impl App {
                 for (_, state) in self.panes.iter_mut() {
                     if state.watched.as_deref() == Some(session.as_str()) {
                         state.conversation_len = len;
+                        state.try_flush_pending_comment(&session);
                         break;
                     }
                 }
@@ -2578,14 +2675,6 @@ impl App {
                 let Some(state) = self.panes.get_mut(pane) else {
                     return Task::none();
                 };
-                let push_error = |state: &mut Pane, text: String| {
-                    state.feed.push(FeedItem {
-                        md: None,
-                        event: error_event(text),
-                        // Locally invented; it exists in no document.
-                        op: None,
-                    });
-                };
                 let body = state.annotate_body.trim().to_string();
                 if body.is_empty() {
                     return Task::none();
@@ -2594,10 +2683,32 @@ impl App {
                     return Task::none();
                 };
                 let Some(mut tx) = state.annotate_tx.clone() else {
-                    return Task::none();
+                    // No live, authenticated socket to sign and send over —
+                    // `Pane::annotate_tx`'s own docs cover why one is never
+                    // fabricated. Compose the steer/comment text (naming the
+                    // clicked file+lines when there is one,
+                    // `pending_comment_text`), hold it as this session's
+                    // pending comment, resume the session with it, and close
+                    // the composer so the gesture reads as done.
+                    // `Message::LiveConnected` flushes the pending comment,
+                    // as a `StreamAnchor`, once the resumed socket
+                    // authenticates.
+                    let text =
+                        pending_comment_text(&state.annotate_path, &state.annotate_lines, &body);
+                    state.pending_comment = Some(PendingComment {
+                        session: session_str,
+                        text: text.clone(),
+                        urgent: state.annotate_urgent,
+                    });
+                    state.annotate_body.clear();
+                    state.annotate_path.clear();
+                    state.annotate_lines.clear();
+                    state.annotate_record = None;
+                    state.annotate_op = None;
+                    return self.issue_steer(pane, text);
                 };
                 let Ok(session) = session_str.parse::<EntryId>() else {
-                    push_error(state, "malformed session id".to_string());
+                    push_annotate_error(state, "malformed session id".to_string());
                     return Task::none();
                 };
                 // The email the socket actually authenticated as — never a
@@ -2606,7 +2717,7 @@ impl App {
                 // docs: doing so would sign as an identity the socket was
                 // never authenticated as, which the host rejects outright).
                 let Some(email) = state.annotate_email.clone() else {
-                    push_error(
+                    push_annotate_error(
                         state,
                         "not authenticated yet — wait for the connection to finish".to_string(),
                     );
@@ -2615,7 +2726,7 @@ impl App {
                 // Sign with the authenticated identity's key on file — never
                 // send unsigned, since the host would reject it anyway.
                 let Some(signing_key) = load_signing_key(&email) else {
-                    push_error(state, format!("no signing key on file for '{email}'"));
+                    push_annotate_error(state, format!("no signing key on file for '{email}'"));
                     return Task::none();
                 };
                 let path = state.annotate_path.trim().to_string();
@@ -2635,21 +2746,21 @@ impl App {
                 // does not relax any of this.
                 let anchor = if let Some((entry, digest)) = state.annotate_record.clone() {
                     let Ok(entry) = entry.parse::<EntryId>() else {
-                        push_error(
+                        push_annotate_error(
                             state,
                             "malformed entry id for the clicked content".to_string(),
                         );
                         return Task::none();
                     };
                     let Ok(digest) = ContentDigest::new(digest) else {
-                        push_error(
+                        push_annotate_error(
                             state,
                             "malformed digest for the clicked content".to_string(),
                         );
                         return Task::none();
                     };
                     let Some(span) = parse_span(&state.annotate_lines) else {
-                        push_error(
+                        push_annotate_error(
                             state,
                             format!(
                                 "invalid line range '{}' — use \"12\" or \"12-14\"",
@@ -2672,7 +2783,7 @@ impl App {
                         .annotate_op
                         .or_else(|| state.conversation_len.checked_sub(1))
                     else {
-                        push_error(
+                        push_annotate_error(
                             state,
                             "nothing to anchor to yet — wait for the first live event".to_string(),
                         );
@@ -2684,7 +2795,7 @@ impl App {
                     })
                 } else {
                     let Some(commit_str) = state.worktree_commit.clone() else {
-                        push_error(
+                        push_annotate_error(
                             state,
                             "no commit seen yet for this session's worktree — clear the path to \
                              comment on the live stream instead"
@@ -2693,14 +2804,14 @@ impl App {
                         return Task::none();
                     };
                     let Ok(commit) = CommitOid::new(commit_str) else {
-                        push_error(
+                        push_annotate_error(
                             state,
                             "malformed commit oid from the worktree feed".to_string(),
                         );
                         return Task::none();
                     };
                     let Some(span) = parse_span(&state.annotate_lines) else {
-                        push_error(
+                        push_annotate_error(
                             state,
                             format!(
                                 "invalid line range '{}' — use \"12\" or \"12-14\"",
@@ -2720,7 +2831,7 @@ impl App {
                         span,
                     })
                 };
-                let mut annotation = Annotation {
+                let annotation = Annotation {
                     id: AnnotationId::new(),
                     author: author_for(state.keys.as_ref(), &email),
                     anchor,
@@ -2731,21 +2842,8 @@ impl App {
                     timestamp: Timestamp::now(),
                     signature: None,
                 };
-                if annotation.sign(&signing_key).is_err() {
-                    push_error(state, "failed to sign annotation".to_string());
-                    return Task::none();
-                }
-                let local = LiveDoc::new();
-                if local.insert_annotation(&annotation).is_err() {
-                    push_error(state, "failed to build annotation update".to_string());
-                    return Task::none();
-                }
-                let frame = WireFrame::update(&local.export_snapshot());
-                if tx.try_send(frame).is_err() {
-                    push_error(
-                        state,
-                        "failed to send annotation — the connection may have dropped".to_string(),
-                    );
+                if let Err(err) = sign_and_send_annotation(annotation, &signing_key, &mut tx) {
+                    push_annotate_error(state, err);
                     return Task::none();
                 }
                 state.annotate_body.clear();
@@ -2883,36 +2981,8 @@ impl App {
                 let Some(state) = self.panes.get_mut(pane) else {
                     return Task::none();
                 };
-                let (Some(session), text) =
-                    (state.watched.clone(), state.steer_text.trim().to_string())
-                else {
-                    return Task::none();
-                };
-                if text.is_empty() {
-                    return Task::none();
-                }
-                let base = state.base().to_string();
-                let channel = state.channel.clone();
-                state.steer_text.clear();
-                // Echo the message immediately so the exchange reads like a chat.
-                state.feed.push(FeedItem {
-                    event: LiveEvent {
-                        kind: "you".into(),
-                        text: text.clone(),
-                        seq: 0,
-                        html: false,
-                        markdown: None,
-                    },
-                    md: None,
-                    // A local echo of your own steer — the host's own copy
-                    // arrives separately, with a real index.
-                    op: None,
-                });
-                let scroll = state.scroll_id.clone();
-                Task::batch([
-                    post_steer(pane, base, channel, session, text),
-                    iced::widget::operation::snap_to_end(scroll),
-                ])
+                let text = state.steer_text.trim().to_string();
+                self.issue_steer(pane, text)
             }
             Message::Steered(pane, result) => {
                 if let Some(state) = self.panes.get_mut(pane) {
@@ -8139,6 +8209,80 @@ impl Pane {
         Some(self.annotate_path.trim()).filter(|path| !path.is_empty())
     }
 
+    /// Attempts to flush this pane's pending comment (`Pane::pending_comment`)
+    /// for `session`, now that its resume may have a live, authenticated
+    /// socket: builds and sends the exact `Anchor::Stream` comment
+    /// `AnnotateSubmit`'s own "nothing picked" branch would, through the
+    /// identical signed path (`sign_and_send_annotation`). Never builds a
+    /// `CodeAnchor` — there is no legitimate commit for one here.
+    ///
+    /// A no-op unless every one of these holds, so a call from either
+    /// `Message::LiveConnected` or `Message::ConversationLen` is always safe
+    /// to make speculatively:
+    /// - There IS a pending comment, and it is for `session` — a pane's
+    ///   pending comment belongs to exactly the session it was written for;
+    ///   a mismatch (this pane watching something else by now, or a stray
+    ///   call for a different session) leaves it untouched.
+    /// - `conversation_len` is nonzero. `LiveConnected` fires before the
+    ///   resumed doc's first sync, so right after connecting there is no
+    ///   real op yet to anchor a `StreamAnchor` at — left in place rather
+    ///   than refused, since `ConversationLen`'s own arrival calls this
+    ///   again the moment a real length is known. The comment is delayed by
+    ///   that race, never lost to it.
+    /// - The socket has actually authenticated (`annotate_tx`/`annotate_email`
+    ///   both `Some`) — true by the time either caller runs this, but
+    ///   checked rather than assumed.
+    ///
+    /// Once past those, the comment is consumed either way: a genuine
+    /// failure (malformed session id, no signing key on file, sign/send
+    /// failure) is reported once via a feed error rather than retried
+    /// forever.
+    fn try_flush_pending_comment(&mut self, session: &str) {
+        let belongs = self
+            .pending_comment
+            .as_ref()
+            .is_some_and(|pending| pending.session == session);
+        if !belongs || self.conversation_len == 0 {
+            return;
+        }
+        let Some(mut tx) = self.annotate_tx.clone() else {
+            return;
+        };
+        let Some(email) = self.annotate_email.clone() else {
+            return;
+        };
+        let Some(pending) = self.pending_comment.take() else {
+            return;
+        };
+        let Ok(session_id) = pending.session.parse::<EntryId>() else {
+            push_annotate_error(self, "malformed session id for pending comment".to_string());
+            return;
+        };
+        let Some(signing_key) = load_signing_key(&email) else {
+            push_annotate_error(self, format!("no signing key on file for '{email}'"));
+            return;
+        };
+        // Checked non-zero above, so this never underflows.
+        let op = self.conversation_len - 1;
+        let annotation = Annotation {
+            id: AnnotationId::new(),
+            author: author_for(self.keys.as_ref(), &email),
+            anchor: Anchor::Stream(StreamAnchor {
+                session: session_id,
+                op_id: op.to_string(),
+            }),
+            body: pending.text,
+            excerpt: None,
+            supersedes: None,
+            urgent: pending.urgent,
+            timestamp: Timestamp::now(),
+            signature: None,
+        };
+        if let Err(err) = sign_and_send_annotation(annotation, &signing_key, &mut tx) {
+            push_annotate_error(self, err);
+        }
+    }
+
     fn loading(channel: &str) -> Self {
         Pane {
             channel: channel.to_string(),
@@ -8161,6 +8305,7 @@ impl Pane {
             annotate_lines: String::new(),
             annotate_body: String::new(),
             annotate_urgent: false,
+            pending_comment: None,
             launch_intent: String::new(),
             steer_text: String::new(),
             launch_agent: None,
@@ -8236,6 +8381,61 @@ impl Pane {
         };
         entries.iter().filter(|entry| entry.kind == "artifact")
     }
+}
+
+/// Formats the text that both steers a resumed session and becomes the
+/// flushed comment's body (`Message::AnnotateSubmit`'s no-socket path,
+/// `Pane::try_flush_pending_comment`): `about {path}:{lines} — {body}` when
+/// a file span was aimed at, `body` alone when the aim was the live stream.
+/// This prefix is the only place the clicked line reference survives the
+/// resume — the flushed comment is a `StreamAnchor` with no span of its
+/// own, so if this doesn't name the lines, nothing does.
+fn pending_comment_text(path: &str, lines: &str, body: &str) -> String {
+    let path = path.trim();
+    if path.is_empty() {
+        body.to_string()
+    } else {
+        format!("about {path}:{lines} — {body}")
+    }
+}
+
+/// Pushes a synthetic error line into `pane`'s feed — locally invented, so
+/// it exists in no document, the same shape `AnnotateSubmit` has always
+/// used for its own recoverable failures. Shared with the pending-comment
+/// flush (`Pane::try_flush_pending_comment`), so a failed send is reported
+/// identically whichever path attempted it.
+fn push_annotate_error(pane: &mut Pane, text: String) {
+    pane.feed.push(FeedItem {
+        md: None,
+        event: error_event(text),
+        // Locally invented; it exists in no document.
+        op: None,
+    });
+}
+
+/// Signs `annotation` and sends it over `tx` as a live-doc update — the one
+/// signing+send step both `AnnotateSubmit`'s immediate (live) path and the
+/// pending-comment flush (`Pane::try_flush_pending_comment`) go through, so
+/// a comment is built and put on the wire identically whichever path sent
+/// it. Callers build the `Annotation` themselves; this only signs and
+/// forwards it, exactly as `AnnotateSubmit` always has.
+fn sign_and_send_annotation(
+    mut annotation: Annotation,
+    signing_key: &SigningKey,
+    tx: &mut mpsc::Sender<WireFrame>,
+) -> Result<(), String> {
+    if annotation.sign(signing_key).is_err() {
+        return Err("failed to sign annotation".to_string());
+    }
+    let local = LiveDoc::new();
+    if local.insert_annotation(&annotation).is_err() {
+        return Err("failed to build annotation update".to_string());
+    }
+    let frame = WireFrame::update(&local.export_snapshot());
+    if tx.try_send(frame).is_err() {
+        return Err("failed to send annotation — the connection may have dropped".to_string());
+    }
+    Ok(())
 }
 
 /// Fetch a channel's structured view from `base` (the pane's effective host,
