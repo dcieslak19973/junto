@@ -28,6 +28,15 @@ pub enum RightView {
     Lineage,
 }
 
+/// Which panel the bottom drawer is showing, or `None` when it is closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BottomView {
+    #[default]
+    Attention,
+    Sessions,
+}
+
 /// A blade width in logical pixels, clamped to a range that keeps both the
 /// blade and the center usable. Deserialization clamps too, so a hand-edited
 /// or corrupt state file cannot strand a blade.
@@ -157,6 +166,8 @@ pub struct ShellState {
     pub right_view: RightView,
     /// Where the left blade divides pinned nav from its switchable view.
     pub left_split: NavSplit,
+    /// Which panel the bottom drawer is showing; `None` when it is closed.
+    pub bottom: Option<BottomView>,
 }
 
 impl Default for ShellState {
@@ -176,6 +187,7 @@ impl Default for ShellState {
             left_view: LeftView::default(),
             right_view: RightView::default(),
             left_split: NavSplit::default(),
+            bottom: None,
         }
     }
 }
@@ -189,6 +201,16 @@ impl ShellState {
     /// Collapse the right blade if expanded, expand it if collapsed.
     pub fn toggle_right(&mut self) {
         self.right_collapsed = !self.right_collapsed;
+    }
+
+    /// Toggle the bottom drawer: selecting the currently open view closes
+    /// it; selecting the other switches to it.
+    pub fn toggle_bottom(&mut self, view: BottomView) {
+        self.bottom = if self.bottom == Some(view) {
+            None
+        } else {
+            Some(view)
+        };
     }
 }
 
@@ -222,7 +244,7 @@ pub fn save(path: &Path, state: &ShellState) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod clamp_tests {
-    use super::{BladeWidth, NavSplit, ShellState};
+    use super::{BladeWidth, BottomView, NavSplit, ShellState};
 
     #[test]
     fn a_width_inside_the_usable_range_is_kept_as_typed() {
@@ -288,6 +310,24 @@ mod clamp_tests {
         assert_eq!(state.left_width.get(), BladeWidth::LEFT_DEFAULT);
         assert_eq!(state.right_width.get(), BladeWidth::RIGHT_DEFAULT);
         assert_ne!(state.left_width, state.right_width);
+    }
+
+    #[test]
+    fn toggling_the_bottom_drawer_to_the_same_view_closes_it() {
+        let mut state = ShellState::default();
+        assert_eq!(state.bottom, None);
+        state.toggle_bottom(BottomView::Attention);
+        assert_eq!(state.bottom, Some(BottomView::Attention));
+        state.toggle_bottom(BottomView::Attention);
+        assert_eq!(state.bottom, None);
+    }
+
+    #[test]
+    fn toggling_the_bottom_drawer_to_a_different_view_switches_without_closing() {
+        let mut state = ShellState::default();
+        state.toggle_bottom(BottomView::Attention);
+        state.toggle_bottom(BottomView::Sessions);
+        assert_eq!(state.bottom, Some(BottomView::Sessions));
     }
 }
 

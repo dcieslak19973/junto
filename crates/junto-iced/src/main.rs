@@ -911,6 +911,8 @@ enum Message {
     LeftViewPicked(shell::LeftView),
     /// Switch the right blade's view.
     RightViewPicked(shell::RightView),
+    /// Press a footer drawer trigger: toggle that view open/closed.
+    BottomViewToggled(shell::BottomView),
     /// Press a blade-width divider handle: begin a resize drag.
     BladeDragStart(Side),
     /// The cursor moved during an in-flight blade-width drag (absolute
@@ -1333,6 +1335,11 @@ impl App {
             }
             Message::RightViewPicked(view) => {
                 self.shell.right_view = view;
+                self.persist_shell();
+                Task::none()
+            }
+            Message::BottomViewToggled(view) => {
+                self.shell.toggle_bottom(view);
                 self.persist_shell();
                 Task::none()
             }
@@ -3039,7 +3046,11 @@ impl App {
         ]
         .spacing(0);
 
-        column![top_bar, shell_row, footer(self)].into()
+        let mut root = column![top_bar, shell_row];
+        if let Some(view) = self.shell.bottom {
+            root = root.push(bottom_drawer(self, view));
+        }
+        root.push(footer(self)).into()
     }
 }
 
@@ -3090,21 +3101,74 @@ fn footer(app: &App) -> Element<'_, Message> {
         if base == HOST { "local" } else { base }
     });
 
-    let mut segments = vec![channel.to_string(), format!("{panes} {pane_word}")];
     let attention = app.focus_items.len();
-    if attention > 0 {
+    let attention_open = app.shell.bottom == Some(shell::BottomView::Attention);
+    let attention_trigger: Element<Message> = if attention > 0 {
         let word = if attention == 1 { "needs" } else { "need" };
-        segments.push(format!("{attention} {word} you"));
-    }
-    segments.push(host.to_string());
+        button(
+            row![
+                icon(ICON_BELL),
+                text(attention.to_string()).size(TEXT_META).font(semibold()),
+                text(format!("{word} you")).size(TEXT_META),
+            ]
+            .spacing(SP_TIGHT)
+            .align_y(Center),
+        )
+        .on_press(Message::BottomViewToggled(shell::BottomView::Attention))
+        .padding([SP_TIGHT, SP])
+        .style(move |_t, _s| chip_style(YELLOW, attention_open))
+        .into()
+    } else {
+        row![
+            icon(ICON_BELL).color(GREEN),
+            text("all clear").size(TEXT_META).color(GREEN),
+        ]
+        .spacing(SP_TIGHT)
+        .align_y(Center)
+        .into()
+    };
 
-    let mut strip = row![].spacing(SP).align_y(Center);
-    for (i, segment) in segments.into_iter().enumerate() {
-        if i > 0 {
-            strip = strip.push(text("·").size(TEXT_META).color(MUTED));
-        }
-        strip = strip.push(text(segment).size(TEXT_META).color(MUTED));
-    }
+    let sessions = pane.map_or(0, |p| p.session_list().len());
+    let sessions_open = app.shell.bottom == Some(shell::BottomView::Sessions);
+    let sessions_trigger: Element<Message> = if sessions > 0 {
+        button(
+            row![
+                icon(ICON_BOT),
+                text(format!("{sessions} sessions")).size(TEXT_META)
+            ]
+            .spacing(SP_TIGHT)
+            .align_y(Center),
+        )
+        .on_press(Message::BottomViewToggled(shell::BottomView::Sessions))
+        .padding([SP_TIGHT, SP])
+        .style(move |_t, _s| chip_style(MUTED, sessions_open))
+        .into()
+    } else {
+        row![
+            icon(ICON_BOT).color(MUTED),
+            text("no sessions").size(TEXT_META).color(MUTED),
+        ]
+        .spacing(SP_TIGHT)
+        .align_y(Center)
+        .into()
+    };
+
+    let dot = || text("·").size(TEXT_META).color(MUTED);
+    let strip = row![
+        text(channel).size(TEXT_META).color(MUTED),
+        dot(),
+        text(format!("{panes} {pane_word}"))
+            .size(TEXT_META)
+            .color(MUTED),
+        dot(),
+        attention_trigger,
+        dot(),
+        sessions_trigger,
+        dot(),
+        text(host).size(TEXT_META).color(MUTED),
+    ]
+    .spacing(SP)
+    .align_y(Center);
 
     container(strip)
         .width(Fill)
@@ -3114,6 +3178,41 @@ fn footer(app: &App) -> Element<'_, Message> {
             bottom: SP_TIGHT,
             left: SP_LOOSE,
         })
+        .style(|_theme| container::Style {
+            background: Some(Background::Color(Color { a: 0.4, ..SURFACE })),
+            border: Border {
+                color: BORDER,
+                width: 1.0,
+                radius: 0.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// The bottom drawer: attention or sessions content, opened from one of the
+/// footer's trigger chips. Rendered full width above the footer at a fixed
+/// height (`DRAWER_H`) — its content scrolls inside via the same
+/// `scrollable(..).height(Fill)` `attention_view`/`sessions_view` already
+/// wrap their lists in, unchanged by living inside a fixed-height parent.
+fn bottom_drawer(app: &App, view: shell::BottomView) -> Element<'_, Message> {
+    let (title, body) = match view {
+        shell::BottomView::Attention => ("attention", attention_view(app)),
+        shell::BottomView::Sessions => ("sessions", sessions_view(app)),
+    };
+
+    let header = row![
+        text(title).size(TEXT_BODY).font(semibold()),
+        Space::new().width(Fill),
+        icon_button(ICON_X, Message::BottomViewToggled(view)),
+    ]
+    .spacing(SP)
+    .align_y(Center);
+
+    container(column![header, body].spacing(SP).height(Fill))
+        .width(Fill)
+        .height(Length::Fixed(DRAWER_H))
+        .padding(SP)
         .style(|_theme| container::Style {
             background: Some(Background::Color(Color { a: 0.4, ..SURFACE })),
             border: Border {
@@ -8860,6 +8959,30 @@ diff --git a/lib.rs b/lib.rs
              768px-tall window, got inner (wraps column![grid] directly) \
              {inner:?} and outer (one level further out) {outer:?} — the \
              predicted zero-height/sliver collapse",
+        );
+    }
+
+    /// A 240px fixed-height bottom drawer is the most plausible way to
+    /// accidentally squeeze the center workspace — this settles it the same
+    /// way as the guard above, with the drawer open instead of closed.
+    #[test]
+    fn the_center_pane_grid_still_gets_real_height_with_the_bottom_drawer_open() {
+        let (mut app, _) = App::new();
+        app.shell = shell::ShellState::default();
+        app.shell.bottom = Some(shell::BottomView::Attention);
+
+        let mut ui = iced_test::simulator(app.view());
+        let outer = ui
+            .find(iced::widget::Id::new("center-pane-grid"))
+            .expect("the center container must be laid out")
+            .bounds();
+
+        assert!(
+            outer.height > 100.0,
+            "expected the center pane grid to keep real height in a \
+             768px-tall window even with the 240px bottom drawer open, got \
+             {outer:?} — a fixed-height drawer is the most plausible way to \
+             accidentally squeeze the workspace",
         );
     }
 
