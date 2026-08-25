@@ -562,6 +562,95 @@ struct GEdge {
     relation: String,
 }
 
+// ---- pure lineage-graph logic: row order, structural relations, and a
+// node's role — decidable from `LineageGraphDto` alone, with no widget or
+// `App` state, and tested as such (`lineage_tests`) before `lineage_view`
+// (the vertical-list rewrite of the old horizontal `LineageCanvas`) ever
+// touches them. ----
+
+/// Newest-activity-first ordering for the lineage list: sort nodes by
+/// `last_ms` descending. A node's `last_ms` is `None` when its channel has
+/// no recorded entries yet — treated as the oldest possible activity
+/// (`i64::MIN`), on the reasoning that "no evidence of recent activity"
+/// belongs at the bottom of a newest-first list, not jumping to the top.
+/// Ties (equal `last_ms`, including two `None`s) break on `name` so the
+/// list never silently reorders between two frames over identical data.
+fn lineage_row_order(graph: &LineageGraphDto) -> Vec<&GNode> {
+    let mut nodes: Vec<&GNode> = graph.nodes.iter().collect();
+    nodes.sort_by(|a, b| {
+        let a_key = a.last_ms.unwrap_or(i64::MIN);
+        let b_key = b.last_ms.unwrap_or(i64::MIN);
+        b_key.cmp(&a_key).then_with(|| a.name.cmp(&b.name))
+    });
+    nodes
+}
+
+/// One node's structural relations within the lineage DAG, as borrowed
+/// node ids — never a formatted string; `lineage_view` owns turning these
+/// into words.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct LineageRelations<'a> {
+    /// The `from` of the one `diverge` edge pointing at this node, if any.
+    parent: Option<&'a str>,
+    /// The `to` of every `diverge` edge FROM this node — other channels
+    /// that branched off it.
+    children: Vec<&'a str>,
+    /// The `to` of this node's own outgoing `converge` edge, if its thread
+    /// merged back into another channel.
+    converged_into: Option<&'a str>,
+}
+
+/// Scans `graph`'s edges for everything touching `id`. `relation` is only
+/// ever `"diverge"` or `"converge"` in the live data; anything else (there
+/// is none today) is silently ignored rather than treated as a parse
+/// error, since this walks already-deserialized JSON, not the wire itself.
+fn node_relations<'a>(graph: &'a LineageGraphDto, id: &str) -> LineageRelations<'a> {
+    let mut relations = LineageRelations::default();
+    for edge in &graph.edges {
+        match edge.relation.as_str() {
+            "diverge" if edge.to == id => relations.parent = Some(edge.from.as_str()),
+            "diverge" if edge.from == id => relations.children.push(edge.to.as_str()),
+            "converge" if edge.from == id => relations.converged_into = Some(edge.to.as_str()),
+            _ => {}
+        }
+    }
+    relations
+}
+
+/// A node's structural role in the lineage DAG — what `lineage_view` picks
+/// the rail glyph from, computed from a node's own `LineageRelations`
+/// rather than re-scanning the graph, so it's testable in isolation.
+///
+/// A node can satisfy more than one of these at once — the real data's own
+/// hub channel is both a root (no parent) AND a fork (six diverges out).
+/// Precedence, checked in this order: `Fork` first, since other channels
+/// branching off a node is the most structurally significant fact about
+/// it and must never be hidden behind a rarer one; then `Converged`; then
+/// `Root`; `Ordinary` is the fallback once none apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineageRole {
+    /// No incoming diverge — nothing forked this channel off another.
+    Root,
+    /// At least one outgoing diverge — other channels forked off THIS one.
+    Fork,
+    /// An outgoing converge — this channel's thread merged into another.
+    Converged,
+    /// A parented, non-forking, non-converging interior node.
+    Ordinary,
+}
+
+fn node_role(relations: &LineageRelations) -> LineageRole {
+    if !relations.children.is_empty() {
+        LineageRole::Fork
+    } else if relations.converged_into.is_some() {
+        LineageRole::Converged
+    } else if relations.parent.is_none() {
+        LineageRole::Root
+    } else {
+        LineageRole::Ordinary
+    }
+}
+
 /// A configured Agent the launch picker offers (mirrors `/agents.json`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct AgentDto {
@@ -10457,5 +10546,167 @@ mod channel_filter_tests {
 
         let _ = app.update(Message::ToggleCreating);
         assert!(!app.creating, "the second press must close it again");
+    }
+}
+
+#[cfg(test)]
+mod lineage_tests {
+    use super::*;
+
+    /// A small hand-built graph mirroring the real data's shape: a
+    /// parentless "hub" that forks three channels — one of which
+    /// ("child-a") itself forks a "sub" channel AND converges back into
+    /// the hub, the "both children and a converge" case — plus a
+    /// converge-only channel ("child-b"), an ordinary interior channel
+    /// ("child-c"), and a channel wired into nothing at all ("ghostly"),
+    /// with no timestamps either.
+    fn hub_graph() -> LineageGraphDto {
+        let node = |id: &str, last_ms: Option<i64>| GNode {
+            id: id.to_string(),
+            name: id.to_string(),
+            first_ms: last_ms,
+            last_ms,
+            milestones: Vec::new(),
+        };
+        let edge = |from: &str, to: &str, relation: &str| GEdge {
+            from: from.to_string(),
+            to: to.to_string(),
+            relation: relation.to_string(),
+        };
+        LineageGraphDto {
+            nodes: vec![
+                node("hub", Some(1000)),
+                node("child-a", Some(4000)),
+                node("child-b", Some(3000)),
+                node("child-c", Some(2000)),
+                node("sub", Some(5000)),
+                node("ghostly", None),
+            ],
+            edges: vec![
+                edge("hub", "child-a", "diverge"),
+                edge("hub", "child-b", "diverge"),
+                edge("hub", "child-c", "diverge"),
+                edge("child-a", "sub", "diverge"),
+                edge("child-a", "hub", "converge"),
+                edge("child-b", "hub", "converge"),
+            ],
+        }
+    }
+
+    #[test]
+    fn rows_are_ordered_newest_activity_first() {
+        let graph = hub_graph();
+        let order: Vec<&str> = lineage_row_order(&graph)
+            .iter()
+            .map(|n| n.id.as_str())
+            .collect();
+        assert_eq!(
+            order,
+            vec!["sub", "child-a", "child-b", "child-c", "hub", "ghostly"]
+        );
+    }
+
+    #[test]
+    fn a_node_with_no_last_ms_sorts_after_every_timestamped_node() {
+        let graph = hub_graph();
+        let order = lineage_row_order(&graph);
+        assert_eq!(
+            order.last().map(|n| n.id.as_str()),
+            Some("ghostly"),
+            "no recorded activity is no evidence of being recent, so it belongs at the bottom of a newest-first list, not the top"
+        );
+    }
+
+    #[test]
+    fn nodes_tied_on_last_ms_break_the_tie_by_name() {
+        let mut graph = hub_graph();
+        // Ties "hub" at last_ms 1000 but sorts first alphabetically.
+        graph.nodes.push(GNode {
+            id: "aardvark".to_string(),
+            name: "aardvark".to_string(),
+            first_ms: Some(1000),
+            last_ms: Some(1000),
+            milestones: Vec::new(),
+        });
+        let order: Vec<&str> = lineage_row_order(&graph)
+            .iter()
+            .map(|n| n.id.as_str())
+            .collect();
+        let hub_pos = order.iter().position(|id| *id == "hub").unwrap();
+        let aardvark_pos = order.iter().position(|id| *id == "aardvark").unwrap();
+        assert!(
+            aardvark_pos < hub_pos,
+            "a tied last_ms must break deterministically by name, not by insertion order"
+        );
+    }
+
+    #[test]
+    fn a_roots_relations_have_no_parent() {
+        let graph = hub_graph();
+        let relations = node_relations(&graph, "hub");
+        assert_eq!(relations.parent, None);
+        assert_eq!(relations.children, vec!["child-a", "child-b", "child-c"]);
+        assert_eq!(relations.converged_into, None);
+    }
+
+    #[test]
+    fn a_forking_and_converging_nodes_relations_carry_both() {
+        let graph = hub_graph();
+        let relations = node_relations(&graph, "child-a");
+        assert_eq!(relations.parent, Some("hub"));
+        assert_eq!(relations.children, vec!["sub"]);
+        assert_eq!(relations.converged_into, Some("hub"));
+    }
+
+    #[test]
+    fn a_leaf_nodes_relations_have_no_children_or_convergence() {
+        let graph = hub_graph();
+        let relations = node_relations(&graph, "sub");
+        assert_eq!(relations.parent, Some("child-a"));
+        assert_eq!(relations.children, Vec::<&str>::new());
+        assert_eq!(relations.converged_into, None);
+    }
+
+    #[test]
+    fn a_hub_with_several_diverges_is_a_fork() {
+        assert_eq!(
+            node_role(&node_relations(&hub_graph(), "hub")),
+            LineageRole::Fork
+        );
+    }
+
+    #[test]
+    fn a_node_with_both_children_and_an_outgoing_converge_is_a_fork_not_converged() {
+        // "child-a" forked "sub" AND converged back into "hub" — the fork
+        // wins, since other channels branching off a node is the more
+        // structurally significant fact about it.
+        assert_eq!(
+            node_role(&node_relations(&hub_graph(), "child-a")),
+            LineageRole::Fork
+        );
+    }
+
+    #[test]
+    fn a_node_with_only_an_outgoing_converge_is_converged() {
+        assert_eq!(
+            node_role(&node_relations(&hub_graph(), "child-b")),
+            LineageRole::Converged
+        );
+    }
+
+    #[test]
+    fn a_parented_non_forking_non_converging_node_is_ordinary() {
+        assert_eq!(
+            node_role(&node_relations(&hub_graph(), "child-c")),
+            LineageRole::Ordinary
+        );
+    }
+
+    #[test]
+    fn an_isolated_node_with_no_parent_and_no_children_is_root() {
+        assert_eq!(
+            node_role(&node_relations(&hub_graph(), "ghostly")),
+            LineageRole::Root
+        );
     }
 }
