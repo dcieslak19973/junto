@@ -36,7 +36,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
 use pointing::{diff_row_targets, drag_lines, popup_anchor_line, watch_identity, watcher_initials};
-use popover::{Popover, PopupPlacement};
+use popover::Popover;
 
 const HOST: &str = "http://127.0.0.1:1727";
 
@@ -277,10 +277,10 @@ struct App {
     /// like `channel_filter`/`creating`: a chrome toggle, not layout worth
     /// persisting, so this lives on `App`, not `ShellState`.
     lineage_collapsed: bool,
-    /// The node id whose chevron popover (`lineage_row`'s per-row
-    /// disclosure) is showing its relations/milestones detail, if any. A
-    /// popover shows one panel at a time, so this is a single slot, not a
-    /// set — opening a second row's detail replaces the first rather than
+    /// The node id whose row (`lineage_row`'s per-row disclosure) is
+    /// showing its inline relations/milestone-count detail, if any. Only
+    /// one shows at a time, so this is a single slot, not a set —
+    /// opening a second row's detail replaces the first rather than
     /// stacking both. Transient like `lineage_collapsed`.
     lineage_detail: Option<String>,
     /// Cross-channel "needs you" items — the focus board.
@@ -555,14 +555,25 @@ struct GNode {
     id: String,
     name: String,
     last_ms: Option<i64>,
-    #[serde(default)]
-    milestones: Vec<MilestoneDto>,
+    /// How many milestones this channel has recorded. The host's payload
+    /// carries each one as a full `{ms, label}` object, but nothing here
+    /// reads either field individually any more — a milestone's label is
+    /// never rendered (`lineage_detail_inline`'s own doc comment covers
+    /// why) — so this deserializes straight to the array's length via
+    /// `milestone_count`, rather than keeping a `Vec<MilestoneDto>` that
+    /// nothing would ever read past `.len()`.
+    #[serde(default, rename = "milestones", deserialize_with = "milestone_count")]
+    milestone_count: usize,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct MilestoneDto {
-    ms: i64,
-    label: String,
+/// Deserializes a JSON array into its own length, discarding every
+/// element — `GNode::milestone_count`'s own doc comment covers why a
+/// milestone's fields are never needed here.
+fn milestone_count<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Vec::<serde::de::IgnoredAny>::deserialize(deserializer).map(|v| v.len())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1475,12 +1486,10 @@ enum Message {
     LineageGraphLoaded(Option<LineageGraphDto>),
     /// Press the lineage header's chevron: collapse/expand the section.
     ToggleLineageCollapsed,
-    /// Press a lineage row's disclosure chevron: open or close a popover
-    /// beside the row showing its relations + milestones detail (the
-    /// node's id) — replaces any other row's open detail, and closes that
-    /// same row's own name placement menu if it was open (`lineage_row`'s
-    /// own doc comment covers why only one of a row's two popovers may
-    /// ever show at once).
+    /// Press a lineage row's disclosure chevron: open or close its inline
+    /// detail block (`lineage_row`'s own doc comment covers what it
+    /// shows) — replaces any other row's open detail, since only one
+    /// shows at once.
     LineageRowToggled(String),
     /// Press the lineage header's refresh icon: refetch just the lineage DAG.
     RefreshLineage,
@@ -1490,6 +1499,8 @@ enum Message {
     /// already-open channel is FOCUSED rather than closed, since a
     /// history view should always take you there
     /// (`Message::FocusChipPicked`'s own reasoning for attention chips).
+    /// Also closes that row's own inline detail if it was open — `update`'s
+    /// own match arm covers why.
     LineageChannelPicked(String),
     FocusLoaded(Vec<FocusItem>),
     AgentsLoaded(Vec<AgentDto>),
@@ -1913,11 +1924,12 @@ impl App {
             }
             Message::LineageGraphLoaded(graph) => {
                 self.lineage = graph;
-                // A chevron popover left open for a channel that dropped
-                // off the graph (the lineage refetches on a timer) would
-                // otherwise be an orphaned panel with nothing left to
-                // explain it — the same reasoning `FocusLoaded` already
-                // applies to an attention-originated pending below.
+                // A row's inline detail left open for a channel that
+                // dropped off the graph (the lineage refetches on a
+                // timer) would otherwise be an orphaned block with
+                // nothing left to explain it — the same reasoning
+                // `FocusLoaded` already applies to an attention-originated
+                // pending below.
                 if let Some(id) = &self.lineage_detail
                     && !self
                         .lineage
@@ -1934,23 +1946,6 @@ impl App {
             }
             Message::LineageRowToggled(id) => {
                 let opening = self.lineage_detail.as_deref() != Some(id.as_str());
-                // A row hosts two popovers — this chevron's detail panel
-                // and the name's placement menu — and only one may ever be
-                // open, or they'd stack on the same row. Opening this one
-                // closes that row's placement menu; `LineageChannelPicked`
-                // enforces the same rule the other way round.
-                if opening
-                    && let Some(name) = self
-                        .lineage
-                        .as_ref()
-                        .and_then(|g| g.nodes.iter().find(|node| node.id == id))
-                        .map(|node| node.name.clone())
-                    && self.pending.as_ref().is_some_and(|pending| {
-                        matches!(&pending.target, PendingTarget::Channel) && pending.channel == name
-                    })
-                {
-                    self.pending = None;
-                }
                 self.lineage_detail = opening.then_some(id);
                 Task::none()
             }
@@ -1964,10 +1959,16 @@ impl App {
                 if let Some(pane) = self.open_pane_or_toggle_pending(name) {
                     self.focus_pane(pane);
                 } else if self.lineage_detail == node_id {
-                    // The other half of `LineageRowToggled`'s rule: opening
-                    // (or re-closing) this row's placement menu must not
-                    // leave that row's chevron detail panel stacked
-                    // underneath it.
+                    // A row's inline detail (`lineage_row`) and its name's
+                    // placement menu (still a `Popover`, still a real
+                    // floating overlay) can otherwise both show for the
+                    // same row at once: the menu floats right where the
+                    // detail's top lines sit. Opening the menu closes an
+                    // already-open detail to avoid that overlap. There is
+                    // no reverse rule any more — the detail is inline, not
+                    // an overlay, so opening IT never needs to reach over
+                    // and close the menu (`LineageRowToggled` above is a
+                    // plain toggle).
                     self.lineage_detail = None;
                 }
                 Task::none()
@@ -4789,31 +4790,34 @@ struct LineageRowState {
     expanded: bool,
 }
 
-/// Width of a lineage row's chevron popover (`lineage_detail_panel`).
-/// Wider than the 211px right blade this shell allows — the whole point
-/// of floating the detail beside the row instead of expanding it inline
-/// is that the panel is no longer squeezed to the blade's own width —
-/// and wider than the 170px name popover on the same row, since a
-/// milestone label needs room to wrap across a couple of lines rather
-/// than many. Close to, but narrower than, the footer's own 360px chip
-/// panels: a relation or milestone line is a short phrase, not a tagged
-/// summary carrying an author and a channel name too.
-const LINEAGE_DETAIL_W: f32 = 320.0;
+/// Horizontal indent for a lineage row's inline detail block
+/// (`lineage_detail_inline`): lines its text up under the row's chevron
+/// and name rather than its full-width rail, so the block visually reads
+/// as belonging to the row above it instead of starting flush with the
+/// rail's own lanes.
+const LINEAGE_DETAIL_INDENT: f32 = MAX_LANE as f32 * LANE_W + ICON_BTN + SP_TIGHT * 2.0;
 
 /// One lineage row: the rail cell, a per-row disclosure chevron, and the
-/// channel name. The chevron wraps a `Popover` (`PopupPlacement::Side`)
-/// that floats that node's relations and milestones BESIDE the row
-/// instead of expanding it inline — the old inline block pushed every
-/// sibling row down the list and clipped milestone text at the blade's
-/// own narrow width (`lineage_detail_panel`'s own doc comment covers the
-/// panel itself). Clicking the name behaves like a channel chip
-/// (`channel_nav`): an unopened channel offers the same
-/// `placement_choices` menu (`placement_menu`, reused verbatim, not
-/// copied) in its own `Popover`; an already-open one is focused rather
-/// than closed (`Message::LineageChannelPicked`'s own doc comment covers
-/// why). A row hosts both popovers but only one may ever show at once —
-/// `Message::LineageRowToggled` and `Message::LineageChannelPicked` each
-/// close the other's popover when they open their own.
+/// channel name. The chevron toggles `lineage_detail_inline` — a small
+/// block of relations and a milestone count rendered INLINE beneath the
+/// row, nudging sibling rows down rather than floating over them. An
+/// earlier version floated this beside the row instead (`PopupPlacement::
+/// Side`, deleted in the commit that removed `popover_position_side`):
+/// that was built on the premise that milestone text was clipping at the
+/// blade's own width, which turned out to be false — the host caps every
+/// milestone label at 81 characters regardless of panel width
+/// (`lineage_detail_inline`'s own doc comment has the measurement) — so
+/// widening or floating the panel bought nothing, and a large panel
+/// covering the sibling rows and rail it was anchored to was pure cost.
+///
+/// Clicking the name behaves like a channel chip (`channel_nav`): an
+/// unopened channel offers the same `placement_choices` menu
+/// (`placement_menu`, reused verbatim, not copied) in its own `Popover`;
+/// an already-open one is focused rather than closed
+/// (`Message::LineageChannelPicked`'s own doc comment covers why). That
+/// menu is still a real floating `Popover` — it's small and short-lived —
+/// and `Message::LineageChannelPicked` still closes this row's inline
+/// detail when it opens, so the menu never floats on top of it.
 fn lineage_row<'a>(
     node: &'a GNode,
     by_id: &HashMap<&'a str, &'a GNode>,
@@ -4828,7 +4832,7 @@ fn lineage_row<'a>(
         is_open,
         expanded,
     } = state;
-    let disclosure_button = icon_button(
+    let disclosure: Element<Message> = icon_button(
         if expanded {
             ICON_CHEVRON_DOWN
         } else {
@@ -4842,14 +4846,6 @@ fn lineage_row<'a>(
         tooltip::Position::Bottom,
         Message::LineageRowToggled(node.id.clone()),
     );
-    let disclosure: Element<Message> = Popover::new(
-        disclosure_button,
-        expanded.then(|| lineage_detail_panel(by_id, node, relations)),
-    )
-    .width(LINEAGE_DETAIL_W)
-    .placement(PopupPlacement::Side)
-    .on_dismiss(Message::LineageRowToggled(node.id.clone()))
-    .into();
 
     let name_button = button(
         text(truncate(&node.name, 28))
@@ -4876,14 +4872,21 @@ fn lineage_row<'a>(
     // (TEAL) / neither (MUTED) state already driving the name text below
     // — so an open pane or the focused row is findable by colour alone,
     // without reading every name in the list.
-    row![
+    let head = row![
         lineage_rail_cell(rail, color, is_focused),
         disclosure,
         name_cell
     ]
     .spacing(SP_TIGHT)
-    .align_y(Center)
-    .into()
+    .align_y(Center);
+
+    if expanded {
+        column![head, lineage_detail_inline(by_id, node, relations)]
+            .spacing(SP_TIGHT)
+            .into()
+    } else {
+        head.into()
+    }
 }
 
 /// One lane's width in the rail (`lineage_rail_cell`): wide enough for a
@@ -5073,25 +5076,27 @@ fn join_and(names: &[String]) -> String {
     }
 }
 
-/// The lineage row's chevron popover: the channel name as a heading, then
-/// its relations in words — diverged from/into, converged into — then
-/// its milestones oldest-to-newest. Floats beside the row instead of
-/// expanding it inline (`lineage_row`, `PopupPlacement::Side`), so it no
-/// longer needs to fit inside the 211px right blade — styled as an
-/// elevated floating surface the same way `bottom_panel` is (opaque
-/// `SURFACE`, a `BORDER` hairline, a small radius), not the recessed
-/// translucent fill this file uses for panels that sit flush against
-/// their own background, since this one floats over the workspace.
+/// A lineage row's inline detail: its structural relations in words —
+/// diverged from/into, converged into — plus a single line giving its
+/// milestone COUNT. Rendered inline beneath the row (`lineage_row`), not
+/// as a floating overlay, and bounded to roughly four lines so opening it
+/// nudges sibling rows down a little rather than burying them.
 ///
-/// Milestone labels run past 70 characters in the live data. This panel
-/// lets them WRAP — the default `Text` behaviour, same as every other
-/// multi-line block in this file that doesn't opt out via
-/// `text::Wrapping::None` — rather than `truncate()`ing them the way the
-/// old inline block did. A char-count truncation cutting a label
-/// mid-word was the whole complaint this panel exists to fix, and a
-/// floated panel is not squeezed to the blade's own width, so there is
-/// no longer a reason to shorten the text instead of just showing it.
-fn lineage_detail_panel<'a>(
+/// The milestone LABELS are deliberately never rendered here — do not
+/// "restore" them, and note the wire data isn't even kept around to do so
+/// (`GNode::milestone_count`'s own doc comment covers why).
+/// Measured against the live `/lineage.json` payload: the host caps every
+/// milestone label at 81 characters and truncates mid-word, and every one
+/// of the 83 milestones across the graph hits that cap. So a label is
+/// never the complete text regardless of how much width or wrapping this
+/// panel gives it — the earlier floated, wider panel "fixed" nothing, it
+/// just spent more screen showing the same incomplete string. A channel
+/// can carry over a dozen of these; listing them here would blow well
+/// past "roughly four lines" for text that isn't even whole. The
+/// channel's own pane timeline is where the real, untruncated history
+/// lives — this line is a count, a pointer to "go look there", not a
+/// substitute for it.
+fn lineage_detail_inline<'a>(
     by_id: &HashMap<&'a str, &'a GNode>,
     node: &'a GNode,
     relations: &LineageRelations<'a>,
@@ -5102,8 +5107,7 @@ fn lineage_detail_panel<'a>(
             .map_or_else(|| id.to_string(), |n| n.name.clone())
     };
 
-    let mut detail =
-        column![text(node.name.as_str()).size(TEXT_BODY).font(semibold())].spacing(SP_TIGHT);
+    let mut detail = column![].spacing(SP_TIGHT);
     if let Some(parent) = relations.parent {
         detail = detail.push(
             text(format!("diverged from {}", name_of(parent)))
@@ -5127,19 +5131,19 @@ fn lineage_detail_panel<'a>(
         );
     }
 
-    let mut milestones: Vec<&MilestoneDto> = node.milestones.iter().collect();
-    // The host's own array order isn't documented as chronological — sort
-    // explicitly so a node's history always reads oldest-to-newest here,
-    // regardless of how it arrived over the wire.
-    milestones.sort_by_key(|m| m.ms);
-    for milestone in milestones {
-        detail = detail.push(text(milestone.label.as_str()).size(TEXT_META).color(MUTED));
-    }
+    let count = node.milestone_count;
+    let word = if count == 1 {
+        "milestone"
+    } else {
+        "milestones"
+    };
+    detail = detail.push(text(format!("{count} {word}")).size(TEXT_META).color(MUTED));
 
     container(detail)
-        .padding(SP)
+        .padding(Padding::new(SP).left(LINEAGE_DETAIL_INDENT))
+        .width(Fill)
         .style(|_theme| container::Style {
-            background: Some(Background::Color(SURFACE)),
+            background: Some(Background::Color(Color { a: 0.4, ..SURFACE })),
             border: Border {
                 color: BORDER,
                 width: 1.0,
@@ -11191,7 +11195,7 @@ mod lineage_tests {
             id: id.to_string(),
             name: id.to_string(),
             last_ms,
-            milestones: Vec::new(),
+            milestone_count: 0,
         };
         let edge = |from: &str, to: &str, relation: &str| GEdge {
             from: from.to_string(),
@@ -11256,7 +11260,7 @@ mod lineage_tests {
             id: "aardvark".to_string(),
             name: "aardvark".to_string(),
             last_ms: Some(1000),
-            milestones: Vec::new(),
+            milestone_count: 0,
         });
         let order: Vec<&str> = lineage_row_order(&graph)
             .iter()
@@ -11353,7 +11357,7 @@ mod lineage_tests {
             id: id.to_string(),
             name: id.to_string(),
             last_ms: Some(last_ms),
-            milestones: Vec::new(),
+            milestone_count: 0,
         };
         let edge = |from: &str, to: &str, relation: &str| GEdge {
             from: from.to_string(),
@@ -11396,7 +11400,7 @@ mod lineage_tests {
                 id: format!("n{i}"),
                 name: format!("n{i}"),
                 last_ms: Some(i as i64),
-                milestones: Vec::new(),
+                milestone_count: 0,
             });
             if i > 0 {
                 edges.push(GEdge {
@@ -11613,7 +11617,7 @@ mod lineage_view_tests {
                 id: "n1".to_string(),
                 name: name.to_string(),
                 last_ms: Some(1),
-                milestones: Vec::new(),
+                milestone_count: 0,
             }],
             edges: Vec::new(),
         }
@@ -11646,13 +11650,13 @@ mod lineage_view_tests {
                     id: "a".into(),
                     name: "a".into(),
                     last_ms: None,
-                    milestones: Vec::new(),
+                    milestone_count: 0,
                 },
                 GNode {
                     id: "b".into(),
                     name: "b".into(),
                     last_ms: None,
-                    milestones: Vec::new(),
+                    milestone_count: 0,
                 },
             ],
             edges: Vec::new(),
@@ -11700,29 +11704,25 @@ mod lineage_view_tests {
     }
 
     #[test]
-    fn the_detail_panel_names_relations_in_words_and_shows_milestones_in_full() {
-        // Through `lineage_detail_panel` directly, not `lineage_row`'s
-        // `Popover`: `iced_test`'s `Simulator` does not route events to
-        // overlays, so a popup's own content is only reachable by
-        // rendering the panel-producing function on its own.
-        // `opening_a_rows_detail_panel_does_not_move_its_sibling_rows`
-        // below covers the list itself, but not what the popup shows.
+    fn the_detail_panel_names_relations_in_words_and_shows_a_milestone_count() {
+        // Through `lineage_detail_inline` directly, not `lineage_row`: the
+        // block only appears once `LineageRowState::expanded` is true, and
+        // reaching that through `lineage_view` needs an `App` in the right
+        // state — the bounded-nudge test below covers the list itself, but
+        // not what the block shows.
         let graph = LineageGraphDto {
             nodes: vec![
                 GNode {
                     id: "hub".into(),
                     name: "hub".into(),
                     last_ms: Some(1),
-                    milestones: Vec::new(),
+                    milestone_count: 0,
                 },
                 GNode {
                     id: "child".into(),
                     name: "child".into(),
                     last_ms: Some(2),
-                    milestones: vec![MilestoneDto {
-                        ms: 1,
-                        label: "a".repeat(90),
-                    }],
+                    milestone_count: 2,
                 },
             ],
             edges: vec![GEdge {
@@ -11736,45 +11736,47 @@ mod lineage_view_tests {
         let relations = node_relations(&graph, "child");
         let long_label = "a".repeat(90);
 
-        let mut ui = iced_test::simulator(lineage_detail_panel(&by_id, child, &relations));
-        ui.find("child")
-            .expect("the panel must head with the channel's own name");
+        let mut ui = iced_test::simulator(lineage_detail_inline(&by_id, child, &relations));
         ui.find("diverged from hub")
-            .expect("the panel must name the parent it diverged from");
-        ui.find(long_label.as_str()).expect(
-            "a milestone label past 70 characters must render in full, not truncated mid-word",
+            .expect("the block must name the parent it diverged from");
+        ui.find("2 milestones")
+            .expect("the block must give the milestone count, not the labels");
+        assert!(
+            ui.find(long_label.as_str()).is_err(),
+            "a milestone label must never render — the host truncates every one \
+             of them mid-word regardless of panel width, so showing them was \
+             never showing the complete text"
         );
     }
 
     #[test]
-    fn opening_a_rows_detail_panel_does_not_move_its_sibling_rows() {
-        // The regression this change exists to prevent: the old inline
-        // expansion pushed every row below an expanded one down the
-        // list. `iced_test`'s `Simulator` does not route events to
-        // overlays, so this can only assert on the LIST's own layout —
-        // not the popup's contents, covered separately above.
+    fn opening_a_rows_detail_panel_nudges_its_sibling_rows_by_a_bounded_amount() {
+        // The old floated panel moved no sibling row at all; the trade this
+        // inline block makes on purpose is a SMALL, bounded nudge — relations
+        // plus one milestone-count line, not the old per-milestone list that
+        // used to bury the rows below it (`lineage_detail_inline`'s own doc
+        // comment covers why the labels are gone). This pins that nudge to a
+        // sane ceiling so a regression back to listing every milestone (which
+        // would push "after" far down the list) fails loudly here.
         let graph = LineageGraphDto {
             nodes: vec![
                 GNode {
                     id: "hub".into(),
                     name: "hub".into(),
                     last_ms: Some(3),
-                    milestones: Vec::new(),
+                    milestone_count: 0,
                 },
                 GNode {
                     id: "child".into(),
                     name: "child".into(),
                     last_ms: Some(2),
-                    milestones: vec![MilestoneDto {
-                        ms: 1,
-                        label: "kickoff".to_string(),
-                    }],
+                    milestone_count: 1,
                 },
                 GNode {
                     id: "after".into(),
                     name: "after".into(),
                     last_ms: Some(1),
-                    milestones: Vec::new(),
+                    milestone_count: 0,
                 },
             ],
             edges: vec![
@@ -11804,31 +11806,21 @@ mod lineage_view_tests {
         let mut open_ui = iced_test::simulator(lineage_view(&open));
         let open_y = open_ui
             .find("after")
-            .expect("the row after a row with an open detail panel must still render")
+            .expect("the row after a row with an open detail block must still render")
             .bounds()
             .y;
 
-        assert_eq!(
-            closed_y, open_y,
-            "opening a row's detail panel must not move any sibling row — it floats beside \
-             the row instead of expanding it inline"
+        let shift = open_y - closed_y;
+        assert!(
+            shift > 0.0,
+            "opening a row's inline detail must push its siblings down at all \
+             — a zero shift would mean the block isn't rendering"
         );
-    }
-
-    #[test]
-    fn opening_a_rows_detail_panel_closes_that_rows_placement_menu() {
-        let mut app = app_with_lineage_view("unopened");
-        app.pending = Some(PendingOpen {
-            channel: "unopened".to_string(),
-            target: PendingTarget::Channel,
-        });
-
-        let _ = app.update(Message::LineageRowToggled("n1".to_string()));
-
-        assert_eq!(app.lineage_detail.as_deref(), Some("n1"));
-        assert_eq!(
-            app.pending, None,
-            "opening the chevron's detail panel must close that row's name placement menu"
+        assert!(
+            shift < 150.0,
+            "opening a row's inline detail must nudge siblings by a bounded \
+             amount, not bury them — got a {shift}px shift for a two-line \
+             (one relation + one milestone count) block"
         );
     }
 
@@ -11889,13 +11881,13 @@ mod lineage_view_tests {
                     id: "hub".into(),
                     name: "hub".into(),
                     last_ms: Some(2),
-                    milestones: Vec::new(),
+                    milestone_count: 0,
                 },
                 GNode {
                     id: "child".into(),
                     name: "child".into(),
                     last_ms: Some(1),
-                    milestones: Vec::new(),
+                    milestone_count: 0,
                 },
             ],
             edges: vec![GEdge {
