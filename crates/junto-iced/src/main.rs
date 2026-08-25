@@ -17,14 +17,15 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use iced::futures::channel::mpsc;
+use iced::widget::canvas::{self, Canvas, Frame, Geometry, Path, Stroke};
 use iced::widget::pane_grid;
 use iced::widget::{
     Space, button, checkbox, column, container, markdown, mouse_area, pick_list, row, scrollable,
     text, text_input, tooltip,
 };
 use iced::{
-    Background, Border, Center, Color, Element, Fill, Length, Padding, Point, Size, Task, Theme,
-    mouse,
+    Background, Border, Center, Color, Element, Fill, Length, Padding, Point, Rectangle, Renderer,
+    Size, Task, Theme, mouse,
 };
 use junto_kernel::{
     Anchor, Annotation, AnnotationId, CodeAnchor, CommitOid, ContentDigest, EntryId, Member,
@@ -205,19 +206,6 @@ const ICON_BOT: char = '\u{e1ba}';
 const ICON_FILE_DIFF: char = '\u{e319}';
 const ICON_GIT_BRANCH: char = '\u{e0e5}';
 const ICON_REFRESH_CW: char = '\u{e148}';
-/// A hollow, unbranching origin node — `lineage_view`'s rail glyph for a
-/// `LineageRole::Root` node.
-const ICON_CIRCLE: char = '\u{e07a}';
-/// A dot inside a ring — `lineage_view`'s rail glyph for the focused
-/// channel, overriding whatever its `LineageRole` would otherwise pick.
-const ICON_CIRCLE_DOT: char = '\u{e348}';
-/// A small filled node — `lineage_view`'s rail glyph for a
-/// `LineageRole::Ordinary` node.
-const ICON_DOT: char = '\u{e453}';
-/// `lineage_view`'s rail glyph for a `LineageRole::Fork` node.
-const ICON_GIT_FORK: char = '\u{e28c}';
-/// `lineage_view`'s rail glyph for a `LineageRole::Converged` node.
-const ICON_GIT_MERGE: char = '\u{e0e7}';
 
 /// The default font at Semibold weight — the one hierarchy tool this pass
 /// introduces. Reserved for `TEXT_TITLE`-sized text and blade section
@@ -647,9 +635,12 @@ fn node_relations<'a>(graph: &'a LineageGraphDto, id: &str) -> LineageRelations<
 /// branching off a node is the most structurally significant fact about
 /// it and must never be hidden behind a rarer one; then `Converged`; then
 /// `Root`; `Ordinary` is the fallback once none apply.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum LineageRole {
     /// No incoming diverge — nothing forked this channel off another.
+    /// Also `LineageRailRow`'s own `#[default]`: the closest thing to
+    /// "no relations known" if a row's rail ever had to fall back.
+    #[default]
     Root,
     /// At least one outgoing diverge — other channels forked off THIS one.
     Fork,
@@ -748,13 +739,9 @@ fn lineage_visit<'a>(
 /// unreachable from any real root; anything `walk.visited` doesn't cover
 /// once every root is drained is emitted afterward as its own root,
 /// newest-first, so a cycle breaks rather than a node silently vanishing.
-fn lineage_hierarchy<'a>(
-    graph: &'a LineageGraphDto,
-) -> (
-    Vec<&'a GNode>,
-    HashMap<&'a str, usize>,
-    HashMap<&'a str, &'a str>,
-) {
+fn lineage_hierarchy(
+    graph: &LineageGraphDto,
+) -> (Vec<&GNode>, HashMap<&str, usize>, HashMap<&str, &str>) {
     let by_id: HashMap<&str, &GNode> = graph.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
 
     let mut children: HashMap<&str, Vec<&GNode>> = HashMap::new();
@@ -785,13 +772,6 @@ fn lineage_hierarchy<'a>(
     }
 
     (walk.order, walk.ends, walk.parents)
-}
-
-/// The lineage list's row order (`lineage_hierarchy`'s own doc comment
-/// covers the shape) — the entry point for callers that only need the
-/// order, not the lane/rail structure derived alongside it.
-fn lineage_row_order(graph: &LineageGraphDto) -> Vec<&GNode> {
-    lineage_hierarchy(graph).0
 }
 
 /// Cap on the rail's rendered depth (`lineage_lanes`): the live graph's
@@ -857,7 +837,7 @@ fn lineage_lanes<'a>(
 /// `lineage_rail_cell`'s `canvas::Program` turns into paint calls.
 /// Everything here is a lane index or a role; the canvas program owns
 /// turning a lane into an x coordinate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct LineageRailRow {
     /// This row's own lane, already clamped to `MAX_LANE - 1`.
     lane: usize,
@@ -4595,24 +4575,26 @@ fn right_blade(app: &App) -> Element<'_, Message> {
         .into()
 }
 
-/// The whole lineage DAG as a vertical list, one row per channel, newest
-/// activity first — modelled on Orca's "Commit Tree" rather than the old
-/// horizontal time-axis `LineageCanvas` it replaced. That graph scaled its
-/// track width with the time span, needing real horizontal room; a
-/// narrow blade (the right blade's actual, user-configured width) left it
-/// almost nothing to draw in and the whole graph went blank. A vertical
-/// list scales with nothing horizontally — a fixed-width rail plus a
-/// `truncate()`d name — so it survives any blade width, including the
-/// narrowest one this shell allows (`lineage_view_tests`).
+/// The whole lineage DAG as a vertical list, one row per channel,
+/// ordered hierarchically (`lineage_hierarchy`'s own doc comment) so a
+/// branch and everything that reconnects into it sit together — modelled
+/// on Orca's "Commit Tree" rather than the old horizontal time-axis
+/// `LineageCanvas` it replaced. That graph scaled its track width with
+/// the time span, needing real horizontal room; a narrow blade (the
+/// right blade's actual, user-configured width) left it almost nothing
+/// to draw in and the whole graph went blank. This rail instead scales
+/// with graph DEPTH (`MAX_LANE` lanes, `LANE_W` wide each —
+/// `lineage_rail_cell`'s own doc comment covers the pixel budget), which
+/// the live data never makes large, so a small fixed-width rail plus a
+/// `truncate()`d name survives any blade width, including the narrowest
+/// one this shell allows (`lineage_view_tests`).
 ///
-/// Rail continuity is suggested, not drawn: a short `BORDER` hairline
-/// above and below each row's glyph (`lineage_rail`), stacked with tight
-/// spacing, reads as a rail without a `Fill`-height line (which Iced
-/// forbids inside a scrollable's content column — `rail`'s own doc
-/// comment covers the same limitation for the entry timeline). Curved
-/// branch connectors are deliberately out of scope: the graph is a real
-/// DAG (one hub forks six ways), curves are canvas work, and every
-/// relation is already spelled out in a row's own disclosure.
+/// Each row's rail cell (`lineage_rail_cell`) is a small `Canvas`
+/// drawing that row's `LineageRailRow`: a through-line for every lane a
+/// real ancestor still owns below this row, a branch peeling in from the
+/// owner's lane, a reconnect curving out to a converge target's lane,
+/// and the node's own marker — the "peels off and reconnects" feel a
+/// flat list of glyphs never gave.
 fn lineage_view(app: &App) -> Element<'_, Message> {
     let Some(graph) = &app.lineage else {
         return text("no lineage yet").size(TEXT_BODY).color(MUTED).into();
@@ -4637,11 +4619,11 @@ fn lineage_view(app: &App) -> Element<'_, Message> {
         .iter()
         .map(|node| (node.id.as_str(), node))
         .collect();
+    let layout = lineage_layout(graph);
 
     let mut list = column![];
-    for node in lineage_row_order(graph) {
+    for node in layout.order.iter().copied() {
         let relations = node_relations(graph, &node.id);
-        let role = node_role(&relations);
         let is_focused = focused_channel == Some(node.name.as_str());
         let is_open = open.contains(&node.name);
         let color = if is_focused {
@@ -4652,8 +4634,13 @@ fn lineage_view(app: &App) -> Element<'_, Message> {
             MUTED
         };
         let state = LineageRowState {
-            glyph: lineage_glyph(role, is_focused),
+            rail: layout
+                .rails
+                .get(node.id.as_str())
+                .copied()
+                .unwrap_or_default(),
             color,
+            is_focused,
             is_open,
             expanded: app.lineage_expanded.contains(&node.id),
         };
@@ -4710,39 +4697,25 @@ fn lineage_header(app: &App, count: usize) -> Element<'_, Message> {
     .into()
 }
 
-/// The rail glyph for one row, from its structural role and whether its
-/// channel is the one currently focused. Focus overrides role — the
-/// glyph's job is "where am I", which a plain ordinary node showing as
-/// focused is just as true of as a fork point.
-fn lineage_glyph(role: LineageRole, focused: bool) -> char {
-    if focused {
-        return ICON_CIRCLE_DOT;
-    }
-    match role {
-        LineageRole::Fork => ICON_GIT_FORK,
-        LineageRole::Converged => ICON_GIT_MERGE,
-        LineageRole::Root => ICON_CIRCLE,
-        LineageRole::Ordinary => ICON_DOT,
-    }
-}
-
 /// A lineage row's presentation state, computed once per node in
-/// `lineage_view`'s loop from its role, focus, and open-ness — bundled
-/// into one argument (rather than four) since all four travel together
-/// from that loop into `lineage_row`. `Copy`: every field is a plain
-/// value, cheaper to copy than to borrow.
+/// `lineage_view`'s loop from its rail geometry, focus, and open-ness —
+/// bundled into one argument (rather than five) since all five travel
+/// together from that loop into `lineage_row`. `Copy`: every field is a
+/// plain value (`LineageRailRow` is itself `Copy` — its own doc comment
+/// covers why), cheaper to copy than to borrow.
 #[derive(Debug, Clone, Copy)]
 struct LineageRowState {
-    glyph: char,
+    rail: LineageRailRow,
     color: Color,
+    is_focused: bool,
     is_open: bool,
     expanded: bool,
 }
 
-/// One lineage row: the fixed-width rail, a per-row disclosure chevron,
-/// and the channel name, plus — while expanded — that node's relations
-/// and milestones underneath. Clicking the name behaves like a channel
-/// chip (`channel_nav`): an unopened channel offers the same
+/// One lineage row: the rail cell, a per-row disclosure chevron, and the
+/// channel name, plus — while expanded — that node's relations and
+/// milestones underneath. Clicking the name behaves like a channel chip
+/// (`channel_nav`): an unopened channel offers the same
 /// `placement_choices` menu (`placement_menu`, reused verbatim, not
 /// copied); an already-open one is focused rather than closed
 /// (`Message::LineageChannelPicked`'s own doc comment covers why).
@@ -4754,8 +4727,9 @@ fn lineage_row<'a>(
     pending: Option<&PendingOpen>,
 ) -> Element<'a, Message> {
     let LineageRowState {
-        glyph,
+        rail,
         color,
+        is_focused,
         is_open,
         expanded,
     } = state;
@@ -4795,9 +4769,13 @@ fn lineage_row<'a>(
             .into()
     };
 
-    let header_row = row![lineage_rail(glyph, color), disclosure, name_cell]
-        .spacing(SP_TIGHT)
-        .align_y(Center);
+    let header_row = row![
+        lineage_rail_cell(rail, TEXT, is_focused),
+        disclosure,
+        name_cell
+    ]
+    .spacing(SP_TIGHT)
+    .align_y(Center);
 
     let mut col = column![header_row].spacing(SP_TIGHT);
     if expanded {
@@ -4806,25 +4784,150 @@ fn lineage_row<'a>(
     col.into()
 }
 
-/// The rail cell for one lineage row: the role glyph on a short `BORDER`
-/// hairline above and below it, mirroring `rail()`/`dot()`'s own git-log
-/// idiom for the entry timeline — fixed pixel segments, not a
-/// `Fill`-height line (`lineage_view`'s own doc comment covers why).
-/// Fixed-width so every row's glyph lines up in one column.
-fn lineage_rail(glyph: char, color: Color) -> Element<'static, Message> {
-    let hairline = || {
-        container(Space::new())
-            .width(Length::Fixed(1.0))
-            .height(Length::Fixed(6.0))
-            .style(|_theme| container::Style {
-                background: Some(Background::Color(BORDER)),
-                ..container::Style::default()
-            })
-    };
-    column![hairline(), icon(glyph).color(color), hairline()]
-        .align_x(Center)
-        .width(Length::Fixed(ICON_BTN))
-        .into()
+/// One lane's width in the rail (`lineage_rail_cell`): wide enough for a
+/// through-line, a curved connector, and the node marker to stay legible
+/// at this size; narrow enough that `MAX_LANE` lanes (`MAX_LANE`'s own
+/// doc comment covers the depth cap) plus the disclosure chevron still
+/// leave most of a 211px right blade — this shell's narrowest
+/// (`a_lineage_row_stays_single_line_at_the_narrowest_reported_blade_width`)
+/// — for the channel name.
+const LANE_W: f32 = 10.0;
+
+/// The rail cell for one lineage row: a small `Canvas` (`LineageRailCanvas`
+/// below) drawing that row's `LineageRailRow`. The `canvas::Program`
+/// wiring — `Frame`/`Path`/`Stroke`/`into_geometry` — is lifted from the
+/// deleted horizontal `LineageCanvas` (commit `18a18af`); only the
+/// geometry changed, from a time axis to vertical lanes.
+///
+/// Fixed `MAX_LANE * LANE_W` wide, but `Fill` height rather than a
+/// hardcoded guess: every row's natural height is already the same
+/// constant (the disclosure button is a fixed `ICON_BTN` square and the
+/// name is always a single line at one text size — `lineage_view`'s own
+/// doc comment on width applies the same reasoning to height), so `Fill`
+/// just matches whatever that shared height resolves to, guaranteeing a
+/// through-line touches this cell's true top and bottom edges and lines
+/// up with the next row's — a hardcoded height even one pixel off would
+/// leave a gap and break the rail's continuity.
+fn lineage_rail_cell(
+    rail: LineageRailRow,
+    marker_color: Color,
+    focused: bool,
+) -> Element<'static, Message> {
+    Canvas::new(LineageRailCanvas {
+        rail,
+        marker_color,
+        focused,
+    })
+    .width(Length::Fixed(MAX_LANE as f32 * LANE_W))
+    .height(Fill)
+    .into()
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LineageRailCanvas {
+    rail: LineageRailRow,
+    marker_color: Color,
+    focused: bool,
+}
+
+impl canvas::Program<Message> for LineageRailCanvas {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<Geometry> {
+        let mut frame = Frame::new(renderer, bounds.size());
+        let height = bounds.height;
+        let mid = height / 2.0;
+        let lane_x = |lane: usize| LANE_W * (lane as f32 + 0.5);
+        let connector_stroke = Stroke::default().with_color(MAUVE).with_width(1.5);
+
+        // Every lane a real ancestor still owns below this row, drawn the
+        // full cell height — the persistent "main timeline" a branch
+        // peels off from and reconnects into.
+        for lane in self.rail.through.lanes() {
+            frame.stroke(
+                &Path::line(
+                    Point::new(lane_x(lane), 0.0),
+                    Point::new(lane_x(lane), height),
+                ),
+                Stroke::default().with_color(BORDER).with_width(1.5),
+            );
+        }
+
+        // Branch peel-in: this row forks off its owner's lane at the top
+        // of the cell, arriving at this row's own lane by the centre.
+        if let Some(parent_lane) = self.rail.branch_from {
+            frame.stroke(
+                &lineage_connector(
+                    Point::new(lane_x(parent_lane), 0.0),
+                    Point::new(lane_x(self.rail.lane), mid),
+                ),
+                connector_stroke,
+            );
+        }
+
+        // Reconnect: this row's own outgoing converge curves from its
+        // lane at the centre out to the target lane by the bottom edge.
+        if let Some(target_lane) = self.rail.converge_to {
+            frame.stroke(
+                &lineage_connector(
+                    Point::new(lane_x(self.rail.lane), mid),
+                    Point::new(lane_x(target_lane), height),
+                ),
+                connector_stroke,
+            );
+        }
+
+        if self.focused {
+            frame.stroke(
+                &Path::circle(
+                    Point::new(lane_x(self.rail.lane), mid),
+                    lineage_marker_radius(self.rail.role) + 2.5,
+                ),
+                Stroke::default().with_color(MAUVE).with_width(1.5),
+            );
+        }
+        frame.fill(
+            &Path::circle(
+                Point::new(lane_x(self.rail.lane), mid),
+                lineage_marker_radius(self.rail.role),
+            ),
+            self.marker_color,
+        );
+
+        vec![frame.into_geometry()]
+    }
+}
+
+/// A flowing branch/reconnect connector between two lane positions — a
+/// cubic Bézier with vertical tangents at both ends (each control point
+/// pulled to the OTHER end's x, at the shared vertical midpoint), which
+/// reads as one continuous curve the way the user's TVA-branch reference
+/// does, rather than the flowchart elbow a two-segment line would give.
+fn lineage_connector(from: Point, to: Point) -> Path {
+    let mid_y = (from.y + to.y) / 2.0;
+    Path::new(|builder| {
+        builder.move_to(from);
+        builder.bezier_curve_to(Point::new(from.x, mid_y), Point::new(to.x, mid_y), to);
+    })
+}
+
+/// A structurally significant node (root or fork) gets a slightly larger
+/// marker — the drawn geometry's own equivalent of the old glyph swap
+/// (`ICON_CIRCLE`/`ICON_GIT_FORK` read visually bigger than a plain dot
+/// too), now that the branch/converge connectors carry most of the role
+/// signal instead of the marker's own shape.
+fn lineage_marker_radius(role: LineageRole) -> f32 {
+    match role {
+        LineageRole::Root | LineageRole::Fork => 3.5,
+        LineageRole::Converged | LineageRole::Ordinary => 2.5,
+    }
 }
 
 /// Joins names the way a sentence would: "a", "a and b", or "a, b, and c"
@@ -10914,6 +11017,14 @@ mod channel_filter_tests {
 mod lineage_tests {
     use super::*;
 
+    /// Test-local convenience: the hierarchical order alone, without the
+    /// lane/rail structure `lineage_hierarchy` derives alongside it —
+    /// `lineage_view` itself goes through `lineage_layout` for both at
+    /// once, so this has no production caller of its own.
+    fn lineage_row_order(graph: &LineageGraphDto) -> Vec<&GNode> {
+        lineage_hierarchy(graph).0
+    }
+
     /// A small hand-built graph mirroring the real data's shape: a
     /// parentless "hub" that forks three channels — one of which
     /// ("child-a") itself forks a "sub" channel AND converges back into
@@ -11469,16 +11580,20 @@ mod lineage_view_tests {
     }
 
     #[test]
-    fn the_focused_channels_row_uses_the_circle_dot_glyph() {
-        // `App::new`'s own pane is "junto-dev" and focused.
+    fn the_focused_channels_row_still_renders_its_name_now_that_the_rail_is_drawn() {
+        // `App::new`'s own pane is "junto-dev" and focused. The rail's
+        // focus/role distinction is now drawn geometry
+        // (`LineageRailCanvas`), not a findable glyph — `lineage_tests`
+        // covers that geometry directly; this just proves the row (rail
+        // cell included) still renders without panicking.
         let app = app_with_lineage_view("junto-dev");
         let mut ui = iced_test::simulator(lineage_view(&app));
-        ui.find(ICON_CIRCLE_DOT.to_string().as_str())
-            .expect("the focused channel's row must use the circle-dot glyph");
+        ui.find("junto-dev")
+            .expect("the focused channel's row must still render its name");
     }
 
     #[test]
-    fn a_forking_nodes_row_uses_the_git_fork_glyph() {
+    fn a_forking_nodes_row_still_renders_both_names_now_that_the_rail_is_drawn() {
         let app = app_with_lineage(LineageGraphDto {
             nodes: vec![
                 GNode {
@@ -11501,8 +11616,10 @@ mod lineage_view_tests {
             }],
         });
         let mut ui = iced_test::simulator(lineage_view(&app));
-        ui.find(ICON_GIT_FORK.to_string().as_str())
-            .expect("a node with children must use the git-fork glyph");
+        ui.find("hub")
+            .expect("the fork row must still render its name");
+        ui.find("child")
+            .expect("the forked child row must still render its name");
     }
 
     #[test]
