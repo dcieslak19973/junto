@@ -82,6 +82,10 @@ struct App {
     /// Three-pane shell layout — collapse, widths, active blade views.
     /// Loaded at startup and written back on every change (`shell::save`).
     shell: shell::ShellState,
+    /// An in-flight blade-width drag. Transient: deliberately not part of
+    /// `ShellState`, since a half-finished gesture is not layout worth
+    /// saving.
+    blade_drag: Option<BladeDrag>,
     /// Available channel names for the type-ahead picker.
     channels: combo_box::State<String>,
     /// The same names as a plain list, for widgets that need to OFFER them
@@ -820,6 +824,15 @@ enum Message {
     LeftViewPicked(shell::LeftView),
     /// Switch the right blade's view.
     RightViewPicked(shell::RightView),
+    /// Press a blade-width divider handle: begin a resize drag.
+    BladeDragStart(Side),
+    /// The cursor moved during an in-flight blade-width drag (absolute
+    /// window coordinates, from the global `CursorMoved` event).
+    BladeDragMoved(Point),
+    /// Release the mouse button, ending an in-flight blade-width drag.
+    BladeDragEnd,
+    /// Double-click a divider handle: reset that blade to its default width.
+    BladeReset(Side),
     /// Edit the rationale draft for an inline verification act (pane, entry, text).
     ActRationaleChanged(pane_grid::Pane, String, String),
     /// Submit a verification act on an entry (pane, entry, act route, rationale).
@@ -1059,6 +1072,7 @@ impl App {
             join_result: None,
             device_key_fingerprint: None,
             shell: shell::load(&shell_state_path()),
+            blade_drag: None,
         };
         (
             app,
@@ -1160,6 +1174,68 @@ impl App {
             }
             Message::ToggleRightBlade => {
                 self.shell.toggle_right();
+                self.persist_shell();
+                Task::none()
+            }
+            Message::BladeDragStart(side) => {
+                let origin_width = match side {
+                    Side::Left => self.shell.left_width.get(),
+                    Side::Right => self.shell.right_width.get(),
+                };
+                self.blade_drag = Some(BladeDrag {
+                    side,
+                    origin_width,
+                    origin_x: None,
+                });
+                Task::none()
+            }
+            Message::BladeDragMoved(position) => {
+                let Some(drag) = self.blade_drag.as_mut() else {
+                    return Task::none();
+                };
+                let Some(origin_x) = drag.origin_x else {
+                    // `on_press` carries no cursor position at all, so the
+                    // drag's origin is established by the FIRST move after
+                    // the press instead. The resulting one-frame lag before
+                    // the divider starts tracking is imperceptible.
+                    drag.origin_x = Some(position.x);
+                    return Task::none();
+                };
+                let delta = position.x - origin_x;
+                let width = match drag.side {
+                    // The left blade grows as the cursor moves right.
+                    Side::Left => shell::BladeWidth::new(drag.origin_width + delta),
+                    // The right blade's divider sits on its OWN left edge,
+                    // so it grows as the cursor moves left, toward center.
+                    Side::Right => shell::BladeWidth::new(drag.origin_width - delta),
+                };
+                match drag.side {
+                    Side::Left => self.shell.left_width = width,
+                    Side::Right => self.shell.right_width = width,
+                }
+                Task::none()
+            }
+            Message::BladeDragEnd => {
+                // Deliberately NOT persisted on every `BladeDragMoved` above,
+                // unlike every other shell mutation in this file: a drag
+                // emits a message per mouse move, and writing `ui.toml` on
+                // each one would hammer the disk for a single gesture.
+                // Persistence happens once, here, when the gesture ends.
+                self.blade_drag = None;
+                self.persist_shell();
+                Task::none()
+            }
+            Message::BladeReset(side) => {
+                match side {
+                    Side::Left => {
+                        self.shell.left_width =
+                            shell::BladeWidth::new(shell::BladeWidth::LEFT_DEFAULT);
+                    }
+                    Side::Right => {
+                        self.shell.right_width =
+                            shell::BladeWidth::new(shell::BladeWidth::RIGHT_DEFAULT);
+                    }
+                }
                 self.persist_shell();
                 Task::none()
             }
@@ -2744,11 +2820,28 @@ impl App {
                 _ => None,
             }
         });
+        // A global cursor subscription, live ONLY during an in-flight blade
+        // drag — gating on `blade_drag.is_some()` keeps `update` from
+        // running on every mouse move for the rest of the app's life.
+        // `listen_with` takes a fn pointer, not a closure, so all the drag
+        // arithmetic lives in `update` instead of here.
+        let blade_drag_sub = self.blade_drag.is_some().then(|| {
+            iced::event::listen_with(|event, _status, _window| match event {
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
+                    Some(Message::BladeDragMoved(position))
+                }
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                    iced::mouse::Button::Left,
+                )) => Some(Message::BladeDragEnd),
+                _ => None,
+            })
+        });
         iced::Subscription::batch(
             streams
                 .into_iter()
                 .chain([tick, keys])
-                .chain(countdown_tick),
+                .chain(countdown_tick)
+                .chain(blade_drag_sub),
         )
     }
 
@@ -2828,18 +2921,21 @@ impl App {
                 .into()
         };
 
-        column![
-            top_bar,
-            row![
-                left,
-                container(center)
-                    .id(iced::widget::Id::new("center-pane-grid"))
-                    .width(Fill),
-                right
-            ]
-            .spacing(0),
-        ]
-        .into()
+        let mut shell_row = row![left];
+        if !self.shell.left_collapsed {
+            shell_row = shell_row.push(blade_divider(Side::Left));
+        }
+        shell_row = shell_row.push(
+            container(center)
+                .id(iced::widget::Id::new("center-pane-grid"))
+                .width(Fill),
+        );
+        if !self.shell.right_collapsed {
+            shell_row = shell_row.push(blade_divider(Side::Right));
+        }
+        shell_row = shell_row.push(right);
+
+        column![top_bar, shell_row.spacing(0)].into()
     }
 }
 
@@ -2877,6 +2973,21 @@ enum Side {
     Right,
 }
 
+/// An in-flight blade-width drag, started by pressing a divider handle.
+/// Populated in two steps because `mouse_area::on_press` carries no cursor
+/// position: `BladeDragStart` records the side and the width to resize
+/// from, then the FIRST `BladeDragMoved` after it fills in `origin_x`.
+struct BladeDrag {
+    /// Which blade is being resized.
+    side: Side,
+    /// That blade's width when the drag began — the running delta is
+    /// applied to this, not to the blade's live (already-updated) width.
+    origin_width: f32,
+    /// The cursor's x position when the drag began, in absolute window
+    /// coordinates. `None` until the first `BladeDragMoved` sets it.
+    origin_x: Option<f32>,
+}
+
 /// The collapsed form of a blade: a narrow rail carrying a chevron to reopen
 /// it and, on the left, the count of items wanting attention. Collapsing must
 /// not be able to hide that count entirely.
@@ -2894,6 +3005,25 @@ fn blade_stub<'a>(side: Side, badge: Option<usize>) -> Element<'a, Message> {
     container(rail)
         .width(Length::Fixed(24.0))
         .height(Fill)
+        .into()
+}
+
+/// A thin draggable handle between a blade and the center: press-drag to
+/// resize that blade, double-click to reset it to its default width.
+/// Rendered only beside an EXPANDED blade (`App::view`) — a collapsed blade
+/// is a 24px stub with nothing to resize.
+fn blade_divider<'a>(side: Side) -> Element<'a, Message> {
+    let handle = container(Space::new())
+        .width(Length::Fixed(5.0))
+        .height(Fill)
+        .style(|_theme| container::Style {
+            background: Some(Background::Color(BORDER)),
+            ..container::Style::default()
+        });
+    mouse_area(handle)
+        .on_press(Message::BladeDragStart(side))
+        .on_double_click(Message::BladeReset(side))
+        .interaction(mouse::Interaction::ResizingHorizontally)
         .into()
 }
 
