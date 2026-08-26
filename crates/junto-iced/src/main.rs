@@ -2622,17 +2622,28 @@ impl App {
                 if let Some(state) = self.panes.get_mut(pane) {
                     // Shift-click reaches the same span a drag does, without
                     // dragging: click line 2, shift-click line 6, and this is
-                    // exactly `drag_lines(2, 6)`. Scoped to the SAME target
-                    // (`aimed_key`, the guard `AnchorOver`'s own drag-straddle
-                    // check already uses) — a shift-click into a different
-                    // file must not build a cross-file span, for exactly the
-                    // reason that guard exists. `drag_lines` normalises the
-                    // order itself, so shift-clicking ABOVE the existing
-                    // span's start still yields a valid ascending range.
-                    let extend_from = (self.modifiers.shift()
-                        && state.aimed_key() == Some(target.key()))
-                    .then(|| parse_span(&state.annotate_lines).map(|span| span.start))
-                    .flatten();
+                    // exactly `drag_lines(2, 6)`. Ctrl (and Cmd) do the same
+                    // thing rather than nothing, because that is the key
+                    // people reach for first — but note it EXTENDS a range
+                    // rather than adding a discontiguous line, which is the
+                    // usual meaning of ctrl-click. A `CodeAnchor` is one
+                    // contiguous span, so a set of unconnected lines is not
+                    // representable and honouring that convention would take
+                    // a kernel change, not a view change.
+                    //
+                    // Scoped to the SAME target (`aimed_key`, the guard
+                    // `AnchorOver`'s own drag-straddle check already uses) — a
+                    // modified click into a different file must not build a
+                    // cross-file span, for exactly the reason that guard
+                    // exists. `drag_lines` normalises the order itself, so
+                    // clicking ABOVE the existing span's start still yields a
+                    // valid ascending range.
+                    let extends = self.modifiers.shift()
+                        || self.modifiers.control()
+                        || self.modifiers.command();
+                    let extend_from = (extends && state.aimed_key() == Some(target.key()))
+                        .then(|| parse_span(&state.annotate_lines).map(|span| span.start))
+                        .flatten();
                     let lines = match extend_from {
                         Some(start) => drag_lines(start, line),
                         None => drag_lines(line, line),
@@ -6981,17 +6992,18 @@ fn pane_body<'a>(
         } else {
             // Say what a click still does, since there is otherwise nothing
             // on screen telling the reviewer that clicking is not inert —
-            // the host closes a finished session's socket silently, giving
-            // no other hint that this pane is not live. Names both ways to
-            // span several rows (drag, or shift-click) — a reviewer reached
-            // for Ctrl-click once, found nothing, and the only other clue
-            // was a wrong guess; nothing here says Ctrl-click still can't
-            // work, since an anchor is one contiguous span and Ctrl-click's
-            // whole point is a discontiguous one.
+            // the host closes a finished session's socket silently, giving no
+            // other hint that this pane is not live.
+            //
+            // Names every gesture that reaches a range, because a user
+            // reaching for one that silently did nothing is how this hint
+            // earned its current wording. Ctrl and Cmd extend the range
+            // exactly as Shift does — they do NOT add a discontiguous line,
+            // which an anchor's single contiguous span cannot represent.
             session_col = session_col.push(
                 text(
                     "not live — click a diff line to comment, drag or \
-                     shift-click for a range; submitting resumes the \
+                     shift/ctrl-click for a range; submitting resumes the \
                      session with that note",
                 )
                 .size(TEXT_META)
@@ -11332,6 +11344,61 @@ diff --git a/other.rs b/other.rs
         );
     }
 
+    /// Ctrl is the key a reviewer actually reached for first, so it extends
+    /// the range exactly as Shift does. It does NOT add a discontiguous line
+    /// — see `Message::AnchorPress` for why an anchor's single contiguous
+    /// span makes that unrepresentable.
+    #[test]
+    fn ctrl_clicking_below_a_plain_click_extends_the_span_just_like_shift() {
+        let (mut app, id) = diff_pane(DIFF);
+        let pane = app.panes.get(id).expect("the pane just built");
+        let mut ui = iced_test::simulator(artifact_body(
+            id,
+            "a1",
+            "sha256:x",
+            "diff",
+            DIFF,
+            None,
+            Some(aim_for(pane)),
+        ));
+        let row2 = row_center(&mut ui, "+fn two() {}");
+        for message in click(ui, row2) {
+            let _ = app.update(message);
+        }
+        assert_eq!(
+            app.panes
+                .get(id)
+                .expect("the pane still exists")
+                .annotate_lines,
+            "2",
+            "the plain click must land a single-row span first"
+        );
+
+        let _ = app.update(Message::ModifiersChanged(iced::keyboard::Modifiers::CTRL));
+        let pane = app.panes.get(id).expect("the pane still exists");
+        let mut ui = iced_test::simulator(artifact_body(
+            id,
+            "a1",
+            "sha256:x",
+            "diff",
+            DIFF,
+            None,
+            Some(aim_for(pane)),
+        ));
+        let row16 = row_center(&mut ui, "+fn line16() {}");
+        for message in click(ui, row16) {
+            let _ = app.update(message);
+        }
+
+        let pane = app.panes.get(id).expect("the pane still exists");
+        assert_eq!(
+            pane.annotate_lines, "2-16",
+            "a ctrl-click on row 16 after a plain click on row 2 must extend \
+             the span the same way shift does, got {:?}",
+            pane.annotate_lines,
+        );
+    }
+
     #[test]
     fn shift_clicking_above_the_first_click_still_yields_a_valid_ordered_span() {
         let (mut app, id) = diff_pane(DIFF);
@@ -11629,7 +11696,7 @@ diff --git a/lib.rs b/lib.rs
             "the old, now-false hint must not still be on screen"
         );
         ui.find(
-            "not live — click a diff line to comment, drag or shift-click for a range; \
+            "not live — click a diff line to comment, drag or shift/ctrl-click for a range; \
              submitting resumes the session with that note",
         )
         .expect("the replacement hint must be on screen for a finished session");
