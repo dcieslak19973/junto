@@ -97,3 +97,54 @@ jobs:
         run: cargo fmt --manifest-path crates/junto-desktop/Cargo.toml --check
       - name: Clippy (warnings are errors)
         run: cargo clippy --manifest-path crates/junto-desktop/Cargo.toml --all-targets -- -D warnings
+
+  # junto-iced is its own workspace (separate from the kernel one), so none
+  # of fmt/check/check-platforms above ever reach it: root
+  # `cargo fmt --all --check` and `cargo test --workspace` both stop at the
+  # manifest boundary. This job (and its platform-matrix sibling below) is
+  # what makes junto-iced's ~80 tests run on a pull request at all — it
+  # mirrors the desktop job's manifest-path / rust-cache shape, but adds the
+  # test step desktop has no need for yet.
+  iced:
+    name: junto-iced (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/junto-iced
+      - name: Format check
+        run: cargo fmt --manifest-path crates/junto-iced/Cargo.toml --check
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --manifest-path crates/junto-iced/Cargo.toml --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --manifest-path crates/junto-iced/Cargo.toml
+
+  # Merges to main only: the real target platforms, at 2x/10x billing — the
+  # same canary/matrix split as check/check-platforms above, applied to
+  # junto-iced's own workspace instead of the kernel one.
+  iced-platforms:
+    name: junto-iced (${{ matrix.os }})
+    if: github.event_name == 'push'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false # see every platform's result, not just the first failure
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/junto-iced
+      - name: Format check
+        run: cargo fmt --manifest-path crates/junto-iced/Cargo.toml --check
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --manifest-path crates/junto-iced/Cargo.toml --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --manifest-path crates/junto-iced/Cargo.toml
