@@ -1591,7 +1591,13 @@ enum Message {
     // --- pointing: press-drag-release across rendered rows to aim the composer ---
     /// The mouse went down on a rendered row (pane, what that row points at,
     /// the row's line in that target's own units) — aims the composer at a
-    /// single line and begins a drag.
+    /// single line and begins a drag. With shift held AND an existing span
+    /// already aimed at the SAME target (`aimed_key`, the same guard
+    /// `AnchorOver` uses), extends from that span's start to this line
+    /// instead (`pointing::drag_lines`, order-independent) — a click-drag
+    /// alternative for a range a mouse trackpad makes awkward. Shift held
+    /// with nothing aimed on this target falls back to the plain
+    /// single-line behaviour, never silently doing nothing.
     AnchorPress(pane_grid::Pane, AnchorTarget, u32),
     /// The cursor entered a rendered row. Always updates the hover paint; while
     /// a drag is in progress on the SAME target it also extends the selection
@@ -2614,7 +2620,30 @@ impl App {
             }
             Message::AnchorPress(pane, target, line) => {
                 if let Some(state) = self.panes.get_mut(pane) {
-                    state.aim_at(&target, drag_lines(line, line));
+                    // Shift-click reaches the same span a drag does, without
+                    // dragging: click line 2, shift-click line 6, and this is
+                    // exactly `drag_lines(2, 6)`. Scoped to the SAME target
+                    // (`aimed_key`, the guard `AnchorOver`'s own drag-straddle
+                    // check already uses) — a shift-click into a different
+                    // file must not build a cross-file span, for exactly the
+                    // reason that guard exists. `drag_lines` normalises the
+                    // order itself, so shift-clicking ABOVE the existing
+                    // span's start still yields a valid ascending range.
+                    let extend_from = (self.modifiers.shift()
+                        && state.aimed_key() == Some(target.key()))
+                    .then(|| parse_span(&state.annotate_lines).map(|span| span.start))
+                    .flatten();
+                    let lines = match extend_from {
+                        Some(start) => drag_lines(start, line),
+                        None => drag_lines(line, line),
+                    };
+                    state.aim_at(&target, lines);
+                    // Set exactly as a plain click sets it: this row's own
+                    // `on_release` (or the artifact's `on_exit` backstop)
+                    // always follows a press with no intervening move, so
+                    // the popup opens right after release — same guarantee
+                    // `a_single_row_click_still_opens_the_composer_immediately`
+                    // already covers, whether or not shift was held.
                     state.drag_from = Some(line);
                 }
                 Task::none()
@@ -11117,6 +11146,361 @@ diff --git a/other.rs b/other.rs
         ));
         ui.find("comment on these lines…")
             .expect("the composer must actually be on screen once the drag settles");
+    }
+}
+
+#[cfg(test)]
+mod shift_click_tests {
+    use super::*;
+    use iced::Event;
+
+    /// `drag_gesture_tests::DIFF`'s own twin, but with more added rows: an
+    /// extension test that shift-clicks DOWNWARD needs its target row clear
+    /// of the first click's own composer popup, which (per
+    /// `drag_gesture_tests`'s own comment on this exact fixture) opens below
+    /// the aimed row and physically covers a handful of rows beneath it. A
+    /// row this many lines further down is clear of it — verified against
+    /// real layout, not assumed.
+    const DIFF: &str = "\
+diff --git a/lib.rs b/lib.rs
++++ b/lib.rs
+@@ -1,2 +1,17 @@
+ fn one() {}
++fn two() {}
++fn three() {}
++fn four() {}
++fn five() {}
++fn six() {}
++fn line07() {}
++fn line08() {}
++fn line09() {}
++fn line10() {}
++fn line11() {}
++fn line12() {}
++fn line13() {}
++fn line14() {}
++fn line15() {}
++fn line16() {}
+ fn seventeen() {}
+";
+
+    /// `drag_gesture_tests::MULTI_FILE_DIFF`'s own twin — two files in one
+    /// diff body, for the shift-click cross-file guard.
+    const MULTI_FILE_DIFF: &str = "\
+diff --git a/lib.rs b/lib.rs
++++ b/lib.rs
+@@ -1,1 +1,2 @@
+ fn one() {}
++fn two() {}
+diff --git a/other.rs b/other.rs
++++ b/other.rs
+@@ -1,1 +1,2 @@
+ fn a() {}
++fn b() {}
+";
+
+    /// A pane watching nothing in particular, with `diff` already fetched as
+    /// artifact `a1` — `drag_gesture_tests::diff_pane`'s own twin.
+    fn diff_pane(diff: &'static str) -> (App, pane_grid::Pane) {
+        let (mut app, _) = App::new();
+        let id = app.focus.expect("App::new focuses its one pane");
+        let pane = app.panes.get_mut(id).expect("the pane just created");
+        pane.artifacts.insert(
+            "a1".into(),
+            ArtifactContent::Loaded {
+                format: "diff".into(),
+                body: diff.into(),
+                md: None,
+                digest: ContentDigest::sha256_of(diff.as_bytes())
+                    .as_str()
+                    .to_string(),
+            },
+        );
+        (app, id)
+    }
+
+    /// `drag_gesture_tests::aim_for`'s own twin: the `Aim` `pane_body` builds
+    /// from a pane, so a test can hand `artifact_body` the same projection
+    /// production does.
+    fn aim_for(pane: &Pane) -> Aim<'_> {
+        Aim {
+            path: pane.annotate_path.as_str(),
+            record: pane
+                .annotate_record
+                .as_ref()
+                .map(|(entry, _)| entry.as_str()),
+            span: parse_span(&pane.annotate_lines),
+            popup_at: popup_anchor(pane),
+            hover: pane.hover.as_ref().map(|(key, line)| (key.as_str(), *line)),
+            pane,
+        }
+    }
+
+    /// Presses and releases at the same point with no move between — a
+    /// plain click — and hands back whatever the widget tree published.
+    /// `drag_gesture_tests::press_drag_release`'s own twin, specialised to
+    /// the click case since every gesture in this module is a click, never
+    /// a drag: shift state (`App::modifiers`) lives on `App`, not on the
+    /// widget tree, so there is nothing for `mouse_area` to observe moving.
+    fn click(mut ui: iced_test::Simulator<'_, Message>, at: Point) -> Vec<Message> {
+        ui.point_at(at);
+        ui.simulate([Event::Mouse(mouse::Event::ButtonPressed(
+            mouse::Button::Left,
+        ))]);
+        ui.simulate([Event::Mouse(mouse::Event::ButtonReleased(
+            mouse::Button::Left,
+        ))]);
+        ui.into_messages().collect()
+    }
+
+    /// Finds `row`'s rendered centre in `ui` — the point `click` needs.
+    fn row_center(ui: &mut iced_test::Simulator<'_, Message>, row: &str) -> Point {
+        ui.find(row)
+            .unwrap_or_else(|_| panic!("row {row:?} must be on screen"))
+            .visible_bounds()
+            .unwrap_or_else(|| panic!("row {row:?} must be visible"))
+            .center()
+    }
+
+    #[test]
+    fn shift_clicking_below_a_plain_click_extends_the_span_to_cover_both_rows() {
+        let (mut app, id) = diff_pane(DIFF);
+        let pane = app.panes.get(id).expect("the pane just built");
+        let mut ui = iced_test::simulator(artifact_body(
+            id,
+            "a1",
+            "sha256:x",
+            "diff",
+            DIFF,
+            None,
+            Some(aim_for(pane)),
+        ));
+        let row2 = row_center(&mut ui, "+fn two() {}");
+        for message in click(ui, row2) {
+            let _ = app.update(message);
+        }
+        let pane = app.panes.get(id).expect("the pane still exists");
+        assert_eq!(
+            pane.annotate_lines, "2",
+            "the plain click must land a single-row span first"
+        );
+
+        // `App::subscription`'s modifiers listener never runs under
+        // `Simulator` (it drives only the widget tree, not the real
+        // program's subscriptions) — so the realistic way to simulate
+        // "shift already held when the press lands" is to feed the exact
+        // message that listener would have produced, directly, before the
+        // pane is even borrowed for this render — a later `app.update`
+        // would conflict with `pane`'s borrow living through `ui`.
+        let _ = app.update(Message::ModifiersChanged(iced::keyboard::Modifiers::SHIFT));
+        let pane = app.panes.get(id).expect("the pane still exists");
+        let mut ui = iced_test::simulator(artifact_body(
+            id,
+            "a1",
+            "sha256:x",
+            "diff",
+            DIFF,
+            None,
+            Some(aim_for(pane)),
+        ));
+        let row16 = row_center(&mut ui, "+fn line16() {}");
+        for message in click(ui, row16) {
+            let _ = app.update(message);
+        }
+
+        let pane = app.panes.get(id).expect("the pane still exists");
+        assert_eq!(
+            pane.annotate_lines, "2-16",
+            "a shift-click on row 16 after a plain click on row 2 must \
+             extend the span to cover both rows, got {:?}",
+            pane.annotate_lines,
+        );
+    }
+
+    #[test]
+    fn shift_clicking_above_the_first_click_still_yields_a_valid_ordered_span() {
+        let (mut app, id) = diff_pane(DIFF);
+        let pane = app.panes.get(id).expect("the pane just built");
+        let mut ui = iced_test::simulator(artifact_body(
+            id,
+            "a1",
+            "sha256:x",
+            "diff",
+            DIFF,
+            None,
+            Some(aim_for(pane)),
+        ));
+        let row6 = row_center(&mut ui, "+fn six() {}");
+        for message in click(ui, row6) {
+            let _ = app.update(message);
+        }
+        let pane = app.panes.get(id).expect("the pane still exists");
+        assert_eq!(pane.annotate_lines, "6");
+
+        let _ = app.update(Message::ModifiersChanged(iced::keyboard::Modifiers::SHIFT));
+        let pane = app.panes.get(id).expect("the pane still exists");
+        let mut ui = iced_test::simulator(artifact_body(
+            id,
+            "a1",
+            "sha256:x",
+            "diff",
+            DIFF,
+            None,
+            Some(aim_for(pane)),
+        ));
+        let row2 = row_center(&mut ui, "+fn two() {}");
+        for message in click(ui, row2) {
+            let _ = app.update(message);
+        }
+
+        let pane = app.panes.get(id).expect("the pane still exists");
+        assert_eq!(
+            pane.annotate_lines, "2-6",
+            "shift-clicking ABOVE the first click (row 2, after row 6) must \
+             still normalise to an ascending span — `pointing::drag_lines` \
+             is non-directional by construction — got {:?}",
+            pane.annotate_lines,
+        );
+    }
+
+    #[test]
+    fn shift_clicking_a_different_files_row_does_not_extend_across_files() {
+        let (mut app, id) = diff_pane(MULTI_FILE_DIFF);
+        let pane = app.panes.get(id).expect("the pane just built");
+        let mut ui = iced_test::simulator(artifact_body(
+            id,
+            "a1",
+            "sha256:x",
+            "diff",
+            MULTI_FILE_DIFF,
+            None,
+            Some(aim_for(pane)),
+        ));
+        let lib_row = row_center(&mut ui, "+fn two() {}");
+        for message in click(ui, lib_row) {
+            let _ = app.update(message);
+        }
+        let pane = app.panes.get(id).expect("the pane still exists");
+        assert_eq!(pane.annotate_path, "lib.rs");
+        assert_eq!(pane.annotate_lines, "2");
+
+        let _ = app.update(Message::ModifiersChanged(iced::keyboard::Modifiers::SHIFT));
+        let pane = app.panes.get(id).expect("the pane still exists");
+        let mut ui = iced_test::simulator(artifact_body(
+            id,
+            "a1",
+            "sha256:x",
+            "diff",
+            MULTI_FILE_DIFF,
+            None,
+            Some(aim_for(pane)),
+        ));
+        let other_row = row_center(&mut ui, "+fn b() {}");
+        for message in click(ui, other_row) {
+            let _ = app.update(message);
+        }
+
+        let pane = app.panes.get(id).expect("the pane still exists");
+        assert_eq!(
+            pane.annotate_path, "other.rs",
+            "a shift-click into another file's rows must move the aim to \
+             that file, never straddle the two"
+        );
+        assert_eq!(
+            pane.annotate_lines, "2",
+            "with no existing span on the clicked target, shift-click must \
+             fall back to the plain single-line behaviour rather than \
+             extending across files or doing nothing, got {:?}",
+            pane.annotate_lines,
+        );
+    }
+
+    #[test]
+    fn a_plain_click_with_no_shift_still_resets_to_a_single_line() {
+        let (mut app, id) = diff_pane(DIFF);
+        let pane = app.panes.get_mut(id).expect("the pane just built");
+        // Seed an existing multi-row span exactly as a prior shift-click (or
+        // a drag) would leave one.
+        pane.aim_at(&AnchorTarget::Code("lib.rs".into()), drag_lines(2, 6));
+
+        let pane = app.panes.get(id).expect("the pane still exists");
+        let mut ui = iced_test::simulator(artifact_body(
+            id,
+            "a1",
+            "sha256:x",
+            "diff",
+            DIFF,
+            None,
+            Some(aim_for(pane)),
+        ));
+        let row3 = row_center(&mut ui, "+fn three() {}");
+        for message in click(ui, row3) {
+            let _ = app.update(message);
+        }
+
+        let pane = app.panes.get(id).expect("the pane still exists");
+        assert_eq!(
+            pane.annotate_lines, "3",
+            "a plain click (no shift) must reset to the clicked row alone, \
+             the shipped single-line behaviour, not extend the prior span, \
+             got {:?}",
+            pane.annotate_lines,
+        );
+    }
+
+    #[test]
+    fn the_composer_opens_at_the_shift_clicked_spans_end() {
+        let (mut app, id) = diff_pane(DIFF);
+        let pane = app.panes.get(id).expect("the pane just built");
+        let mut ui = iced_test::simulator(artifact_body(
+            id,
+            "a1",
+            "sha256:x",
+            "diff",
+            DIFF,
+            None,
+            Some(aim_for(pane)),
+        ));
+        let row2 = row_center(&mut ui, "+fn two() {}");
+        for message in click(ui, row2) {
+            let _ = app.update(message);
+        }
+
+        let _ = app.update(Message::ModifiersChanged(iced::keyboard::Modifiers::SHIFT));
+        let pane = app.panes.get(id).expect("the pane still exists");
+        let mut ui = iced_test::simulator(artifact_body(
+            id,
+            "a1",
+            "sha256:x",
+            "diff",
+            DIFF,
+            None,
+            Some(aim_for(pane)),
+        ));
+        let row16 = row_center(&mut ui, "+fn line16() {}");
+        for message in click(ui, row16) {
+            let _ = app.update(message);
+        }
+
+        let pane = app.panes.get(id).expect("the pane still exists");
+        assert_eq!(pane.annotate_lines, "2-16");
+        assert_eq!(
+            popup_anchor(pane),
+            Some(16),
+            "the composer must hang off the shift-clicked span's END (row 16)"
+        );
+
+        let mut ui = iced_test::simulator(artifact_body(
+            id,
+            "a1",
+            "sha256:x",
+            "diff",
+            DIFF,
+            None,
+            Some(aim_for(pane)),
+        ));
+        ui.find("comment on these lines…")
+            .expect("the composer must actually be on screen once the shift-click settles");
     }
 }
 
