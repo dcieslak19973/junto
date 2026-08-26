@@ -6982,11 +6982,17 @@ fn pane_body<'a>(
             // Say what a click still does, since there is otherwise nothing
             // on screen telling the reviewer that clicking is not inert —
             // the host closes a finished session's socket silently, giving
-            // no other hint that this pane is not live.
+            // no other hint that this pane is not live. Names both ways to
+            // span several rows (drag, or shift-click) — a reviewer reached
+            // for Ctrl-click once, found nothing, and the only other clue
+            // was a wrong guess; nothing here says Ctrl-click still can't
+            // work, since an anchor is one contiguous span and Ctrl-click's
+            // whole point is a discontiguous one.
             session_col = session_col.push(
                 text(
-                    "not live — click a diff line to comment; submitting \
-                     resumes the session with that note",
+                    "not live — click a diff line to comment, drag or \
+                     shift-click for a range; submitting resumes the \
+                     session with that note",
                 )
                 .size(TEXT_META)
                 .color(MUTED),
@@ -8098,6 +8104,15 @@ fn diff_line_color(line: &str) -> Color {
 /// that a range was picked. Colour distinguishes the claim: mauve for a
 /// `CodeAnchor` at a file line, teal for a `RecordAnchor` at stored content, so
 /// a reviewer can tell which one a drag is making without reading the composer.
+///
+/// No per-row tooltip naming the gesture: `with_tip` wraps its content in an
+/// overlay-bearing widget, and this function is called once per rendered
+/// row — for the same 500-row diff the doc comment above already sizes for,
+/// that is 500 extra widgets on the single highest-frequency render path in
+/// the pane, for a tip that would fire on every hover of a gesture whose
+/// whole point is dragging or shift-clicking THROUGH several rows in a row.
+/// The bottom-of-pane hint (`pane_body`) says both gestures once, for the
+/// whole diff, at zero per-row cost.
 fn anchor_row<'a>(
     id: pane_grid::Pane,
     body: &str,
@@ -11614,9 +11629,10 @@ diff --git a/lib.rs b/lib.rs
             "the old, now-false hint must not still be on screen"
         );
         ui.find(
-            "not live — click a diff line to comment; submitting resumes the session with that note",
+            "not live — click a diff line to comment, drag or shift-click for a range; \
+             submitting resumes the session with that note",
         )
-            .expect("the replacement hint must be on screen for a finished session");
+        .expect("the replacement hint must be on screen for a finished session");
     }
 
     // --- COMMIT 2: `AnnotateSubmit` with no socket resumes + holds a pending comment ---
