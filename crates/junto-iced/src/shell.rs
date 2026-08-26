@@ -340,17 +340,23 @@ mod persistence_tests {
     }
 
     #[test]
-    fn stale_left_view_and_left_split_keys_from_an_older_build_still_load_to_defaults() {
+    fn stale_left_view_left_split_and_right_view_keys_from_an_older_build_still_load_to_defaults() {
         // `left_view`/`left_split` existed before the left blade lost its
-        // switchable Attention/Sessions view. An old `ui.toml` still
-        // carrying those keys must not block startup: serde ignores
-        // unknown fields by default, and `#[serde(default)]` fills what is
-        // now missing — a stale or corrupt file is never a reason to
-        // refuse to launch.
-        let path = temp_path("stale-left-view-and-split-keys");
+        // switchable Attention/Sessions view; `right_view` existed before
+        // the right blade lost its switchable Artifacts/Lineage view for
+        // the same underlying reason — the blade's Artifacts view read the
+        // exact same per-pane expansion cache the channel-entry cards
+        // already render every artifact through, so it was a duplicate
+        // toggle over existing state, not a distinct view worth keeping.
+        // An old `ui.toml` still carrying any of these keys — the real
+        // `ui.toml` this build inherits carries `right_view = "lineage"`
+        // today — must not block startup: serde ignores unknown fields by
+        // default, and `#[serde(default)]` fills what is now missing — a
+        // stale or corrupt file is never a reason to refuse to launch.
+        let path = temp_path("stale-left-view-split-and-right-view-keys");
         std::fs::write(
             &path,
-            "left_collapsed = true\nleft_view = \"sessions\"\nleft_split = 0.99\n",
+            "left_collapsed = true\nleft_view = \"sessions\"\nleft_split = 0.99\nright_view = \"lineage\"\n",
         )
         .expect("write temp file");
 
