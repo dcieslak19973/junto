@@ -7932,8 +7932,17 @@ fn artifact_body<'a>(
         let row = anchor_row(id, line, color, target, row_line, lit, hovered);
         // The comment surface hangs off the row it is about, rather than sitting
         // 800px away at the bottom of the pane (ledger `02ff24be`). Exactly one
-        // row in the pane carries it: the aimed span's end.
-        if aimed_here && aim.popup_at == Some(row_line) {
+        // row in the pane carries it: the aimed span's end — but never while a
+        // drag is still in flight (`Pane::drag_from`). The popup is a real
+        // overlay laid out just below its row, so an OPEN one covers whatever
+        // rows follow; if it opened on the first row a drag presses, every
+        // later row's `mouse_area` would sit under that overlay and never see
+        // the cursor pass over it, so the drag could never extend past the row
+        // it started on. Gating this on the gesture being FINISHED is the
+        // fix: the panel now appears only once the row it hangs off is
+        // settled, exactly as it already does for a plain click (a press
+        // immediately followed by a release, with no move in between).
+        if aimed_here && aim.popup_at == Some(row_line) && aim.pane.drag_from.is_none() {
             col = col.push(Popover::new(row, Some(annotate_popup(id, aim.pane))));
         } else {
             col = col.push(row);
@@ -10767,10 +10776,26 @@ diff --git a/lib.rs b/lib.rs
  fn seven() {}
 ";
 
-    /// A pane watching nothing in particular, with `DIFF` already fetched as
+    /// Two files in one diff body, so a single `artifact_body` renders rows
+    /// from both — the fixture the span-straddle guard needs to be driven as
+    /// a real gesture rather than only as hand-built messages.
+    const MULTI_FILE_DIFF: &str = "\
+diff --git a/lib.rs b/lib.rs
++++ b/lib.rs
+@@ -1,1 +1,2 @@
+ fn one() {}
++fn two() {}
+diff --git a/other.rs b/other.rs
++++ b/other.rs
+@@ -1,1 +1,2 @@
+ fn a() {}
++fn b() {}
+";
+
+    /// A pane watching nothing in particular, with `diff` already fetched as
     /// artifact `a1` — the minimum `popup_anchor` needs to resolve a real
     /// popup row, built the same way `reviewing_pane` (in `mod tests`) does.
-    fn diff_pane() -> (App, pane_grid::Pane) {
+    fn diff_pane(diff: &'static str) -> (App, pane_grid::Pane) {
         let (mut app, _) = App::new();
         let id = app.focus.expect("App::new focuses its one pane");
         let pane = app.panes.get_mut(id).expect("the pane just created");
@@ -10778,9 +10803,9 @@ diff --git a/lib.rs b/lib.rs
             "a1".into(),
             ArtifactContent::Loaded {
                 format: "diff".into(),
-                body: DIFF.into(),
+                body: diff.into(),
                 md: None,
-                digest: ContentDigest::sha256_of(DIFF.as_bytes())
+                digest: ContentDigest::sha256_of(diff.as_bytes())
                     .as_str()
                     .to_string(),
             },
@@ -10805,9 +10830,31 @@ diff --git a/lib.rs b/lib.rs
         }
     }
 
+    /// Presses `from`, drags to `to` and releases there, then hands back
+    /// whatever the widget tree published — the `point_at` + `simulate`
+    /// sequence a real press-move-release takes. `from == to` is a plain
+    /// click: a press immediately followed by a release with no move
+    /// between, exactly like `iced_test::click`'s own event pair.
+    fn press_drag_release(
+        mut ui: iced_test::Simulator<'_, Message>,
+        from: Point,
+        to: Point,
+    ) -> Vec<Message> {
+        ui.point_at(from);
+        ui.simulate([Event::Mouse(mouse::Event::ButtonPressed(
+            mouse::Button::Left,
+        ))]);
+        ui.point_at(to);
+        ui.simulate([Event::Mouse(mouse::Event::CursorMoved { position: to })]);
+        ui.simulate([Event::Mouse(mouse::Event::ButtonReleased(
+            mouse::Button::Left,
+        ))]);
+        ui.into_messages().collect()
+    }
+
     #[test]
     fn dragging_past_the_pressed_row_extends_the_aimed_span_to_the_row_released_on() {
-        let (mut app, id) = diff_pane();
+        let (mut app, id) = diff_pane(DIFF);
         // The state a press on row 2 leaves behind (`Message::AnchorPress`,
         // main.rs ~2597) — built with `Pane::aim_at` exactly as other tests
         // seed a pane, not by re-deriving that handler. This test is about
@@ -10828,10 +10875,6 @@ diff --git a/lib.rs b/lib.rs
             None,
             Some(aim_for(pane)),
         ));
-
-        // Press row 2 again (a real `ButtonPressed`, not a hand-built
-        // message), then drag down to row 6 and release there — exactly the
-        // `point_at` + `simulate` sequence a real press-move-release takes.
         // Row 6 is the one that physically falls under the open composer's
         // `text_input` once row 2's popup is showing (verified against real
         // layout, not assumed) — the row a real drag would cross.
@@ -10839,26 +10882,16 @@ diff --git a/lib.rs b/lib.rs
             .find("+fn two() {}")
             .expect("the pressed row must be on screen")
             .visible_bounds()
-            .expect("the pressed row must be visible");
-        ui.point_at(row2.center());
-        ui.simulate([Event::Mouse(mouse::Event::ButtonPressed(
-            mouse::Button::Left,
-        ))]);
-
+            .expect("the pressed row must be visible")
+            .center();
         let row6 = ui
             .find("+fn six() {}")
             .expect("the fifth added row must be on screen")
             .visible_bounds()
-            .expect("the fifth added row must be visible");
-        ui.point_at(row6.center());
-        ui.simulate([Event::Mouse(mouse::Event::CursorMoved {
-            position: row6.center(),
-        })]);
-        ui.simulate([Event::Mouse(mouse::Event::ButtonReleased(
-            mouse::Button::Left,
-        ))]);
+            .expect("the fifth added row must be visible")
+            .center();
 
-        let messages: Vec<Message> = ui.into_messages().collect();
+        let messages = press_drag_release(ui, row2, row6);
         for message in messages {
             let _ = app.update(message);
         }
@@ -10873,6 +10906,171 @@ diff --git a/lib.rs b/lib.rs
              — the composer popover open over row 2 ate it, got {:?}",
             pane.annotate_lines,
         );
+    }
+
+    #[test]
+    fn a_single_row_click_still_opens_the_composer_immediately() {
+        // Guards the shipped path: a click is a press immediately followed by
+        // a release with no move between, and it must keep opening the
+        // composer right away — the drag fix only defers the popup while
+        // `Pane::drag_from` is still set, and a plain click clears that in
+        // the same gesture.
+        let (mut app, id) = diff_pane(DIFF);
+        let pane = app.panes.get(id).expect("the pane just built");
+        let mut ui = iced_test::simulator(artifact_body(
+            id,
+            "a1",
+            "sha256:x",
+            "diff",
+            DIFF,
+            None,
+            Some(aim_for(pane)),
+        ));
+        let row2 = ui
+            .find("+fn two() {}")
+            .expect("the row must be on screen")
+            .visible_bounds()
+            .expect("the row must be visible")
+            .center();
+
+        let messages = press_drag_release(ui, row2, row2);
+        for message in messages {
+            let _ = app.update(message);
+        }
+
+        let pane = app.panes.get(id).expect("the pane still exists");
+        assert!(
+            pane.drag_from.is_none(),
+            "a full click must end the gesture, not leave it dangling"
+        );
+        assert_eq!(pane.annotate_lines, "2");
+
+        let mut ui = iced_test::simulator(artifact_body(
+            id,
+            "a1",
+            "sha256:x",
+            "diff",
+            DIFF,
+            None,
+            Some(aim_for(pane)),
+        ));
+        ui.find("comment on these lines…").expect(
+            "a single-row click must still open the composer immediately, \
+             with no separate move required",
+        );
+    }
+
+    #[test]
+    fn a_drag_that_crosses_into_another_files_rows_does_not_extend_into_them() {
+        // The straddle guard already lives in `Message::AnchorOver` (main.rs
+        // ~2604) and is unit-tested there against hand-built messages; this
+        // drives the same guard with a real gesture over two files rendered
+        // in one diff body.
+        let (mut app, id) = diff_pane(MULTI_FILE_DIFF);
+        let pane = app.panes.get_mut(id).expect("the pane just built");
+        pane.aim_at(&AnchorTarget::Code("lib.rs".into()), drag_lines(2, 2));
+        pane.drag_from = Some(2);
+
+        let pane = app.panes.get(id).expect("the pane just built");
+        let mut ui = iced_test::simulator(artifact_body(
+            id,
+            "a1",
+            "sha256:x",
+            "diff",
+            MULTI_FILE_DIFF,
+            None,
+            Some(aim_for(pane)),
+        ));
+        let lib_row = ui
+            .find("+fn two() {}")
+            .expect("lib.rs's added row must be on screen")
+            .visible_bounds()
+            .expect("lib.rs's added row must be visible")
+            .center();
+        let other_row = ui
+            .find("+fn b() {}")
+            .expect("other.rs's added row must be on screen")
+            .visible_bounds()
+            .expect("other.rs's added row must be visible")
+            .center();
+
+        let messages = press_drag_release(ui, lib_row, other_row);
+        for message in messages {
+            let _ = app.update(message);
+        }
+
+        let pane = app.panes.get(id).expect("the pane still exists");
+        assert_eq!(
+            pane.annotate_path, "lib.rs",
+            "the aim must stay on the file the drag started in"
+        );
+        assert_eq!(
+            pane.annotate_lines, "2",
+            "a drag that crosses into another file's rows must not extend \
+             the span there, got {:?}",
+            pane.annotate_lines,
+        );
+    }
+
+    #[test]
+    fn the_aimed_span_survives_release_and_the_composer_opens_at_its_end() {
+        let (mut app, id) = diff_pane(DIFF);
+        let pane = app.panes.get_mut(id).expect("the pane just built");
+        pane.aim_at(&AnchorTarget::Code("lib.rs".into()), drag_lines(2, 2));
+        pane.drag_from = Some(2);
+
+        let pane = app.panes.get(id).expect("the pane just built");
+        let mut ui = iced_test::simulator(artifact_body(
+            id,
+            "a1",
+            "sha256:x",
+            "diff",
+            DIFF,
+            None,
+            Some(aim_for(pane)),
+        ));
+        let row2 = ui
+            .find("+fn two() {}")
+            .expect("the pressed row must be on screen")
+            .visible_bounds()
+            .expect("the pressed row must be visible")
+            .center();
+        let row6 = ui
+            .find("+fn six() {}")
+            .expect("the released-on row must be on screen")
+            .visible_bounds()
+            .expect("the released-on row must be visible")
+            .center();
+
+        let messages = press_drag_release(ui, row2, row6);
+        for message in messages {
+            let _ = app.update(message);
+        }
+
+        let pane = app.panes.get(id).expect("the pane still exists");
+        assert_eq!(
+            pane.annotate_lines, "2-6",
+            "the span must survive the release rather than resetting to a \
+             single row or clearing outright"
+        );
+        assert_eq!(
+            popup_anchor(pane),
+            Some(6),
+            "the composer must hang off the span's END (row 6), not the row \
+             the drag started on"
+        );
+
+        let mut ui = iced_test::simulator(artifact_body(
+            id,
+            "a1",
+            "sha256:x",
+            "diff",
+            DIFF,
+            None,
+            Some(aim_for(pane)),
+        ));
+        ui.find("comment on these lines…")
+            .expect("the composer must actually be on screen once the drag settles");
     }
 }
 
