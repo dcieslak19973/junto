@@ -254,6 +254,17 @@ struct App {
     /// `ShellState`, since a half-finished gesture is not layout worth
     /// saving.
     blade_drag: Option<BladeDrag>,
+    /// The keyboard modifiers currently held, kept live by an unconditional
+    /// `iced::event::listen_with` subscription (`App::subscription`) rather
+    /// than the command/control-gated `keys` one, since a shift-click on a
+    /// diff row (`Message::AnchorPress`) needs to know shift is down at
+    /// press time even though `mouse_area::on_press` carries no modifier
+    /// state of its own. Cleared on `window::Event::Unfocused` too: winit
+    /// reports a focus change with no accompanying `ModifiersChanged`, so a
+    /// shift released while the window was in the background would
+    /// otherwise stay "held" here forever. Transient like `blade_drag`: not
+    /// part of `ShellState`.
+    modifiers: iced::keyboard::Modifiers,
     /// The channel whose placement is pending, if any — set by pressing
     /// an unopened channel's chip (`PendingTarget::Channel`), an unopened
     /// attention chip (`Entry`, the entry to jump to), or an unwatched
@@ -1721,6 +1732,12 @@ enum Message {
     /// A 1-second tick, live only while a minted invite is on screen and
     /// unexpired (`App::subscription`) — drives the countdown.
     Tick,
+    /// The keyboard modifiers changed — kept live by an unconditional
+    /// `App::subscription` listener so `App::modifiers` never goes stale
+    /// while a diff row is pressed (`Message::AnchorPress`'s shift check).
+    /// Also fired with `Modifiers::empty()` on window unfocus, since a
+    /// modifier released off-screen never emits its own change.
+    ModifiersChanged(iced::keyboard::Modifiers),
 }
 
 impl App {
@@ -1763,6 +1780,7 @@ impl App {
             device_key_fingerprint: None,
             shell: shell::load(&shell_state_path()),
             blade_drag: None,
+            modifiers: iced::keyboard::Modifiers::empty(),
             pending: None,
         };
         (
@@ -3329,6 +3347,10 @@ impl App {
                 }
             }
             Message::Tick => Task::none(),
+            Message::ModifiersChanged(modifiers) => {
+                self.modifiers = modifiers;
+                Task::none()
+            }
             Message::SubstratesLoaded(paths) => {
                 // Default the new-channel substrate to the first registered one.
                 self.new_channel_repo = paths.first().cloned();
@@ -3832,10 +3854,34 @@ impl App {
                 _ => None,
             })
         });
+        // Unconditional, unlike `blade_drag_sub` above: a stale shift flag
+        // produces a wrong span in a SIGNED comment, so this must never be
+        // gated behind some other piece of transient state. `keys` above
+        // is the wrong subscription to piggyback on for this — it only
+        // sees events the rest of the UI left `Status::Ignored`
+        // (`iced::keyboard::listen`'s own contract), so a modifier change
+        // while a text field is focused (which marks its own key events
+        // `Captured`) would never reach it, leaving `App::modifiers` stale
+        // the moment a reviewer's cursor was sitting in, say, the
+        // new-channel field. `listen_with` sees every event regardless of
+        // status. It also clears on `window::Event::Unfocused`: winit's
+        // focus-loss conversion (`iced_winit::conversion`) maps
+        // `Focused(false)` straight to `Unfocused` with no accompanying
+        // `ModifiersChanged`, so a shift key released while the window was
+        // in the background would otherwise stay "held" here forever.
+        let modifiers_sub = iced::event::listen_with(|event, _status, _window| match event {
+            iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(modifiers)) => {
+                Some(Message::ModifiersChanged(modifiers))
+            }
+            iced::Event::Window(iced::window::Event::Unfocused) => {
+                Some(Message::ModifiersChanged(iced::keyboard::Modifiers::empty()))
+            }
+            _ => None,
+        });
         iced::Subscription::batch(
             streams
                 .into_iter()
-                .chain([tick, keys])
+                .chain([tick, keys, modifiers_sub])
                 .chain(countdown_tick)
                 .chain(blade_drag_sub),
         )
