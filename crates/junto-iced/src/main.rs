@@ -10747,6 +10747,136 @@ diff --git a/lib.rs b/lib.rs
 }
 
 #[cfg(test)]
+mod drag_gesture_tests {
+    use super::*;
+    use iced::Event;
+
+    /// A small diff with several new-file rows on screen at once, so a drag
+    /// can move from the pressed row down across rows a wrongly-open popup
+    /// would otherwise cover.
+    const DIFF: &str = "\
+diff --git a/lib.rs b/lib.rs
++++ b/lib.rs
+@@ -1,2 +1,7 @@
+ fn one() {}
++fn two() {}
++fn three() {}
++fn four() {}
++fn five() {}
++fn six() {}
+ fn seven() {}
+";
+
+    /// A pane watching nothing in particular, with `DIFF` already fetched as
+    /// artifact `a1` — the minimum `popup_anchor` needs to resolve a real
+    /// popup row, built the same way `reviewing_pane` (in `mod tests`) does.
+    fn diff_pane() -> (App, pane_grid::Pane) {
+        let (mut app, _) = App::new();
+        let id = app.focus.expect("App::new focuses its one pane");
+        let pane = app.panes.get_mut(id).expect("the pane just created");
+        pane.artifacts.insert(
+            "a1".into(),
+            ArtifactContent::Loaded {
+                format: "diff".into(),
+                body: DIFF.into(),
+                md: None,
+                digest: ContentDigest::sha256_of(DIFF.as_bytes())
+                    .as_str()
+                    .to_string(),
+            },
+        );
+        (app, id)
+    }
+
+    /// The `Aim` `pane_body` builds from a pane (main.rs ~6805), factored out
+    /// so a test can hand `artifact_body` the same projection production
+    /// does instead of inventing a second one.
+    fn aim_for(pane: &Pane) -> Aim<'_> {
+        Aim {
+            path: pane.annotate_path.as_str(),
+            record: pane
+                .annotate_record
+                .as_ref()
+                .map(|(entry, _)| entry.as_str()),
+            span: parse_span(&pane.annotate_lines),
+            popup_at: popup_anchor(pane),
+            hover: pane.hover.as_ref().map(|(key, line)| (key.as_str(), *line)),
+            pane,
+        }
+    }
+
+    #[test]
+    fn dragging_past_the_pressed_row_extends_the_aimed_span_to_the_row_released_on() {
+        let (mut app, id) = diff_pane();
+        // The state a press on row 2 leaves behind (`Message::AnchorPress`,
+        // main.rs ~2597) — built with `Pane::aim_at` exactly as other tests
+        // seed a pane, not by re-deriving that handler. This test is about
+        // the drag's CONTINUATION past the press, which
+        // `clicking_a_rendered_diff_row_emits_that_rows_anchor` already
+        // covers on its own.
+        let pane = app.panes.get_mut(id).expect("the pane just built");
+        pane.aim_at(&AnchorTarget::Code("lib.rs".into()), drag_lines(2, 2));
+        pane.drag_from = Some(2);
+
+        let pane = app.panes.get(id).expect("the pane just built");
+        let mut ui = iced_test::simulator(artifact_body(
+            id,
+            "a1",
+            "sha256:x",
+            "diff",
+            DIFF,
+            None,
+            Some(aim_for(pane)),
+        ));
+
+        // Press row 2 again (a real `ButtonPressed`, not a hand-built
+        // message), then drag down to row 6 and release there — exactly the
+        // `point_at` + `simulate` sequence a real press-move-release takes.
+        // Row 6 is the one that physically falls under the open composer's
+        // `text_input` once row 2's popup is showing (verified against real
+        // layout, not assumed) — the row a real drag would cross.
+        let row2 = ui
+            .find("+fn two() {}")
+            .expect("the pressed row must be on screen")
+            .visible_bounds()
+            .expect("the pressed row must be visible");
+        ui.point_at(row2.center());
+        ui.simulate([Event::Mouse(mouse::Event::ButtonPressed(
+            mouse::Button::Left,
+        ))]);
+
+        let row6 = ui
+            .find("+fn six() {}")
+            .expect("the fifth added row must be on screen")
+            .visible_bounds()
+            .expect("the fifth added row must be visible");
+        ui.point_at(row6.center());
+        ui.simulate([Event::Mouse(mouse::Event::CursorMoved {
+            position: row6.center(),
+        })]);
+        ui.simulate([Event::Mouse(mouse::Event::ButtonReleased(
+            mouse::Button::Left,
+        ))]);
+
+        let messages: Vec<Message> = ui.into_messages().collect();
+        for message in messages {
+            let _ = app.update(message);
+        }
+
+        let pane = app.panes.get(id).expect("the pane still exists");
+        assert_eq!(
+            pane.annotate_lines, "2-6",
+            "a press on row 2 dragged down to row 6 and released there must \
+             aim a span covering both rows; \"2\" (a bare single-row span, \
+             `pointing::drag_lines`'s output for a drag that never moved) \
+             means row 6's move event never reached its `mouse_area` at all \
+             — the composer popover open over row 2 ate it, got {:?}",
+            pane.annotate_lines,
+        );
+    }
+}
+
+#[cfg(test)]
 mod resume_and_comment_tests {
     use super::*;
 
