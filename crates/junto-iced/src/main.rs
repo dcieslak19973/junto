@@ -203,8 +203,6 @@ const ICON_SEARCH: char = '\u{e154}';
 const ICON_PLUS: char = '\u{e140}';
 const ICON_BELL: char = '\u{e05d}';
 const ICON_BOT: char = '\u{e1ba}';
-const ICON_FILE_DIFF: char = '\u{e319}';
-const ICON_GIT_BRANCH: char = '\u{e0e5}';
 const ICON_REFRESH_CW: char = '\u{e148}';
 
 /// The default font at Semibold weight — the one hierarchy tool this pass
@@ -1497,8 +1495,6 @@ enum Message {
     ToggleLeftBlade,
     /// Collapse or expand the right blade.
     ToggleRightBlade,
-    /// Switch the right blade's view.
-    RightViewPicked(shell::RightView),
     /// Press a footer trigger chip: toggle that floating panel open/closed.
     BottomViewToggled(shell::BottomView),
     /// Press a blade-width divider handle: begin a resize drag.
@@ -2301,11 +2297,6 @@ impl App {
                             shell::BladeWidth::new(shell::BladeWidth::RIGHT_DEFAULT);
                     }
                 }
-                self.persist_shell();
-                Task::none()
-            }
-            Message::RightViewPicked(view) => {
-                self.shell.right_view = view;
                 self.persist_shell();
                 Task::none()
             }
@@ -4756,47 +4747,23 @@ fn left_blade(app: &App) -> Element<'_, Message> {
         .into()
 }
 
-/// The right blade: a switchable Artifacts/Lineage view, with its own
-/// collapse toggle in a footer row pinned to the blade's bottom-right
-/// corner — mirrors `left_blade`'s bottom-left one.
+/// The right blade: the lineage DAG, with its own collapse toggle in a
+/// footer row pinned to the blade's bottom-right corner — mirrors
+/// `left_blade`'s bottom-left one. This used to switch between Artifacts
+/// and Lineage (`shell::RightView`); the design spec's §3 migration table
+/// still says artifacts "moved" here, but they never did — `artifact_row`
+/// read the exact same per-pane expansion cache (`Pane::artifacts`) that
+/// `entry_card`'s own artifact branch (`artifact_for`) already renders
+/// every artifact entry through, so the blade's copy was a second toggle
+/// over state the pane already showed, not a relocation. Deleting it loses
+/// no capability, and with only lineage left there is nothing to switch
+/// between — `lineage_view` carries its own collapsible header, so this
+/// adds none of its own.
 fn right_blade(app: &App) -> Element<'_, Message> {
-    let switcher = row![
-        button(
-            container(
-                row![icon(ICON_FILE_DIFF), text("artifacts").size(TEXT_BODY)]
-                    .spacing(SP_TIGHT)
-                    .align_y(Center),
-            )
-            .center_x(Fill),
-        )
-        .on_press(Message::RightViewPicked(shell::RightView::Artifacts))
-        .width(Length::FillPortion(1))
-        .padding(SP_TIGHT)
-        .style(move |_t, _s| tab_style(app.shell.right_view == shell::RightView::Artifacts)),
-        button(
-            container(
-                row![icon(ICON_GIT_BRANCH), text("lineage").size(TEXT_BODY)]
-                    .spacing(SP_TIGHT)
-                    .align_y(Center),
-            )
-            .center_x(Fill),
-        )
-        .on_press(Message::RightViewPicked(shell::RightView::Lineage))
-        .width(Length::FillPortion(1))
-        .padding(SP_TIGHT)
-        .style(move |_t, _s| tab_style(app.shell.right_view == shell::RightView::Lineage)),
-    ]
-    .spacing(SP_TIGHT);
-
-    let body: Element<Message> = match app.shell.right_view {
-        shell::RightView::Artifacts => artifacts_view(app),
-        shell::RightView::Lineage => lineage_view(app),
-    };
-
-    let content = container(column![switcher, body].spacing(SP)).height(Fill);
+    let content = container(lineage_view(app)).height(Fill);
     let toggle = container(icon_button(
         ICON_CHEVRON_RIGHT,
-        "close artifacts & lineage · ctrl+r",
+        "close lineage · ctrl+r",
         tooltip::Position::Top,
         Message::ToggleRightBlade,
     ))
@@ -5332,41 +5299,6 @@ fn lineage_name_style(color: Color, status: button::Status) -> button::Style {
     }
 }
 
-/// Artifacts attached to the focused channel — diffs, logs, charts. Rendered
-/// from the focused pane's existing artifact state rather than a new fetch.
-fn artifacts_view(app: &App) -> Element<'_, Message> {
-    let Some(id) = app.focus else {
-        return text("no channel focused")
-            .size(TEXT_BODY)
-            .color(MUTED)
-            .into();
-    };
-    let Some(pane) = app.panes.get(id) else {
-        return text("no channel focused")
-            .size(TEXT_BODY)
-            .color(MUTED)
-            .into();
-    };
-    match &pane.content {
-        Content::Loading => return text("loading…").size(TEXT_BODY).color(MUTED).into(),
-        Content::Error(err) => {
-            return row![
-                icon(ICON_CIRCLE_ALERT).color(RED),
-                text(err).size(TEXT_BODY).color(RED)
-            ]
-            .spacing(SP_TIGHT)
-            .align_y(Center)
-            .into();
-        }
-        Content::Loaded(_) => {}
-    }
-    let mut items = column![].spacing(SP_TIGHT);
-    for entry in pane.artifact_entries() {
-        items = items.push(artifact_row(id, pane, entry));
-    }
-    scrollable(items).height(Fill).into()
-}
-
 /// Agent sessions for the focused channel.
 fn sessions_view(app: &App) -> Element<'_, Message> {
     let Some(id) = app.focus else {
@@ -5408,88 +5340,6 @@ fn sessions_view(app: &App) -> Element<'_, Message> {
         }
     }
     scrollable(items).into()
-}
-
-/// One artifact entry in the right blade's Artifacts view: the same kind
-/// badge, `Message::ToggleArtifact` wiring, and (once expanded) the same
-/// `artifact_body` rendering the pane's own entry card uses with no pointing
-/// aim — the code path `entry_card` already takes whenever the pane's
-/// annotate composer isn't live — rather than new artifact markup.
-fn artifact_row<'a>(
-    id: pane_grid::Pane,
-    pane: &'a Pane,
-    entry: &'a EntryDto,
-) -> Element<'a, Message> {
-    let expanded = pane.artifacts.get(&entry.id);
-    let (toggle_icon, toggle_text) = if expanded.is_some() {
-        (ICON_CHEVRON_DOWN, "hide content")
-    } else {
-        (ICON_CHEVRON_RIGHT, "show content")
-    };
-    let mut card = column![
-        row![
-            badge(artifact_label(&entry.summary), kind_color(&entry.kind)),
-            text(truncate(&entry.author, 24))
-                .size(TEXT_META)
-                .color(MUTED),
-        ]
-        .spacing(SP),
-        button(
-            row![icon(toggle_icon), text(toggle_text).size(TEXT_META)]
-                .spacing(SP_TIGHT)
-                .align_y(Center),
-        )
-        .on_press(Message::ToggleArtifact(id, entry.id.clone()))
-        .padding([SP_TIGHT, SP])
-        .style(|_t, _s| chip_style(TEAL, false)),
-    ]
-    .spacing(SP);
-    match expanded {
-        Some(ArtifactContent::Loading) => {
-            card = card.push(text("loading…").size(TEXT_META).color(MUTED));
-        }
-        Some(ArtifactContent::Error(err)) => {
-            card = card.push(
-                row![
-                    icon(ICON_CIRCLE_ALERT).color(RED),
-                    text(err).size(TEXT_META).color(RED)
-                ]
-                .spacing(SP_TIGHT)
-                .align_y(Center),
-            );
-        }
-        Some(ArtifactContent::Loaded {
-            format,
-            body,
-            md,
-            digest,
-        }) => {
-            card = card.push(artifact_body(
-                id,
-                &entry.id,
-                digest,
-                format,
-                body,
-                md.as_deref(),
-                None,
-            ));
-        }
-        None => {}
-    }
-    container(card)
-        .padding(SP)
-        .width(Fill)
-        .style(|_theme| container::Style {
-            background: Some(Background::Color(SURFACE)),
-            border: Border {
-                color: BORDER,
-                width: 1.0,
-                radius: 6.0.into(),
-            },
-            text_color: Some(TEXT),
-            ..container::Style::default()
-        })
-        .into()
 }
 
 /// One session chip in the left blade's Sessions view: the same
@@ -8478,19 +8328,6 @@ impl Pane {
             Content::Loaded(dto) => &dto.sessions,
             Content::Loading | Content::Error(_) => &[],
         }
-    }
-
-    /// This channel's artifact entries (`entry.kind == "artifact"`) from the
-    /// pane's already-fetched `view.json` data — empty while `content` is
-    /// still `Loading` or `Error`. Named `artifact_entries`, not `artifacts`,
-    /// because that name already belongs to the expanded-inline-content
-    /// cache (`Pane::artifacts`) and means something different.
-    fn artifact_entries(&self) -> impl Iterator<Item = &EntryDto> {
-        let entries: &[EntryDto] = match &self.content {
-            Content::Loaded(dto) => &dto.entries,
-            Content::Loading | Content::Error(_) => &[],
-        };
-        entries.iter().filter(|entry| entry.kind == "artifact")
     }
 }
 
@@ -13061,7 +12898,6 @@ mod lineage_view_tests {
 
     fn app_with_lineage(graph: LineageGraphDto) -> App {
         let (mut app, _) = App::new();
-        app.shell.right_view = shell::RightView::Lineage;
         app.lineage = Some(graph);
         app
     }

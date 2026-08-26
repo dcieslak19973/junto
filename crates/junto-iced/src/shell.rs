@@ -1,21 +1,10 @@
 //! Pure layout state for the three-pane shell — blade collapse, widths,
-//! the right blade's active view, and the bottom drawer.
+//! and the bottom drawer.
 //!
 //! Everything decidable about the shell lives here rather than in `view()`,
 //! which Iced gives no way to unit-test. `view()` is a projection over this.
 
 use serde::{Deserialize, Serialize};
-
-/// Which switchable view the right blade is showing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum RightView {
-    /// Diffs, logs, and charts attached to the channel.
-    #[default]
-    Artifacts,
-    /// The diverge/converge DAG.
-    Lineage,
-}
 
 /// Which panel the bottom drawer is showing, or `None` when it is closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -44,9 +33,9 @@ impl BladeWidth {
     /// The left blade holds the channel list; this is comfortable for a
     /// name plus a badge without stealing width from the center.
     pub const LEFT_DEFAULT: f32 = 280.0;
-    /// The right blade holds artifacts and the lineage DAG, whose canvas
-    /// derives its track region as `width - 24 - LABEL_W` (`LABEL_W` =
-    /// 150px): 280px would leave it ~90px of track, barely enough to draw a
+    /// The right blade holds the lineage DAG, whose canvas derives its
+    /// track region as `width - 24 - LABEL_W` (`LABEL_W` = 150px): 280px
+    /// would leave it ~90px of track, barely enough to draw a
     /// diverge/converge connector. 520px gives it ~330px, matching the
     /// reference three-pane layout.
     pub const RIGHT_DEFAULT: f32 = 520.0;
@@ -102,8 +91,6 @@ pub struct ShellState {
     pub left_width: BladeWidth,
     /// Right blade width when expanded.
     pub right_width: BladeWidth,
-    /// The right blade's active switchable view.
-    pub right_view: RightView,
     /// Which panel the bottom drawer is showing; `None` when it is closed.
     pub bottom: Option<BottomView>,
 }
@@ -122,7 +109,6 @@ impl Default for ShellState {
             right_collapsed: false,
             left_width: BladeWidth::new(BladeWidth::LEFT_DEFAULT),
             right_width: BladeWidth::new(BladeWidth::RIGHT_DEFAULT),
-            right_view: RightView::default(),
             bottom: None,
         }
     }
@@ -263,7 +249,7 @@ mod clamp_tests {
 
 #[cfg(test)]
 mod persistence_tests {
-    use super::{BladeWidth, RightView, ShellState, load, save};
+    use super::{BladeWidth, ShellState, load, save};
 
     /// A unique temp path per test — these run in parallel, so a shared
     /// filename would make them flaky.
@@ -276,7 +262,6 @@ mod persistence_tests {
         let path = temp_path("round-trip");
         let written = ShellState {
             left_collapsed: true,
-            right_view: RightView::Lineage,
             right_width: BladeWidth::new(400.0),
             ..Default::default()
         };
@@ -343,7 +328,6 @@ mod persistence_tests {
         // must be able to fail.
         let state = ShellState {
             left_collapsed: true,
-            right_view: RightView::Lineage,
             right_width: BladeWidth::new(400.0),
             ..Default::default()
         };
