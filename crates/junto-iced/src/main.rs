@@ -3968,13 +3968,13 @@ impl App {
         }
     }
 
-    /// Push the emulated viewport to the browser once both its logical size and
-    /// the scale factor are known. The CSS viewport equals the logical size, so
-    /// input mapping stays 1:1; the scale factor renders the frame at physical
-    /// resolution.
+    /// Push the emulated viewport to the browser once its logical size is
+    /// known. The viewport is `fit_width`-scaled — at least a desktop width so
+    /// real sites lay out as desktop, scaled down to fit a narrow blade — and
+    /// the display scale factor renders the frame at physical resolution.
     fn sync_browser_viewport(&mut self) {
         if let (Some(size), true) = (self.browser_logical, self.browser_cmd.is_some()) {
-            let viewport = browser::ViewportSize::from_logical(size.width, size.height);
+            let viewport = browser::ViewportSize::fit_width(size.width, size.height);
             self.send_browser(cdp::Command::SetViewport {
                 size: viewport,
                 scale: self.browser_scale,

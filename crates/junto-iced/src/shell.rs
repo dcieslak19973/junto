@@ -35,8 +35,11 @@ pub struct BladeWidth(f32);
 impl BladeWidth {
     /// Narrow enough to be frugal, wide enough to read a channel name.
     pub const MIN: f32 = 180.0;
-    /// Beyond this the center stops being the center.
-    pub const MAX: f32 = 560.0;
+    /// The ceiling a blade can be dragged to. Generous because the right blade
+    /// can hold the browser, which wants real width — at ~1200px a desktop page
+    /// renders essentially 1:1 (`browser::DESKTOP_MIN_WIDTH`). Dragging a blade
+    /// this wide is the user's call; the center shrinks but is never gone.
+    pub const MAX: f32 = 1200.0;
     /// Comfortable for a channel list plus badges.
     pub const DEFAULT: f32 = 280.0;
 

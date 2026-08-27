@@ -4,15 +4,30 @@
 //! view live here so they are unit-tested without a running app, exactly as
 //! `pointing.rs` keeps the pointing gesture's logic testable in isolation.
 
-/// The emulated CSS viewport, in CSS pixels. Equal to the screencast widget's
-/// logical size (see `screencast.rs`): making the emulated viewport match the
-/// widget is what lets `map_cursor` be 1:1 and keeps the frame crisp — the
-/// display scale factor rides separately as `deviceScaleFactor`, so the frame
-/// renders at physical resolution.
+/// The minimum CSS width we emulate. Below a blade this wide, a real site laid
+/// out at the blade's own ~360–560px would collapse to a cramped mobile view or
+/// overflow; emulating at least this width makes it lay out as a desktop page,
+/// and the frame is then scaled DOWN to fit the blade (`fit_width`). At or above
+/// this width the page renders at the blade's own width (no zoom).
+pub const DESKTOP_MIN_WIDTH: f32 = 1280.0;
+
+/// The emulated CSS viewport, in CSS pixels — always at least
+/// `DESKTOP_MIN_WIDTH` wide (see `fit_width`). The display scale factor rides
+/// separately as `deviceScaleFactor`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ViewportSize {
     pub width: u32,
     pub height: u32,
+}
+
+/// The zoom ratio (page CSS pixels per widget logical pixel) for a blade
+/// `logical_w` wide: 1.0 once the blade is at least `DESKTOP_MIN_WIDTH`, and
+/// `DESKTOP_MIN_WIDTH / logical_w` (> 1) below it, so a narrow blade shows a
+/// desktop page shrunk to fit. Shared by `fit_width` and `map_cursor` so the
+/// viewport and the input mapping never disagree.
+fn zoom_ratio(logical_w: f32) -> f32 {
+    let w = logical_w.max(1.0);
+    w.max(DESKTOP_MIN_WIDTH) / w
 }
 
 impl ViewportSize {
@@ -21,11 +36,15 @@ impl ViewportSize {
     /// crash.
     const MIN: u32 = 1;
 
-    /// Round the widget's logical size to whole CSS pixels, flooring at `MIN`.
-    pub fn from_logical(width: f32, height: f32) -> Self {
+    /// The emulated viewport for a blade of logical size `(w, h)`: the width is
+    /// raised to at least `DESKTOP_MIN_WIDTH` so real sites lay out as desktop,
+    /// and the height is scaled by the same zoom ratio so the frame's aspect
+    /// matches the blade and fills it without letterboxing.
+    pub fn fit_width(logical_w: f32, logical_h: f32) -> Self {
+        let ratio = zoom_ratio(logical_w);
         Self {
-            width: (width.round() as u32).max(Self::MIN),
-            height: (height.round() as u32).max(Self::MIN),
+            width: ((logical_w.max(1.0) * ratio).round() as u32).max(Self::MIN),
+            height: ((logical_h.max(1.0) * ratio).round() as u32).max(Self::MIN),
         }
     }
 }
@@ -39,15 +58,16 @@ pub struct PagePoint {
     pub y: f32,
 }
 
-/// Map a widget-local cursor position to a page point. Identity by
-/// construction — the emulated viewport equals the widget's logical size — but
-/// clamped into `[0, w] × [0, h]` so a cursor exactly on the far edge never
-/// yields an out-of-viewport coordinate. This is the one seam a future
-/// letterbox mode would change.
+/// Map a widget-local cursor position to a page point, scaling by the same
+/// `zoom_ratio` `fit_width` used so a click lands where it looks like it does,
+/// and clamping into the CSS viewport so an edge cursor never lands outside it.
 pub fn map_cursor(local_x: f32, local_y: f32, bounds_w: f32, bounds_h: f32) -> PagePoint {
+    let ratio = zoom_ratio(bounds_w);
+    let css_w = bounds_w.max(1.0) * ratio;
+    let css_h = bounds_h.max(0.0) * ratio;
     PagePoint {
-        x: local_x.clamp(0.0, bounds_w),
-        y: local_y.clamp(0.0, bounds_h),
+        x: (local_x * ratio).clamp(0.0, css_w),
+        y: (local_y * ratio).clamp(0.0, css_h),
     }
 }
 
@@ -229,37 +249,46 @@ mod viewport_url_tests {
     use super::*;
 
     #[test]
-    fn logical_size_rounds_and_never_collapses_to_zero() {
-        // The emulated CSS viewport is the widget's logical size; a degenerate
-        // 0-height blade must still yield a layout-able viewport, not a 0 that
-        // Chromium rejects.
+    fn fit_width_gives_a_desktop_viewport_below_the_threshold_and_1to1_above() {
+        // A narrow blade renders a desktop-width page scaled to fit; the height
+        // scales by the same ratio so the frame fills without letterboxing.
         assert_eq!(
-            ViewportSize::from_logical(519.6, 1399.4),
+            ViewportSize::fit_width(400.0, 900.0),
             ViewportSize {
-                width: 520,
-                height: 1399
+                width: 1280,
+                height: 2880
             }
         );
+        // A blade wider than the threshold renders at its own width (no zoom).
         assert_eq!(
-            ViewportSize::from_logical(0.0, 0.0),
+            ViewportSize::fit_width(1400.0, 900.0),
             ViewportSize {
-                width: 1,
-                height: 1
+                width: 1400,
+                height: 900
             }
         );
+        // Degenerate sizes never collapse to a zero Chromium would reject.
+        let degenerate = ViewportSize::fit_width(0.0, 0.0);
+        assert!(degenerate.width >= 1 && degenerate.height >= 1);
     }
 
     #[test]
-    fn a_cursor_maps_one_to_one_and_clamps_to_the_viewport() {
-        // Viewport == widget logical size, so mapping is identity; a cursor on
-        // the far edge must not produce an out-of-viewport CSS coordinate.
+    fn a_cursor_scales_by_the_zoom_ratio_and_clamps_to_the_viewport() {
+        // In a 400px blade the page is 1280 CSS px wide, so the horizontal
+        // midpoint (200) maps to 640 — the midpoint of the page.
         assert_eq!(
-            map_cursor(12.0, 34.0, 520.0, 1400.0),
-            PagePoint { x: 12.0, y: 34.0 }
+            map_cursor(200.0, 100.0, 400.0, 900.0),
+            PagePoint { x: 640.0, y: 320.0 }
         );
+        // A cursor past the edge clamps into the CSS viewport, never outside it.
         assert_eq!(
-            map_cursor(600.0, -5.0, 520.0, 1400.0),
-            PagePoint { x: 520.0, y: 0.0 }
+            map_cursor(500.0, -5.0, 400.0, 900.0),
+            PagePoint { x: 1280.0, y: 0.0 }
+        );
+        // At or above the threshold the mapping is 1:1.
+        assert_eq!(
+            map_cursor(12.0, 34.0, 1400.0, 900.0),
+            PagePoint { x: 12.0, y: 34.0 }
         );
     }
 
