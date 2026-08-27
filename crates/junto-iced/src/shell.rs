@@ -15,6 +15,16 @@ pub enum BottomView {
     Sessions,
 }
 
+/// Which surface the right blade shows. Persisted like the other blade state
+/// so the choice survives a restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RightView {
+    #[default]
+    Lineage,
+    Browser,
+}
+
 /// A blade width in logical pixels, clamped to a range that keeps both the
 /// blade and the center usable. Deserialization clamps too, so a hand-edited
 /// or corrupt state file cannot strand a blade.
@@ -93,6 +103,11 @@ pub struct ShellState {
     pub right_width: BladeWidth,
     /// Which panel the bottom drawer is showing; `None` when it is closed.
     pub bottom: Option<BottomView>,
+    /// Which surface the right blade shows.
+    pub right_view: RightView,
+    /// The browser view's last-visited URL, so it reopens where you left off.
+    /// `None` until the first navigation.
+    pub browser_url: Option<String>,
 }
 
 impl Default for ShellState {
@@ -110,6 +125,8 @@ impl Default for ShellState {
             left_width: BladeWidth::new(BladeWidth::LEFT_DEFAULT),
             right_width: BladeWidth::new(BladeWidth::RIGHT_DEFAULT),
             bottom: None,
+            right_view: RightView::Lineage,
+            browser_url: None,
         }
     }
 }
@@ -249,7 +266,7 @@ mod clamp_tests {
 
 #[cfg(test)]
 mod persistence_tests {
-    use super::{BladeWidth, ShellState, load, save};
+    use super::{BladeWidth, RightView, ShellState, load, save};
 
     /// A unique temp path per test — these run in parallel, so a shared
     /// filename would make them flaky.
@@ -371,5 +388,24 @@ mod persistence_tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn right_view_and_browser_url_round_trip() {
+        let mut state = ShellState::default();
+        assert_eq!(state.right_view, RightView::Lineage);
+        state.right_view = RightView::Browser;
+        state.browser_url = Some("https://example.com".to_owned());
+        let toml = toml::to_string_pretty(&state).expect("serialize");
+        let back: ShellState = toml::from_str(&toml).expect("deserialize");
+        assert_eq!(back, state);
+    }
+
+    #[test]
+    fn an_old_file_without_right_view_defaults_to_lineage() {
+        // A ui.toml written before the browser view must still load.
+        let back: ShellState = toml::from_str("left_collapsed = false").expect("partial");
+        assert_eq!(back.right_view, RightView::Lineage);
+        assert_eq!(back.browser_url, None);
     }
 }

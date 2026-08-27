@@ -298,13 +298,21 @@ mod key_tests {
 
     #[test]
     fn a_named_key_carries_its_virtual_key_code_on_both_phases() {
-        let down = key_event(&Key::Named(NamedKey::Enter), KeyPhase::Down, Modifiers::default())
-            .expect("down");
+        let down = key_event(
+            &Key::Named(NamedKey::Enter),
+            KeyPhase::Down,
+            Modifiers::default(),
+        )
+        .expect("down");
         assert_eq!(down.kind, "keyDown");
         assert_eq!(down.key, "Enter");
         assert_eq!(down.windows_virtual_key_code, 13);
-        let up =
-            key_event(&Key::Named(NamedKey::Enter), KeyPhase::Up, Modifiers::default()).expect("up");
+        let up = key_event(
+            &Key::Named(NamedKey::Enter),
+            KeyPhase::Up,
+            Modifiers::default(),
+        )
+        .expect("up");
         assert_eq!(up.kind, "keyUp");
     }
 
