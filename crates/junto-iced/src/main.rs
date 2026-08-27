@@ -11270,6 +11270,44 @@ diff --git a/lib.rs b/lib.rs
              blade collapsed to its edge tab, got {outer:?}"
         );
     }
+
+    /// The browser view shows a URL bar; the lineage view does not — the two
+    /// right-blade surfaces are mutually exclusive.
+    #[test]
+    fn the_browser_view_shows_a_url_bar_and_lineage_does_not() {
+        let (mut app, _) = App::new();
+        app.shell = shell::ShellState::default();
+
+        app.shell.right_view = shell::RightView::Browser;
+        {
+            let mut browser = iced_test::simulator(app.view());
+            browser
+                .find(iced::widget::Id::new("browser-url"))
+                .expect("the browser view must show the URL bar");
+        }
+
+        app.shell.right_view = shell::RightView::Lineage;
+        let mut lineage = iced_test::simulator(app.view());
+        assert!(
+            lineage.find(iced::widget::Id::new("browser-url")).is_err(),
+            "the lineage view must not show a URL bar"
+        );
+    }
+
+    /// The no-browser error state replaces the frame and its URL bar.
+    #[test]
+    fn the_error_state_replaces_the_browser_frame() {
+        let (mut app, _) = App::new();
+        app.shell = shell::ShellState::default();
+        app.shell.right_view = shell::RightView::Browser;
+        app.browser_error = Some("No Chromium-based browser found.".to_owned());
+
+        let mut ui = iced_test::simulator(app.view());
+        assert!(
+            ui.find(iced::widget::Id::new("browser-url")).is_err(),
+            "the error state must hide the URL bar"
+        );
+    }
 }
 
 #[cfg(test)]
