@@ -9,6 +9,7 @@
 //! to resize, drag a pane's title bar to reorder. The point is to feel whether
 //! native (Iced) beats the webview as the desktop power-surface.
 
+mod browser;
 mod cdp;
 mod pointing;
 mod popover;
