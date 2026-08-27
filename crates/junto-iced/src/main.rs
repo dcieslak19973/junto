@@ -10,6 +10,7 @@
 //! native (Iced) beats the webview as the desktop power-surface.
 
 mod browser;
+mod browser_surface;
 mod cdp;
 mod pointing;
 mod popover;
@@ -261,7 +262,7 @@ struct App {
     /// The newest screencast frame, decoded once into an image handle. Only one
     /// is kept — the stream is change-driven; a backlog would only render as
     /// staleness.
-    browser_frame: Option<iced::widget::image::Handle>,
+    browser_frame: Option<browser_surface::FrameData>,
     /// The current page's navigation state (url + back/forward + loading).
     browser_nav: browser::NavState,
     /// The URL-bar text — mirrors the page location, editable while typing.
@@ -2374,10 +2375,14 @@ impl App {
                 height,
                 pixels,
             } => {
-                // Already-decoded RGBA — the render thread just uploads it.
-                self.browser_frame = Some(iced::widget::image::Handle::from_rgba(
-                    width, height, pixels,
-                ));
+                // Already-decoded RGBA — handed to the shader as a shared buffer
+                // and uploaded into a persistent GPU texture (no per-frame atlas
+                // churn, which is what strobed).
+                self.browser_frame = Some(browser_surface::FrameData {
+                    width,
+                    height,
+                    pixels: pixels.into(),
+                });
                 Task::none()
             }
             Message::BrowserNav(nav) => {
@@ -5123,13 +5128,14 @@ fn browser_pane(app: &App) -> Element<'_, Message> {
     // beforehand so the widget still occupies — and therefore reports the size
     // of — the blade, which is what drives the first paint.
     let surface_content: Element<Message> = match &app.browser_frame {
-        Some(handle) => iced::widget::image(handle.clone())
-            .width(Fill)
-            .height(Fill)
-            // The frame is blade-shaped (emulated viewport == widget), so `Fill`
-            // neither stretches nor letterboxes — it maps 1:1.
-            .content_fit(iced::ContentFit::Fill)
-            .into(),
+        // Blit the frame from a persistent GPU texture (see `browser_surface`);
+        // the image widget's per-frame texture churn is what strobed.
+        Some(frame) => iced::widget::shader(browser_surface::BrowserProgram {
+            frame: frame.clone(),
+        })
+        .width(Fill)
+        .height(Fill)
+        .into(),
         None => container(text("starting browser…").size(TEXT_META).color(MUTED))
             .center(Length::Fill)
             .style(|_theme| container::Style {
