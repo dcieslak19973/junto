@@ -9496,8 +9496,11 @@ fn no_chromium_message() -> String {
 /// scrolling janky — so the longer side is capped. The frame is displayed
 /// scaled into the blade anyway, so the cap costs only fine detail, not layout.
 fn screencast_max(viewport: browser::ViewportSize, scale: f32) -> (u32, u32) {
-    /// Longest captured edge, in device pixels — a responsiveness/detail dial.
-    const CAP: f32 = 1600.0;
+    /// Longest captured edge, in device pixels. High enough that normal widths
+    /// capture the full framebuffer (supersampled → crisp text); it only bounds
+    /// the pathological tall/narrow `fit_width` case so a frame can't balloon to
+    /// many megapixels and stall decode.
+    const CAP: f32 = 2560.0;
     let width = viewport.width as f32 * scale;
     let height = viewport.height as f32 * scale;
     let longest = width.max(height).max(1.0);

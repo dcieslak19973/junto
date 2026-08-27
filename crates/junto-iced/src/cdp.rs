@@ -277,14 +277,17 @@ pub fn enable_request(id: u64) -> String {
 }
 
 /// The JSON for `Page.startScreencast`. `everyNthFrame: 1` asks for all of
-/// them; quality is the latency/fidelity dial.
+/// them. Quality 95 (matching wmux's `cef_embedded.mjs`): JPEG at 95 is nearly
+/// PNG-crisp on text but far smaller, so frame rate holds — wmux tried PNG and
+/// chose 95 deliberately. Crispness otherwise comes from capturing at the
+/// blade's device resolution (`screencast_max`), not from the codec.
 pub fn start_screencast_request(id: u64, max_width: u32, max_height: u32) -> String {
     serde_json::json!({
         "id": id,
         "method": "Page.startScreencast",
         "params": {
             "format": "jpeg",
-            "quality": 70,
+            "quality": 95,
             "maxWidth": max_width,
             "maxHeight": max_height,
             "everyNthFrame": 1,
