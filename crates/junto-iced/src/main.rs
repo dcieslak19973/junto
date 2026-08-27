@@ -1535,8 +1535,12 @@ enum Message {
     SelectRightView(shell::RightView),
     /// The browser driver handed over its command channel.
     BrowserReady(mpsc::Sender<cdp::Command>),
-    /// A decoded screencast frame (JPEG bytes).
-    BrowserFrame(Vec<u8>),
+    /// A screencast frame, already decoded to RGBA off the UI thread.
+    BrowserFrame {
+        width: u32,
+        height: u32,
+        pixels: Vec<u8>,
+    },
     /// The page's navigation state changed.
     BrowserNav(browser::NavState),
     /// The driver failed or found no Chromium installed.
@@ -2365,8 +2369,15 @@ impl App {
                 self.sync_browser_viewport();
                 Task::none()
             }
-            Message::BrowserFrame(jpeg) => {
-                self.browser_frame = Some(iced::widget::image::Handle::from_bytes(jpeg));
+            Message::BrowserFrame {
+                width,
+                height,
+                pixels,
+            } => {
+                // Already-decoded RGBA — the render thread just uploads it.
+                self.browser_frame = Some(iced::widget::image::Handle::from_rgba(
+                    width, height, pixels,
+                ));
                 Task::none()
             }
             Message::BrowserNav(nav) => {
@@ -9410,7 +9421,27 @@ fn browser_stream() -> impl iced::futures::Stream<Item = Message> {
                     match wire {
                         Some(Ok(tungstenite::Message::Text(text))) => {
                             if let Some((frame, session_id)) = cdp::parse_screencast_frame(&text) {
-                                if output.send(Message::BrowserFrame(frame.jpeg)).await.is_err() {
+                                // Decode the JPEG on a blocking worker, not the
+                                // render thread — decoding each frame inline in
+                                // the UI was the scroll/frame-rate jank. The UI
+                                // then only uploads ready pixels.
+                                let decoded = tokio::task::spawn_blocking(move || {
+                                    image::load_from_memory(&frame.jpeg).ok().map(|img| {
+                                        let rgba = img.to_rgba8();
+                                        (rgba.width(), rgba.height(), rgba.into_raw())
+                                    })
+                                })
+                                .await;
+                                if let Ok(Some((width, height, pixels))) = decoded
+                                    && output
+                                        .send(Message::BrowserFrame {
+                                            width,
+                                            height,
+                                            pixels,
+                                        })
+                                        .await
+                                        .is_err()
+                                {
                                     return;
                                 }
                                 // Ack is mandatory flow control — skip it and
@@ -9453,13 +9484,21 @@ fn no_chromium_message() -> String {
         .to_owned()
 }
 
-/// The screencast's max frame dimensions in device pixels: the emulated CSS
-/// viewport times the device scale factor, so a HiDPI frame is captured at full
-/// resolution rather than downscaled by the `maxWidth`/`maxHeight` cap.
+/// The screencast's max frame dimensions in device pixels. It would be the
+/// emulated viewport times the scale factor, but a `fit_width` viewport can be
+/// large and tall, and a multi-megapixel frame per repaint is what makes
+/// scrolling janky — so the longer side is capped. The frame is displayed
+/// scaled into the blade anyway, so the cap costs only fine detail, not layout.
 fn screencast_max(viewport: browser::ViewportSize, scale: f32) -> (u32, u32) {
+    /// Longest captured edge, in device pixels — a responsiveness/detail dial.
+    const CAP: f32 = 1600.0;
+    let width = viewport.width as f32 * scale;
+    let height = viewport.height as f32 * scale;
+    let longest = width.max(height).max(1.0);
+    let shrink = (CAP / longest).min(1.0);
     (
-        (viewport.width as f32 * scale).ceil() as u32,
-        (viewport.height as f32 * scale).ceil() as u32,
+        ((width * shrink).ceil() as u32).max(1),
+        ((height * shrink).ceil() as u32).max(1),
     )
 }
 

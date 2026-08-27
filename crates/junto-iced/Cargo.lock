@@ -2534,6 +2534,7 @@ dependencies = [
  "base64",
  "iced",
  "iced_test",
+ "image",
  "junto-kernel",
  "junto-live",
  "open",
