@@ -2531,6 +2531,7 @@ dependencies = [
 name = "junto-iced"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "iced",
  "iced_test",
  "junto-kernel",

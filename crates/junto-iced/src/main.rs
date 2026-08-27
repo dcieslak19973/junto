@@ -9,6 +9,7 @@
 //! to resize, drag a pane's title bar to reorder. The point is to feel whether
 //! native (Iced) beats the webview as the desktop power-surface.
 
+mod cdp;
 mod pointing;
 mod popover;
 mod shell;
@@ -252,6 +253,22 @@ struct App {
     /// `ShellState`, since a half-finished gesture is not layout worth
     /// saving.
     blade_drag: Option<BladeDrag>,
+    /// SPIKE (browser blade): whether the right blade is showing the browser
+    /// instead of the lineage rail. Deliberately NOT in `ShellState` — a spike
+    /// must not write itself into the persisted layout other builds read.
+    browser_on: bool,
+    /// SPIKE: the newest screencast frame, already decoded into an image
+    /// handle. One frame is all that is kept — the stream is change-driven and
+    /// a backlog would only ever render as staleness.
+    browser_frame: Option<iced::widget::image::Handle>,
+    /// SPIKE: frames seen, so the on-screen overlay can prove the stream is
+    /// live rather than a single stuck paint.
+    browser_frames_seen: u64,
+    /// SPIKE: the size Chromium rendered the newest frame at. Shown on screen
+    /// because it is the crux of a real implementation: the capture must be
+    /// sized to the blade's PHYSICAL pixels, and this machine's window is
+    /// 2474x1884 at 150% scale while the spike asks for a fixed 1200x900.
+    browser_frame_size: (f32, f32),
     /// The keyboard modifiers currently held, kept live by an unconditional
     /// `iced::event::listen_with` subscription (`App::subscription`) rather
     /// than the command/control-gated `keys` one, since a shift-click on a
@@ -1495,6 +1512,12 @@ enum Message {
     ToggleLeftBlade,
     /// Collapse or expand the right blade.
     ToggleRightBlade,
+    /// SPIKE (browser blade): swap the right blade between lineage and browser.
+    ToggleBrowser,
+    /// SPIKE: a decoded screencast frame arrived from Chromium — JPEG bytes
+    /// plus the size Chromium actually rendered at, which is NOT the blade's
+    /// size and (on a scaled display) not its logical size either.
+    BrowserFrame(Vec<u8>, f32, f32),
     /// Press a footer trigger chip: toggle that floating panel open/closed.
     BottomViewToggled(shell::BottomView),
     /// Press a blade-width divider handle: begin a resize drag.
@@ -1782,6 +1805,12 @@ impl App {
             device_key_fingerprint: None,
             shell: shell::load(&shell_state_path()),
             blade_drag: None,
+            // SPIKE: starts ON so the probe is visible without hunting for a
+            // toggle. The real feature would default OFF and spawn lazily.
+            browser_on: true,
+            browser_frame: None,
+            browser_frames_seen: 0,
+            browser_frame_size: (0.0, 0.0),
             modifiers: iced::keyboard::Modifiers::empty(),
             pending: None,
         };
@@ -2236,6 +2265,23 @@ impl App {
             Message::ToggleRightBlade => {
                 self.shell.toggle_right();
                 self.persist_shell();
+                Task::none()
+            }
+            Message::ToggleBrowser => {
+                self.browser_on = !self.browser_on;
+                // Drop the last frame on the way out so re-opening cannot show
+                // a stale paint from the previous session before the first new
+                // frame lands.
+                if !self.browser_on {
+                    self.browser_frame = None;
+                    self.browser_frames_seen = 0;
+                }
+                Task::none()
+            }
+            Message::BrowserFrame(jpeg, w, h) => {
+                self.browser_frames_seen += 1;
+                self.browser_frame_size = (w, h);
+                self.browser_frame = Some(iced::widget::image::Handle::from_bytes(jpeg));
                 Task::none()
             }
             Message::BladeDragStart(side) => {
@@ -3909,12 +3955,22 @@ impl App {
             }
             _ => None,
         });
+        // SPIKE (browser blade): live only while the browser view is showing,
+        // so no Chromium is spawned — and nothing is paid — until asked for.
+        // The `"browser-spike"` id keeps this ONE subscription across redraws;
+        // a changing id would respawn the browser on every frame.
+        let browser_sub = self.browser_on.then(|| {
+            iced::Subscription::run_with("browser-spike", |_: &&str| {
+                browser_stream("https://example.com".to_owned())
+            })
+        });
         iced::Subscription::batch(
             streams
                 .into_iter()
                 .chain([tick, keys, modifiers_sub])
                 .chain(countdown_tick)
-                .chain(blade_drag_sub),
+                .chain(blade_drag_sub)
+                .chain(browser_sub),
         )
     }
 
@@ -4760,7 +4816,52 @@ fn left_blade(app: &App) -> Element<'_, Message> {
 /// between — `lineage_view` carries its own collapsible header, so this
 /// adds none of its own.
 fn right_blade(app: &App) -> Element<'_, Message> {
-    let content = container(lineage_view(app)).height(Fill);
+    // SPIKE (browser blade): the blade swaps between the lineage rail and a
+    // live browser frame. The point of rendering it HERE, rather than in a
+    // window of its own, is to prove the frame is an ordinary Iced widget —
+    // clipped by the blade and composited UNDER the popovers and drawers, which
+    // is exactly what an overlaid platform webview could never do.
+    let content: Element<Message> = if app.browser_on {
+        let body: Element<Message> = match &app.browser_frame {
+            Some(handle) => iced::widget::image(handle.clone())
+                .width(Fill)
+                .height(Fill)
+                // `Contain` letterboxes; the frame is now blade-shaped, so it
+                // should occupy the blade the way a page occupies a window.
+                .content_fit(iced::ContentFit::Contain)
+                .into(),
+            None => text("starting browser…")
+                .size(TEXT_META)
+                .color(MUTED)
+                .into(),
+        };
+        container(
+            column![
+                text(format!(
+                    "SPIKE · browser · {} frames",
+                    app.browser_frames_seen
+                ))
+                .size(TEXT_META)
+                .color(MUTED),
+                body,
+            ]
+            .spacing(SP),
+        )
+        .height(Fill)
+        .into()
+    } else {
+        container(lineage_view(app)).height(Fill).into()
+    };
+    let swap = icon_button(
+        ICON_CHEVRON_RIGHT,
+        if app.browser_on {
+            "show lineage"
+        } else {
+            "show browser (spike)"
+        },
+        tooltip::Position::Top,
+        Message::ToggleBrowser,
+    );
     let toggle = container(icon_button(
         ICON_CHEVRON_RIGHT,
         "close lineage · ctrl+r",
@@ -4768,7 +4869,7 @@ fn right_blade(app: &App) -> Element<'_, Message> {
         Message::ToggleRightBlade,
     ))
     .id(iced::widget::Id::new("right-blade-toggle"));
-    let footer = row![Space::new().width(Fill), toggle];
+    let footer = row![swap, Space::new().width(Fill), toggle];
     container(column![content, footer].spacing(SP))
         .padding(SP)
         .width(Fill)
@@ -8885,6 +8986,84 @@ fn fetch_channels() -> Task<Message> {
 
 /// A long-lived SSE subscription streaming a session's live feed from the host
 /// (`/channels/{channel}/sessions/{session}/stream`) into `Message::Live`.
+/// SPIKE (browser blade) — spawn a Chromium, stream its screencast, and emit
+/// one `Message::BrowserFrame` per repaint.
+///
+/// Modelled on `session_stream` below: same `iced::stream::channel` shape, so
+/// the app sees a browser exactly as it sees any other live source. The browser
+/// process is owned by this stream and dies with it (`cdp::Chromium`'s `Drop`),
+/// which is what keeps a spike from leaking browsers across toggles.
+///
+/// Measured on this machine: first frame ~200ms, then ~60fps at ~11KB/frame on
+/// an animating page. The stream is CHANGE-DRIVEN — a static page pays nothing
+/// after its first paint, so an idle blade costs no CPU.
+fn browser_stream(url: String) -> impl iced::futures::Stream<Item = Message> {
+    use iced::futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite;
+
+    iced::stream::channel::<Message>(4, move |mut output: mpsc::Sender<Message>| async move {
+        let Some(exe) = cdp::find_chromium() else {
+            return;
+        };
+        // Held for the whole stream: dropping it kills the browser.
+        // Blade-shaped, NOT desktop-shaped. This is the whole "it looked funky"
+        // fix: Chromium lays the page out at its window size, so a 1200x900
+        // viewport shrunk into a ~520px blade renders a desktop page at ~40%
+        // scale — unreadable text in a letterboxed strip. Giving it the blade's
+        // own proportions makes the page lay out narrow, the way a phone or a
+        // side panel does, and the frame then fills the blade instead of
+        // floating in it. A real implementation reads the blade's live width
+        // (and the display's scale factor) instead of these constants.
+        let Ok(browser) = cdp::spawn(&exe, &url, 520, 1400) else {
+            return;
+        };
+        let Ok(ws_url) = cdp::page_websocket_url(browser.port).await else {
+            return;
+        };
+        let Ok((mut socket, _)) = tokio_tungstenite::connect_async(&ws_url).await else {
+            return;
+        };
+        for req in [
+            r#"{"id":1,"method":"Page.enable"}"#.to_owned(),
+            cdp::start_screencast_request(2, 520, 1400),
+        ] {
+            if socket
+                .send(tungstenite::Message::Text(req.into()))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+
+        let mut next_id = 100u64;
+        while let Some(Ok(msg)) = socket.next().await {
+            let tungstenite::Message::Text(text) = msg else {
+                continue;
+            };
+            let Some((frame, session_id)) = cdp::parse_screencast_frame(&text) else {
+                continue;
+            };
+            let msg = Message::BrowserFrame(frame.jpeg, frame.device_width, frame.device_height);
+            if output.send(msg).await.is_err() {
+                return; // the app dropped the receiver — stop and kill the browser
+            }
+            // Chromium throttles the stream to the acks it receives: skip this
+            // and the stream stops after one frame, looking like a dead pipe
+            // rather than backpressure doing its job.
+            let ack = cdp::frame_ack_request(next_id, session_id);
+            if socket
+                .send(tungstenite::Message::Text(ack.into()))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            next_id += 1;
+        }
+    })
+}
+
 fn session_stream(channel: String, session: String) -> impl iced::futures::Stream<Item = Message> {
     use iced::futures::{SinkExt, StreamExt};
     iced::stream::channel::<Message>(64, move |mut output: mpsc::Sender<Message>| async move {

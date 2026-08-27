@@ -40,6 +40,10 @@ tokio = { version = "1", default-features = false, features = ["time", "macros"]
 junto-kernel = { path = "../junto-kernel" }
 junto-live = { path = "../junto-live" }
 toml = "0.9"
+# SPIKE ONLY (browser blade): CDP `Page.screencastFrame` delivers each frame as
+# a base64 JPEG. Already in the lock file transitively at this version, so
+# naming it directly moves no resolution.
+base64 = "0.22"
 
 [workspace]
 
