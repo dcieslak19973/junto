@@ -9,8 +9,12 @@
 //! to resize, drag a pane's title bar to reorder. The point is to feel whether
 //! native (Iced) beats the webview as the desktop power-surface.
 
+mod browser;
+mod browser_surface;
+mod cdp;
 mod pointing;
 mod popover;
+mod screencast;
 mod shell;
 
 use std::collections::{HashMap, HashSet};
@@ -252,6 +256,35 @@ struct App {
     /// `ShellState`, since a half-finished gesture is not layout worth
     /// saving.
     blade_drag: Option<BladeDrag>,
+    /// The control end of the running browser driver — `None` until the driver
+    /// sends `BrowserReady`, and after the browser exits.
+    browser_cmd: Option<mpsc::Sender<cdp::Command>>,
+    /// The newest screencast frame, decoded once into an image handle. Only one
+    /// is kept — the stream is change-driven; a backlog would only render as
+    /// staleness.
+    browser_frame: Option<browser_surface::FrameData>,
+    /// The current page's navigation state (url + back/forward + loading).
+    browser_nav: browser::NavState,
+    /// The URL-bar text — mirrors the page location, editable while typing.
+    browser_url_input: String,
+    /// A driver-reported error (no Chromium, spawn/connect failure, or exit);
+    /// shown in place of the frame.
+    browser_error: Option<String>,
+    /// The display scale factor; the frame renders at `logical × scale`
+    /// physical pixels so text stays crisp on a HiDPI display.
+    browser_scale: f32,
+    /// The browser widget's last reported logical size, paired with the scale
+    /// factor to size the emulated viewport.
+    browser_logical: Option<Size>,
+    /// Latched true the first time the Browser view is opened; keeps the driver
+    /// subscription alive across view switches (Orca's tab persistence) so the
+    /// page survives a peek at lineage. Cleared only when the browser exits.
+    browser_ever_opened: bool,
+    /// Salts the driver subscription id so a crashed/closed browser respawns as
+    /// a fresh stream rather than a dead one.
+    browser_generation: u64,
+    /// The main window id, for querying the scale factor.
+    window_id: Option<iced::window::Id>,
     /// The keyboard modifiers currently held, kept live by an unconditional
     /// `iced::event::listen_with` subscription (`App::subscription`) rather
     /// than the command/control-gated `keys` one, since a shift-click on a
@@ -1495,6 +1528,46 @@ enum Message {
     ToggleLeftBlade,
     /// Collapse or expand the right blade.
     ToggleRightBlade,
+    /// The window's scale factor arrived (startup or after a resize).
+    WindowScale(iced::window::Id, f32),
+    /// The window was resized — re-query the scale factor.
+    WindowResized(iced::window::Id),
+    /// Switch the right blade between lineage and browser (persisted).
+    SelectRightView(shell::RightView),
+    /// The browser driver handed over its command channel.
+    BrowserReady(mpsc::Sender<cdp::Command>),
+    /// A screencast frame, already decoded to RGBA off the UI thread.
+    BrowserFrame {
+        width: u32,
+        height: u32,
+        pixels: Vec<u8>,
+    },
+    /// The page's navigation state changed.
+    BrowserNav(browser::NavState),
+    /// The driver failed or found no Chromium installed.
+    BrowserError(String),
+    /// The browser process or socket ended.
+    BrowserClosed,
+    /// Re-open the browser after an exit or error.
+    BrowserReopen,
+    /// Edit the URL-bar text.
+    BrowserUrlInput(String),
+    /// Submit the URL bar (Enter or the Go button).
+    BrowserNavigate,
+    /// Go back in history.
+    BrowserBack,
+    /// Go forward in history.
+    BrowserForward,
+    /// Reload the current page.
+    BrowserReload,
+    /// The browser widget's region was laid out at this logical size.
+    BrowserResized(Size),
+    /// Mouse input from the browser widget, in page coordinates.
+    BrowserMouse(cdp::MouseKind, browser::PagePoint, cdp::MouseButton),
+    /// Wheel input from the browser widget, in page coordinates.
+    BrowserScroll(browser::PagePoint, f32, f32),
+    /// Keyboard input from the browser widget while the page is focused.
+    BrowserKey(browser::Key, browser::KeyPhase, browser::Modifiers),
     /// Press a footer trigger chip: toggle that floating panel open/closed.
     BottomViewToggled(shell::BottomView),
     /// Press a blade-width divider handle: begin a resize drag.
@@ -1745,6 +1818,12 @@ enum Message {
 impl App {
     fn new() -> (Self, Task<Message>) {
         let (panes, first) = pane_grid::State::new(Pane::loading("junto-dev"));
+        let shell = shell::load(&shell_state_path());
+        // Read the browser view's persisted choices before `shell` is moved
+        // into the struct: reopen where you left off, and keep the driver
+        // subscription latched on if the browser was the last surface shown.
+        let browser_url_input = shell.browser_url.clone().unwrap_or_default();
+        let browser_ever_opened = matches!(shell.right_view, shell::RightView::Browser);
         let app = App {
             panes,
             focus: Some(first),
@@ -1780,8 +1859,18 @@ impl App {
             join_error: None,
             join_result: None,
             device_key_fingerprint: None,
-            shell: shell::load(&shell_state_path()),
+            shell,
             blade_drag: None,
+            browser_cmd: None,
+            browser_frame: None,
+            browser_nav: browser::NavState::default(),
+            browser_url_input,
+            browser_error: None,
+            browser_scale: 1.0,
+            browser_logical: None,
+            browser_ever_opened,
+            browser_generation: 0,
+            window_id: None,
             modifiers: iced::keyboard::Modifiers::empty(),
             pending: None,
         };
@@ -1796,6 +1885,9 @@ impl App {
                 fetch_workspaces(),
                 fetch_substrates(),
                 fetch_settings(),
+                iced::window::latest().and_then(|id| {
+                    iced::window::scale_factor(id).map(move |s| Message::WindowScale(id, s))
+                }),
             ]),
         )
     }
@@ -2236,6 +2328,147 @@ impl App {
             Message::ToggleRightBlade => {
                 self.shell.toggle_right();
                 self.persist_shell();
+                Task::none()
+            }
+            Message::WindowScale(id, s) => {
+                self.window_id = Some(id);
+                self.browser_scale = s;
+                self.sync_browser_viewport();
+                Task::none()
+            }
+            Message::WindowResized(id) => {
+                // Re-learn the scale factor: moving the window to a display with
+                // a different scale changes the physical pixels a frame needs.
+                iced::window::scale_factor(id).map(move |s| Message::WindowScale(id, s))
+            }
+            Message::SelectRightView(view) => {
+                self.shell.right_view = view;
+                self.persist_shell();
+                match view {
+                    shell::RightView::Browser => {
+                        self.browser_ever_opened = true;
+                        self.browser_error = None;
+                        // Resume painting if the browser is live; if it is not
+                        // yet, the latch above spawns it via the subscription.
+                        self.send_browser(cdp::Command::Show);
+                    }
+                    shell::RightView::Lineage => self.send_browser(cdp::Command::Hide),
+                }
+                Task::none()
+            }
+            Message::BrowserReady(tx) => {
+                self.browser_cmd = Some(tx);
+                // Reopen where we left off, start painting, and size the
+                // viewport once the widget has reported its logical size.
+                let url = self
+                    .shell
+                    .browser_url
+                    .clone()
+                    .unwrap_or_else(|| "about:blank".to_owned());
+                self.send_browser(cdp::Command::Navigate(url));
+                self.send_browser(cdp::Command::Show);
+                self.sync_browser_viewport();
+                Task::none()
+            }
+            Message::BrowserFrame {
+                width,
+                height,
+                pixels,
+            } => {
+                // Already-decoded RGBA — handed to the shader as a shared buffer
+                // and uploaded into a persistent GPU texture (no per-frame atlas
+                // churn, which is what strobed).
+                self.browser_frame = Some(browser_surface::FrameData {
+                    width,
+                    height,
+                    pixels: pixels.into(),
+                });
+                Task::none()
+            }
+            Message::BrowserNav(nav) => {
+                self.browser_url_input = nav.url.clone();
+                self.shell.browser_url = Some(nav.url.clone());
+                self.browser_nav = nav;
+                // Persist so the URL survives a quit even without a later view
+                // toggle; navigations are user-paced, so this is not chatty.
+                self.persist_shell();
+                Task::none()
+            }
+            Message::BrowserError(message) => {
+                self.browser_error = Some(message);
+                Task::none()
+            }
+            Message::BrowserClosed => {
+                // The driver ended: drop the dead control channel, bump the
+                // generation so re-opening starts a fresh stream instance, and
+                // surface a reopen affordance.
+                self.browser_cmd = None;
+                self.browser_frame = None;
+                self.browser_generation += 1;
+                self.browser_ever_opened = false;
+                self.browser_error =
+                    Some("The browser exited. Reopen to start it again.".to_owned());
+                Task::none()
+            }
+            Message::BrowserReopen => {
+                self.browser_error = None;
+                // Bump the generation so the subscription restarts even after a
+                // no-Chromium error, where the ended stream kept the same id.
+                self.browser_generation += 1;
+                self.browser_ever_opened = true;
+                Task::none()
+            }
+            Message::BrowserUrlInput(text) => {
+                self.browser_url_input = text;
+                Task::none()
+            }
+            Message::BrowserNavigate => {
+                if let Some(url) = browser::normalize_url(&self.browser_url_input) {
+                    self.send_browser(cdp::Command::Navigate(url));
+                }
+                Task::none()
+            }
+            Message::BrowserBack => {
+                self.send_browser(cdp::Command::Back);
+                Task::none()
+            }
+            Message::BrowserForward => {
+                self.send_browser(cdp::Command::Forward);
+                Task::none()
+            }
+            Message::BrowserReload => {
+                self.send_browser(cdp::Command::Reload);
+                Task::none()
+            }
+            Message::BrowserResized(size) => {
+                self.browser_logical = Some(size);
+                self.sync_browser_viewport();
+                Task::none()
+            }
+            Message::BrowserMouse(kind, at, button) => {
+                let modifiers = screencast::to_mods(self.modifiers).bits();
+                self.send_browser(cdp::Command::Mouse {
+                    kind,
+                    at,
+                    button,
+                    modifiers,
+                });
+                Task::none()
+            }
+            Message::BrowserScroll(at, dx, dy) => {
+                let modifiers = screencast::to_mods(self.modifiers).bits();
+                self.send_browser(cdp::Command::Scroll {
+                    at,
+                    dx,
+                    dy,
+                    modifiers,
+                });
+                Task::none()
+            }
+            Message::BrowserKey(key, phase, mods) => {
+                if let Some(event) = browser::key_event(&key, phase, mods) {
+                    self.send_browser(cdp::Command::Key(event));
+                }
                 Task::none()
             }
             Message::BladeDragStart(side) => {
@@ -3743,6 +3976,28 @@ impl App {
         let _ = shell::save(&shell_state_path(), &self.shell);
     }
 
+    /// Send a command to the running browser, if any. A dropped or closed
+    /// driver makes this a no-op — the view is already showing the exit state.
+    fn send_browser(&mut self, command: cdp::Command) {
+        if let Some(tx) = self.browser_cmd.as_mut() {
+            let _ = tx.try_send(command);
+        }
+    }
+
+    /// Push the emulated viewport to the browser once its logical size is
+    /// known. The viewport is `fit_width`-scaled — at least a desktop width so
+    /// real sites lay out as desktop, scaled down to fit a narrow blade — and
+    /// the display scale factor renders the frame at physical resolution.
+    fn sync_browser_viewport(&mut self) {
+        if let (Some(size), true) = (self.browser_logical, self.browser_cmd.is_some()) {
+            let viewport = browser::ViewportSize::fit_width(size.width, size.height);
+            self.send_browser(cdp::Command::SetViewport {
+                size: viewport,
+                scale: self.browser_scale,
+            });
+        }
+    }
+
     fn subscription(&self) -> iced::Subscription<Message> {
         // One live subscription per pane that is watching a session. The
         // authenticated websocket is preferred WHEREVER an identity to watch as
@@ -3909,12 +4164,30 @@ impl App {
             }
             _ => None,
         });
+        // Re-learn the scale factor whenever the window is resized — it may
+        // have moved to a display with a different scale.
+        let resize_sub = iced::event::listen_with(|event, _status, window| match event {
+            iced::Event::Window(iced::window::Event::Resized(_)) => {
+                Some(Message::WindowResized(window))
+            }
+            _ => None,
+        });
+        // The browser driver lives while the browser has ever been opened this
+        // session (Orca-style tab persistence): switching to lineage sends
+        // `Hide`, not a teardown. The subscription id is the generation only —
+        // navigations must not change identity (that would respawn the
+        // browser), but a crash-driven `BrowserClosed` bumps the generation so
+        // a reopen gets a fresh stream instance rather than a dead one.
+        let browser_sub = self.browser_ever_opened.then(|| {
+            iced::Subscription::run_with(self.browser_generation, |_: &u64| browser_stream())
+        });
         iced::Subscription::batch(
             streams
                 .into_iter()
-                .chain([tick, keys, modifiers_sub])
+                .chain([tick, keys, modifiers_sub, resize_sub])
                 .chain(countdown_tick)
-                .chain(blade_drag_sub),
+                .chain(blade_drag_sub)
+                .chain(browser_sub),
         )
     }
 
@@ -4747,33 +5020,164 @@ fn left_blade(app: &App) -> Element<'_, Message> {
         .into()
 }
 
-/// The right blade: the lineage DAG, with its own collapse toggle in a
-/// footer row pinned to the blade's bottom-right corner — mirrors
-/// `left_blade`'s bottom-left one. This used to switch between Artifacts
-/// and Lineage (`shell::RightView`); the design spec's §3 migration table
-/// still says artifacts "moved" here, but they never did — `artifact_row`
-/// read the exact same per-pane expansion cache (`Pane::artifacts`) that
-/// `entry_card`'s own artifact branch (`artifact_for`) already renders
-/// every artifact entry through, so the blade's copy was a second toggle
-/// over state the pane already showed, not a relocation. Deleting it loses
-/// no capability, and with only lineage left there is nothing to switch
-/// between — `lineage_view` carries its own collapsible header, so this
-/// adds none of its own.
+/// The right blade: a switch over `RightView` — the lineage DAG or the live
+/// browser — with its own collapse toggle pinned to the blade's bottom-right
+/// corner, mirroring `left_blade`'s. The browser renders HERE, as an ordinary
+/// Iced widget, rather than in a window of its own: it clips to the blade and
+/// composites UNDER the popovers and drawers, which an overlaid platform
+/// webview never could (finding `f463944e`).
 fn right_blade(app: &App) -> Element<'_, Message> {
-    let content = container(lineage_view(app)).height(Fill);
+    let content: Element<Message> = match app.shell.right_view {
+        shell::RightView::Lineage => container(lineage_view(app)).height(Fill).into(),
+        shell::RightView::Browser => container(browser_pane(app)).height(Fill).into(),
+    };
     let toggle = container(icon_button(
         ICON_CHEVRON_RIGHT,
-        "close lineage · ctrl+r",
+        "close · ctrl+r",
         tooltip::Position::Top,
         Message::ToggleRightBlade,
     ))
     .id(iced::widget::Id::new("right-blade-toggle"));
-    let footer = row![Space::new().width(Fill), toggle];
+    let footer = row![right_view_switch(app), Space::new().width(Fill), toggle];
     container(column![content, footer].spacing(SP))
         .padding(SP)
         .width(Fill)
         .height(Fill)
         .into()
+}
+
+/// The lineage/browser segmented control in the right blade's footer.
+fn right_view_switch(app: &App) -> Element<'_, Message> {
+    let tab = |label: &'static str, view: shell::RightView| {
+        let selected = app.shell.right_view == view;
+        button(text(label).size(TEXT_META))
+            .on_press(Message::SelectRightView(view))
+            .padding([SP_TIGHT, SP])
+            .style(move |_theme, status| segmented_style(selected, status))
+    };
+    row![
+        tab("lineage", shell::RightView::Lineage),
+        tab("browser", shell::RightView::Browser),
+    ]
+    .spacing(SP_TIGHT)
+    .into()
+}
+
+/// A segmented-control tab: filled + bordered when selected, ghost otherwise.
+fn segmented_style(selected: bool, status: button::Status) -> button::Style {
+    if selected {
+        button::Style {
+            background: Some(Background::Color(Color { a: 0.5, ..SURFACE })),
+            text_color: TEXT,
+            border: Border {
+                color: BORDER,
+                width: 1.0,
+                radius: 4.0.into(),
+            },
+            ..button::Style::default()
+        }
+    } else {
+        ghost_style(status)
+    }
+}
+
+/// A browser nav-bar icon button, disabled (and dimmed) when `message` is
+/// `None` — the back/forward controls are disabled at the ends of history.
+fn nav_button(codepoint: char, tip: &str, message: Option<Message>) -> Element<'_, Message> {
+    with_tip(
+        icon_button_raw(codepoint, message).style(|_theme, status| ghost_style(status)),
+        tip,
+        tooltip::Position::Bottom,
+    )
+}
+
+/// The browser view: a nav bar (back/forward/reload + URL) over the live frame,
+/// or — when the driver reported no browser — an error state in its place.
+fn browser_pane(app: &App) -> Element<'_, Message> {
+    if let Some(err) = &app.browser_error {
+        return browser_error_view(err);
+    }
+    let nav = row![
+        nav_button(
+            ICON_CHEVRON_LEFT,
+            "back",
+            app.browser_nav.can_back.then_some(Message::BrowserBack)
+        ),
+        nav_button(
+            ICON_CHEVRON_RIGHT,
+            "forward",
+            app.browser_nav
+                .can_forward
+                .then_some(Message::BrowserForward)
+        ),
+        nav_button(ICON_ROTATE_CW, "reload", Some(Message::BrowserReload)),
+        container(
+            text_input("enter a URL…", &app.browser_url_input)
+                .on_input(Message::BrowserUrlInput)
+                .on_submit(Message::BrowserNavigate)
+                .size(TEXT_BODY)
+                .width(Fill),
+        )
+        .id(iced::widget::Id::new("browser-url"))
+        .width(Fill),
+    ]
+    .spacing(SP_TIGHT)
+    .align_y(Center);
+
+    // The screencast content: the frame once it exists, or a plain background
+    // beforehand so the widget still occupies — and therefore reports the size
+    // of — the blade, which is what drives the first paint.
+    let surface_content: Element<Message> = match &app.browser_frame {
+        // Blit the frame from a persistent GPU texture (see `browser_surface`);
+        // the image widget's per-frame texture churn is what strobed.
+        Some(frame) => iced::widget::shader(browser_surface::BrowserProgram {
+            frame: frame.clone(),
+        })
+        .width(Fill)
+        .height(Fill)
+        .into(),
+        None => container(text("starting browser…").size(TEXT_META).color(MUTED))
+            .center(Length::Fill)
+            .style(|_theme| container::Style {
+                background: Some(Background::Color(SURFACE)),
+                ..container::Style::default()
+            })
+            .into(),
+    };
+    let surface = screencast::screencast(surface_content)
+        .on_resize(Message::BrowserResized)
+        .on_mouse(Message::BrowserMouse)
+        .on_scroll(Message::BrowserScroll)
+        .on_key(Message::BrowserKey);
+
+    column![nav, container(surface).height(Fill)]
+        .spacing(SP)
+        .into()
+}
+
+/// Shown in place of the frame when the driver found no Chromium or the browser
+/// exited: what went wrong, and a way to try again.
+fn browser_error_view(message: &str) -> Element<'_, Message> {
+    let heading = row![
+        icon(ICON_CIRCLE_ALERT).color(RED),
+        text("browser unavailable")
+            .size(TEXT_TITLE)
+            .font(semibold()),
+    ]
+    .spacing(SP)
+    .align_y(Center);
+    container(
+        column![
+            heading,
+            text(message).size(TEXT_BODY).color(MUTED),
+            button(text("reopen").size(TEXT_BODY))
+                .on_press(Message::BrowserReopen)
+                .style(|_theme, status| ghost_style(status)),
+        ]
+        .spacing(SP_LOOSE),
+    )
+    .padding(SP_LOOSE)
+    .into()
 }
 
 /// The whole lineage DAG as a vertical list, one row per channel,
@@ -8883,8 +9287,230 @@ fn fetch_channels() -> Task<Message> {
     )
 }
 
-/// A long-lived SSE subscription streaming a session's live feed from the host
-/// (`/channels/{channel}/sessions/{session}/stream`) into `Message::Live`.
+/// Drives an already-installed Chromium and multiplexes its DevTools socket:
+/// screencast frames out as `Message::BrowserFrame`, and app `cdp::Command`s in
+/// over the channel handed back via `Message::BrowserReady`. The browser is
+/// owned by this future — it is killed and its profile removed when the stream
+/// ends (`cdp::Chromium`'s `Drop`), so it can never be orphaned.
+///
+/// Measured (finding `f463944e`): first frame ~200ms, then ~60fps at ~11KB per
+/// frame on an animating page. The stream is CHANGE-DRIVEN — a static page pays
+/// nothing after its first paint, so an idle browser costs no CPU.
+fn browser_stream() -> impl iced::futures::Stream<Item = Message> {
+    use iced::futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite;
+
+    iced::stream::channel::<Message>(8, move |mut output: mpsc::Sender<Message>| async move {
+        let Some(exe) = cdp::find_chromium() else {
+            let _ = output
+                .send(Message::BrowserError(no_chromium_message()))
+                .await;
+            return;
+        };
+        // A sane launch size; the real layout viewport is set by SetViewport.
+        let initial = browser::ViewportSize {
+            width: 1024,
+            height: 768,
+        };
+        let browser = match cdp::spawn(&exe, "about:blank", initial) {
+            Ok(browser) => browser,
+            Err(e) => {
+                let _ = output.send(Message::BrowserError(e)).await;
+                return;
+            }
+        };
+        let ws_url = match cdp::page_websocket_url(browser.port).await {
+            Ok(url) => url,
+            Err(e) => {
+                let _ = output.send(Message::BrowserError(e)).await;
+                return;
+            }
+        };
+        let Ok((mut socket, _)) = tokio_tungstenite::connect_async(&ws_url).await else {
+            let _ = output
+                .send(Message::BrowserError(
+                    "failed to connect to the browser".to_owned(),
+                ))
+                .await;
+            return;
+        };
+
+        // The control channel: the app drives the browser through this.
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<cdp::Command>(32);
+        if output.send(Message::BrowserReady(cmd_tx)).await.is_err() {
+            return;
+        }
+
+        let mut next_id = 1u64;
+        let mut viewport = initial;
+        let mut device_scale = 1.0f32;
+        let mut screencasting = false;
+        let mut history: Option<cdp::NavHistory> = None;
+        let mut loading = false;
+
+        // One monotonic id per request. Ids only correlate replies we do not
+        // match by id anyway, so reuse would be harmless — but a counter keeps
+        // the wire legible. `return` on a send error ends the stream, which
+        // drops (and kills) the browser.
+        macro_rules! send {
+            ($build:expr) => {{
+                let id = next_id;
+                next_id += 1;
+                if socket
+                    .send(tungstenite::Message::Text($build(id).into()))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }};
+        }
+
+        send!(cdp::enable_request);
+
+        loop {
+            tokio::select! {
+                cmd = cmd_rx.next() => {
+                    let Some(cmd) = cmd else { return };
+                    match cmd {
+                        cdp::Command::Navigate(url) => send!(|id| cdp::navigate_request(id, &url)),
+                        cdp::Command::Reload => send!(cdp::reload_request),
+                        cdp::Command::Back => {
+                            if let Some(h) = &history
+                                && h.current_index > 0
+                                && let Some(entry) = h.entries.get((h.current_index - 1) as usize)
+                            {
+                                let entry_id = entry.id;
+                                send!(|id| cdp::navigate_to_history_request(id, entry_id));
+                            }
+                        }
+                        cdp::Command::Forward => {
+                            if let Some(h) = &history
+                                && let Some(entry) = h.entries.get((h.current_index + 1) as usize)
+                            {
+                                let entry_id = entry.id;
+                                send!(|id| cdp::navigate_to_history_request(id, entry_id));
+                            }
+                        }
+                        cdp::Command::Mouse { kind, at, button, modifiers } => {
+                            send!(|id| cdp::mouse_request(id, kind, at, button, modifiers));
+                        }
+                        cdp::Command::Scroll { at, dx, dy, modifiers } => {
+                            send!(|id| cdp::wheel_request(id, at, dx, dy, modifiers));
+                        }
+                        cdp::Command::Key(event) => send!(|id| cdp::key_request(id, &event)),
+                        cdp::Command::SetViewport { size, scale } => {
+                            viewport = size;
+                            device_scale = scale;
+                            // Re-applying metrics relayouts AND forces a frame —
+                            // the resize repaint trigger.
+                            send!(|id| cdp::set_device_metrics_request(id, size, scale));
+                            if screencasting {
+                                let (mw, mh) = screencast_max(viewport, device_scale);
+                                send!(|id| cdp::start_screencast_request(id, mw, mh));
+                            }
+                        }
+                        cdp::Command::Show => {
+                            screencasting = true;
+                            // (Re)starting the screencast forces one fresh frame
+                            // of the current page — the show/refocus trigger.
+                            let (mw, mh) = screencast_max(viewport, device_scale);
+                            send!(|id| cdp::start_screencast_request(id, mw, mh));
+                        }
+                        cdp::Command::Hide => {
+                            screencasting = false;
+                            send!(cdp::stop_screencast_request);
+                        }
+                    }
+                }
+                wire = socket.next() => {
+                    match wire {
+                        Some(Ok(tungstenite::Message::Text(text))) => {
+                            if let Some((frame, session_id)) = cdp::parse_screencast_frame(&text) {
+                                // Decode the JPEG on a blocking worker, not the
+                                // render thread — decoding each frame inline in
+                                // the UI was the scroll/frame-rate jank. The UI
+                                // then only uploads ready pixels.
+                                let decoded = tokio::task::spawn_blocking(move || {
+                                    image::load_from_memory(&frame.jpeg).ok().map(|img| {
+                                        let rgba = img.to_rgba8();
+                                        (rgba.width(), rgba.height(), rgba.into_raw())
+                                    })
+                                })
+                                .await;
+                                if let Ok(Some((width, height, pixels))) = decoded
+                                    && output
+                                        .send(Message::BrowserFrame {
+                                            width,
+                                            height,
+                                            pixels,
+                                        })
+                                        .await
+                                        .is_err()
+                                {
+                                    return;
+                                }
+                                // Ack is mandatory flow control — skip it and
+                                // Chromium sends one frame then goes quiet.
+                                send!(|id| cdp::frame_ack_request(id, session_id));
+                            } else if let Some(signal) = cdp::parse_page_signal(&text) {
+                                loading = matches!(signal, cdp::PageSignal::LoadingStarted);
+                                // Refresh history so url + back/forward stay current.
+                                send!(cdp::navigation_history_request);
+                            } else if let Some(h) = cdp::parse_navigation_history(&text) {
+                                let urls: Vec<String> =
+                                    h.entries.iter().map(|e| e.url.clone()).collect();
+                                let mut nav = browser::nav_from_history(h.current_index, &urls);
+                                nav.loading = loading;
+                                history = Some(h);
+                                if output.send(Message::BrowserNav(nav)).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        // Ping/pong/binary/close-payload frames carry nothing for us.
+                        Some(Ok(_)) => {}
+                        // Stream end or error: the browser is gone.
+                        _ => {
+                            let _ = output.send(Message::BrowserClosed).await;
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// The error text shown when no Chromium is installed — names what was looked
+/// for so the user can act.
+fn no_chromium_message() -> String {
+    "No Chromium-based browser found. Install Microsoft Edge or Google Chrome, \
+     or set the JUNTO_BROWSER environment variable to a Chromium executable."
+        .to_owned()
+}
+
+/// The screencast's max frame dimensions in device pixels. It would be the
+/// emulated viewport times the scale factor, but a `fit_width` viewport can be
+/// large and tall, and a multi-megapixel frame per repaint is what makes
+/// scrolling janky — so the longer side is capped. The frame is displayed
+/// scaled into the blade anyway, so the cap costs only fine detail, not layout.
+fn screencast_max(viewport: browser::ViewportSize, scale: f32) -> (u32, u32) {
+    /// Longest captured edge, in device pixels. High enough that normal widths
+    /// capture the full framebuffer (supersampled → crisp text); it only bounds
+    /// the pathological tall/narrow `fit_width` case so a frame can't balloon to
+    /// many megapixels and stall decode.
+    const CAP: f32 = 2560.0;
+    let width = viewport.width as f32 * scale;
+    let height = viewport.height as f32 * scale;
+    let longest = width.max(height).max(1.0);
+    let shrink = (CAP / longest).min(1.0);
+    (
+        ((width * shrink).ceil() as u32).max(1),
+        ((height * shrink).ceil() as u32).max(1),
+    )
+}
+
 fn session_stream(channel: String, session: String) -> impl iced::futures::Stream<Item = Message> {
     use iced::futures::{SinkExt, StreamExt};
     iced::stream::channel::<Message>(64, move |mut output: mpsc::Sender<Message>| async move {
@@ -10690,6 +11316,44 @@ diff --git a/lib.rs b/lib.rs
             outer.height > 100.0,
             "expected the center pane grid to keep real height with the right \
              blade collapsed to its edge tab, got {outer:?}"
+        );
+    }
+
+    /// The browser view shows a URL bar; the lineage view does not — the two
+    /// right-blade surfaces are mutually exclusive.
+    #[test]
+    fn the_browser_view_shows_a_url_bar_and_lineage_does_not() {
+        let (mut app, _) = App::new();
+        app.shell = shell::ShellState::default();
+
+        app.shell.right_view = shell::RightView::Browser;
+        {
+            let mut browser = iced_test::simulator(app.view());
+            browser
+                .find(iced::widget::Id::new("browser-url"))
+                .expect("the browser view must show the URL bar");
+        }
+
+        app.shell.right_view = shell::RightView::Lineage;
+        let mut lineage = iced_test::simulator(app.view());
+        assert!(
+            lineage.find(iced::widget::Id::new("browser-url")).is_err(),
+            "the lineage view must not show a URL bar"
+        );
+    }
+
+    /// The no-browser error state replaces the frame and its URL bar.
+    #[test]
+    fn the_error_state_replaces_the_browser_frame() {
+        let (mut app, _) = App::new();
+        app.shell = shell::ShellState::default();
+        app.shell.right_view = shell::RightView::Browser;
+        app.browser_error = Some("No Chromium-based browser found.".to_owned());
+
+        let mut ui = iced_test::simulator(app.view());
+        assert!(
+            ui.find(iced::widget::Id::new("browser-url")).is_err(),
+            "the error state must hide the URL bar"
         );
     }
 }

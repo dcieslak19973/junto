@@ -15,7 +15,7 @@ description = "Spike: a native (Iced) multi-channel pane workspace over the junt
 # Iced 0.13 has no popover primitive: an interactive floating panel must be a
 # custom Widget returning a real Overlay (`src/popover.rs`) — `tooltip`'s
 # overlay is draw-only and its content cannot be clicked or focused.
-iced = { version = "0.14", features = ["tokio", "image", "canvas", "markdown", "advanced"] }
+iced = { version = "0.14", features = ["tokio", "image", "canvas", "markdown", "advanced", "wgpu"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -40,6 +40,14 @@ tokio = { version = "1", default-features = false, features = ["time", "macros"]
 junto-kernel = { path = "../junto-kernel" }
 junto-live = { path = "../junto-live" }
 toml = "0.9"
+# Decodes CDP `Page.screencastFrame` JPEG frames (base64 on the wire). Already
+# in the lock file transitively at this version, so naming it moves no resolution.
+base64 = "0.22"
+# Decodes screencast JPEG frames to RGBA off the UI thread, so the render
+# thread only uploads pixels rather than decoding each frame (responsiveness).
+# Already in the tree via iced's "image" feature; jpeg-only, so naming it here
+# moves no resolution.
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 
 [workspace]
 
